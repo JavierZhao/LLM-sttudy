@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>33 · Architecture atlas · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="33" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VI · Model case studies · Page 33</div>
+  <h1>Architecture atlas</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~35 min</span>
+    <span>Prereqs: <a href="07-kv-efficient-attention.html">07 KV-efficient attention</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="09-beyond-full-attention.html">09 Beyond full attention</a>, <a href="26-deepseek-1-foundations.html">26</a> to <a href="32-frontier-open-models.html">32</a> (the case studies)</span>
+  </div>
+  <p class="lede">Thirty open configurations from GPT-3 to DeepSeek-V4.1-Flash side by side, with parameters, KV bytes per token and FLOPs per token recomputed from each released <code>config.json</code>. Read it to know the numbers an interviewer expects you to have in your head (head dimension 128, eight KV heads, RoPE bases, expert widths), what the field converged on and why, and which choices are still open.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Typical numbers on demand.</strong> "What head dimension, how many KV heads, what FFN ratio, how many experts and how many active, what vocabulary and RoPE base would you pick for a new model?" A good answer gives the modal value, the spread, and the reason.</li>
+    <li><strong>Config to numbers in a minute.</strong> Given a <code>config.json</code>: total and activated parameters, KV bytes per token, FLOPs per token. Which \(N\) you mean, and whether the headline count is exact.</li>
+    <li><strong>Convergence with reasons.</strong> Why RMSNorm, SwiGLU, RoPE, GQA-8, a large vocabulary, MoE at the frontier, QK-norm; what each replaced and which paper introduced it.</li>
+    <li><strong>Open questions with experiments.</strong> Attention family, MoE granularity, shared experts, balancing, optimizer, local-to-global ratio: what evidence exists and what run would settle it.</li>
+    <li><strong>Exactness.</strong> "405B" is 405.85B, Kimi K2's report says 1.04T while its config gives 1.026T. Can you reconcile a headline with a config, and say which gap is a convention and which is a discrepancy?</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>State from memory the modal value and the spread of head dimension, KV heads, \(d_{ff}/d\), vocabulary size, RoPE base, routed experts and top-\(k\), expert width relative to \(d\), and tokens per parameter.</li>
+    <li>Compute total parameters, activated parameters, KV bytes per token and FLOPs per token from a <code>config.json</code>, and say which convention you used.</li>
+    <li>Explain each convergent choice in one sentence (the problem it solved) and point to the page that derives it.</li>
+    <li>Name six open design dimensions and, for each, the evidence so far and the experiment that would settle it.</li>
+    <li>Reconcile a headline parameter count with a config in three worked cases (Kimi K2, GLM-4.5, MiniMax-M2).</li>
+    <li>Implement <code>load_config</code>, <code>params</code>, <code>kv_bytes_per_token</code> and <code>flops_per_token</code>, and reproduce 8,030,261,248 for Llama-3-8B and 671,026,404,352 for DeepSeek-V3.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="how-to-read">How to read the atlas</h2>
+  <p>The atlas has 30 rows in four tables that share one row order: 12 dense models, then 18 sparse, hybrid or compressed-attention models, each block in release order. DeepSeek-V3 and V3.2 share a row (the backbone is the same; V3.2 adds sparse attention). Table 1 gives identity and scale, Table 2 the attention block, positions and norms, Table 3 the FFN and experts, Table 4 the derived columns. A single table with 35 columns is unreadable, so read the four as one table cut into vertical bands. The two shaded rows are the course's reference models: Llama-3-8B (pages <a href="04-transformer-block.html">04</a> and <a href="06-decoding-kv-cache.html">06</a>) and DeepSeek-V3 (pages <a href="07-kv-efficient-attention.html">07</a>, <a href="08-mixture-of-experts.html">08</a>, <a href="27-deepseek-2-v3.html">27</a>).</p>
+
+  <p><strong>Where each number comes from.</strong> Architecture cells are read from the released <code>config.json</code> (for gated repositories, an ungated mirror of the same file, named in the Sources column) and checked against the technical report or model card when one exists. Advertised quantities (parameters as named, training tokens, context length) come from the report or card and are labeled as such. Where the report and the config disagree, both are shown; nothing is guessed, and "n/d" means the primary source does not state it. Every row was compared with the finished page that treats it, and the counts agree with those pages (for example 671,026,404,352 for V3 on page 08, 235,741,434,880 for V2 on page 26, 116,829,156,672 for gpt-oss-120b on page 31, 235,093,634,560 for Qwen3-235B on page 30).</p>
+
+  <p><strong>Conventions of the derived columns.</strong> They are the drill's, so you can reproduce any cell (<a href="#exercises">Hands-on</a>).</p>
+  <ul>
+    <li><em>Recount.</em> Decoder only: norm gains are parameters, rotary tables and other buffers are not, and the vision tower and any multi-token-prediction (MTP) module are excluded. Total is every weight; activated is total minus the routed experts a token does not select.</li>
+    <li><em>Three activated counts.</em> Without either vocabulary matrix (non-embedding), with the output head only, or with both matrices. Sources use different ones: Qwen3-235B's "22B" is the both-matrices count (22.19B) while MiniMax-M2's "9.8B" is the non-embedding count (9.80B). Table 1 shows what each source says, Table 4 shows the span.</li>
+    <li><em>KV bytes per token.</em> bf16, the marginal growth per token once every window is full, so only global layers count. MLA caches \(d_c + d_h^R\) numbers per layer (page <a href="07-kv-efficient-attention.html">07</a>). The GiB at 128K includes the fixed part held by windowed layers.</li>
+    <li><em>GFLOPs per token at 8K.</em> \(2 N_{\text{act}}\) (input table excluded, output head included) plus causal attention averaged over an 8K sequence: \(2\,n_h (d_{qk} + d_v)\) FLOPs per cached key, over \(T/2\) keys in a global layer and \(w - w^2/2T\) keys in a layer with window \(w\). A multiply-add is 2 FLOPs (pages <a href="04-transformer-block.html">04</a>, <a href="34-back-of-envelope.html">34</a>).</li>
+    <li><em>Tokens per activated parameter.</em> Reported training tokens over the reported activated parameters. Chinchilla's compute-optimum is about 20 (page <a href="13-scaling-laws.html">13</a>). Conventions move the ratio by a few percent: page 29 divides Maverick's 22T by the recounted 17.18B (1,281) and page 34 divides V3's 14.8T by the reported 37B (400); the table uses the reported count throughout (1,294 for Maverick).</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="master-table">The master table</h2>
+
+  <h3>Table 1. Identity and scale</h3>
+  <p>Parameters are as the source advertises them, with our exact recount in parentheses where the rounded name hides a difference. Vocabulary is the number of embedding rows in the released tensor.</p>
+  <div class="table-wrap"><table class="data" style="min-width:1240px">
+<thead><tr><th>Model</th><th>Released</th><th class="num">Parameters (total / activated)</th><th class="num">L</th><th class="num">d</th><th class="num">Vocab (rows)</th><th>Context</th><th class="num">Train tokens</th><th>Sources</th></tr></thead>
+<tbody>
+<tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
+<tr><td><strong>GPT-3 175B</strong></td><td>May 2020</td><td class="num">175B (174.60B)</td><td class="num">96</td><td class="num">12,288</td><td class="num">50,257†</td><td>2,048</td><td class="num">300B</td><td class="small"><a href="https://arxiv.org/abs/2005.14165">GPT-3 §2.1, Tab. 2.1</a>; <a href="https://huggingface.co/openai-community/gpt2/blob/main/config.json">GPT-2 config (vocab)</a></td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td>Jul 2023</td><td class="num">70B (68.98B)</td><td class="num">80</td><td class="num">8,192</td><td class="num">32,000</td><td>4,096</td><td class="num">2.0T</td><td class="small"><a href="https://arxiv.org/abs/2307.09288">Llama 2, Tab. 1</a>; <a href="https://huggingface.co/NousResearch/Llama-2-70b-hf/blob/main/config.json">config (mirror)</a></td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td>Sep 2023</td><td class="num">7B (7.24B)</td><td class="num">32</td><td class="num">4,096</td><td class="num">32,000</td><td>8,192 (paper); 32,768 (config)</td><td class="num">n/d</td><td class="small"><a href="https://arxiv.org/abs/2310.06825">Mistral 7B, Tab. 1</a>; <a href="https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td>Jun 2024</td><td class="num">27.2B</td><td class="num">46</td><td class="num">4,608</td><td class="num">256,000‡</td><td>8,192</td><td class="num">13T</td><td class="small"><a href="https://arxiv.org/abs/2408.00118">Gemma 2, Tab. 1-2</a>; <a href="https://huggingface.co/unsloth/gemma-2-27b/blob/main/config.json">config (mirror)</a></td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td>Jul 2024</td><td class="num">8B (8.03B)</td><td class="num">32</td><td class="num">4,096</td><td class="num">128,256</td><td>131,072</td><td class="num">~15T</td><td class="small"><a href="https://arxiv.org/abs/2407.21783">Llama 3, Tab. 3</a>; <a href="https://huggingface.co/unsloth/Llama-3.1-8B/blob/main/config.json">config (mirror)</a></td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td>Jul 2024</td><td class="num">70B (70.55B)</td><td class="num">80</td><td class="num">8,192</td><td class="num">128,256</td><td>131,072</td><td class="num">~15T</td><td class="small"><a href="https://arxiv.org/abs/2407.21783">Llama 3, Tab. 3</a>; <a href="https://huggingface.co/unsloth/Llama-3.1-70B/blob/main/config.json">config (mirror)</a></td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td>Jul 2024</td><td class="num">405B (405.85B)</td><td class="num">126</td><td class="num">16,384</td><td class="num">128,256</td><td>131,072</td><td class="num">15.6T</td><td class="small"><a href="https://arxiv.org/abs/2407.21783">Llama 3, Tab. 3</a>; <a href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8/blob/main/config.json">config (FP8 derivative of Meta&#x27;s file)</a></td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td>Sep 2024</td><td class="num">72.7B</td><td class="num">80</td><td class="num">8,192</td><td class="num">152,064</td><td>131,072</td><td class="num">18T</td><td class="small"><a href="https://arxiv.org/abs/2412.15115">Qwen2.5, Tab. 1</a>; <a href="https://huggingface.co/Qwen/Qwen2.5-72B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td>Mar 2025</td><td class="num">32.2B</td><td class="num">64</td><td class="num">5,120</td><td class="num">100,352</td><td>4,096</td><td class="num">6.6T</td><td class="small"><a href="https://arxiv.org/abs/2501.00656">OLMo 2, §2.1, Tab. 3</a>; <a href="https://huggingface.co/allenai/OLMo-2-0325-32B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td>Mar 2025</td><td class="num">27.0B (text)</td><td class="num">62</td><td class="num">5,376</td><td class="num">262,208</td><td>131,072</td><td class="num">14T</td><td class="small"><a href="https://arxiv.org/abs/2503.19786">Gemma 3, §2, Tab. 1</a>; <a href="https://huggingface.co/unsloth/gemma-3-27b-pt/blob/main/config.json">config (mirror)</a></td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td>Apr 2025</td><td class="num">32.8B</td><td class="num">64</td><td class="num">5,120</td><td class="num">151,936</td><td>32,768 native (config: 40,960); 131,072 with YaRN</td><td class="num">36T</td><td class="small"><a href="https://arxiv.org/abs/2505.09388">Qwen3, §2, Tab. 1</a>; <a href="https://huggingface.co/Qwen/Qwen3-32B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td>Apr 2026</td><td class="num">30.7B (text)</td><td class="num">60</td><td class="num">5,376</td><td class="num">262,144</td><td>262,144</td><td class="num">n/d</td><td class="small"><a href="https://arxiv.org/abs/2607.02770">Gemma 4, §2, Tab. 1</a>; <a href="https://huggingface.co/google/gemma-4-31B/blob/main/config.json">config</a></td></tr>
+<tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Sparse (MoE), hybrid and compressed-attention models</strong></td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td>Apr 2024</td><td class="num">141B / 39B</td><td class="num">56</td><td class="num">6,144</td><td class="num">32,000</td><td>65,536</td><td class="num">n/d</td><td class="small"><a href="https://mistral.ai/news/mixtral-8x22b">announcement</a>; <a href="https://huggingface.co/mistralai/Mixtral-8x22B-v0.1/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td>May 2024</td><td class="num">236B / 21B</td><td class="num">60</td><td class="num">5,120</td><td class="num">102,400</td><td>128K (config: 163,840)</td><td class="num">8.1T</td><td class="small"><a href="https://arxiv.org/abs/2405.04434">V2, §3.1.2</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/config.json">config</a></td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td>Dec 2024 / Dec 2025</td><td class="num">671B / 37B</td><td class="num">61</td><td class="num">7,168</td><td class="num">129,280</td><td>128K (config: 163,840)</td><td class="num">14.8T</td><td class="small"><a href="https://arxiv.org/abs/2412.19437">V3, §4.2</a>; <a href="https://arxiv.org/abs/2512.02556">V3.2</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json">config</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/config.json">V3.2 config</a></td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td>Apr 2025</td><td class="num">400B / 17B</td><td class="num">48</td><td class="num">5,120</td><td class="num">202,048</td><td>1,048,576</td><td class="num">~22T (card)</td><td class="small"><a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">Meta post</a>; <a href="https://huggingface.co/unsloth/Llama-4-Maverick-17B-128E-Instruct/blob/main/config.json">config (mirror)</a></td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td>Apr 2025</td><td class="num">235B / 22B</td><td class="num">94</td><td class="num">4,096</td><td class="num">151,936</td><td>32,768 native (config: 40,960); 131,072 with YaRN</td><td class="num">36T</td><td class="small"><a href="https://arxiv.org/abs/2505.09388">Qwen3, §2, Tab. 2</a>; <a href="https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td>Jun 2025</td><td class="num">456B / 45.9B</td><td class="num">80</td><td class="num">6,144</td><td class="num">200,064</td><td>1M (config: 10.24M positions)</td><td class="num">7.5T on top of Text-01</td><td class="small"><a href="https://arxiv.org/abs/2506.13585">M1, §1</a>; <a href="https://arxiv.org/abs/2501.08313">MiniMax-01, §2</a>; <a href="https://huggingface.co/MiniMaxAI/MiniMax-M1-80k/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Kimi K2</strong></td><td>Jul 2025</td><td class="num">1.04T / 32.6B</td><td class="num">61</td><td class="num">7,168</td><td class="num">163,840</td><td>131,072</td><td class="num">15.5T</td><td class="small"><a href="https://arxiv.org/abs/2507.20534">K2, §2.3, Tab. 2</a>; <a href="https://huggingface.co/moonshotai/Kimi-K2-Base/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td>Jul 2025</td><td class="num">355B / 32B</td><td class="num">92</td><td class="num">5,120</td><td class="num">151,552</td><td>131,072</td><td class="num">23T</td><td class="small"><a href="https://arxiv.org/abs/2508.06471">GLM-4.5, §2.1, Tab. 1</a>; <a href="https://huggingface.co/zai-org/GLM-4.5/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td>Aug 2025</td><td class="num">116.8B / 5.13B</td><td class="num">36</td><td class="num">2,880</td><td class="num">201,088</td><td>131,072</td><td class="num">n/d</td><td class="small"><a href="https://arxiv.org/abs/2508.10925">gpt-oss model card, Tab. 1</a>; <a href="https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td>Sep 2025</td><td class="num">80B / 3B</td><td class="num">48</td><td class="num">2,048</td><td class="num">151,936</td><td>262,144</td><td class="num">15T</td><td class="small"><a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">model card</a>; <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td>Oct 2025</td><td class="num">229.9B / 9.8B</td><td class="num">62</td><td class="num">3,072</td><td class="num">200,064</td><td>196,608</td><td class="num">29.2T</td><td class="small"><a href="https://arxiv.org/abs/2605.26494">M2 report, §1-2</a>; <a href="https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td>Feb 2026</td><td class="num">397B / 17B</td><td class="num">60</td><td class="num">4,096</td><td class="num">248,320</td><td>262,144</td><td class="num">n/d</td><td class="small"><a href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B">model card</a>; <a href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td>Apr 2026</td><td class="num">26B / 3.8B</td><td class="num">30</td><td class="num">2,816</td><td class="num">262,144</td><td>262,144</td><td class="num">n/d</td><td class="small"><a href="https://arxiv.org/abs/2607.02770">Gemma 4, §2, Tab. 1</a>; <a href="https://huggingface.co/google/gemma-4-26B-A4B/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td>Apr 2026</td><td class="num">284B / 13B</td><td class="num">43</td><td class="num">4,096</td><td class="num">129,280</td><td>1,048,576</td><td class="num">32T</td><td class="small"><a href="https://arxiv.org/abs/2606.19348">V4, §4.2</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td>Apr 2026</td><td class="num">1.6T / 49B</td><td class="num">61</td><td class="num">7,168</td><td class="num">129,280</td><td>1,048,576</td><td class="num">33T</td><td class="small"><a href="https://arxiv.org/abs/2606.19348">V4, §4.2</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Kimi K3</strong></td><td>Jul 2026</td><td class="num">2.8T / 104B</td><td class="num">93</td><td class="num">7,168</td><td class="num">163,840</td><td>1,048,576</td><td class="num">n/d</td><td class="small"><a href="https://huggingface.co/moonshotai/Kimi-K3">model card</a>; <a href="https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td>Aug 2026</td><td class="num">125B / 6B (+51B n-gram)</td><td class="num">48</td><td class="num">2,560</td><td class="num">248,320</td><td>262,144</td><td class="num">n/d</td><td class="small"><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">model card</a>; <a href="https://arxiv.org/abs/2608.30320">design paper</a>; <a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/config.json">config</a></td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td>Sep 2026</td><td class="num">552B (+196B Engram) / 8B prefill, 16B decode</td><td class="num">40</td><td class="num">5,120</td><td class="num">129,280</td><td>1,048,576</td><td class="num">45T</td><td class="small"><a href="https://arxiv.org/abs/2609.19969">V4.1-Flash, §1, §4.2</a>; <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json">config</a></td></tr>
+</tbody></table></div>
+  <p class="small muted">† GPT-3 reuses GPT-2's byte-level BPE (50,257 tokens); the paper says only that it keeps GPT-2's tokenization. ‡ The Gemma 2 report lists 256,128 (page <a href="31-mistral-gemma-gptoss.html">31</a>); the released embedding has 256,000 rows and the recount matches the checkpoint exactly. Context: V2 and V3 are 128K in the reports and 163,840 in the configs (YaRN factor 40 over 4,096); MiniMax-M1 was trained to 1M and its config allows 10.24M positions; Mistral 7B's paper says 8,192; Qwen3's config says 40,960 while the report gives 32,768 native. Tokens: OLMo 2 32B's 6.6T includes mid-training (6.06T in the pretraining stage); MiniMax-M1's 7.5T is continued pretraining on top of MiniMax-Text-01; Maverick's ~22T is the model card's figure (Meta's post says more than 30T for the mixture; page <a href="29-llama.html">29</a>); V4.1-Flash's 45T are multimodal tokens and its activated count is 8B in prefill, 16B in decode. Llama 3.1 rows are the 3.1 releases: same architecture as Llama 3 with the RoPE rescaling and 128K context (page <a href="29-llama.html">29</a>). "n/d": not disclosed.</p>
+
+  <h3>Table 2. Attention, positions, norms</h3>
+  <p>"Heads" is query heads over KV heads times head dimension; for MLA it is the head count and the cached latent. When a model mixes layer types, the softmax layers are given.</p>
+  <div class="table-wrap"><table class="data" style="min-width:1100px">
+<thead><tr><th>Model</th><th>Attention</th><th class="num">Heads: query / KV × head dim</th><th>Positions</th><th>Norm and stability</th></tr></thead>
+<tbody>
+<tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
+<tr><td><strong>GPT-3 175B</strong></td><td>MHA, alternating dense and locally banded</td><td class="num">96 / 96 × 128</td><td>learned absolute (as GPT-2)</td><td>pre-LayerNorm</td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>4</sup>§</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td>GQA, sliding window 4,096 in every layer</td><td class="num">32 / 8 × 128</td><td>RoPE, θ = 10<sup>4</sup></td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td>GQA, local (4,096) : global = 1 : 1</td><td class="num">32 / 16 × 128</td><td>RoPE, θ = 10<sup>4</sup></td><td>pre + post RMSNorm; soft-cap 50 (attention), 30 (logits)</td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td>GQA</td><td class="num">32 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td>GQA</td><td class="num">128 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QKV bias</td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td>GQA</td><td class="num">40 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup></td><td>output-side RMSNorm per sublayer; QK-norm (full width)</td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td>GQA, local (1,024) : global = 5 : 1</td><td class="num">32 / 16 × 128</td><td>RoPE, θ = 10<sup>4</sup> local, 10<sup>6</sup> global (×8)</td><td>pre + post RMSNorm; QK-norm</td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm, no QKV bias</td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td>GQA, local (1,024) : global = 5 : 1; global K = V</td><td class="num">local 32 / 16 × 256; global 32 / 4 × 512</td><td>RoPE θ = 10<sup>4</sup> local; p-RoPE (25% of dims), θ = 10<sup>6</sup> global</td><td>pre + post RMSNorm; QK-norm; logit cap 30</td></tr>
+<tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Sparse (MoE), hybrid and compressed-attention models</strong></td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td>GQA, full (window off)</td><td class="num">48 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td>MLA</td><td class="num">128 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 10<sup>4</sup>; YaRN ×40</td><td>RMSNorm; latent norms</td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td>MLA (V3.2: + sparse top-2,048, DSA)</td><td class="num">128 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 10<sup>4</sup>; YaRN ×40</td><td>RMSNorm; latent norms</td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td>GQA, chunked (8,192) RoPE layers : global NoPE layers = 3 : 1</td><td class="num">40 / 8 × 128</td><td>RoPE θ = 5×10<sup>5</sup> on 3 of 4 layers; none on the 4th</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td>GQA</td><td class="num">64 / 4 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm</td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td>hybrid: 7 lightning (linear) : 1 softmax GQA</td><td class="num">softmax layers 64 / 8 × 128</td><td>RoPE on half of each head, θ = 10<sup>7</sup></td><td>post-norm with DeepNorm scaling</td></tr>
+<tr><td><strong>Kimi K2</strong></td><td>MLA</td><td class="num">64 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 5×10<sup>4</sup>; YaRN ×32</td><td>RMSNorm; QK-Clip (MuonClip)</td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td>GQA</td><td class="num">96 / 8 × 128</td><td>partial RoPE (50% of dims), θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm; QKV bias</td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td>GQA, banded (128) : dense = 1 : 1</td><td class="num">64 / 8 × 64</td><td>RoPE, θ = 1.5×10<sup>5</sup>; YaRN ×32</td><td>pre-RMSNorm; learned sink logit per head; attention biases</td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td>hybrid: 3 Gated DeltaNet : 1 gated softmax GQA</td><td class="num">softmax layers 16 / 2 × 256</td><td>RoPE on 25% of dims, θ = 10<sup>7</sup></td><td>zero-centered RMSNorm; QK-norm; sigmoid output gate</td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td>GQA, full in all 62 layers</td><td class="num">48 / 8 × 128</td><td>RoPE on 64 of 128 dims, θ = 5×10<sup>6</sup></td><td>pre-RMSNorm; QK-norm (full width)</td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td>hybrid: 3 Gated DeltaNet : 1 gated softmax GQA</td><td class="num">softmax layers 32 / 2 × 256</td><td>RoPE on 25% of dims (interleaved M-RoPE), θ = 10<sup>7</sup></td><td>sigmoid output gate</td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td>GQA, local (1,024) : global = 5 : 1; global K = V</td><td class="num">local 16 / 8 × 256; global 16 / 2 × 512</td><td>as 31B: θ = 10<sup>4</sup> local; p-RoPE 25%, 10<sup>6</sup> global</td><td>pre + post RMSNorm; QK-norm; logit cap 30</td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td>compressed shared-KV MQA: CSA (÷4, top-512) and HCA (÷128) layers; 2 window-only layers first</td><td class="num">64 / 1 × 512</td><td>RoPE on last 64 of 512 dims, θ = 10<sup>4</sup> (160,000 on compressed); YaRN ×16</td><td>mHC residual (4 streams); RMSNorm on q and KV; sink logits</td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td>compressed shared-KV MQA: CSA (÷4, top-1,024) and HCA (÷128) layers; 2 HCA first</td><td class="num">128 / 1 × 512</td><td>as V4-Flash</td><td>mHC residual (4 streams); RMSNorm on q and KV; sink logits</td></tr>
+<tr><td><strong>Kimi K3</strong></td><td>hybrid: 3 Kimi Delta Attention : 1 gated MLA (69 + 24)</td><td class="num">MLA layers: 96 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>NoPE in the MLA layers (gates carry position)</td><td>attention residuals (AttnRes); MLA output gate</td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td>hybrid: 3 Gated DeltaNet : 1 sparse softmax (QSA)</td><td class="num">softmax layers 24 / 2 × 256</td><td>RoPE on 25% of dims, θ = 10<sup>7</sup></td><td>gated residual (4 streams); sigmoid output gate</td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td>CSA2: compressed sparse, KV shared across layers (4 Full owners); causal encoder-decoder</td><td class="num">64 / 1 × 512</td><td>as V4-Flash</td><td>mHC residual (single-pass); sliding-window KV in FP8</td></tr>
+</tbody></table></div>
+  <p class="small muted">§ Llama 2's released config has no <code>rope_theta</code>; the default of 10,000 in Meta's reference code applies. Gemma 4's global layers use "proportional" RoPE (rotate the first 25% of dimensions) with keys reused as values. The V4 family's compressed shared-KV attention is treated on pages <a href="09-beyond-full-attention.html">09</a> and <a href="28-deepseek-3-reasoning.html">28</a>; Kimi K3's attention residuals and Qwen3.8's gated residual are the 2026 replacements for the plain residual stream (page <a href="11-stability-tweaks.html">11</a>).</p>
+
+  <h3>Table 3. FFN and experts</h3>
+  <p>"Sparsity" is routed experts divided by routed experts activated, the definition of the Kimi K2 report (384 / 8 = 48). Shared experts are not counted in it.</p>
+  <div class="table-wrap"><table class="data" style="min-width:1060px">
+<thead><tr><th>Model</th><th>FFN (hidden width, ratio to d)</th><th>Experts: routed / active / shared × width</th><th class="num">Sparsity</th><th>Routing and balancing</th></tr></thead>
+<tbody>
+<tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
+<tr><td><strong>GPT-3 175B</strong></td><td>GELU MLP, 49,152 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td>SwiGLU, 28,672 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td>SwiGLU, 14,336 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td>GeGLU, 36,864 (8d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td>SwiGLU, 14,336 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td>SwiGLU, 28,672 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td>SwiGLU, 53,248 (3.25d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td>SwiGLU, 29,568 (3.6d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td>SwiGLU, 27,648 (5.4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td>GeGLU, 21,504 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td>SwiGLU, 25,600 (5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td>GeGLU, 21,504 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Sparse (MoE), hybrid and compressed-attention models</strong></td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td>SwiGLU experts</td><td>8 / 2 / 0 × 16,384; all 56 layers</td><td class="num">4</td><td>softmax over the top-2 logits</td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td>SwiGLU; layer 1 dense 12,288</td><td>160 / 6 / 2 × 1,536; 59 MoE layers</td><td class="num">26.7</td><td>softmax; device-limited (3 of 8 groups); three aux losses</td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td>SwiGLU; layers 1–3 dense 18,432</td><td>256 / 8 / 1 × 2,048; 58 MoE layers</td><td class="num">32</td><td>sigmoid, normalized, ×2.5; bias balancing, no aux loss; ≤ 4 nodes</td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td>SwiGLU; 24 dense layers 16,384, alternating</td><td>128 / 1 / 1 × 8,192; 24 MoE layers</td><td class="num">128</td><td>top-1 plus always-on shared expert</td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td>SwiGLU experts</td><td>128 / 8 / 0 × 1,536; all 94 layers</td><td class="num">16</td><td>softmax top-8 renormalized; global-batch aux loss</td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td>SwiGLU experts</td><td>32 / 2 / 0 × 9,216; all 80 layers</td><td class="num">16</td><td>top-2</td></tr>
+<tr><td><strong>Kimi K2</strong></td><td>SwiGLU; layer 1 dense 18,432</td><td>384 / 8 / 1 × 2,048; 60 MoE layers</td><td class="num">48</td><td>sigmoid, bias balancing; no expert groups</td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td>SwiGLU; layers 1–3 dense 12,288</td><td>160 / 8 / 1 × 1,536; 89 MoE layers</td><td class="num">20</td><td>sigmoid, loss-free balancing</td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td>clamped SwiGLU experts (limit 7)</td><td>128 / 4 / 0 × 2,880; all 36 layers</td><td class="num">32</td><td>top-4 softmax</td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 512; all 48 layers</td><td class="num">51.2</td><td>softmax top-10 renormalized; gated shared expert</td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td>SwiGLU experts</td><td>256 / 8 / 0 × 1,536; all 62 layers</td><td class="num">32</td><td>sigmoid with learned routing bias</td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 1,024; all 60 layers</td><td class="num">51.2</td><td>top-10 plus shared expert</td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td>GeGLU experts + parallel dense MLP 2,112</td><td>128 / 8 / 1 (dense MLP) × 704; all 30 layers</td><td class="num">16</td><td>top-8</td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td>SwiGLU (clamped ±10); all 43 layers MoE</td><td>256 / 6 / 1 × 2,048; first 3 hash-routed</td><td class="num">42.7</td><td>Sqrt(Softplus) affinities; bias balancing; FP4 experts</td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td>SwiGLU (clamped ±10); all 61 layers MoE</td><td>384 / 6 / 1 × 3,072; first 3 hash-routed</td><td class="num">64</td><td>as V4-Flash</td></tr>
+<tr><td><strong>Kimi K3</strong></td><td>SiTU-GLU; layer 1 dense 33,792</td><td>896 / 16 / 2 × 3,072; 92 MoE layers, LatentMoE (3,584)</td><td class="num">56</td><td>sigmoid, bias balancing</td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 640; all 48 layers</td><td class="num">51.2</td><td>top-10 plus shared expert</td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td>SwiGLU (clamped ±10); all 40 layers MoE</td><td>384 / 6 / 1 × 2,304</td><td class="num">64</td><td>as V4-Flash</td></tr>
+</tbody></table></div>
+  <p class="small muted">Expert widths are per routed expert (the intermediate size of one SwiGLU or GeGLU expert). Gemma 4 26B-A4B runs a dense MLP of width 2,112 in parallel with 8 of 128 experts of width 704 in every layer, which we list as its shared branch. Kimi K3 projects tokens from \(d = 7168\) to a latent width of 3,584 before routing (LatentMoE, page <a href="32-frontier-open-models.html">32</a>), so its expert width is not comparable with the others by \(d\).</p>
+
+  <h3>Table 4. Derived columns, recomputed with the drill</h3>
+  <p>Every cell is produced by <code>exercises/solutions/config_zoo.py</code> from the config of the same row, and compared with the released checkpoint's tensor count where the file allows it. Worked arithmetic for one full row is in <a href="#config">From config.json to numbers</a>.</p>
+  <div class="table-wrap"><table class="data" style="min-width:1360px">
+<thead><tr><th>Model</th><th class="num">Recount, total</th><th class="num">Recount, activated (no embeddings to both matrices)</th><th>Recount versus released file</th><th class="num">KV bytes / token (bf16)</th><th class="num">KV GiB, 1 seq. at 128K</th><th class="num">GFLOPs / token at 8K</th><th class="num">Tokens per activated param</th><th class="num">6·N<sub>act</sub>·D (FLOPs)</th></tr></thead>
+<tbody>
+<tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
+<tr><td><strong>GPT-3 175B</strong></td><td class="num">174.60B</td><td class="num">–</td><td class="small">hand count (no config file): matmuls, biases, LayerNorms, 2,048 learned positions</td><td class="num">4,718,592</td><td class="num">–</td><td class="num">368.5</td><td class="num">1.7</td><td class="num">3.2×10<sup>23</sup></td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td class="num">68.98B</td><td class="num">–</td><td class="small">exact (file +5,120 buffer elements)</td><td class="num">327,680</td><td class="num">–</td><td class="num">148.2</td><td class="num">28.6</td><td class="num">8.4×10<sup>23</sup></td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td class="num">7.24B</td><td class="num">–</td><td class="small">exact</td><td class="num">0 (all windowed)</td><td class="num">–</td><td class="num">15.8</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td class="num">27.23B</td><td class="num">–</td><td class="small">exact (file has 256,000 embedding rows; report lists 256,128)</td><td class="num">188,416</td><td class="num">–</td><td class="num">57.2</td><td class="num">478</td><td class="num">2.1×10<sup>24</sup></td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td class="num">8.03B</td><td class="num">–</td><td class="small">exact</td><td class="num">131,072</td><td class="num">16.00</td><td class="num">17.2</td><td class="num">1,868</td><td class="num">7.2×10<sup>23</sup></td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td class="num">70.55B</td><td class="num">–</td><td class="small">exact</td><td class="num">327,680</td><td class="num">40.00</td><td class="num">149.7</td><td class="num">213</td><td class="num">6.3×10<sup>24</sup></td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td class="num">405.85B</td><td class="num">–</td><td class="small">exact</td><td class="num">516,096</td><td class="num">63.00</td><td class="num">841.3</td><td class="num">38.4</td><td class="num">3.8×10<sup>25</sup></td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td class="num">72.71B</td><td class="num">–</td><td class="small">exact</td><td class="num">327,680</td><td class="num">40.00</td><td class="num">153.7</td><td class="num">248</td><td class="num">7.9×10<sup>24</sup></td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td class="num">32.23B</td><td class="num">–</td><td class="small">exact</td><td class="num">262,144</td><td class="num">–</td><td class="num">68.8</td><td class="num">205</td><td class="num">1.3×10<sup>24</sup></td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td class="num">27.01B</td><td class="num">–</td><td class="small">text only; report Tab. 1: 27.02B</td><td class="num">81,920</td><td class="num">10.41</td><td class="num">55.5</td><td class="num">519</td><td class="num">2.3×10<sup>24</sup></td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td class="num">32.76B</td><td class="num">–</td><td class="small">exact</td><td class="num">262,144</td><td class="num">32.00</td><td class="num">72.6</td><td class="num">1,098</td><td class="num">7.1×10<sup>24</sup></td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td class="num">30.70B</td><td class="num">–</td><td class="small">text only; report Tab. 1: 30.70B</td><td class="num">40,960</td><td class="num">5.78</td><td class="num">65.7</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Sparse (MoE), hybrid and compressed-attention models</strong></td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td class="num">140.62B</td><td class="num">38.76–39.15B</td><td class="small">exact</td><td class="num">229,376</td><td class="num">–</td><td class="num">83.5</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td class="num">235.74B</td><td class="num">20.33–21.38B</td><td class="small">exact</td><td class="num">69,120</td><td class="num">8.44</td><td class="num">61.8</td><td class="num">386</td><td class="num">1.0×10<sup>24</sup></td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td class="num">671.03B</td><td class="num">35.70–37.55B</td><td class="small">file 684.53B adds the MTP module and FP8 scales</td><td class="num">70,272</td><td class="num">8.58</td><td class="num">93.7</td><td class="num">400</td><td class="num">3.3×10<sup>24</sup></td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td class="num">400.71B</td><td class="num">15.12–17.18B</td><td class="small">text tensors exact (file adds vision)</td><td class="num">49,152</td><td class="num">7.12</td><td class="num">36.3</td><td class="num">1,294</td><td class="num">2.2×10<sup>24</sup></td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td class="num">235.09B</td><td class="num">20.95–22.19B</td><td class="small">exact</td><td class="num">192,512</td><td class="num">23.50</td><td class="num">55.8</td><td class="num">1,636</td><td class="num">4.8×10<sup>24</sup></td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">linear-attention layers not modeled</td><td class="num">40,960</td><td class="num">5.00</td><td class="num">≈ 93.1‡</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>Kimi K2</strong></td><td class="num">1.026T</td><td class="num">30.51–32.86B</td><td class="small">file +62.5M FP8 scales; report says 1.04T (page 08)</td><td class="num">70,272</td><td class="num">8.58</td><td class="num">73.6</td><td class="num">475</td><td class="num">3.0×10<sup>24</sup></td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td class="num">352.80B</td><td class="num">32.08–33.63B</td><td class="small">exact: file = recount + MTP layer 3.99B + its own embedding and head 1.55B</td><td class="num">376,832</td><td class="num">46.00</td><td class="num">84.2</td><td class="num">719</td><td class="num">4.4×10<sup>24</sup></td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td class="num">116.79B</td><td class="num">4.55–5.71B</td><td class="small">file +39.8M: expert and router biases, sinks</td><td class="num">36,864</td><td class="num">4.50</td><td class="num">11.5</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">linear-attention layers not modeled</td><td class="num">24,576</td><td class="num">3.00</td><td class="num">≈ 7.9‡</td><td class="num">5,000</td><td class="num">2.7×10<sup>23</sup></td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td class="num">228.69B</td><td class="num">9.80–11.03B</td><td class="small">file +15,872 routing biases; report says 229.9B</td><td class="num">253,952</td><td class="num">31.00</td><td class="num">27.1</td><td class="num">2,980</td><td class="num">1.7×10<sup>24</sup></td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">linear-attention layers not modeled</td><td class="num">30,720</td><td class="num">3.75</td><td class="num">≈ 36.0‡</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td class="num">25.23B</td><td class="num">3.08–3.82B</td><td class="small">text only; report Tab. 1: 25.24B</td><td class="num">10,240</td><td class="num">1.45</td><td class="num">8.7</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">compressed attention, mHC, hash layers not modeled</td><td class="num">≈ 3,471†</td><td class="num">≈ 0.42†</td><td class="num">n/a‡</td><td class="num">2,462</td><td class="num">2.5×10<sup>24</sup></td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">compressed attention, mHC, hash layers not modeled</td><td class="num">≈ 4,970†</td><td class="num">≈ 0.61†</td><td class="num">n/a‡</td><td class="num">673</td><td class="num">9.7×10<sup>24</sup></td></tr>
+<tr><td><strong>Kimi K3</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">KDA layers and LatentMoE not modeled</td><td class="num">27,648</td><td class="num">3.38</td><td class="num">≈ 214.0‡</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">linear-attention layers not modeled</td><td class="num">24,576</td><td class="num">3.00</td><td class="num">≈ 13.2‡</td><td class="num">n/d</td><td class="num">n/d</td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td class="num">n/a‡</td><td class="num">n/a‡</td><td class="small">CSA2, encoder-decoder split not modeled</td><td class="num">890†</td><td class="num">≈ 0.11†</td><td class="num">n/a‡</td><td class="num">2,812</td><td class="num">4.3×10<sup>24</sup></td></tr>
+</tbody></table></div>
+  <p class="small muted">† V4 KV bytes are our reconstructions from the configurations (page <a href="28-deepseek-3-reasoning.html">28</a>, Table 17: 30 CSA and 31 HCA layers for Pro, 21 CSA and 20 HCA for Flash, 644 B per compressed CSA entry, 576 B per HCA entry; page 09 gets 4,940 for Pro by storing the indexer key without its scale). V4.1-Flash's 890 B is the report's stated global KV footprint per token, which page 28 reconstructs as 2.5 × (288 + 68) B. For V3.2 the FP8 latent plus indexer key layout gives 48,068 B (page 28), not the bf16 70,272 B shown. The 128K column for these rows is bytes per token times \(2^{17}\), without window entries. ‡ The drill raises <code>NotImplementedError</code> on linear-attention layers and does not model compressed attention. The approximate FLOPs use \(2 N_{\text{act}}\) with the reported activated count (Qwen3-Next: page 30's 3.25B non-embedding plus the output head) plus the softmax-layer term of the drill; recurrent-state updates are ignored. The V3 row is at full 128-head MLA cost, so V3.2's sparse layers would be cheaper at 8K only if the indexer's own cost is ignored (page 28).</p>
+
+  <aside class="callout note"><div class="callout-title">What the numbers already say</div>
+    <p>Four sentences from the tables. KV bytes per token span more than three orders of magnitude: 4,718,592 for GPT-3's 96-head MHA, 131,072 for Llama 3.1 8B, 70,272 for V3's MLA, 27,648 for Kimi K3, 890 for V4.1-Flash's global cache (5,300 times below GPT-3). Total parameters passed a trillion (K2, V4-Pro, K3) while activated parameters stayed under about 105B. Tokens per activated parameter went from 1.7 (GPT-3) to 200 to 2,000 (2024 and 2025 dense models) to about 5,000 (Qwen3-Next). And the FLOPs per token of a 2026 frontier MoE (V3: 93.7 GFLOPs at 8K) is a ninth of Llama 3.1 405B's (841.3), while its weights need more memory than a 70B dense model by a factor of nine.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="converged">What the field converged on, and why</h2>
+  <p>A "standard" 2025 dense decoder is the LLaMA block of 2023 (Touvron et al.), with three later changes. Take GPT-3's block (pre-LayerNorm, GELU MLP with a \(4d\) hidden layer, learned absolute positions, biases, full multi-head attention) and replace each part: LayerNorm by RMSNorm <span class="zh">均方根归一化</span> (Zhang and Sennrich, 2019), the GELU MLP by a gated SwiGLU (Shazeer, 2020), learned positions by rotary embeddings <span class="zh">旋转位置编码</span> (Su et al., 2021), drop the biases, then share keys and values across query groups (GQA <span class="zh">分组查询注意力</span>, Ainslie et al., 2023) and enlarge the vocabulary. The three later changes are QK-norm on the attention logits, a MoE FFN at large scale, and a cheaper attention for long context. Table 5 counts each choice in the atlas.</p>
+
+  <h3>Table 5. What almost everyone does</h3>
+  <div class="table-wrap"><table class="data" style="min-width:920px">
+  <thead><tr><th>Choice</th><th>In the atlas</th><th>What it replaced, and why it won</th><th>Page</th></tr></thead>
+  <tbody>
+  <tr><td><strong>RMSNorm, pre-norm</strong></td><td>RMSNorm in 29 of 30 rows (GPT-3: LayerNorm). Placement varies: pre in most; pre + post in the four Gemma rows; output-side in OLMo 2; post with DeepNorm scaling in MiniMax-M1</td><td>LayerNorm: drops the mean subtraction and the bias, so it is cheaper and as good. Pre-norm keeps an identity path through the residual stream, which lets deep stacks train without careful warmup</td><td><a href="04-transformer-block.html">04</a>, <a href="11-stability-tweaks.html">11</a></td></tr>
+  <tr><td><strong>Gated FFN</strong></td><td>SwiGLU in 24 rows, GeGLU in the 4 Gemma rows, SiTU-GLU in K3; only GPT-3 has a plain GELU MLP</td><td>Gated units beat a GELU MLP at equal parameters (Shazeer 2020). A gated FFN of width \(\tfrac83 d\) matches a \(4d\) MLP in parameters; dense models use 3.25 to 5.4 \(d\)</td><td><a href="04-transformer-block.html">04</a></td></tr>
+  <tr><td><strong>RoPE</strong></td><td>29 of 30 (GPT-3: learned). NoPE layers appear in Llama 4 (1 in 4) and K3's MLA layers. Bases: \(10^4\) (2023) to \(5 \times 10^5\) (Llama 3), \(10^6\) (Qwen, Mixtral, GLM), \(10^7\) (Qwen3-Next family, MiniMax-M1)</td><td>Learned and sinusoidal absolute positions extrapolate poorly. RoPE is relative, costs no parameters, and its base is a knob for context length</td><td><a href="05-positional-encoding.html">05</a>, <a href="10-long-context.html">10</a></td></tr>
+  <tr><td><strong>No biases</strong></td><td>Exceptions: GPT-3, Qwen2.5 and GLM-4.5 (QKV bias), gpt-oss (attention and expert biases)</td><td>Biases add parameters and kernels for no measured gain; Qwen3 removed Qwen2.5's QKV bias</td><td><a href="30-qwen.html">30</a></td></tr>
+  <tr><td><strong>Fewer KV heads than query heads</strong></td><td>8 KV heads in 14 rows; 16 in Gemma 2, 3 and 4 (local); 4 in Qwen3-235B; 2 in the Qwen hybrids; 1 in the V4 family; MLA in V2, V3, K2, K3. Only GPT-3 is MHA</td><td>The KV cache is what decode reads at every step. GQA-8 cuts it \(n_h/8\) times at almost no quality cost; MLA cuts it further by caching a latent</td><td><a href="07-kv-efficient-attention.html">07</a></td></tr>
+  <tr><td><strong>Large vocabulary</strong> <span class="zh">词表</span></td><td>32,000 (Llama 2, Mistral, Mixtral); 100K to 130K (OLMo 2, V2, Llama 3, V3, V4); 150K to 164K (Qwen, GLM, Kimi); about 200K (Maverick, gpt-oss, MiniMax); 248K to 262K (Qwen3.5, Gemma)</td><td>More characters per token means fewer tokens per document (cheaper training and inference, longer effective context) and better multilingual coverage. The price is \(2Vd\) parameters: 1.16B of gpt-oss-120b's 5.13B activated</td><td><a href="02-tokenization.html">02</a></td></tr>
+  <tr><td><strong>MoE at the frontier</strong> <span class="zh">混合专家</span></td><td>Every row above 300B total is sparse except Llama 3.1 405B (Maverick, Qwen3.5, GLM-4.5, M1, V3, V4.1, K2, V4-Pro, K3). Dense survives at or below 128B (Qwen3-32B, Gemma 4 31B, OLMo 2 32B, Qwen2.5-72B; Mistral Medium 3.5 at 128B, page 31)</td><td>Loss follows total parameters and tokens, cost follows activated parameters. The activated FFN width of a MoE (top-\(k\) plus shared) is 2.4 to 4 \(d\), the same as a dense FFN's, while the stored capacity is 16 to 100 times larger</td><td><a href="08-mixture-of-experts.html">08</a>, <a href="13-scaling-laws.html">13</a></td></tr>
+  <tr><td><strong>QK-norm, or an equivalent</strong></td><td>12 rows, all released since March 2025: OLMo 2, Gemma 3 and 4, Qwen3, Qwen3-Next, GLM-4.5, M2, and RMSNorm on q and KV in V4. Not in Maverick or gpt-oss; K2 uses QK-Clip instead</td><td>Bounds the attention logit at \(g^2 \sqrt{d_h}\) for any weights, which removes one cause of loss spikes and tolerates higher learning rates. Needs materialized keys, so MLA applies it to latents</td><td><a href="11-stability-tweaks.html">11</a></td></tr>
+  <tr><td><strong>Fine-grained experts</strong> <span class="zh">细粒度专家</span></td><td>Every MoE since V2 except Mixtral and M1 routes among 128 to 896 experts whose width is 0.25 to 0.5 \(d\) (gpt-oss 1.0, Maverick 1.6); sparsity 16 to 64</td><td>Mixtral's 8 wide experts (2.7 \(d\)) give few combinations; small experts give \(\binom{512}{10} \approx 10^{20.5}\) against \(\binom{128}{8} \approx 10^{12}\) at the same activated width</td><td><a href="08-mixture-of-experts.html">08</a>, <a href="26-deepseek-1-foundations.html">26</a></td></tr>
+  <tr><td><strong>A cheaper long-context attention</strong></td><td>KV per token under 100 KB in 17 of the 30 rows; a windowed, linear, sparse or compressed component in 14 of the 18 sparse rows and in Gemma 2, Gemma 3, Gemma 4, Mistral 7B</td><td>Full attention at 128K to 1M makes the cache the binding resource in serving; every family attacks a different factor of the same product (see below)</td><td><a href="09-beyond-full-attention.html">09</a></td></tr>
+  </tbody></table></div>
+
+  <p>Three points on the table deserve care. First, <strong>GQA-8 was a trade, not a law</strong>: with 8 KV heads and \(d_h = 128\), a layer caches 2,048 numbers; models that keep more (Gemma at 16) pair them with windows, and models with very sparse FFNs keep fewer (Qwen3-235B at 4, the hybrids at 2) because their attention is a small share of the FLOPs but a large share of the memory traffic. Second, <strong>the vocabulary rise is an efficiency trade with a cost that scales</strong>: embedding plus output head is \(2Vd\), which is 1.05B for Llama 3.1 8B, 1.23B for MiniMax-M2 and 2.82B for Gemma 3 27B, so small models tie the two matrices (Gemma 3 and 4) and MoEs pay it once per model, not per expert. Third, <strong>the FFN ratio is not constant</strong>: with GQA an attention layer costs \(2.5 d^2\) in Llama 3.1 8B and the FFN \(3 \times 3.5 d^2 = 10.5 d^2\), so the FFN holds 81% of a layer's \(13 d^2\) (page <a href="34-back-of-envelope.html">34</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Stability tools that spread: QK-norm before soft-capping</div>
+    <dl>
+      <dt>Problem</dt><dd>Attention logits grow with training, which sharpens softmax rows and causes loss spikes at large learning rates.</dd>
+      <dt>Idea</dt><dd>Normalize \(q\) and \(k\) per head (QK-norm), or cap logits with \(c\tanh(z/c)\) (Gemma 2: \(c = 50\)), or clip the weights after the optimizer step when a head's logits explode (Kimi's QK-Clip).</dd>
+      <dt>Why it works</dt><dd>With unit-RMS \(q, k\) and gains \(g\), \(|z| \le g^2\sqrt{d_h}\) for any weights, so the bound holds by construction; a cap bounds the range only and its gradient vanishes past \(c\) (page 11, page 31).</dd>
+      <dt>Evidence</dt><dd>Gemma 3 replaced Gemma 2's soft-cap by QK-norm <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>; Qwen3 added QK-norm while dropping QKV bias <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>; Kimi K2 used QK-Clip under Muon <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.1]</a>; the V4 report says its RMSNorm on q and KV entries makes QK-Clip unnecessary (page 28).</dd>
+      <dt>Cost</dt><dd>Two norms per attention layer, and keys must be materialized, so it does not fit absorbed MLA without applying the norm to latents.</dd>
+      <dt>Used by</dt><dd>OLMo 2, Gemma 3 and 4, Qwen3 and Qwen3-Next, GLM-4.5, MiniMax-M2 (all with QK-norm); Gemma 2 (soft-cap); K2 (QK-Clip); V4 (RMSNorm on q and KV).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="diverged">Where designs still disagree</h2>
+  <p>Below the shared skeleton, the 2025 to 2026 releases differ on the choices that set inference cost and long-context behavior. These are the dimensions an interviewer will ask you to argue about; for each, the table gives the options present in the atlas, the evidence that exists, and the experiment that would settle it.</p>
+
+  <div class="decision">
+    <div class="decision-title">Attention for long context: five families in production</div>
+    <dl>
+      <dt>Problem</dt><dd>At 128K to 1M tokens decode reads the whole KV cache at every step and serving capacity is set by cache bytes per sequence, not by FLOPs.</dd>
+      <dt>Idea</dt><dd>The cache is a product: (global layers) × (numbers cached per layer) × (bytes per number) × (tokens read). Each family attacks one factor. GQA-8: numbers per layer, 2,048 (Llama). MLA: 576 numbers (V3, K2, K3). Windows: only 1 of every 6 layers global (Gemma 3, 4), 1 in 2 (gpt-oss, Gemma 2), 1 in 4 with 8,192-token chunks (Llama 4). Linear hybrids: cache in 1 layer of 4 (Qwen3-Next, 3.5, 3.8-Flash-Next) or 24 of 93 (K3). Sparse and compressed: read only top-2,048 (V3.2) or a 4× to 128× compressed cache (V4), reuse one layer's cache in several layers and store it in FP4 (V4.1).</dd>
+      <dt>Why it works</dt><dd>The factors multiply, so designs stack: K3 stacks a 3:1 hybrid on MLA (27,648 B), V4.1-Flash stacks compression, selection, cross-layer reuse and FP4 (890 B).</dd>
+      <dt>Evidence</dt><dd>Per-token bytes in Table 4. Against hybrids: MiniMax-M2 went back to full attention in all 62 layers after larger-scale hybrid runs showed deficits in multi-hop reasoning <a href="https://arxiv.org/abs/2605.26494">[MiniMax-M2 report, §2.2.2]</a>; MiMo's sliding window of 512 collapsed after context extension while 128 did not (page 09). For hybrids: Kimi Linear's KDA-to-MLA ablation favors 3:1 over pure MLA (page 09).</dd>
+      <dt>Cost</dt><dd>Hybrids and sparse designs need new kernels, prefix-caching and speculative-decoding support, and lose exact recall; an indexer is linear in \(T\) (page 28); compression loses detail a query may need.</dd>
+      <dt>Used by</dt><dd>GQA-8: Llama, Qwen3, GLM-4.5, M2, gpt-oss. MLA: V2, V3, K2, K3 (with KDA). Windows: Gemma, gpt-oss, Mistral 7B, Llama 4. Linear hybrids: Qwen3-Next, 3.5, K3, MiniMax-M1. Sparse or compressed: V3.2, V4, V4.1, Qwen3.8-Flash-Next.</dd>
+    </dl>
+  </div>
+
+  <div class="decision">
+    <div class="decision-title">MoE granularity and the shared expert</div>
+    <dl>
+      <dt>Problem</dt><dd>At fixed activated compute, more stored parameters give lower loss, but each extra expert adds all-to-all traffic, memory and imbalance.</dd>
+      <dt>Idea</dt><dd>Cut experts finer and route among more of them: sparsity (routed over active) from 4 in Mixtral to 16 (Qwen3-235B), 32 (V3, gpt-oss, M2), 48 (K2), 51 (Qwen3-Next), 56 (K3), 64 (V4-Pro) and 128 (Maverick, which routes top-1 plus a shared expert). Optionally add always-on shared experts: none (Mixtral, Qwen3-235B, gpt-oss, M1, M2), one (V3, K2, GLM-4.5, Maverick, Qwen3-Next, V4), two (V2, K3).</dd>
+      <dt>Why it works</dt><dd>For a fixed number of activated experts, the number of expert combinations grows combinatorially, and Kimi's sparsity scaling law measures the gain: to reach validation loss 1.5, sparsity 48 needs 1.69×, 1.39× and 1.15× fewer FLOPs than sparsity 8, 16 and 32 <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.3]</a>.</dd>
+      <dt>Evidence</dt><dd>The scaling law is one lab's, under Muon. The shared expert has thin evidence: DeepSeekMoE's 2B model lost a lot when its shared expert was switched off at test time, but that is a probe, and Qwen3 dropped the shared expert without publishing a reason (page 30).</dd>
+      <dt>Cost</dt><dd>All-to-all bytes grow with active experts times \(d\) (page 15), each expert sees fewer tokens per batch, and V3 needed node-limited routing to bound traffic (page 27); V4 removed the limit by redesigning the parallelism (page 28).</dd>
+      <dt>Used by</dt><dd>See Table 3.</dd>
+    </dl>
+  </div>
+
+  <h3>Table 6. Other open dimensions</h3>
+  <div class="table-wrap"><table class="data" style="min-width:920px">
+  <thead><tr><th>Dimension</th><th>Options in the atlas</th><th>Evidence so far</th><th>What would settle it</th></tr></thead>
+  <tbody>
+  <tr><td><strong>Load balancing</strong> <span class="zh">负载均衡</span></td><td>Auxiliary loss (Mixtral; Qwen3 with a global-batch loss; V2 with three), bias updates without an aux loss (V3, K2, GLM-4.5, M2, V4), hash routing in the first 3 layers (V4)</td><td>V3's ablation favors bias balancing (page 27); Qwen3 favors balancing over the global batch (page 30). No shared-recipe comparison at frontier scale</td><td>Same data, same model, three balancers at 100B+ total, scored on loss, expert specialization and all-to-all skew</td></tr>
+  <tr><td><strong>Optimizer</strong></td><td>AdamW (Llama, Qwen3, V3, most rows); Muon with QK-Clip (K2, K3) or with RMSNorm on q and KV (V4); Muon also in Qwen3.8's design paper</td><td>Moonlight measured about 52% of AdamW's FLOPs for equal loss at 16B total (page 32); K2 hit logit explosions at scale that QK-Clip fixed (page 14)</td><td>An equal-token comparison with a tuned AdamW baseline at 10B+ activated, reporting loss and final benchmark deltas</td></tr>
+  <tr><td><strong>Local-to-global ratio</strong></td><td>1:1 (Gemma 2 at 4,096, gpt-oss at 128), 5:1 (Gemma 3 and 4 at 1,024), 3:1 chunked (Llama 4 at 8,192), 3:1 or 7:1 linear (Qwen, K3, M1)</td><td>Gemma 3 finds perplexity nearly flat from 1:1 to 7:1 (page 31); perplexity hides recall loss (page 09)</td><td>Length-swept recall (RULER, NoLiMa) after post-training, at equal recipe, up to 1M</td></tr>
+  <tr><td><strong>Dense layers at the bottom</strong></td><td>0 (Qwen3, Mixtral, gpt-oss, M2), 1 (V2, K2, K3), 3 (V3, GLM-4.5), 3 hash-routed MoE layers (V4)</td><td>Only DeepSeek's stability motivation; no public ablation of the count</td><td>First-\(k\) dense ablation at fixed activated parameters, scored on stability and loss</td></tr>
+  <tr><td><strong>Position scheme</strong></td><td>RoPE everywhere; partial RoPE (GLM 50%, Qwen3-Next 25%, M2 64 of 128, V4 64 of 512, Gemma 4 global 25%); NoPE global layers (Llama 4, K3)</td><td>NoLiMa effective lengths of 1K to 2K for Llama 4 despite a claimed 1M to 10M (page 29)</td><td>Same trained length, several schemes, measured effective length after extension (page 10)</td></tr>
+  <tr><td><strong>Residual stream</strong></td><td>Plain pre-norm (most); mHC with 4 streams (V4); attention residuals (K3); a 4-branch gated residual (Qwen3.8-Flash-Next)</td><td>Each lab's own ablation (page 11, the Qwen3.8-Next design paper)</td><td>Independent replication at 10B+, including the memory and communication cost of the extra streams</td></tr>
+  <tr><td><strong>Multi-token prediction</strong></td><td>One extra module in V3, GLM-4.5, Qwen3.5, V4; three in M2's config; none in Llama, Qwen3, gpt-oss, Gemma</td><td>V3's ablation gains (page 11); acceptance rates for speculative decoding (page 17)</td><td>A same-recipe ablation reporting both quality and drafter acceptance</td></tr>
+  </tbody></table></div>
+</section>
+
+<section>
+  <h2 id="timeline">Timeline and scale</h2>
+  <p>Figure 1 places the ideas of the atlas in time. Attention changed the most in 2024 to 2026, after a long plateau: from 2019 to 2023 the only move was fewer KV heads; from 2024 every lab attacked a different factor of the cache. The experts lane shows the opposite pattern, a steady march of expert count (8, 64 to 160, 256, 384, 512, 896) as balancing became reliable. The position and norm lane is mostly stabilization: each item exists because a run diverged or a context length was out of reach.</p>
+
+  <figure class="fig">
+    <svg viewBox="0 0 720 515" role="img" aria-labelledby="fig-33-1-title">
+<title id="fig-33-1-title">Timeline 2019 to 2026 of architectural ideas in open models, by year and in three columns: attention and KV cache, FFN and experts, position and normalization</title>
+<text x="62" y="20" class="s-small s-bold s-ta">Attention and KV cache</text>
+<line class="s-line-a" x1="62" y1="28" x2="262" y2="28"/>
+<text x="274" y="20" class="s-small s-bold s-tb">FFN and experts</text>
+<line class="s-line-b" x1="274" y1="28" x2="474" y2="28"/>
+<text x="500" y="20" class="s-small s-bold s-tc">Position, norm, stability</text>
+<line class="s-line-c" x1="500" y1="28" x2="700" y2="28"/>
+<line class="s-line" x1="4" y1="34" x2="716" y2="34" style="opacity:.25"/>
+<text x="8" y="56" class="s-big">2019</text>
+<circle class="s-fill-a" cx="66" cy="48.5" r="3.4"/>
+<text x="74" y="52" class="s-small s-bold">Nov</text>
+<text x="102" y="52" class="s-small">MQA: one shared K/V head</text>
+<text x="102" y="65" class="s-small">(Shazeer)</text>
+<circle class="s-fill-c" cx="504" cy="48.5" r="3.4"/>
+<text x="512" y="52" class="s-small s-bold">Oct</text>
+<text x="540" y="52" class="s-small">RMSNorm (Zhang and Sennrich)</text>
+<line class="s-line" x1="4" y1="79" x2="716" y2="79" style="opacity:.25"/>
+<text x="8" y="101" class="s-big">2020</text>
+<circle class="s-fill-a" cx="66" cy="93.5" r="3.4"/>
+<text x="74" y="97" class="s-small s-bold">May</text>
+<text x="102" y="97" class="s-small">GPT-3: dense and locally</text>
+<text x="102" y="110" class="s-small">banded layers alternate</text>
+<circle class="s-fill-b" cx="278" cy="93.5" r="3.4"/>
+<text x="286" y="97" class="s-small s-bold">Feb</text>
+<text x="314" y="97" class="s-small">GLU variants, SwiGLU (Shazeer)</text>
+<circle class="s-fill-b" cx="278" cy="109.5" r="3.4"/>
+<text x="286" y="113" class="s-small s-bold">Jun</text>
+<text x="314" y="113" class="s-small">GShard: sparse top-2 MoE</text>
+<line class="s-line" x1="4" y1="127" x2="716" y2="127" style="opacity:.25"/>
+<text x="8" y="149" class="s-big">2021</text>
+<circle class="s-fill-b" cx="278" cy="141.5" r="3.4"/>
+<text x="286" y="145" class="s-small s-bold">Jan</text>
+<text x="314" y="145" class="s-small">Switch Transformer: top-1</text>
+<circle class="s-fill-c" cx="504" cy="141.5" r="3.4"/>
+<text x="512" y="145" class="s-small s-bold">Apr</text>
+<text x="540" y="145" class="s-small">RoPE (RoFormer)</text>
+<line class="s-line" x1="4" y1="159" x2="716" y2="159" style="opacity:.25"/>
+<text x="8" y="181" class="s-big">2023</text>
+<circle class="s-fill-a" cx="66" cy="173.5" r="3.4"/>
+<text x="74" y="177" class="s-small s-bold">May</text>
+<text x="102" y="177" class="s-small">GQA (Ainslie et al.)</text>
+<circle class="s-fill-a" cx="66" cy="189.5" r="3.4"/>
+<text x="74" y="193" class="s-small s-bold">Sep</text>
+<text x="102" y="193" class="s-small">Sliding window in every</text>
+<text x="102" y="206" class="s-small">layer (Mistral 7B)</text>
+<circle class="s-fill-c" cx="504" cy="173.5" r="3.4"/>
+<text x="512" y="177" class="s-small s-bold">Feb</text>
+<text x="540" y="177" class="s-small">LLaMA block: RMSNorm + SwiGLU</text>
+<text x="540" y="190" class="s-small">+ RoPE; QK-norm (ViT-22B)</text>
+<circle class="s-fill-c" cx="504" cy="202.5" r="3.4"/>
+<text x="512" y="206" class="s-small s-bold">Aug</text>
+<text x="540" y="206" class="s-small">YaRN; larger RoPE bases</text>
+<line class="s-line" x1="4" y1="220" x2="716" y2="220" style="opacity:.25"/>
+<text x="8" y="242" class="s-big">2024</text>
+<circle class="s-fill-a" cx="66" cy="234.5" r="3.4"/>
+<text x="74" y="238" class="s-small s-bold">May</text>
+<text x="102" y="238" class="s-small">MLA (DeepSeek-V2)</text>
+<circle class="s-fill-a" cx="66" cy="250.5" r="3.4"/>
+<text x="74" y="254" class="s-small s-bold">Jun</text>
+<text x="102" y="254" class="s-small">Local:global 1:1, window</text>
+<text x="102" y="267" class="s-small">4,096 (Gemma 2)</text>
+<circle class="s-fill-b" cx="278" cy="234.5" r="3.4"/>
+<text x="286" y="238" class="s-small s-bold">Jan</text>
+<text x="314" y="238" class="s-small">Mixtral: 8 experts, top-2;</text>
+<text x="314" y="251" class="s-small">DeepSeekMoE: fine-grained</text>
+<text x="314" y="264" class="s-small">+ shared experts</text>
+<circle class="s-fill-b" cx="278" cy="276.5" r="3.4"/>
+<text x="286" y="280" class="s-small s-bold">Aug</text>
+<text x="314" y="280" class="s-small">Bias-based, aux-loss-free</text>
+<text x="314" y="293" class="s-small">balancing</text>
+<circle class="s-fill-b" cx="278" cy="305.5" r="3.4"/>
+<text x="286" y="309" class="s-small s-bold">Dec</text>
+<text x="314" y="309" class="s-small">DeepSeek-V3: 256 experts, top-8</text>
+<circle class="s-fill-c" cx="504" cy="234.5" r="3.4"/>
+<text x="512" y="238" class="s-small s-bold">Jun</text>
+<text x="540" y="238" class="s-small">Logit soft-capping (Gemma 2)</text>
+<line class="s-line" x1="4" y1="323" x2="716" y2="323" style="opacity:.25"/>
+<text x="8" y="345" class="s-big">2025</text>
+<circle class="s-fill-a" cx="66" cy="337.5" r="3.4"/>
+<text x="74" y="341" class="s-small s-bold">Jan</text>
+<text x="102" y="341" class="s-small">7:1 lightning-linear hybrid</text>
+<text x="102" y="354" class="s-small">(MiniMax-01)</text>
+<circle class="s-fill-a" cx="66" cy="366.5" r="3.4"/>
+<text x="74" y="370" class="s-small s-bold">Mar</text>
+<text x="102" y="370" class="s-small">Local:global 5:1, window</text>
+<text x="102" y="383" class="s-small">1,024 (Gemma 3)</text>
+<circle class="s-fill-a" cx="66" cy="395.5" r="3.4"/>
+<text x="74" y="399" class="s-small s-bold">Sep</text>
+<text x="102" y="399" class="s-small">3:1 Gated DeltaNet hybrid</text>
+<text x="102" y="412" class="s-small">(Qwen3-Next)</text>
+<circle class="s-fill-a" cx="66" cy="424.5" r="3.4"/>
+<text x="74" y="428" class="s-small s-bold">Dec</text>
+<text x="102" y="428" class="s-small">Sparse top-2,048 (V3.2)</text>
+<circle class="s-fill-b" cx="278" cy="337.5" r="3.4"/>
+<text x="286" y="341" class="s-small s-bold">Apr</text>
+<text x="314" y="341" class="s-small">Qwen3-235B: 128 experts, no</text>
+<text x="314" y="354" class="s-small">shared expert</text>
+<circle class="s-fill-b" cx="278" cy="366.5" r="3.4"/>
+<text x="286" y="370" class="s-small s-bold">Jul</text>
+<text x="314" y="370" class="s-small">Kimi K2: 384 experts</text>
+<circle class="s-fill-b" cx="278" cy="382.5" r="3.4"/>
+<text x="286" y="386" class="s-small s-bold">Sep</text>
+<text x="314" y="386" class="s-small">Qwen3-Next: 512 experts, top-10</text>
+<circle class="s-fill-c" cx="504" cy="337.5" r="3.4"/>
+<text x="512" y="341" class="s-small s-bold">Mar</text>
+<text x="540" y="341" class="s-small">QK-norm replaces soft-cap</text>
+<text x="540" y="354" class="s-small">(Gemma 3); Qwen3 (Apr)</text>
+<circle class="s-fill-c" cx="504" cy="366.5" r="3.4"/>
+<text x="512" y="370" class="s-small s-bold">Jul</text>
+<text x="540" y="370" class="s-small">QK-Clip (Kimi K2)</text>
+<circle class="s-fill-c" cx="504" cy="382.5" r="3.4"/>
+<text x="512" y="386" class="s-small s-bold">Aug</text>
+<text x="540" y="386" class="s-small">Learned sink logits (gpt-oss)</text>
+<line class="s-line" x1="4" y1="442" x2="716" y2="442" style="opacity:.25"/>
+<text x="8" y="464" class="s-big">2026</text>
+<circle class="s-fill-a" cx="66" cy="456.5" r="3.4"/>
+<text x="74" y="460" class="s-small s-bold">Apr</text>
+<text x="102" y="460" class="s-small">Compressed shared-KV (V4)</text>
+<circle class="s-fill-a" cx="66" cy="472.5" r="3.4"/>
+<text x="74" y="476" class="s-small s-bold">Sep</text>
+<text x="102" y="476" class="s-small">KV reuse across layers, FP4</text>
+<text x="102" y="489" class="s-small">cache (V4.1-Flash)</text>
+<circle class="s-fill-b" cx="278" cy="456.5" r="3.4"/>
+<text x="286" y="460" class="s-small s-bold">Jul</text>
+<text x="314" y="460" class="s-small">Kimi K3: LatentMoE, 896</text>
+<text x="314" y="473" class="s-small">experts, top-16</text>
+<circle class="s-fill-c" cx="504" cy="456.5" r="3.4"/>
+<text x="512" y="460" class="s-small s-bold">Apr</text>
+<text x="540" y="460" class="s-small">mHC residual streams (V4)</text>
+<line class="s-line" x1="4" y1="503" x2="716" y2="503" style="opacity:.25"/>
+</svg>
+    <figcaption><b>Figure 1.</b> Architectural ideas by first paper or release, in three lanes. Dots mark the month; labels name the model that carried the idea into open weights. Notice the gap in the attention lane between 2020 and 2023 (nothing changed but the KV head count) and the density after 2024, and that every dot in the experts lane after 2024 is a change of expert count or balancing. Pages <a href="07-kv-efficient-attention.html">07</a>, <a href="08-mixture-of-experts.html">08</a>, <a href="09-beyond-full-attention.html">09</a>, <a href="11-stability-tweaks.html">11</a> treat the mechanisms.</figcaption>
+  </figure>
+
+  <p>Figure 2 plots total against activated parameters for the sparse rows. The activation ratio moved in three steps: Mixtral 8x22B activates 1 parameter in 3.6; the 2024 to early 2025 generation (V2, Qwen3-235B, GLM-4.5, V3) 1 in 10 to 18; the 2025 to 2026 generation 1 in 21 to 35 (gpt-oss 22.8, M2 23.5, Maverick 23.5, Qwen3-Next 26.7, K3 26.9, K2 31.9, V4-Pro 32.7, V4.1-Flash 34.5 at its decode-time 16B). Totals passed one trillion, but activated parameters stayed between 3B and about 105B.</p>
+
+  <figure class="fig">
+    <svg viewBox="0 0 720 400" role="img" aria-labelledby="fig-33-2-title">
+<title id="fig-33-2-title">Scatter of total versus activated parameters on log-log axes for 19 sparse models, with lines for activation ratios of 1 in 4, 1 in 10 and 1 in 30</title>
+<line class="s-line" x1="66.0" y1="24" x2="66.0" y2="340" style="opacity:.18"/>
+<text x="66.0" y="356" text-anchor="middle" class="s-small s-muted">20B</text>
+<line class="s-line" x1="175.6" y1="24" x2="175.6" y2="340" style="opacity:.18"/>
+<text x="175.6" y="356" text-anchor="middle" class="s-small s-muted">50B</text>
+<line class="s-line" x1="258.6" y1="24" x2="258.6" y2="340" style="opacity:.18"/>
+<text x="258.6" y="356" text-anchor="middle" class="s-small s-muted">100B</text>
+<line class="s-line" x1="341.5" y1="24" x2="341.5" y2="340" style="opacity:.18"/>
+<text x="341.5" y="356" text-anchor="middle" class="s-small s-muted">200B</text>
+<line class="s-line" x1="451.2" y1="24" x2="451.2" y2="340" style="opacity:.18"/>
+<text x="451.2" y="356" text-anchor="middle" class="s-small s-muted">500B</text>
+<line class="s-line" x1="534.1" y1="24" x2="534.1" y2="340" style="opacity:.18"/>
+<text x="534.1" y="356" text-anchor="middle" class="s-small s-muted">1T</text>
+<line class="s-line" x1="617.1" y1="24" x2="617.1" y2="340" style="opacity:.18"/>
+<text x="617.1" y="356" text-anchor="middle" class="s-small s-muted">2T</text>
+<line class="s-line" x1="66" y1="340.0" x2="700" y2="340.0" style="opacity:.18"/>
+<text x="60" y="344.0" text-anchor="end" class="s-small s-muted">2B</text>
+<line class="s-line" x1="66" y1="277.1" x2="700" y2="277.1" style="opacity:.18"/>
+<text x="60" y="281.1" text-anchor="end" class="s-small s-muted">5B</text>
+<line class="s-line" x1="66" y1="229.6" x2="700" y2="229.6" style="opacity:.18"/>
+<text x="60" y="233.6" text-anchor="end" class="s-small s-muted">10B</text>
+<line class="s-line" x1="66" y1="182.0" x2="700" y2="182.0" style="opacity:.18"/>
+<text x="60" y="186.0" text-anchor="end" class="s-small s-muted">20B</text>
+<line class="s-line" x1="66" y1="119.1" x2="700" y2="119.1" style="opacity:.18"/>
+<text x="60" y="123.1" text-anchor="end" class="s-small s-muted">50B</text>
+<line class="s-line" x1="66" y1="71.6" x2="700" y2="71.6" style="opacity:.18"/>
+<text x="60" y="75.6" text-anchor="end" class="s-small s-muted">100B</text>
+<line class="s-line" x1="66" y1="24.0" x2="700" y2="24.0" style="opacity:.18"/>
+<text x="60" y="28.0" text-anchor="end" class="s-small s-muted">200B</text>
+<line class="s-line" x1="66" y1="340" x2="700" y2="340"/>
+<line class="s-line" x1="66" y1="24" x2="66" y2="340"/>
+<text x="383" y="376" text-anchor="middle" class="s-small s-bold">Total parameters</text>
+<text x="14" y="182" text-anchor="middle" class="s-small s-bold" transform="rotate(-90 14 182)">Activated parameters per token</text>
+<line class="s-line s-dash" x1="66.0" y1="277.1" x2="507.4" y2="24.0" style="opacity:.6"/>
+<text x="515.4" y="36.0" class="s-small s-muted">1 in 4</text>
+<line class="s-line s-dash" x1="66.0" y1="340.0" x2="617.1" y2="24.0" style="opacity:.6"/>
+<text x="625.1" y="36.0" class="s-small s-muted">1 in 10</text>
+<line class="s-line s-dash" x1="197.5" y1="340.0" x2="700.0" y2="51.8" style="opacity:.6"/>
+<text x="213.5" y="338.0" class="s-small s-muted">1 in 30</text>
+<circle class="s-fill-d" cx="299.7" cy="136.2" r="4.5"/>
+<text x="307.7" y="140.2" text-anchor="start" class="s-small">Mixtral 8x22B</text>
+<circle class="s-fill-d" cx="97.4" cy="296.0" r="4.5"/>
+<text x="105.4" y="300.0" text-anchor="start" class="s-small">Gemma 4 26B-A4B</text>
+<circle class="s-fill-d" cx="277.2" cy="275.4" r="4.5"/>
+<text x="285.2" y="291.4" text-anchor="start" class="s-small">gpt-oss-120b</text>
+<circle class="s-fill-a" cx="361.3" cy="178.7" r="4.5"/>
+<text x="351.3" y="192.7" text-anchor="end" class="s-small">DeepSeek-V2</text>
+<circle class="s-fill-a" cx="486.4" cy="139.8" r="4.5"/>
+<text x="494.4" y="133.8" text-anchor="start" class="s-small">V3</text>
+<circle class="s-fill-a" cx="383.5" cy="211.6" r="4.5"/>
+<text x="375.5" y="225.6" text-anchor="end" class="s-small">V4-Flash</text>
+<circle class="s-fill-a" cx="590.4" cy="120.5" r="4.5"/>
+<text x="582.4" y="112.5" text-anchor="end" class="s-small">V4-Pro</text>
+<circle class="s-fill-a" cx="463.0" cy="197.3" r="4.5"/>
+<text x="471.0" y="213.3" text-anchor="start" class="s-small">V4.1-Flash</text>
+<circle class="s-fill-b" cx="360.8" cy="175.5" r="4.5"/>
+<text x="350.8" y="171.5" text-anchor="end" class="s-small">Qwen3-235B</text>
+<circle class="s-fill-b" cx="231.9" cy="312.2" r="4.5"/>
+<text x="239.9" y="316.2" text-anchor="start" class="s-small">Qwen3-Next</text>
+<circle class="s-fill-b" cx="423.6" cy="193.2" r="7"/>
+<text x="413.6" y="197.2" text-anchor="end" class="s-small">Qwen3.5</text>
+<circle class="s-fill-d" cx="424.5" cy="193.2" r="3.3"/>
+<text x="432.5" y="181.2" text-anchor="start" class="s-small">Llama 4 Maverick</text>
+<circle class="s-fill-b" cx="285.3" cy="264.6" r="4.5"/>
+<text x="293.3" y="268.6" text-anchor="start" class="s-small">Qwen3.8-Flash-Next</text>
+<circle class="s-fill-b" cx="638.9" cy="75.1" r="4.5"/>
+<text x="630.9" y="91.1" text-anchor="end" class="s-small">Qwen3.8-2.4T</text>
+<circle class="s-fill-c" cx="538.8" cy="148.5" r="4.5"/>
+<text x="546.8" y="152.5" text-anchor="start" class="s-small">Kimi K2</text>
+<circle class="s-fill-c" cx="657.3" cy="68.9" r="4.5"/>
+<text x="649.3" y="62.9" text-anchor="end" class="s-small">Kimi K3</text>
+<circle class="s-fill-c" cx="410.2" cy="149.7" r="4.5"/>
+<text x="402.2" y="153.7" text-anchor="end" class="s-small">GLM-4.5</text>
+<circle class="s-fill-c" cx="440.2" cy="125.0" r="4.5"/>
+<text x="432.2" y="119.0" text-anchor="end" class="s-small">MiniMax-M1</text>
+<circle class="s-fill-c" cx="358.2" cy="230.9" r="4.5"/>
+<text x="366.2" y="244.9" text-anchor="start" class="s-small">MiniMax-M2</text>
+<circle class="s-fill-a" cx="74" cy="28" r="4.5"/>
+<text x="84" y="32" class="s-small">DeepSeek</text>
+<circle class="s-fill-b" cx="74" cy="44" r="4.5"/>
+<text x="84" y="48" class="s-small">Qwen</text>
+<circle class="s-fill-c" cx="74" cy="60" r="4.5"/>
+<text x="84" y="64" class="s-small">Kimi, GLM, MiniMax</text>
+<circle class="s-fill-d" cx="74" cy="76" r="4.5"/>
+<text x="84" y="80" class="s-small">Mistral, Meta, OpenAI, Google</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Total against activated parameters (log-log) for 19 sparse models, as advertised. Dashed lines mark activation ratios of 1 in 4, 10 and 30. Notice that the newest models sit near or beyond the 1-in-30 line, that Kimi K3, V4-Pro and Qwen3.8-2.4T (page <a href="30-qwen.html">30</a>: 2.4T, 95B activated) share a 1-in-25 to 1-in-33 ratio, and that the cost of serving follows the vertical axis plus the KV cache while capacity follows the horizontal.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2 id="rules">Rules of thumb</h2>
+  <p>Each rule below is read off the tables; the exceptions are named, because "why is this model different?" is the follow-up question.</p>
+  <aside class="callout key"><div class="callout-title">Rules of thumb from the atlas</div>
+  <ul>
+    <li><strong>Head dimension 128.</strong> 21 of 30 rows (17 GQA rows, plus the value dimension of the four MLA rows). Exceptions: 64 (gpt-oss), 256 (Gemma 4 local layers, the Qwen3-Next family), 512 (Gemma 4 global layers, V4). MLA uses 192-dimensional queries and keys (128 content plus 64 rotary) and 128-dimensional values.</li>
+    <li><strong>Heads times head dimension is not \(d\).</strong> Llama has \(n_h d_h = d\); Qwen3-32B 1.6×, Qwen3-235B 2.0×, GLM-4.5 2.4× (12,288 against 5,120).</li>
+    <li><strong>KV heads 8, group size 4 to 16.</strong> 14 of 30 rows have 8 KV heads. Fewer (4 or 2) when attention is a small share of FLOPs, more (16) with windows.</li>
+    <li><strong>Dense FFN 3.25 to 3.5 \(d\) in the Llama line</strong> (3.25 for 405B, 3.5 for 8B and 70B), 3.6 in Qwen2.5-72B, 5 to 5.4 in Qwen3-32B and OLMo 2. An FFN is about 80% of a Llama layer's parameters.</li>
+    <li><strong>MoE: activated FFN width of 2.4 to 4 \(d\).</strong> Top-\(k\) routed plus shared widths, in units of \(d\): V2 2.4, V3 and K2 2.6, GLM-4.5 2.7, Qwen3-Next 2.75, Qwen3-235B 3.0, V4-Pro 3.0, Maverick 3.2, V4-Flash 3.5, M2 and gpt-oss 4.0 (Mixtral's coarse experts: 5.3). The stored FFN is 30 to 200 times wider.</li>
+    <li><strong>Experts.</strong> 128 to 512 routed (896 in K3), 6 to 10 active (8 is the mode, 16 in K3), width 0.25 to 0.5 \(d\), one shared expert, sparsity 16 to 64.</li>
+    <li><strong>Vocabulary 128K to 262K</strong> for any 2024+ model; \(2Vd\) matrix parameters, so 1.0B at Llama 3.1 8B and 2.8B at Gemma 3 27B.</li>
+    <li><strong>RoPE base.</strong> The slowest frequency has a wavelength of about \(2\pi\theta\): 54,000 positions at \(10^4\), 2.6M at \(5 \times 10^5\), 5.1M at \(10^6\), 49M at \(10^7\). Pick a base whose wavelength is far above the target context; rotate all of \(d_h\) (Llama, Qwen) or a fraction (25% to 50%).</li>
+    <li><strong>Tokens per parameter.</strong> 20 is compute-optimal; dense 2024 and 2025 models trained on 200 to 1,900 per parameter (Llama 3.1 70B 213, Qwen3-32B 1,098, Llama 3.1 8B 1,868); MoEs on 400 to 5,000 per activated parameter (V3 400, K2 475, GLM-4.5 719, Maverick 1,294, Qwen3-235B 1,636, M2 2,980, Qwen3-Next 5,000).</li>
+    <li><strong>KV per token (bf16).</strong> GQA-8 dense: \(2 \cdot L \cdot 8 \cdot 128 \cdot 2\) B = 128 KiB at 32 layers, 504 KiB at 126. MLA: 68.6 KiB. Hybrids: 24 to 30 KiB (Qwen3-Next 24,576 B, Qwen3.5 30,720 B). At 128K: 16 GiB (Llama 3.1 8B), 8.6 GiB (V3), 3 GiB (Qwen3-Next).</li>
+  </ul>
+  </aside>
+</section>
+
+<section>
+  <h2 id="config">From config.json to numbers</h2>
+  <p>The interview form of this page is: "here is a config; how big is it, what does a token cost, how much does the cache take?" The recipe is five steps, each a line of the drill.</p>
+  <ol>
+    <li>Read \(L, d, n_h, n_{kv}, d_h\) (if <code>head_dim</code> is absent it is \(d/n_h\)), the FFN width, expert fields, vocabulary and <code>tie_word_embeddings</code>.</li>
+    <li><strong>Parameters.</strong> Per layer, GQA attention has \(2 d\, n_h d_h + 2 d\, n_{kv} d_h\) weights and a SwiGLU FFN \(3 d\, d_{ff}\); an MoE layer has \(3 d\, d_e\) per expert plus a router \(d \cdot E\). Add \(V d\) for each of the input table and the head.</li>
+    <li><strong>Activated.</strong> Subtract \((E - k)\, 3 d\, d_e\) per MoE layer; say whether the vocabulary matrices are in.</li>
+    <li><strong>KV per token.</strong> \(L_{\text{global}} \cdot 2\, n_{kv} d_h \cdot b\) for GQA, \(L\,(d_c + d_h^R)\, b\) for MLA, and zero for a layer whose window is full or that has no cache.</li>
+    <li><strong>FLOPs per token.</strong> \(2\,(N_{\text{act}} - Vd) + 2\, L\, n_h (d_{qk} + d_v)\, T/2\) for a causal sequence of length \(T\) with all layers global.</li>
+  </ol>
+
+  <p><strong>Worked example: Qwen3-235B-A22B</strong> (config: \(L = 94\), \(d = 4096\), 64 query and 4 KV heads of 128, 128 experts of width 1,536 with top-8, no shared expert, \(V = 151{,}936\), untied, QK-norm with gains of size \(d_h\)).</p>
+  \[ \begin{aligned}
+  \text{attention per layer} &= \underbrace{4096 \cdot 8192}_{W_Q} + \underbrace{2 \cdot 4096 \cdot 512}_{W_K, W_V} + \underbrace{8192 \cdot 4096}_{W_O} + \underbrace{2 \cdot 128}_{\text{QK-norm}} = 71{,}303{,}424 \\
+  \text{router} &= 4096 \cdot 128 = 524{,}288, \qquad \text{one expert} = 3 \cdot 4096 \cdot 1536 = 18{,}874{,}368 \\
+  \text{one layer} &= 71{,}303{,}424 + 2 \cdot 4096 + 524{,}288 + 128 \cdot 18{,}874{,}368 = 2{,}487{,}755{,}008 \\
+  \text{total} &= 94 \cdot 2{,}487{,}755{,}008 + 2 \cdot 151{,}936 \cdot 4096 + 4096 = 235{,}093{,}634{,}560
+  \end{aligned} \]
+  <p>The idle experts are \(94 \cdot (128 - 8) \cdot 18{,}874{,}368 = 212{,}902{,}871{,}040\), so the activated count with both vocabulary matrices is 22,190,763,520: the report's "22B". Without either matrix it is 20.95B, with the head only 21.57B. KV per token is \(94 \cdot 2 \cdot 4 \cdot 128 \cdot 2 = 192{,}512\) B (188 KiB), 23.5 GiB for one 128K sequence. FLOPs per token at \(T = 8192\): \(2 \cdot 21{,}568{,}433{,}664 = 43.14\) GFLOPs for the matmuls plus \(94 \cdot 2 \cdot 64 \cdot (128 + 128) \cdot 4096 = 12.62\) GFLOPs of attention, 55.75 GFLOPs in all (Table 4). Attention is already 23% of the token's FLOPs at 8K and equals the matmul term at \(T \approx 24\text{K}\).</p>
+
+<pre><code class="language-python">import json
+from solutions.config_zoo import load_config, params, kv_bytes_per_token, kv_cache_bytes, flops_per_token
+
+s = load_config(json.load(open("Qwen3-235B-A22B/config.json")))   # Spec: normalizes the HF keys
+total, act = params(s)                        # (235_093_634_560, 22_190_763_520): both vocabulary matrices in
+_, act_head = params(s, "head")               # 21_568_433_664: the FLOP-correct count (input table is a lookup)
+kv = kv_bytes_per_token(s)                    # 192_512 B: 94 layers x 2 x 4 x 128 x 2 bytes
+kv128k = kv_cache_bytes(s, 131_072) / 2**30   # 23.5 GiB
+gflops = flops_per_token(s, 8192) / 1e9       # 55.75: 2 * act_head + causal attention at T = 8K
+</code></pre>
+
+  <div class="callout bridge"><div class="callout-title">From your jet tagger</div>
+    <p>Your tagger's parameter count was a sum over a handful of linear layers and you knew it to the digit. The same discipline applies here, and it is what makes "which \(N\)?" answerable: write the sum, name what is in it, and compare with the checkpoint. The only new terms are the router, the experts you do not activate, and two vocabulary matrices that dominate small models.</p>
+  </div>
+
+  <p><strong>Where a config and a headline disagree.</strong> Three worked cases, each reconciled to the digit or bounded.</p>
+  <ul>
+    <li><strong>Kimi K2: 1.04T reported, 1.026T in the config.</strong> The recount is 1,026,408,209,408 (page <a href="08-mixture-of-experts.html">08</a>), and the checkpoint metadata lists 1,026,470,731,056 elements, of which 62,518,232 are FP8 scale factors. The report's Table 4 gives 1,043B, exactly what the recipe returns if the dense first layer is counted as an MoE layer (16.6B more). The config is the ground truth for what was released.</li>
+    <li><strong>GLM-4.5: 355B reported, 352.80B recount, 358.34B in the file.</strong> The file's extra 5.54B is one MTP layer (3.99B) plus its own embedding and output head (1.55B): 352,797,814,784 + 3,988,069,632 + 2 \(\cdot\) 151,552 \(\cdot\) 5,120 = 358,337,776,896, the checkpoint's bf16 count to the element. One reading of "355B" is the recount without embeddings (351.25B) plus the MTP layer (3.99B) = 355.24B; the report does not say.</li>
+    <li><strong>MiniMax-M2: 229.9B reported, 228.69B in the file.</strong> The recount matches the file except 15,872 routing biases. The 1.2B gap equals two vocabulary matrices (\(2 \cdot 200{,}064 \cdot 3072 = 1.229\)B) within rounding; we cannot tell from the report whether it counts an embedding and head twice or an extra module's. Its reported 9.8B activated is the non-embedding count.</li>
+  </ul>
+
+  <aside class="callout warn"><div class="callout-title">Config traps</div>
+    <ul>
+      <li><strong>Nesting.</strong> Multimodal releases (Maverick, Gemma 3 and 4, K3, Qwen3.5) put the language model under <code>text_config</code>; the vision tower is excluded here (Maverick's checkpoint holds 871,932,416 parameters more than its text tensors).</li>
+      <li><strong>Missing keys.</strong> No <code>head_dim</code>: \(d/n_h\). No <code>num_key_value_heads</code>: MHA. No <code>tie_word_embeddings</code>: the Hugging Face default is tied. Llama 2 has no <code>rope_theta</code>.</li>
+      <li><strong>MoE layer placement.</strong> <code>first_k_dense_replace</code> and <code>moe_layer_freq</code> (DeepSeek, Kimi, GLM), <code>decoder_sparse_step</code> with <code>mlp_only_layers</code> (Qwen3), <code>interleave_moe_layer_step</code> and <code>moe_layers</code> (Llama 4), all layers (Mixtral, gpt-oss, M2).</li>
+      <li><strong>Inactive fields.</strong> <code>sliding_window</code> is set but off in Qwen2.5 (<code>use_sliding_window: false</code>) and null in Mixtral 8x22B. <code>max_position_embeddings</code> is not the trained length: 163,840 for V2 and V3 (128K trained), 10.24M for M1 (1M trained), 40,960 for Qwen3 (32,768 native).</li>
+      <li><strong>File versus model.</strong> Checkpoints hold MTP layers with their own embeddings, FP8 scale tensors, and packed 4-bit weights whose element count is not the parameter count (V4). Compare with the headline only after accounting for these.</li>
+      <li><strong>Padded vocabularies.</strong> <code>vocab_size</code> can exceed the tokenizer's (Gemma 3: 262,208; Gemma 2: 256,000 in the file, 256,128 in the report).</li>
+    </ul>
+  </aside>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"The number in the model's name is its parameter count."</strong> It is a rounded name: 405B is 405.85B, Llama 2 70B has 68.98B, Kimi K2's "1T" is 1.026T in its config. Recount from the config and say which pieces are in.</li>
+    <li><strong>"Activated parameters means the same thing on every model card."</strong> Qwen3-235B's 22B includes both vocabulary matrices (22.19B); MiniMax-M2's 9.8B excludes them (9.80B); Maverick's 17B includes 2.07B of embedding and head parameters; Gemma 4 26B-A4B's 3.8B includes its tied table. State the convention before comparing.</li>
+    <li><strong>"GQA cuts attention FLOPs."</strong> It cuts the KV cache and the K and V projections. Every query head still scores every key, so attention FLOPs are unchanged (the drill's test checks this).</li>
+    <li><strong>"KV cache per token is one number per model."</strong> It is one number per layer type. Windowed layers stop growing when the window fills, linear layers have a fixed state, and cross-layer reuse shares one cache among several layers. Use the marginal growth for capacity planning and the total at your context for memory.</li>
+    <li><strong>"Everyone moved to MLA."</strong> Four rows use it (V2, V3, K2, K3, the last in a quarter of its layers). Llama, Qwen, GLM, MiniMax and OpenAI stayed with GQA, and DeepSeek itself replaced MLA in V4.</li>
+    <li><strong>"Head dimension is \(d/n_h\)."</strong> Only in the Llama line. Qwen3, GLM-4.5 and gpt-oss set it explicitly, and Gemma 4 uses two head dimensions in one model.</li>
+    <li><strong>"<code>max_position_embeddings</code> is the usable context."</strong> It is the size of a table. Effective length can be far lower: Llama 4 Scout claims 10M and measures 1K on NoLiMa (page <a href="29-llama.html">29</a>).</li>
+    <li><strong>"More experts always means more quality."</strong> Sparsity scaling holds at fixed activated compute and ignores communication; Kimi's own law shows diminishing returns (1.15× at sparsity 32 against 48), and V3 needed node-limited routing to keep all-to-all affordable.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does a "standard" 2025 dense LLM block look like, and where did each component come from?</summary>
+    <div class="answer">
+      <p>A pre-norm decoder: \(x \leftarrow x + \text{Attn}(\RMSNorm(x))\), then \(x \leftarrow x + \text{FFN}(\RMSNorm(x))\), with a final RMSNorm before the output head. Attention is grouped-query with 8 KV heads of dimension 128, rotary positions, no biases, and (since 2025) QK-norm; the FFN is SwiGLU with hidden width 3.25 to 5 \(d\); the vocabulary has 128K or more entries.</p>
+      <p>Provenance: pre-norm and the residual layout from GPT-2 and GPT-3 (Radford et al., Brown et al. 2020); RMSNorm from Zhang and Sennrich (2019); SwiGLU from Shazeer (2020); RoPE from Su et al. (2021); all four together, without biases, in LLaMA (Touvron et al. 2023); GQA from Ainslie et al. (2023), adopted at 70B in Llama 2; the large vocabulary from Llama 3 (128,256) and Gemini-style tokenizers; QK-norm from ViT-22B (2023), reaching LLMs in OLMo 2, Gemma 3 and Qwen3 in 2024 to 2025. Then say what changes at scale: the FFN becomes a fine-grained MoE and attention gets a cheaper form for long context (Tables 5 and 6). Llama 3.1 8B is the reference: 32 layers, \(d = 4096\), 32/8 heads of 128, \(d_{ff} = 14{,}336\), 8,030,261,248 parameters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate the KV cache per token, and for a 128K sequence, of Llama 3.1 405B, Qwen3-235B-A22B and DeepSeek-V3.</summary>
+    <div class="answer">
+      <p>bf16, 2 bytes. Llama 3.1 405B (126 layers, 8 KV heads of 128): \(2 \cdot 126 \cdot 8 \cdot 128 \cdot 2 = 516{,}096\) B = 504 KiB per token; at \(2^{17}\) tokens, \(504 \text{ KiB} \cdot 131{,}072 = 63\) GiB. Qwen3-235B (94 layers, 4 KV heads of 128): \(94 \cdot 2 \cdot 4 \cdot 128 \cdot 2 = 192{,}512\) B = 188 KiB, 23.5 GiB. DeepSeek-V3 (61 layers, MLA, \(d_c + d_h^R = 512 + 64 = 576\)): \(61 \cdot 576 \cdot 2 = 70{,}272\) B = 68.6 KiB, 8.58 GiB. The ratios are 7.3× between 405B and V3, though V3 has 1.66× more total parameters; that is MLA plus fewer KV-carrying dimensions. For scale, GPT-3's 96 layers of 96 heads of 128 cache 4,718,592 B (4.5 MiB) per token.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why do so many models use exactly 8 KV heads and a head dimension of 128?</summary>
+    <div class="answer">
+      <p>Head dimension 128 fits the hardware: it is a multiple of the tensor-core tile widths, gives a full 128-wide row for FlashAttention's tiles, and is the smallest size at which per-head capacity stopped limiting quality in 2020-era ablations (GPT-3 already used 128). Eight KV heads is the elbow of the GQA curve: Ainslie et al. found 8 groups nearly matching MHA while cutting the cache by \(n_h/8\), and 8 divides the tensor-parallel degree of a node, so each of 8 GPUs holds one KV head with no replication. Both are conventions with exceptions: gpt-oss uses 64-dimensional heads, Gemma 4 and the Qwen3-Next family use 256, V4 uses one 512-dimensional KV head, and Qwen3-235B uses 4 KV heads because its FFN is sparse and attention is a large share of what it reads. The honest answer names the constraint (bytes per token, tile size, parallel degree) rather than a law.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Given only a config.json, how do you estimate parameters, KV cache and FLOPs per token?</summary>
+    <div class="answer">
+      <p>Read \(L, d, n_h, n_{kv}, d_h, d_{ff}\), the expert fields, \(V\) and whether embeddings are tied. Parameters: per layer \(2 d\, n_h d_h + 2 d\, n_{kv} d_h + 3 d\, d_{ff}\) (GQA plus SwiGLU), times \(L\), plus \(Vd\) or \(2Vd\), plus small terms (norms, router). Check on Llama 3.1 8B: \(32 \cdot (2 \cdot 4096 \cdot 4096 + 2 \cdot 4096 \cdot 1024 + 3 \cdot 4096 \cdot 14336) + 2 \cdot 128256 \cdot 4096 + \) norms = 8,030,261,248. For MoE, replace the FFN by \(3 d\, d_e (E + n_{shared})\) and subtract \((E - k) 3 d\, d_e\) for activated. KV per token: \(L \cdot 2 n_{kv} d_h \cdot b\), or \(L (d_c + d_h^R) b\) for MLA, only for global layers. FLOPs per token: \(2 N_{mm}\) plus \(2 L\, n_h\, (d_{qk} + d_v)\, T/2\), where \(N_{mm}\) excludes the input table.</p>
+      <p>Then state the caveats: the file's tensor count can differ (MTP layers, vision tower, FP8 scales), "activated" has three conventions, and attention FLOPs matter only at long context (equal to the matmul term at about 24K tokens for Qwen3-235B, 6d to 12d tokens in general). Worked: Qwen3-235B-A22B gives 235,093,634,560 total, 22.19B activated, 192,512 B of KV per token, 55.75 GFLOPs at 8K (section <a href="#config">config</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compare DeepSeek-V3 and Llama 3.1 405B on FLOPs per token, weight memory and KV per token. What does each tell you about serving?</summary>
+    <div class="answer">
+      <p>FLOPs per token at 8K: V3 93.7 GFLOPs (activated 36.63B with the head, 2 × that is 73.3, plus 20.5 of MLA attention at full 128-head cost); Llama 405B 841.3 GFLOPs (2 × 403.75B = 807.5 plus 33.8). V3 does 9.0× less compute per token. Weight memory: V3 holds 671B parameters, 671 GB in FP8, against 812 GB for 405B in bf16 (405.85B × 2), so V3 needs a similar number of GPUs to hold weights. KV per token: 70,272 B against 516,096 B, 7.3× less.</p>
+      <p>Serving: prefill is compute-bound, so V3 is about 9× cheaper per token; decode is memory-bound and reads the weights each step, so at small batch V3 reads about 1.7× more parameters than 405B reads bytes only if all experts are hit, which they are once the batch exceeds a hundred or so (page 08); its edge in decode is the smaller cache and, at large batch, the fewer FLOPs. So MoE wins training cost and prefill, and wins decode only with enough batch to amortize weights and enough parallelism to hold them (page 34).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Which design dimensions are still unsettled, and what evidence would settle them?</summary>
+    <div class="answer">
+      <p>Pick three and be specific. (1) The attention family for 128K to 1M contexts: GQA, MLA, windows, linear hybrids, sparse and compressed designs all ship. Evidence today is per-lab and mostly at small scale or at 32K and below; MiniMax reported deficits in multi-hop reasoning for hybrids at larger scale and went back to full attention in M2, while Qwen, Kimi and DeepSeek went the other way. What settles it: an equal-recipe comparison at 100B+ parameters and 1M context with recall-heavy, length-swept evaluations after SFT and RL. (2) MoE granularity and shared experts: Kimi's sparsity law shows gains from 8 to 48 at fixed activated compute but under Muon and without communication cost; the shared-expert evidence is a probe. What settles it: a scaling study that includes all-to-all time and MFU, with and without the shared expert. (3) The optimizer: Muon appears in K2, K3, V4 with fixes (QK-Clip, RMSNorm on q and KV), but there is no equal-token, tuned-baseline comparison at scale. Also name residual-stream designs (mHC, attention residuals) as the 2026 frontier with single-lab evidence. Say what you would run, at what scale, and which metric.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did expert widths shrink and expert counts grow from Mixtral to DeepSeek-V3, Kimi K2 and Qwen3-Next? What limits it?</summary>
+    <div class="answer">
+      <p>Expert width relative to \(d\) went from 2.67 (Mixtral 8x22B: 16,384 over 6,144) to 0.29 to 0.3 (V3, K2, V2, GLM-4.5), 0.25 (Qwen3-Next), while routed experts went from 8 to 256, 384, 512 and 896 (K3), and sparsity from 4 to 32, 48, 51 and 56. The activated FFN width per token stayed at 2.4 to 4 \(d\) (V3: \(8 \cdot 2048 + 2048 = 18{,}432 = 2.57d\)), so the compute per token is the same as a dense FFN's; the extra experts add capacity for free FLOPs. The reasons: more combinations of experts per token (\(\binom{256}{8}\) against \(\binom{8}{2} = 28\)), finer specialization, and, per Kimi K2, lower loss at equal FLOPs.</p>
+      <p>The limits are systems: each active expert adds \(d\) values of dispatch and combine traffic per layer (V3: at most 4 nodes per token to cap it), small experts have low arithmetic intensity so decode reads all experts' weights once the batch is large, and load imbalance grows with expert count. K3 answers with LatentMoE (project to 3,584 before routing, activate 16 of 896 at unchanged payload); V4 removes the node limit and pays with a redesigned parallelism (pages 27 and 28).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did RoPE bases rise from \(10^4\) to \(5 \times 10^5\), \(10^6\) and \(10^7\), and what does partial RoPE change?</summary>
+    <div class="answer">
+      <p>RoPE rotates dimension pair \(i\) at frequency \(\theta^{-2i/d_h}\), so the slowest pair has a wavelength of about \(2\pi\theta\) positions: 54,000 at \(\theta = 10^4\), 2.6M at \(5 \times 10^5\), 5.1M at \(10^6\), 49M at \(10^7\). If the context is longer than the slowest wavelength, positions alias in the slowest channels. Models trained at 4K to 8K with \(\theta = 10^4\) (Llama 2, Mistral 7B) therefore needed interpolation to extend, while Llama 3 used \(5 \times 10^5\) from the start and then rescaled by 8 (llama3 scaling) for 128K; Qwen2.5, Qwen3, Mixtral and GLM use \(10^6\); the long-context hybrids and MiniMax-M1 use \(10^7\) (pages 05 and 10). A larger base also makes distant tokens less distinguishable, so the base is a trade against short-range resolution.</p>
+      <p>Partial RoPE rotates only a fraction of each head (GLM 50%, Qwen3-Next 25%, M2 64 of 128, V4 64 of 512, Gemma 4 global layers 25%). The unrotated channels carry content only, a natural place for semantic matching that should not vary with distance; with MLA it is required, because the rotated part must be a separate decoupled key that absorption cannot fold into the latent (page 07).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A model card says "activated parameters: X". How do you check which convention it uses?</summary>
+    <div class="answer">
+      <p>Recount from the config and compare three candidates: non-embedding, with the output head, and with both matrices. Qwen3-235B-A22B: 20.95B, 21.57B, 22.19B, and the card says 22B, so both matrices. MiniMax-M2: 9.80B, 10.42B, 11.03B against a stated 9.8B, so non-embedding. Maverick: 15.12B, 16.15B, 17.18B against 17B, both matrices (page 29). DeepSeek-V3: 35.70B, 36.63B, 37.55B against 37B, inside the range (page 08). If none matches within about 2%, look for something the card counts that the config does not (a vision tower, a shared dense MLP in parallel with the experts as in Gemma 4, an MTP module). The convention matters for comparisons: tokens per activated parameter and \(6 N_{\text{act}} D\) move by 5% to 10% between the first and last choices, and the FLOP-correct choice for compute is the head-inclusive one.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> You must serve 32 concurrent 1M-token sequences with about 300 GB of HBM free for the cache. Which attention design do you choose, and why?</summary>
+    <div class="answer">
+      <p>Budget: 300 GB over 32 sequences is 9.4 GB per sequence, or about 9,000 bytes per token at \(2^{20}\) tokens. Use the marginal bytes of Table 4: a GQA-8 model with Llama 405B's 126 layers needs 516,096 B per token, 504 GiB per sequence, 54 times too big. An MLA model like V3 needs 70,272 B, 68.6 GiB per sequence: 7 times too big. A 3:1 KDA hybrid on MLA (K3) needs 27,648 B, exactly 27 GiB per sequence: 3 times too big, so 10 sequences. Only compressed designs fit: V4-Pro caches about 4,970 B per token (page 28; page 09 reports 5.18 GB for 1M tokens, so 32 sequences need about 166 GB) and V4.1-Flash reports 890 B per token of global cache, though its window and persistent caches add to it.</p>
+      <p>So the choice follows from the arithmetic: at this budget you need compression and selection, not a hybrid alone; a hybrid plus FP8 or FP4 KV plus a bigger memory (or offload of cold prefixes to SSD as V4 does, page 28) is the alternative. Then the trade-offs to name: recall after compression (needle tasks pass, multi-hop needs testing), indexer cost linear in \(T\) unless the keys are compressed first, kernel and prefix-cache support, and that 32 sequences at 1M tokens also need enough bandwidth to read the cache each step: \(5\text{ GB} \times 32\) per step is 160 GB, about 48 ms on a 3.35 TB/s H100 for the cache alone per GPU if it is not sharded, which is why the read set (top-\(k\) or compressed entries), not the stored cache, sets decode speed.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> The report says Kimi K2 has 1.04T parameters but your recount from the config gives 1.026T. How do you resolve it, and what would you say in an interview?</summary>
+    <div class="answer">
+      <p>First separate convention from error. The recount (1,026,408,209,408) uses the released config: 61 layers with the first dense, 384 routed and 1 shared expert of width 2,048 in the other 60, 64 heads, \(V = 163{,}840\), untied. It matches the checkpoint's tensor metadata (1,026,470,731,056) except for 62.5M FP8 scale factors, so it describes what was released. The report's Table 2 gives 1.04T and its Table 4 gives 1,043B; the recipe returns 1,043B exactly if all 61 layers are counted as MoE layers with 385 experts, 16.6B more (page 08), and 1.04T is the rounding of that. I would say: "the config gives 1.026T; the report's figure matches an overcount of the dense first layer, so I would quote 1.026T and note the report's 1.04T." The general procedure is to (1) recount from the config, (2) compare with the checkpoint metadata and account for scale tensors and MTP or vision parts, (3) test conventions (embeddings, tied or not), and (4) if a gap remains, state it as unresolved rather than choosing. GLM-4.5 (358.34B file, 355B named) resolves exactly by MTP-layer accounting; MiniMax-M2's 1.2B gap equals two vocabulary matrices but is not confirmed.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Config zoo.</strong> Read a Hugging Face <code>config.json</code> and turn it into numbers. Implement <code>load_config</code> (normalize Llama, Mistral, Qwen2 and Qwen3, Mixtral, Qwen3-MoE and DeepSeek-style keys into a <code>Spec</code>, including nested <code>text_config</code>, missing <code>head_dim</code> and <code>num_key_value_heads</code>, and MoE layer placement), <code>params</code> (total and activated, three embedding conventions, GQA and MLA, shared experts), <code>kv_bytes_per_token</code>, <code>kv_cache_bytes</code> (windows and local layers) and <code>flops_per_token</code> (with causal attention averaged over the sequence). Tests check 8,030,261,248 for Llama-3-8B, 671,026,404,352 total and 37,552,282,624 activated for DeepSeek-V3, Qwen3-235B, Kimi K2 and GLM-4.5 recounts, a torch-module count on small configs, and the KV bytes of Gemma-like and Qwen3-Next-like layouts. An interviewer would expect the dense path (Llama, Qwen) in 20 minutes and MoE plus MLA in 40. <span class="ex-path">exercises/drills/config_zoo.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_config_zoo.py</code>; add <code>--solutions</code> to check the reference. Stretch: extend <code>load_config</code> to read your own model's config, or add a linear-attention layer type (Gated DeltaNet: \(d\)-by-\(d\) projections plus a fixed state) so that the hybrid rows of Table 4 get exact recounts.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2005.14165">Brown et al. (2020). Language Models are Few-Shot Learners.</a> <span class="why">Why read it: Table 2.1 is the 2020 baseline (96 layers, \(d = 12{,}288\), 96 heads of 128) that every column of this atlas is measured against, including the dense and locally banded layers.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">Why read it: Table 3 for the dense 8B, 70B and 405B configs, the RoPE base of \(5 \times 10^5\), and the 15T-token overtraining decision.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: §2 and §4.2 give the MLA plus fine-grained MoE configuration that later models copied or answered.</span></li>
+    <li><a href="https://arxiv.org/abs/2505.09388">Yang et al. (2025). Qwen3 Technical Report.</a> <span class="why">Why read it: Tables 1 and 2 for dense and MoE shapes, QK-norm in place of QKV bias, and MoE without a shared expert.</span></li>
+    <li><a href="https://arxiv.org/abs/2503.19786">Gemma Team (2025). Gemma 3 Technical Report.</a> <span class="why">Why read it: the 5:1 local-to-global layout, the KV cache accounting that motivates it, and QK-norm replacing soft-capping.</span></li>
+    <li><a href="https://arxiv.org/abs/2607.02770">Gemma Team (2026). Gemma 4 Technical Report.</a> <span class="why">Why read it: Table 1 for parameter counts and §2 for keys reused as values, partial RoPE in global layers and a 26B MoE.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: the sparsity scaling law (§2.3) and QK-Clip, the two arguments behind 384 experts and MuonClip.</span></li>
+    <li><a href="https://arxiv.org/abs/2508.10925">OpenAI (2025). gpt-oss-120b and gpt-oss-20b Model Card.</a> <span class="why">Why read it: the parameter table (116.83B and 5.13B), banded and dense alternation, and learned sink logits; a check on which \(N\) a card reports.</span></li>
+    <li><a href="https://arxiv.org/abs/2605.26494">MiniMax (2026). The MiniMax-M2 Series.</a> <span class="why">Why read it: §2.2.2 is the clearest public account of why a lab that had shipped a linear hybrid went back to full attention.</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read it: §2 and §4.2.1 for compressed shared-KV attention, hash-routed early layers, mHC and the 1M-token configurations of V4-Flash and V4-Pro.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Standard dense block:</strong> pre-RMSNorm, GQA with 8 KV heads of 128, RoPE, QK-norm (new), no biases, SwiGLU at 3.25 to 5 \(d\), vocabulary 128K to 262K. Reference: Llama 3.1 8B, 8,030,261,248 parameters, 128 KiB of KV per token.</li>
+      <li><strong>Standard sparse block:</strong> the same attention (or MLA), FFN replaced by 128 to 512 routed experts of width 0.25 to 0.5 \(d\), top-6 to 10, one shared expert, sigmoid gating with bias balancing; activated FFN width 2.4 to 4 \(d\). Reference: V3, 671,026,404,352 total, 37.55B (both matrices), 70,272 B of KV per token.</li>
+      <li><strong>Formulas:</strong> params per GQA layer \(2 d\, n_h d_h + 2 d\, n_{kv} d_h + 3 d\, d_{ff}\); KV \(= L \cdot 2 n_{kv} d_h \cdot b\) (MLA \(L (d_c + d_h^R) b\)); FLOPs \(= 2 N_{mm} + 2 L\, n_h (d_{qk} + d_v)\, T/2\).</li>
+      <li><strong>Three activated counts:</strong> non-embedding, plus head, plus both matrices; V3: 35.70, 36.63, 37.55B. Qwen3-235B's 22B is "both", M2's 9.8B is non-embedding.</li>
+      <li><strong>Key numbers:</strong> KV per token: GPT-3 4.5 MiB, Llama 3.1 405B 504 KiB, Llama 3.1 8B 128 KiB, V3 68.6 KiB, K3 27 KiB, V4.1-Flash 890 B. Activation ratio of recent MoEs 1 in 20 to 35. Tokens per activated parameter 400 to 5,000.</li>
+      <li><strong>RoPE base:</strong> wavelength \(\approx 2\pi\theta\); \(10^4\) (2023), \(5 \times 10^5\) (Llama 3), \(10^6\) (Qwen, GLM), \(10^7\) (hybrids); partial rotation 25% to 50%.</li>
+      <li><strong>Open questions:</strong> attention family at 1M context, MoE granularity and shared experts, balancing method, Muon versus AdamW, local-to-global ratio, residual-stream redesigns (mHC, attention residuals).</li>
+      <li><strong>Reconcile headlines with configs:</strong> recount, compare with checkpoint metadata, account for MTP layers, vision towers and scale tensors, test embedding conventions, and state any residual gap. Kimi K2: 1.026T versus 1.04T; GLM-4.5: 358.34B file versus 355B.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

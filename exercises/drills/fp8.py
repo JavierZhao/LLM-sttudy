@@ -13,6 +13,8 @@ Conventions (row vectors, as in the course): activations A are (M, K) and weight
 so the layer computes A @ W. The scale of a group is amax / 448, so q = round_to_e4m3(x / scale)
 and x is approximated by q * scale (an all-zero group gets scale 1.0).
 """
+from __future__ import annotations
+
 import torch
 from torch import Tensor
 

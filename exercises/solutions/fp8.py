@@ -1,4 +1,6 @@
 """Reference solution (page 27): DeepSeek-V3-style FP8 quantization and GEMM, simulated on CPU."""
+from __future__ import annotations
+
 import torch
 from torch import Tensor
 

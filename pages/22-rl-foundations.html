@@ -203,7 +203,7 @@
   <ol start="3">
     <li><strong>Causality (reward-to-go).</strong> The action \(a_t\) cannot change a reward received earlier. For \(t' &lt; t\), the reward \(r_{t'}\) is determined by \(s_t\) (it is a function of earlier states and actions, all contained in the prefix), so
       \[ \E\big[ r_{t'}\, \nabla\log\pi(a_t|s_t) \big] = \E\Big[ r_{t'}\; \underbrace{\E_{a_t}\big[\nabla\log\pi(a_t|s_t)\big]}_{=\,0} \Big] = 0. \]
-      Dropping those terms replaces the full return by the <strong>reward-to-go</strong> \(G_t = \sum_{t' \ge t} \gamma^{t'-t} r_{t'}\):</li>
+      Dropping those terms replaces the full return by the <strong>reward-to-go</strong> \(G_t = \sum_{t' \ge t} r_{t'}\) (we keep \(\gamma = 1\); a factor \(\gamma^{t'-t}\) inside \(G_t\) is the biased discounted estimator of the GAE section):</li>
   </ol>
 
   <div class="eq-box">

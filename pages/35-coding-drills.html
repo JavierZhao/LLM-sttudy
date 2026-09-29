@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>35 · Coding drills · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="35" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VII · Interview toolkit · Page 35</div>
+  <h1>Coding drills</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~90 min</span>
+    <span>Prereqs: every drill page, especially <a href="03-attention.html">03 Attention</a>, <a href="06-decoding-kv-cache.html">06 Decoding</a>, <a href="04-transformer-block.html">04 Transformer block</a></span>
+  </div>
+  <p class="lede">The practice hub for coding rounds. It indexes every drill in the course by how likely it is to be asked and how long it should take, then adds three classic problems that no earlier page covers: LayerNorm and RMSNorm backward by hand, beam search with length normalization checked against brute force, and a training loop with six planted bugs.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Fluency on the core components:</strong> causal attention, KV-cache decode, RoPE, sampling, cross-entropy. Expect one of them, then a follow-up: add GQA, handle a chunked prefill, make it stable in bf16.</li>
+    <li><strong>Correctness discipline:</strong> shapes stated in comments, mask polarity, end-aligned masks, fully masked rows, upcasting before reductions, said out loud before you run anything.</li>
+    <li><strong>Debugging from symptoms:</strong> given broken code, find the bugs from what the loss, the gradients or the outputs do (loss below the entropy floor, NaNs, a train/eval gap).</li>
+    <li><strong>Testing instinct:</strong> "what would you test?" is answered with properties (causality, rows sum to one, decode equals prefill, gradient equals autograd), not with one example.</li>
+    <li><strong>Complexity and memory:</strong> where the \(O(T^2)\) tensor lives, what a cache reorder costs, what a fused kernel avoids materializing.</li>
+    <li><strong>Derivations on a whiteboard:</strong> the backward pass of softmax, attention or a normalization layer, from the chain rule, without a reference.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Choose drills by frequency tier and time target, and run the practice protocol: timebox, no references, tests, comparison with the reference, a log of mistake classes, a redo.</li>
+    <li>Derive the LayerNorm and RMSNorm backward passes from the chain rule, implement them with \(d\gamma\) and \(d\beta\) reduced over every batch axis, and match autograd to \(10^{-11}\) in float64.</li>
+    <li>Explain why the LayerNorm input gradient sums to zero and is orthogonal to \(x\), and use that as a test that needs no reference implementation.</li>
+    <li>Implement beam search with EOS handling, GNMT length normalization and an exact early-stop rule, and validate it against exhaustive search on a tiny vocabulary.</li>
+    <li>Find the six planted bugs in a language-model training loop from their symptoms, and name one test that catches each.</li>
+    <li>Recite the common-mistakes checklist: mask polarity, upcasting, \(-\infty\) NaNs, label-shift off-by-one, in-place ops under autograd, causal masks in decode chunks.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="rounds">How LLM coding rounds work</h2>
+
+  <aside class="callout note">
+    <div class="callout-title">Scope of this section</div>
+    <p>Labs publish little about their loops, and formats differ by team, role and year. What follows is general guidance derived from what the drills exercise and from common practice in ML interviews, not a sourced description of any lab's process. Ask your recruiter which tools are allowed (documentation, autocomplete, a shared notebook, a plain editor) and whether the round is live or a take-home.</p>
+  </aside>
+
+  <h3 id="formats">Four formats to prepare for</h3>
+  <ol>
+    <li><strong>Implement a component from a spec.</strong> "Write causal multi-head attention", "implement top-p sampling", "write the DPO loss", in PyTorch or NumPy, with follow-ups that change one requirement (add a KV cache, make it stable in bf16). Most drills below are this format.</li>
+    <li><strong>Debug broken code.</strong> A module or training loop that runs but is wrong, with a symptom (loss too low, NaN after step 300). <a href="#debug">The training-loop exercise</a> is this format.</li>
+    <li><strong>Optimize a slow function.</strong> Vectorize a loop over tokens, avoid materializing a \(T\times T\) matrix, fuse two passes. The vocabulary is complexity and memory traffic.</li>
+    <li><strong>Systems-flavored coding.</strong> Simulate an all-reduce, write a tokenizer or a request scheduler, sometimes with concurrency, more often in research-engineer loops. Classic algorithm questions also appear; this course does not cover them, so budget separate practice.</li>
+  </ol>
+
+  <h3 id="checked">What the interviewer is checking</h3>
+  <p>Read this as a rubric for your own solutions:</p>
+  <ul>
+    <li><strong>Shapes:</strong> you can state every intermediate shape. Write it in a comment on each line, as the course code does.</li>
+    <li><strong>Masking:</strong> mask polarity, the mask applied to scores before the softmax, the end-aligned mask when queries are fewer than keys.</li>
+    <li><strong>Numerical stability:</strong> subtract the row maximum, upcast before reductions, keep \(-\infty\) from turning into NaN, prefer <code>log_softmax</code> to <code>log(softmax)</code>.</li>
+    <li><strong>Tests:</strong> a tiny case by hand, then properties, before being asked. A candidate who runs a causality test unprompted has answered half the follow-ups.</li>
+    <li><strong>Complexity:</strong> time, memory and, for anything that decodes, cost per generated token. Say it unprompted.</li>
+    <li><strong>Communication:</strong> state assumptions, narrate trade-offs, correct yourself early. A correct, slower solution you can defend beats a fast one you cannot.</li>
+  </ul>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 240" role="img" aria-labelledby="fig-35-1-title">
+<title id="fig-35-1-title">A suggested split of a 45-minute coding slot into four phases, with what to do in each</title>
+<text x="20" y="20" class="s-bold s-small">Phase</text>
+<text x="420" y="20" class="s-bold s-small">What to do</text>
+
+<text x="20" y="49" class="s-bold">Clarify and plan</text>
+<text x="20" y="65" class="s-small s-muted">minutes 0 to 6</text>
+<rect class="s-e" x="150" y="34" width="33.3" height="30" rx="4"/>
+<text x="420" y="47" class="s-small">Restate inputs, shapes and edge cases.</text>
+<text x="420" y="62" class="s-small">Agree on the test and the complexity target.</text>
+
+<text x="20" y="95" class="s-bold">Write the core</text>
+<text x="20" y="111" class="s-small s-muted">minutes 6 to 26</text>
+<rect class="s-a" x="183.3" y="80" width="111.1" height="30" rx="4"/>
+<text x="420" y="93" class="s-small">Simplest correct version first. Shapes in comments,</text>
+<text x="420" y="108" class="s-small">talk while you type, no premature optimization.</text>
+
+<text x="20" y="141" class="s-bold">Test it yourself</text>
+<text x="20" y="157" class="s-small s-muted">minutes 26 to 35</text>
+<rect class="s-c" x="294.4" y="126" width="50" height="30" rx="4"/>
+<text x="420" y="139" class="s-small">A tiny case by hand, then a property: causality,</text>
+<text x="420" y="154" class="s-small">rows sum to one, decode equals prefill.</text>
+
+<text x="20" y="187" class="s-bold">Edge cases and extension</text>
+<text x="20" y="203" class="s-small s-muted">minutes 35 to 45</text>
+<rect class="s-d" x="344.4" y="172" width="55.6" height="30" rx="4"/>
+<text x="420" y="185" class="s-small">Empty input, masked rows, bf16, T different from S.</text>
+<text x="420" y="200" class="s-small">State time and memory, then take the follow-up.</text>
+
+<line class="s-line" x1="150" y1="216" x2="400" y2="216"/>
+<line class="s-line" x1="150" y1="212" x2="150" y2="220"/><text x="150" y="232" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" x1="205.6" y1="212" x2="205.6" y2="220"/><text x="205.6" y="232" text-anchor="middle" class="s-small s-muted">10</text>
+<line class="s-line" x1="261.1" y1="212" x2="261.1" y2="220"/><text x="261.1" y="232" text-anchor="middle" class="s-small s-muted">20</text>
+<line class="s-line" x1="316.7" y1="212" x2="316.7" y2="220"/><text x="316.7" y="232" text-anchor="middle" class="s-small s-muted">30</text>
+<line class="s-line" x1="372.2" y1="212" x2="372.2" y2="220"/><text x="372.2" y="232" text-anchor="middle" class="s-small s-muted">40</text>
+<line class="s-line" x1="400" y1="212" x2="400" y2="220"/><text x="404" y="232" class="s-small s-muted">45 min</text>
+</svg>
+    <figcaption><b>Figure 1.</b> A suggested allocation for a 45-minute slot, not a rule from any lab. Testing gets nearly as much time as the first version: the phase most candidates skip is the one that separates a working solution from a defended one.</figcaption>
+  </figure>
+
+  <h3 id="protocol">The practice protocol</h3>
+  <p>Do every drill the same way, so the time targets in the index mean something.</p>
+  <ol>
+    <li><strong>Timebox.</strong> Set a timer for the index target. When it rings, stop and note how far you got. A first attempt takes about twice the target.</li>
+    <li><strong>No references.</strong> Open the stub in <code>exercises/drills/</code> (signatures and docstring only) and write the body without a browser or the earlier page. If you cannot recall an API, write what you would call it and move on, as in an interview.</li>
+    <li><strong>Run the tests.</strong> <code>pytest exercises/tests/test_&lt;name&gt;.py</code>. Read only the first failure, fix it, rerun. Test names state the property being checked, which is often the hint you needed.</li>
+    <li><strong>Compare with the reference.</strong> Confirm with <code>--solutions</code>, then read <code>exercises/solutions/&lt;name&gt;.py</code> beside your code. Sort each difference into a typo, a missed edge case or a conceptual gap. Only the last deserves another drill.</li>
+    <li><strong>Log the class of mistake</strong> with the labels of the <a href="#checklist">checklist</a>. After ten drills the log shows the two or three classes that cost you time.</li>
+    <li><strong>Redo from scratch</strong> two or three days later at half the target, then explain the solution aloud. Speaking is a separate skill from typing, and rounds test both.</li>
+  </ol>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>You have validated custom layers with finite differences, so the <a href="#layernorm">LayerNorm exercise</a> is familiar ground (<code>torch.autograd.gradcheck</code> is the same idea in float64). You probably also tested permutation invariance by shuffling a jet's particles. The language-model analog is the <em>causality test</em>: rewrite the future tokens and check that outputs at earlier positions do not move by a single bit. Run it on any decoder code you write; <a href="#debug">the debug exercise</a> shows why.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="index">The drill index</h2>
+  <p>Every drill in the course, one module per row, in three tiers. Stubs live in <code>exercises/drills/</code>, references in <code>exercises/solutions/</code>, tests in <code>exercises/tests/</code>. The page column links to the page that teaches the topic. The list was built from the module files and the course manifest and checked against both: 37 modules exist today, and page 33's <code>config_zoo</code> is planned but has no file yet.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Frequency is a judgment</div>
+    <p>The tiers are my estimate of how often a topic is asked in coding rounds for model-building roles, from how central it is to LLM work and how well it fits a 30 to 45 minute slot. They are not survey data, and no lab publishes such a ranking. Move a drill up if your target team works on it: RL teams on <code>pg</code>, kernel teams on <code>flash</code>, data teams on <code>data_pipeline</code>.</p>
+  </aside>
+
+  <p><strong>Tier 1, be fluent:</strong> write it from a blank file at the target time, edge cases included. <strong>Tier 2, be comfortable:</strong> get the core working at the target time and explain the rest. <strong>Tier 3, stretch or role-specific:</strong> practice once or twice, and expect questions about the idea more than coding. <strong>Target</strong> is minutes for someone who has done the drill before, for the functions named in the row; "+" adds extras.</p>
+
+  <h3 id="tier-1">Tier 1: be fluent</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Page · module · target</th><th>You implement</th><th>The interviewer checks · why this tier</th></tr></thead>
+    <tbody>
+      <tr><td><a href="03-attention.html">03</a> · <code>attention</code><br><span class="small muted">25 min</span></td><td><code>softmax</code>, <code>causal_mask</code>, <code>scaled_dot_product_attention</code>, <code>MultiHeadAttention</code></td><td>Max subtraction; masked rows stay finite; <code>True</code> means "may attend"; end-aligned mask (\(T\ne S\)); the \(1/\sqrt{d_h}\) scale; head reshapes.<br><span class="small muted">Why: The most likely single prompt, and the base of the rest.</span></td></tr>
+      <tr><td><a href="06-decoding-kv-cache.html">06</a> · <code>kv_cache</code><br><span class="small muted">30 min</span></td><td><code>KVCache</code>, <code>attend_with_cache</code>, <code>generate_greedy</code></td><td>Preallocated in-place buffers; new queries see every cached key; positions offset by the cache length; stop at EOS; decode equals the full forward pass.<br><span class="small muted">Why: Decoding is what encoder work never needed.</span></td></tr>
+      <tr><td><a href="05-positional-encoding.html">05</a> · <code>rope</code><br><span class="small muted">20 min</span></td><td><code>apply_rope_interleaved</code>, <code>apply_rope_half</code>, layout permutation; + partial RoPE, ALiBi</td><td>Which dimensions pair up; angles built in float32 before casting; position ids that are not <code>arange</code>; the relative-offset property.<br><span class="small muted">Why: In nearly every open model, and layout mismatches break checkpoints.</span></td></tr>
+      <tr><td><a href="06-decoding-kv-cache.html">06</a> · <code>sampling</code><br><span class="small muted">20 min</span></td><td><code>apply_temperature</code>, <code>top_k_filter</code>, <code>top_p_filter</code>, <code>min_p_filter</code>, <code>sample</code></td><td>Filter order; top-p keeps the token that crosses \(p\); ties; incoming \(-\infty\); one token always survives; a seeded generator.<br><span class="small muted">Why: Short and easy to get subtly wrong: a warm-up or debug prompt.</span></td></tr>
+      <tr><td><a href="01-big-picture.html">01</a> · <code>lm_loss</code><br><span class="small muted">15 min</span></td><td><code>shift_for_lm</code>, <code>lm_cross_entropy</code>, <code>perplexity</code>, <code>bits_per_byte</code></td><td>Label shift and \(-100\) masking; stable log-sum-exp; mean over tokens, not sequences; an all-ignored batch.<br><span class="small muted">Why: In every training loop, and shift errors fail silently.</span></td></tr>
+      <tr><td><a href="02-tokenization.html">02</a> · <code>bpe</code><br><span class="small muted">35 min</span></td><td><code>pair_counts</code>, <code>merge_pair</code>, <code>train_bpe</code>, <code>encode</code>, <code>decode</code></td><td>Overlapping pairs (<code>[a, a, a]</code> holds two <code>(a, a)</code>); tie-breaks; lowest-rank merge first; byte-level round trip; the naive loop's cost.<br><span class="small muted">Why: The classic LLM-specific question, with no encoder analog.</span></td></tr>
+      <tr><td><a href="20-peft-lora.html">20</a> · <code>lora</code><br><span class="small muted">20 min</span></td><td><code>LoRALinear</code> with <code>merge</code>, <code>unmerge</code>; + NF4, QLoRA</td><td>\(B=0\) init so step 0 equals the base; \(\alpha/r\) scaling; frozen base; exact merge and unmerge; parameter count.<br><span class="small muted">Why: The most used fine-tuning method, and compact.</span></td></tr>
+      <tr><td><a href="21-preference-optimization.html">21</a> · <code>dpo</code><br><span class="small muted">20 min</span></td><td><code>sequence_logprob</code>, <code>dpo_loss</code>; + Bradley-Terry, IPO, SimPO, ORPO</td><td>Sum over response tokens only; <code>logsigmoid</code>, not <code>log(sigmoid)</code>; fixed reference; chosen minus rejected; what \(\beta\) scales.<br><span class="small muted">Why: The standard preference loss: few lines, many slips.</span></td></tr>
+      <tr><td><a href="24-rlvr-reasoning.html">24</a> · <code>grpo</code><br><span class="small muted">15 min, +25 (loss)</span></td><td><code>group_advantages</code>, <code>grpo_loss</code>; + GSPO, dynamic sampling</td><td>Normalize inside each group; zero standard deviation; token versus sequence aggregation; asymmetric clip; padding junk cannot leak.<br><span class="small muted">Why: The default RL objective for reasoning models.</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="tier-2">Tier 2: be comfortable</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Page · module · target</th><th>You implement</th><th>The interviewer checks · why this tier</th></tr></thead>
+    <tbody>
+      <tr><td><a href="04-transformer-block.html">04</a> · <code>transformer</code><br><span class="small muted">25 min (block), 60 (all)</span></td><td><code>RMSNorm</code>, <code>SwiGLU</code>, <code>CausalSelfAttention</code>, <code>Block</code>, <code>GPT</code>, <code>count_params</code></td><td>Pre-norm wiring; \(\epsilon\) inside the root, float32 statistics; three SwiGLU matrices; weight tying; an exact parameter count.<br><span class="small muted">Why: A common long round, but 45 minutes rarely fits it all.</span></td></tr>
+      <tr><td><a href="07-kv-efficient-attention.html">07</a> · <code>gqa</code><br><span class="small muted">15 min</span></td><td><code>repeat_kv</code>, <code>gqa_attention</code>, <code>mha_to_gqa_kv_weight</code></td><td>Query head \(i\) reads KV head \(\lfloor i/g\rfloor\); <code>repeat_interleave</code>; end-aligned mask in decode; mean-pool conversion.<br><span class="small muted">Why: Default attention of dense open models.</span></td></tr>
+      <tr><td><a href="08-mixture-of-experts.html">08</a> · <code>moe</code><br><span class="small muted">30 min, +5 per extra</span></td><td><code>topk_router</code>, <code>MoELayer</code>; + balance losses, bias update, capacity mask</td><td>Softmax versus sigmoid gates; the bias picks experts but gates use unbiased scores; dispatch without a per-token loop; empty experts.<br><span class="small muted">Why: Dominant in recent open frontier models.</span></td></tr>
+      <tr><td><a href="16-gpus-kernels.html">16</a> · <code>flash</code><br><span class="small muted">30 min</span></td><td><code>merge_softmax_stats</code>, <code>online_softmax</code>, <code>flash_attention_forward</code>; + backward, split-KV</td><td>Rescale by the running maximum; no \(T\times T\) matrix; skip fully masked tiles; save log-sum-exp; huge logits stay finite.<br><span class="small muted">Why: Kernel roles; online softmax is a whiteboard favorite.</span></td></tr>
+      <tr><td><a href="17-inference-serving.html">17</a> · <code>speculative</code><br><span class="small muted">20 min</span></td><td><code>acceptance_rate</code>, <code>expected_tokens_per_step</code>, <code>speedup</code>, <code>speculative_accept</code></td><td>Accept with \(\min(1,p/q)\); resample from the normalized \(\max(p-q,0)\); the bonus token; why the output law is the target's.<br><span class="small muted">Why: Inference roles; the argument beats the code.</span></td></tr>
+      <tr><td><a href="14-optimization.html">14</a> · <code>optim</code><br><span class="small muted">20 min</span></td><td><code>adamw_step</code>, <code>lr_schedule</code>; + <code>newton_schulz</code>, <code>muon_step</code></td><td>Bias correction; decoupled weight decay; where \(\epsilon\) goes; the off-by-one at the end of warmup.<br><span class="small muted">Why: "Implement Adam" is a fundamentals classic.</span></td></tr>
+      <tr><td><a href="11-stability-tweaks.html">11</a> · <code>stability</code><br><span class="small muted">10 min (norm), 30 (rest)</span></td><td><code>rms_norm</code>, <code>qk_norm_attention</code>, <code>z_loss</code>, <code>softcap</code>, <code>attention_entropy</code>, <code>MTPDepth</code></td><td>Float32 statistics; z-loss on \(\log Z\); the soft-cap bound and gradient.<br><span class="small muted">Why: Small pieces, often warm-ups.</span></td></tr>
+      <tr><td><a href="22-rl-foundations.html">22</a> · <code>pg</code><br><span class="small muted">30 min</span></td><td><code>reinforce_loss</code>, <code>gae</code>, <code>ppo_clip_loss</code>, <code>kl_estimators</code>, <code>masked_whiten</code></td><td>Reward-to-go under a mask; GAE runs backward; the four PPO-clip gradient regions; the \(k_3\) estimator.<br><span class="small muted">Why: Tier 1 on RL teams.</span></td></tr>
+      <tr><td><a href="19-sft-distillation.html">19</a> · <code>sft</code><br><span class="small muted">30 min</span></td><td><code>build_example</code>, <code>pack</code>, <code>document_causal_mask</code>, <code>packed_lm_loss</code>, <code>kd_loss</code></td><td>Loss mask aligned to the token, not shifted; train only assistant and end tokens; block-diagonal packing mask; token versus sequence normalization.<br><span class="small muted">Why: Plumbing bugs quietly change what the model learns.</span></td></tr>
+      <tr><td><a href="18-evaluation.html">18</a> · <code>evals</code><br><span class="small muted">10 min (pass@k), 25 (all)</span></td><td><code>pass_at_k</code>, <code>mean_pass_at_k</code>, <code>accuracy_ci</code>, <code>paired_bootstrap</code>, and more</td><td>\(1-\binom{n-c}{k}/\binom{n}{k}\) computed stably; mean of per-problem pass@k; Wilson interval at the edges; pairing.<br><span class="small muted">Why: Short, and tests what a benchmark number means.</span></td></tr>
+      <tr><td><a href="#layernorm">35</a> · <code>layernorm_backward</code><br><span class="small muted">25 min, +10 (RMSNorm)</span></td><td><code>layernorm_forward</code>, <code>layernorm_backward</code>, <code>rmsnorm_forward</code>, <code>rmsnorm_backward</code></td><td>Three-term \(dx\); \(d\gamma,d\beta\) summed over batch axes; float32 statistics; no in-place cache edits; gradcheck.<br><span class="small muted">Why: Classic "derive the backward"; rarer, but one checkable answer.</span></td></tr>
+      <tr><td><a href="#beam">35</a> · <code>beam_search</code><br><span class="small muted">30 min, +10 (oracle)</span></td><td><code>normalized_score</code>, <code>beam_search</code>, <code>exhaustive_search</code></td><td>Flat top-\(k\) and divmod; EOS finishes and is never expanded; raw scores inside a step; normalize to compare finished ones; a stop rule.<br><span class="small muted">Why: Classic search question; chat models sample, so rarer here.</span></td></tr>
+      <tr><td><a href="34-back-of-envelope.html">34</a> · <code>napkin</code><br><span class="small muted">20 min (all)</span></td><td>19 formulas: <code>params</code>, <code>flops</code>, <code>kv_bytes</code>, <code>decode_time</code>, <code>chinchilla_opt</code>, and more</td><td>Name \(N\); hunt factors of 2 (multiply-add, sparsity, GB versus GiB); say which resource binds.<br><span class="small muted">Why: Asked aloud in nearly every loop.</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="tier-3">Tier 3: stretch and role-specific</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Page · module · target</th><th>You implement</th><th>The interviewer checks · why this tier</th></tr></thead>
+    <tbody>
+      <tr><td><a href="07-kv-efficient-attention.html">07</a> · <code>mla</code><br><span class="small muted">40 min</span></td><td><code>mla_forward</code>, <code>mla_decode_step</code>, <code>kv_cache_bytes_per_token</code></td><td>Absorbed decode reproduces the decompressed forward; the cache is latent plus shared RoPE key; score scale.<br><span class="small muted">Why: DeepSeek-specific.</span></td></tr>
+      <tr><td><a href="28-deepseek-3-reasoning.html">28</a> · <code>dsa</code><br><span class="small muted">40 min</span></td><td><code>lightning_index_scores</code>, <code>dsa_attention</code>, <code>indexer_kl_loss</code>, <code>dsa_decode_flops</code></td><td>ReLU-gated indexer; \(-\infty\), not 0, for forbidden keys; one selection for all heads; break-even cost.<br><span class="small muted">Why: Recent, DeepSeek-specific.</span></td></tr>
+      <tr><td><a href="27-deepseek-2-v3.html">27</a> · <code>fp8</code><br><span class="small muted">40 min</span></td><td><code>round_to_e4m3</code>, <code>quantize_tiles</code>, <code>quantize_blocks</code>, <code>fp8_matmul</code></td><td>Scale amax/448; ties to even; per-tile scales confine outliers; float32 promotion every 128.<br><span class="small muted">Why: Low-precision training roles.</span></td></tr>
+      <tr><td><a href="09-beyond-full-attention.html">09</a> · <code>efficient_attention</code><br><span class="small muted">5 min (mask), 15 (recurrence)</span></td><td><code>sliding_window_*</code>, linear attention (parallel, recurrent), <code>delta_rule_recurrent</code>, <code>topk_sparse_attention</code></td><td>Parallel equals recurrent; the normalizer; the delta rule overwrites; no future keys.<br><span class="small muted">Why: Long-context roles; the window mask alone is Tier 2.</span></td></tr>
+      <tr><td><a href="10-long-context.html">10</a> · <code>rope_scaling</code><br><span class="small muted">25 min, +20 (YaRN)</span></td><td><code>pi_scale</code>, <code>ntk_base</code>, <code>yarn_inv_freq</code>, <code>llama3_inv_freq</code>, NIAH grid</td><td>Vanilla frequencies at scale 1; wavelength versus index ramps; which pairs move.<br><span class="small muted">Why: Long-context specialists.</span></td></tr>
+      <tr><td><a href="15-distributed-training.html">15</a> · <code>parallel</code><br><span class="small muted">25 min (ring), 25 (TP MLP)</span></td><td><code>ring_allreduce</code>, <code>column_row_parallel_mlp</code>, <code>head_parallel_attention</code>, ZeRO memory, <code>simulate_1f1b</code>, <code>mfu</code></td><td>\(2(n-1)/n\) bytes per rank; one all-reduce for column then row split; bubble \((p-1)/m\).<br><span class="small muted">Why: Infrastructure research-engineer loops.</span></td></tr>
+      <tr><td><a href="23-rlhf.html">23</a> · <code>rlhf</code><br><span class="small muted">20 min</span></td><td><code>whiten</code>, <code>shaped_rewards</code>, <code>apply_eos_penalty</code>, <code>AdaptiveKLController</code></td><td>KL penalty on every token, score on the last; masked whitening; truncation penalty.<br><span class="small muted">Why: PPO-RLHF, now rarer than GRPO.</span></td></tr>
+      <tr><td><a href="25-rl-systems-agentic.html">25</a> · <code>rl_systems</code><br><span class="small muted">20 min</span></td><td><code>truncated_is_weights</code>, <code>agent_loss_mask</code>, <code>sequence_ratio_drift</code>, <code>staleness_admits</code></td><td>Ratio is trainer over rollout; cap from above only; train assistant tokens only.<br><span class="small muted">Why: RL infrastructure teams.</span></td></tr>
+      <tr><td><a href="12-pretraining-data.html">12</a> · <code>data_pipeline</code><br><span class="small muted">30 min</span></td><td><code>shingles</code>, <code>minhash_signature</code>, <code>lsh_candidates</code>, <code>choose_bands_rows</code>, <code>gopher_quality_filter</code></td><td>Deterministic hash (not Python's salted <code>hash()</code>); the S-curve \(1-(1-s^r)^b\).<br><span class="small muted">Why: Data-team roles.</span></td></tr>
+      <tr><td><a href="13-scaling-laws.html">13</a> · <code>scaling</code><br><span class="small muted">25 min</span></td><td><code>compute_optimal</code>, <code>fit_power_law</code>, <code>isoflop_optimum</code>, <code>inference_aware_optimum</code>, and more</td><td>Closed-form optimum under \(C=6ND\); log-log fit; parabola vertex.<br><span class="small muted">Why: Research-scientist loops, usually as derivation.</span></td></tr>
+      <tr><td><a href="29-llama.html">29</a> · <code>llama_config</code><br><span class="small muted">25 min</span></td><td><code>ffn_hidden_dim</code>, <code>llama_params</code>, <code>llama4_params</code>, <code>kv_cache_bytes</code></td><td>Meta's FFN rounding; tied embeddings; total versus active; KV with local layers.<br><span class="small muted">Why: Exact counting, usually aloud.</span></td></tr>
+      <tr><td><a href="26-deepseek-1-foundations.html">26</a> · <code>deepseek_params</code><br><span class="small muted">35 min</span></td><td><code>mla_params</code>, <code>moe_layer_params</code>, <code>count_params</code>, <code>hp_scaling</code>, and more</td><td>Which matrices count; total versus activated per embedding convention.<br><span class="small muted">Why: DeepSeek-specific counting.</span></td></tr>
+      <tr><td><a href="30-qwen.html">30</a> · <code>qwen_bits</code><br><span class="small muted">10 min (gate), 20 (losses)</span></td><td><code>gated_attention_output</code>, micro- and global-batch balance losses, <code>qwen3_moe_param_counts</code>, <code>hybrid_cache_bytes</code></td><td>Sigmoid output gate; micro versus global frequencies; recurrent state bytes.<br><span class="small muted">Why: Qwen-specific.</span></td></tr>
+      <tr><td><a href="31-mistral-gemma-gptoss.html">31</a> · <code>sinks</code> <span class="small muted">(page coming)</span><br><span class="small muted">target not set</span></td><td>Module present in <code>exercises/drills/sinks.py</code> (attention sinks, banded masks, layer schedules, hybrid KV bytes, MXFP4)</td><td>To be filled from the finished page.<br><span class="small muted">Why: Provisional Tier 3.</span></td></tr>
+      <tr><td><a href="32-frontier-open-models.html">32</a> · <code>muonclip</code> <span class="small muted">(page coming)</span><br><span class="small muted">target not set</span></td><td>Module present in <code>exercises/drills/muonclip.py</code> (per-head max logit and QK-Clip, with an MLA variant)</td><td>To be filled from the finished page.<br><span class="small muted">Why: Provisional Tier 3.</span></td></tr>
+      <tr><td><a href="33-architecture-atlas.html">33</a> · <code>config_zoo</code> <span class="small muted">(page coming)</span><br><span class="small muted">target not set</span></td><td>Planned in the manifest; no file yet, so nothing is described.</td><td>To be filled from the finished page.<br><span class="small muted">Why: Provisional Tier 3.</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="small muted">Two Tier 2 rows, <code>layernorm_backward</code> and <code>beam_search</code>, are this page's own drills and link to their sections below. The tiers hold 9 + 13 + 16 = 38 modules: 35 earlier drills, the two new ones here, and the planned <code>config_zoo</code>. Run every reference solution with <code>pytest exercises --solutions</code>.</p>
+</section>
+
+<section>
+  <h2 id="layernorm">LayerNorm and RMSNorm backward by hand</h2>
+  <p>Interviewers like this problem: it has one checkable answer, it applies the chain rule through a mean and a variance, and it leads into kernel design. The drill is <code>exercises/drills/layernorm_backward.py</code>: write <code>layernorm_forward</code> (returning the output and a cache), <code>layernorm_backward</code> (returning \(dx, d\gamma, d\beta\)) and the same pair for RMSNorm. The tests compare with autograd in float64, run <code>gradcheck</code> through your pair, and check properties that need no reference.</p>
+
+  <h3 id="ln-forward">The forward pass and what to cache</h3>
+  <p>Both norms act on the last axis of one token's vector \(x\in\R^d\) (<a href="04-transformer-block.html#rmsnorm">page 04</a> explains why RMSNorm replaced LayerNorm). With \(r\) the reciprocal standard deviation and \(\hat x\) the normalized vector:</p>
+  \[ \text{LayerNorm:}\quad \mu=\tfrac1d\sum_i x_i,\;\; r=\big(\tfrac1d\sum_i (x_i-\mu)^2+\epsilon\big)^{-1/2},\;\; \hat x_i=(x_i-\mu)\,r,\;\; y_i=\gamma_i\hat x_i+\beta_i \]
+  \[ \text{RMSNorm:}\quad r=\big(\tfrac1d\sum_i x_i^2+\epsilon\big)^{-1/2},\;\; \hat x_i=x_i\,r,\;\; y_i=\gamma_i\hat x_i \]
+  <p>The variance divides by \(d\), not \(d-1\), and \(\epsilon\) sits inside the root. Everything the backward pass needs is \(\hat x\), \(r\) and \(\gamma\), so that is the cache. Compute the statistics in at least float32 (in code: <code>torch.promote_types(x.dtype, torch.float32)</code>), so bf16 inputs are upcast while float64 inputs, which the gradient checks need, are left alone.</p>
+
+  <h3 id="ln-derivation">The backward pass, step by step</h3>
+  <p>Write \(\delta_i=\partial L/\partial y_i\) for the incoming gradient and \(\bar v\) for the mean of a vector \(v\) over its \(d\) entries. Three steps, easiest first.</p>
+  <p><strong>Step 1, the parameters.</strong> Since \(y_i=\gamma_i\hat x_i+\beta_i\) and the same \(\gamma,\beta\) are used at every token, their gradients sum over all batch and position axes:</p>
+  \[ \frac{\partial L}{\partial\gamma_i}=\sum_{\text{rows}}\delta_i\,\hat x_i,\qquad \frac{\partial L}{\partial\beta_i}=\sum_{\text{rows}}\delta_i \]
+  <p><strong>Step 2, the normalized values.</strong> \(u_i:=\partial L/\partial\hat x_i=\gamma_i\delta_i\).</p>
+  <p><strong>Step 3, the input.</strong> For LayerNorm, \(x_j\) reaches \(\hat x_i=c_i r\) (with \(c_i=x_i-\mu\)) along two routes: through the centered value \(c_i\) (directly, and through the mean), and through \(r\), which depends on \(\sigma^2=\overline{c^2}\). The pieces are
+
+  \[ \frac{\partial c_i}{\partial x_j}=\delta_{ij}-\frac1d,\qquad \frac{\partial\sigma^2}{\partial x_j}=\frac2d\sum_k c_k\Big(\delta_{kj}-\frac1d\Big)=\frac2d\,c_j,\qquad \frac{\partial r}{\partial x_j}=-\tfrac12 r^3\frac{\partial\sigma^2}{\partial x_j}=-\frac{r^2}{d}\,\hat x_j\,, \]
+
+  where the middle equality uses \(\sum_k c_k=0\) and the last one uses \(r c_j=\hat x_j\). Then
+
+  \[ \frac{\partial L}{\partial x_j}=\sum_i u_i\Big(r\,\frac{\partial c_i}{\partial x_j}+c_i\,\frac{\partial r}{\partial x_j}\Big)=r\,(u_j-\bar u)-r\,\hat x_j\,\overline{u\hat x}\,. \]</p>
+
+  <div class="eq-box">
+  \[ dx_j \;=\; r\Big(u_j-\bar u-\hat x_j\,\overline{u\odot\hat x}\Big),\qquad u=\gamma\odot\delta \qquad\text{(LayerNorm)} \]
+  \[ dx_j \;=\; r\Big(u_j-\hat x_j\,\overline{u\odot\hat x}\Big),\qquad u=\gamma\odot\delta \qquad\text{(RMSNorm)} \]
+  <div class="eq-label">RMSNorm has no centering, so no mean(u) term, and no bias</div>
+  </div>
+
+  <p>For RMSNorm take \(c_i=x_i\): there is no \(-1/d\) in \(\partial x_i/\partial x_j=\delta_{ij}\), and \(\partial r/\partial x_j=-r^2\hat x_j/d\) again, which gives the second line. I checked both lines against autograd (maximum error about \(10^{-15}\) in float64), and the drill's tests repeat that check.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea: the gradient lives in a subspace</div>
+    <p>LayerNorm's output is unchanged if you add a constant to every entry of \(x\) or multiply \(x\) by a positive scalar, so the gradient with respect to \(x\) has no component along the all-ones vector or along \(x\). The two correction terms subtract exactly those components. At \(\epsilon=0\) the Jacobian is \(r\,(I-\tfrac1d\mathbf 1\mathbf 1^\top-\tfrac1d\hat x\hat x^\top)\), \(r\) times an orthogonal projection of rank \(d-2\), because \(\hat x\perp\mathbf 1\) and \(\|\hat x\|^2=d\). RMSNorm is scale-invariant but not shift-invariant: its Jacobian is \(r\,(I-\tfrac1d\hat x\hat x^\top)\), rank \(d-1\). Two reference-free tests follow: \(\sum_j dx_j=0\) for LayerNorm, and \(\sum_j dx_j x_j=0\) for both at \(\epsilon=0\).</p>
+  </aside>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 306" role="img" aria-labelledby="fig-35-2-title">
+<title id="fig-35-2-title">LayerNorm forward path on top with the tensors cached for backward, and the backward path below computing dx, dgamma and dbeta</title>
+<defs><marker id="arrow-35-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="16" y="20" class="s-bold s-small">Forward</text>
+<rect class="s-box" x="16" y="30" width="100" height="52" rx="6"/>
+<text x="66" y="54" text-anchor="middle" class="s-bold">x</text>
+<text x="66" y="71" text-anchor="middle" class="s-small s-muted">(..., d)</text>
+<rect class="s-c" x="160" y="30" width="140" height="52" rx="6"/>
+<text x="230" y="54" text-anchor="middle" class="s-bold">mean, r</text>
+<text x="230" y="71" text-anchor="middle" class="s-small">per row · cached</text>
+<rect class="s-a" x="340" y="30" width="160" height="52" rx="6"/>
+<text x="420" y="54" text-anchor="middle" class="s-bold">x̂ = (x − mean) · r</text>
+<text x="420" y="71" text-anchor="middle" class="s-small">(..., d) · cached</text>
+<rect class="s-box" x="545" y="30" width="159" height="52" rx="6"/>
+<text x="624" y="54" text-anchor="middle" class="s-bold">y = γ ⊙ x̂ + β</text>
+<text x="624" y="71" text-anchor="middle" class="s-small s-muted">(..., d)</text>
+<path class="s-line" d="M116,56 L160,56" marker-end="url(#arrow-35-2)"/>
+<path class="s-line" d="M300,56 L340,56" marker-end="url(#arrow-35-2)"/>
+<path class="s-line" d="M500,56 L545,56" marker-end="url(#arrow-35-2)"/>
+
+<text x="16" y="128" class="s-bold s-small">Backward</text>
+<rect class="s-box" x="560" y="138" width="144" height="52" rx="6"/>
+<text x="632" y="162" text-anchor="middle" class="s-bold">δ = ∂L/∂y</text>
+<text x="632" y="179" text-anchor="middle" class="s-small s-muted">(..., d)</text>
+<rect class="s-box" x="385" y="138" width="130" height="52" rx="6"/>
+<text x="450" y="162" text-anchor="middle" class="s-bold">u = γ ⊙ δ</text>
+<text x="450" y="179" text-anchor="middle" class="s-small s-muted">(..., d)</text>
+<rect class="s-d" x="12" y="138" width="340" height="52" rx="6"/>
+<text x="182" y="160" text-anchor="middle" class="s-mono">dx = r · (u − mean(u) − x̂ · mean(u ⊙ x̂))</text>
+<text x="182" y="178" text-anchor="middle" class="s-small">row-wise: two reductions over d</text>
+<path class="s-line" d="M560,164 L515,164" marker-end="url(#arrow-35-2)"/>
+<path class="s-line" d="M385,164 L352,164" marker-end="url(#arrow-35-2)"/>
+<path class="s-line s-dash" d="M230,82 L230,138" marker-end="url(#arrow-35-2)"/>
+<path class="s-line s-dash" d="M400,82 L300,138" marker-end="url(#arrow-35-2)"/>
+<text x="238" y="114" class="s-small s-muted">r</text>
+<text x="378" y="120" class="s-small s-muted">x̂</text>
+
+<rect class="s-box" x="380" y="238" width="160" height="46" rx="6"/>
+<text x="460" y="258" text-anchor="middle" class="s-bold">dγ = Σ δ ⊙ x̂</text>
+<text x="460" y="275" text-anchor="middle" class="s-small s-muted">summed over all rows</text>
+<rect class="s-box" x="560" y="238" width="144" height="46" rx="6"/>
+<text x="632" y="258" text-anchor="middle" class="s-bold">dβ = Σ δ</text>
+<text x="632" y="275" text-anchor="middle" class="s-small s-muted">summed over all rows</text>
+<path class="s-line" d="M600,190 L470,238" marker-end="url(#arrow-35-2)"/>
+<path class="s-line" d="M645,190 L645,238" marker-end="url(#arrow-35-2)"/>
+<text x="16" y="222" class="s-small s-muted">LayerNorm: Σ dx = 0 in every row. RMSNorm drops the mean(u) term.</text>
+<text x="16" y="240" class="s-small s-muted">dγ and dβ have shape (d,), not (..., d).</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Data flow of LayerNorm forward and backward. Green and blue tensors are what the backward pass reads: the per-row statistic \(r\) and the normalized values. The input gradient needs two row-wise reductions (over \(d\), inside one token), while \(d\gamma\) and \(d\beta\) reduce across all tokens, which is why a fused kernel treats them differently.</figcaption>
+  </figure>
+
+  <h3 id="ln-check">Checking it: gradcheck through your own pair</h3>
+  <p>Wrap your pair as a <code>torch.autograd.Function</code> and let PyTorch compare it against finite differences (this is what the drill's tests do):</p>
+<pre><code class="language-python">import torch
+from layernorm_backward import layernorm_forward, layernorm_backward   # your module
+
+class MyLayerNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, g, b):
+        y, ctx.cache = layernorm_forward(x, g, b, 1e-5)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        return layernorm_backward(dy, ctx.cache)          # (dx, dg, db)
+
+x = torch.randn(3, 5, 8, dtype=torch.float64, requires_grad=True)
+g = torch.randn(8, dtype=torch.float64, requires_grad=True)
+b = torch.randn(8, dtype=torch.float64, requires_grad=True)
+print(torch.autograd.gradcheck(MyLayerNorm.apply, (x, g, b)))   # True
+</code></pre>
+  <p>Float64 matters: <code>gradcheck</code> perturbs inputs by \(10^{-6}\) and compares to a tolerance near \(10^{-5}\), which float32 cannot resolve.</p>
+
+  <h3 id="ln-numbers">Worked numbers</h3>
+  <p>Take \(d=4\), \(x=(1,2,3,6)\), \(\gamma=\mathbf 1\), \(\beta=0\), \(\epsilon=0\). Then \(\mu=3\), \(\sigma^2=(4+1+0+9)/4=3.5\), \(r=1/\sqrt{3.5}=0.5345\), and \(\hat x=(-1.069,\,-0.535,\,0,\,1.604)\). Let \(\delta=(1,0,0,0)\), so \(u=\delta\), \(\bar u=0.25\) and \(\overline{u\hat x}=-1.069/4=-0.2673\):</p>
+  \[ dx_j=0.5345\big(u_j-0.25+0.2673\,\hat x_j\big)\;\Rightarrow\;dx=(0.2482,\,-0.2100,\,-0.1336,\,0.0955). \]
+  <p>The entries sum to \(0\) (\(2.8\times10^{-17}\) in float64) and \(\sum_j dx_jx_j=0.2482-0.4200-0.4008+0.5730=0\), as the subspace argument predicts, and autograd gives the same four numbers. Also \(d\gamma=(-1.069,0,0,0)\) and \(d\beta=(1,0,0,0)\). For RMSNorm on the same input, \(r=1/\sqrt{12.5}=0.2828\) and \(dx=(0.2772,\,-0.0113,\,-0.0170,\,-0.0339)\): it sums to \(0.215\), not zero, but \(\sum_j dx_jx_j\) is still zero.</p>
+
+  <h3 id="ln-pitfalls">What the interviewer checks</h3>
+  <ul>
+    <li><strong>Reduction axes of \(d\gamma\) and \(d\beta\).</strong> Sum over <em>all</em> leading axes with <code>reshape(-1, d).sum(0)</code>. PyTorch's <code>x.sum(dim=())</code> reduces over every dimension, so a 1-D input silently returns a scalar (checked on torch 2.14).</li>
+    <li><strong>A dropped mean term</strong> (the RMSNorm formula used for LayerNorm) passes a shape check and is off by \(r\,\bar u\); \(\sum_j dx_j=0\) catches it in one line.</li>
+    <li><strong>Precision.</strong> Statistics in float32 or better. In bf16, values near 100 are spaced 0.5 apart, so bf16 statistics destroy the normalization: on my check input a bf16 implementation was off by 0.35 and the float32-statistics one by 0.015 (output rounding). The drill's low-precision test uses that input.</li>
+    <li><strong>Mutating the cache.</strong> <code>xhat *= ...</code> in backward corrupts a second call (activation recomputation, double backward). The test calls backward twice.</li>
+    <li><strong>Degenerate rows.</strong> A constant row has zero variance; \(\epsilon\) keeps \(r=1/\sqrt\epsilon\) finite (316 for \(10^{-5}\)), so outputs are finite but large.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Cache the normalized values, or recompute them?</div>
+    <dl>
+      <dt>Problem</dt><dd>Backward needs \(\hat x\). Storing it costs \(d\) numbers per token per norm layer, and each of the \(L\) blocks has two norms.</dd>
+      <dt>Idea</dt><dd>Save the input (usually alive anyway) and two scalars per row, and recompute \(\hat x=(x-\mu)\,r\) inside backward.</dd>
+      <dt>Why it works</dt><dd>Normalization is memory-bound: a few FLOPs per element against an HBM read. Recomputing adds negligible arithmetic and removes a full-size tensor from the activation footprint.</dd>
+      <dt>Evidence</dt><dd>PyTorch's fused op returns <code>(out, mean, rstd)</code> and its backward takes <code>(grad_out, input, ..., mean, rstd, weight, bias)</code>, so it does not keep \(\hat x\) (I read both operator schemas on torch 2.14). The Triton layer-norm tutorial saves <code>x</code>, <code>mean</code> and <code>rstd</code> <a href="https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html">[Triton tutorial 05]</a>.</dd>
+      <dt>Cost</dt><dd>A second pass over \(x\) in backward. In a from-scratch drill, caching \(\hat x\) is simpler and equally correct.</dd>
+      <dt>Used by</dt><dd>PyTorch's native layer norm and the Triton tutorial kernel, per the sources above. The kernel view (one program per row, partial sums for \(d\gamma\) and \(d\beta\)) is worked out in a deep-dive question below.</dd>
+    </dl>
+  </div>
+
+  <details class="solution" style="border:1px solid var(--border);border-radius:var(--radius);margin:.9rem 0;background:var(--bg)">
+    <summary style="cursor:pointer;padding:9px 14px;font-weight:600;background:var(--bg-soft);border-radius:var(--radius)">Full solution: LayerNorm and RMSNorm, forward and backward (attempt it first)</summary>
+    <div style="padding:2px 14px 6px">
+<pre><code class="language-python">import torch
+from torch import Tensor
+
+def _acc_dtype(dtype: torch.dtype) -&gt; torch.dtype:
+    # statistics in at least float32; float64 inputs stay float64 (needed for gradcheck)
+    return torch.promote_types(dtype, torch.float32)
+
+
+def layernorm_forward(x: Tensor, g: Tensor, b: Tensor, eps: float = 1e-5) -&gt; tuple[Tensor, tuple]:
+    xf = x.to(_acc_dtype(x.dtype))
+    mu = xf.mean(-1, keepdim=True)
+    xc = xf - mu
+    var = (xc * xc).mean(-1, keepdim=True)          # biased variance: divide by d, not d - 1
+    rstd = torch.rsqrt(var + eps)                    # eps inside the square root
+    xhat = xc * rstd
+    y = xhat * g.to(xf.dtype) + b.to(xf.dtype)
+    return y.to(x.dtype), (xhat, rstd, g, x.dtype)
+
+
+def layernorm_backward(dy: Tensor, cache: tuple) -&gt; tuple[Tensor, Tensor, Tensor]:
+    xhat, rstd, g, x_dtype = cache
+    d = xhat.shape[-1]
+    dyf = dy.to(xhat.dtype)
+    dxhat = dyf * g.to(xhat.dtype)                   # gradient w.r.t. the normalized values
+    # remove the mean (shift invariance) and the component along xhat (scale invariance)
+    dx = rstd * (dxhat
+                 - dxhat.mean(-1, keepdim=True)
+                 - xhat * (dxhat * xhat).mean(-1, keepdim=True))
+    # reshape(-1, d).sum(0) also works for 1-D input, where sum(dim=()) would reduce everything
+    dg = (dyf * xhat).reshape(-1, d).sum(0)
+    db = dyf.reshape(-1, d).sum(0)
+    return dx.to(x_dtype), dg.to(g.dtype), db.to(g.dtype)
+
+
+def rmsnorm_forward(x: Tensor, g: Tensor, eps: float = 1e-6) -&gt; tuple[Tensor, tuple]:
+    xf = x.to(_acc_dtype(x.dtype))
+    rstd = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + eps)
+    xhat = xf * rstd
+    y = xhat * g.to(xf.dtype)
+    return y.to(x.dtype), (xhat, rstd, g, x.dtype)
+
+
+def rmsnorm_backward(dy: Tensor, cache: tuple) -&gt; tuple[Tensor, Tensor]:
+    xhat, rstd, g, x_dtype = cache
+    d = xhat.shape[-1]
+    dyf = dy.to(xhat.dtype)
+    dxhat = dyf * g.to(xhat.dtype)
+    dx = rstd * (dxhat - xhat * (dxhat * xhat).mean(-1, keepdim=True))   # no mean term: no re-centering
+    dg = (dyf * xhat).reshape(-1, d).sum(0)
+    return dx.to(x_dtype), dg.to(g.dtype)
+</code></pre>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="beam">Beam search with length normalization and EOS handling</h2>
+  <p><a href="06-decoding-kv-cache.html#beam-search">Page 06</a> explains when beam search is the right tool and why chat models rarely use it. Here you write it. The interview version has four parts: the search itself (a flat top-\(k\) over \(b\times V\) candidates), what happens at EOS, how finished hypotheses of different lengths are compared, and when to stop. The drill is <code>exercises/drills/beam_search.py</code>, and its tests check your result against exhaustive search.</p>
+
+  <h3 id="beam-interface">The interface and the conventions</h3>
+  <p>The model is a black box called once per step on all live hypotheses, like a batched decoder with a KV cache: <code>step_logprobs_fn(prefixes)</code> takes an \((n,t)\) tensor of token ids (every row starts with BOS) and returns \((n,V)\) log-probabilities of the next token, possibly \(-\infty\) for forbidden tokens. State your conventions before coding, since libraries differ:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Question</th><th>Convention in the drill</th></tr></thead>
+    <tbody>
+      <tr><td>Does the length \(\lvert Y\rvert\) count EOS?</td><td>Yes, and EOS's log-probability is in the sum. Hugging Face's <code>BeamSearchScorer.process</code> also counts it (<code>cur_len = input_ids.shape[-1] + 1</code>, transformers v4.44), but say which you use.</td></tr>
+      <tr><td>What ranks candidates inside one step?</td><td>The raw cumulative log-probability. All candidates have the same length, so a length penalty would not change their order.</td></tr>
+      <tr><td>What compares finished hypotheses?</td><td>\(\log P(Y)/lp(Y)\) with \(lp(Y)=\big((5+\lvert Y\rvert)/6\big)^{\alpha}\), the GNMT form without the coverage term <a href="https://arxiv.org/abs/1609.08144">[Wu et al. 2016, §7, Eq. 14]</a>. \(\alpha=0\) means no normalization.</td></tr>
+      <tr><td>What happens at EOS?</td><td>The extension is recorded as finished and never expanded. The beam refills from non-EOS candidates, so it keeps \(b\) live hypotheses.</td></tr>
+      <tr><td>What if <code>max_len</code> is reached without EOS?</td><td>The hypothesis is finished and <em>truncated</em>, with length <code>max_len</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="beam-algorithm">The algorithm</h3>
+  <p>Start from the single prefix <code>[bos]</code> with score 0 and repeat for step \(=1,\dots,\texttt{max\_len}\):</p>
+  <ol>
+    <li>Call the model on the \(n\le b\) live prefixes and form <code>total = scores[:, None] + logp</code>, shape \((n,V)\).</li>
+    <li>Each live hypothesis's EOS extension <code>total[i, eos]</code> (if finite) is a finished hypothesis with score \(\text{total}/lp(\text{step})\).</li>
+    <li>Set the EOS column to \(-\infty\), flatten to \(nV\) entries, take the top \(\min(b,nV)\), and drop entries equal to \(-\infty\). A flat index \(f\) is parent \(\lfloor f/V\rfloor\), token \(f\bmod V\).</li>
+    <li>Gather the parents' prefixes and append the tokens. This gather is the "reorder the KV cache" step of a real decoder.</li>
+    <li>After the last step, the survivors are truncated hypotheses. Sort all finished hypotheses by normalized score and return the best \(b\).</li>
+  </ol>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="fig-35-3-title">
+<title id="fig-35-3-title">Trace of beam search with beam width 2 over three steps on a toy model: candidates with cumulative log-probability and whether each is live, finished by EOS, truncated at max length, or pruned</title>
+<text x="16" y="18" class="s-bold">Step 1</text><text x="70" y="18" class="s-small s-muted">from [BOS]</text>
+<text x="256" y="18" class="s-bold">Step 2</text><text x="310" y="18" class="s-small s-muted">from a, b</text>
+<text x="496" y="18" class="s-bold">Step 3</text><text x="550" y="18" class="s-small s-muted">from ab, ba (last step)</text>
+
+<rect class="s-a" x="16" y="30" width="208" height="30" rx="5"/><text x="26" y="50" class="s-mono s-bold">a</text><text x="86" y="50" class="s-mono">−0.80</text><text x="150" y="50" class="s-small">live</text>
+<rect class="s-a" x="16" y="66" width="208" height="30" rx="5"/><text x="26" y="86" class="s-mono s-bold">b</text><text x="86" y="86" class="s-mono">−0.92</text><text x="150" y="86" class="s-small">live</text>
+<rect class="s-c" x="16" y="102" width="208" height="30" rx="5"/><text x="26" y="122" class="s-mono s-bold">EOS</text><text x="86" y="122" class="s-mono">−1.90</text><text x="150" y="122" class="s-small">finished</text>
+
+<rect class="s-a" x="256" y="30" width="208" height="30" rx="5"/><text x="266" y="50" class="s-mono s-bold">ab</text><text x="326" y="50" class="s-mono">−0.96</text><text x="390" y="50" class="s-small">live</text>
+<rect class="s-c" x="256" y="66" width="208" height="30" rx="5"/><text x="266" y="86" class="s-mono s-bold">bEOS</text><text x="326" y="86" class="s-mono">−1.51</text><text x="390" y="86" class="s-small">finished</text>
+<rect class="s-a" x="256" y="102" width="208" height="30" rx="5"/><text x="266" y="122" class="s-mono s-bold">ba</text><text x="326" y="122" class="s-mono">−1.97</text><text x="390" y="122" class="s-small">live</text>
+<rect class="s-c" x="256" y="138" width="208" height="30" rx="5"/><text x="266" y="158" class="s-mono s-bold">aEOS</text><text x="326" y="158" class="s-mono">−3.10</text><text x="390" y="158" class="s-small">finished</text>
+<rect class="s-plain s-dash" x="256" y="174" width="208" height="30" rx="5"/><text x="266" y="194" class="s-mono s-bold">bb</text><text x="326" y="194" class="s-mono">−3.22</text><text x="390" y="194" class="s-small s-muted">pruned</text>
+<rect class="s-plain s-dash" x="256" y="210" width="208" height="30" rx="5"/><text x="266" y="230" class="s-mono s-bold">aa</text><text x="326" y="230" class="s-mono">−3.79</text><text x="390" y="230" class="s-small s-muted">pruned</text>
+
+<rect class="s-c" x="496" y="30" width="208" height="30" rx="5"/><text x="506" y="50" class="s-mono s-bold">abEOS</text><text x="576" y="50" class="s-mono">−1.56</text><text x="640" y="50" class="s-small">finished</text>
+<rect class="s-e" x="496" y="66" width="208" height="30" rx="5"/><text x="506" y="86" class="s-mono s-bold">aba</text><text x="576" y="86" class="s-mono">−2.01</text><text x="640" y="86" class="s-small">truncated</text>
+<rect class="s-e" x="496" y="102" width="208" height="30" rx="5"/><text x="506" y="122" class="s-mono s-bold">bab</text><text x="576" y="122" class="s-mono">−2.13</text><text x="640" y="122" class="s-small">truncated</text>
+<rect class="s-plain s-dash" x="496" y="138" width="208" height="30" rx="5"/><text x="506" y="158" class="s-mono s-bold">abb</text><text x="576" y="158" class="s-mono">−3.26</text><text x="640" y="158" class="s-small s-muted">pruned</text>
+<rect class="s-c" x="496" y="174" width="208" height="30" rx="5"/><text x="506" y="194" class="s-mono s-bold">baEOS</text><text x="576" y="194" class="s-mono">−4.27</text><text x="640" y="194" class="s-small">finished</text>
+<rect class="s-plain s-dash" x="496" y="210" width="208" height="30" rx="5"/><text x="506" y="230" class="s-mono s-bold">baa</text><text x="576" y="230" class="s-mono">−4.96</text><text x="640" y="230" class="s-small s-muted">pruned</text>
+
+<rect class="s-a" x="16" y="262" width="14" height="14" rx="3"/><text x="36" y="274" class="s-small">live (top 2 non-EOS)</text>
+<rect class="s-c" x="230" y="262" width="14" height="14" rx="3"/><text x="250" y="274" class="s-small">finished by EOS</text>
+<rect class="s-e" x="390" y="262" width="14" height="14" rx="3"/><text x="410" y="274" class="s-small">truncated at max_len</text>
+<rect class="s-plain s-dash" x="590" y="262" width="14" height="14" rx="3"/><text x="610" y="274" class="s-small">pruned</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Beam width 2 on the toy model of the drill's tests, <code>max_len</code> 3. Each column is sorted by cumulative log-probability. Every EOS extension is recorded, whatever its rank (the step 1 one is the empty output), and only non-EOS candidates compete for the two live slots. The seven finished hypotheses (five ended by EOS, two truncated) are compared in the table below.</figcaption>
+  </figure>
+
+  <p>The toy conditions on the last token only: BOS is followed by <code>a</code>, <code>b</code>, EOS with probabilities \(0.45, 0.40, 0.15\); <code>a</code> by \(0.05, 0.85, 0.10\); <code>b</code> by \(0.35, 0.10, 0.55\). Every number in Figure 3 is a sum of logarithms you can check by hand, for example \(\log(0.45\cdot0.85)=-0.961\). Greedy decoding takes <code>a</code>, then <code>b</code>, then EOS and returns <code>abEOS</code> with probability \(0.2104\), but the most probable sequence is <code>bEOS</code> with \(0.40\cdot0.55=0.22\). Beam 2 finds it, because <code>b</code> survives step 1 although it is not the best token.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Finished hypothesis</th><th class="num">Length</th><th class="num">\(\log P\)</th><th class="num">Score at \(\alpha=0\)</th><th class="num">Rank</th><th class="num">Score at \(\alpha=1\)</th><th class="num">Rank</th></tr></thead>
+    <tbody>
+      <tr><td><code>bEOS</code></td><td class="num">2</td><td class="num">−1.514</td><td class="num">−1.514</td><td class="num">1</td><td class="num">−1.298</td><td class="num">2</td></tr>
+      <tr><td><code>abEOS</code></td><td class="num">3</td><td class="num">−1.559</td><td class="num">−1.559</td><td class="num">2</td><td class="num">−1.169</td><td class="num">1</td></tr>
+      <tr><td><code>EOS</code> (empty)</td><td class="num">1</td><td class="num">−1.897</td><td class="num">−1.897</td><td class="num">3</td><td class="num">−1.897</td><td class="num">5</td></tr>
+      <tr><td><code>aba</code> (truncated)</td><td class="num">3</td><td class="num">−2.011</td><td class="num">−2.011</td><td class="num">4</td><td class="num">−1.508</td><td class="num">3</td></tr>
+      <tr><td><code>bab</code> (truncated)</td><td class="num">3</td><td class="num">−2.129</td><td class="num">−2.129</td><td class="num">5</td><td class="num">−1.596</td><td class="num">4</td></tr>
+      <tr><td><code>aEOS</code></td><td class="num">2</td><td class="num">−3.101</td><td class="num">−3.101</td><td class="num">6</td><td class="num">−2.658</td><td class="num">6</td></tr>
+      <tr><td><code>baEOS</code></td><td class="num">3</td><td class="num">−4.269</td><td class="num">−4.269</td><td class="num">7</td><td class="num">−3.202</td><td class="num">7</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">With \(lp(1)=1\), \(lp(2)=7/6\), \(lp(3)=8/6\) at \(\alpha=1\), the longer hypothesis is divided by more, so <code>abEOS</code> overtakes <code>bEOS</code>. <code>beam_search</code> (<code>beam=2, max_len=3</code>) and <code>exhaustive_search</code> reproduce this, and the drill's test asserts the top two under both settings.</p>
+
+  <div class="decision">
+    <div class="decision-title">Length normalization for finished hypotheses</div>
+    <dl>
+      <dt>Problem</dt><dd>Each token adds a negative log-probability, so raw sums favor short outputs. Plain beam search "will favor shorter results over longer ones on average" (Wu et al.), and exact search can prefer the empty output (<a href="06-decoding-kv-cache.html#beam-search">page 06</a>).</dd>
+      <dt>Idea</dt><dd>Divide by a length penalty before comparing finished hypotheses: GNMT's \(lp(Y)=((5+\lvert Y\rvert)/6)^\alpha\), or the simpler \(\lvert Y\rvert\) (mean token log-probability) or \(\lvert Y\rvert^{\alpha}\).</dd>
+      <dt>Why it works</dt><dd>\(\alpha\) interpolates between no correction and a per-token average, and the offset 5 stops very short outputs from being over-rewarded (\(lp(1)=1\) for every \(\alpha\)).</dd>
+      <dt>Evidence</dt><dd>GNMT first divided by length, then by length\(^\alpha\) (best \(\alpha\) in 0.6 to 0.7), then adopted the form above. On the WMT'14 En-Fr development set \(\alpha=\beta=0.2\) raised BLEU from 30.3 to 31.4 without RL refinement, and helped less after it <a href="https://arxiv.org/abs/1609.08144">[Wu et al. 2016, §7, Tab. 2-3]</a>. Hugging Face divides by <code>generated_len ** length_penalty</code>, default 1.0 (transformers v4.44, <a href="https://github.com/huggingface/transformers/blob/v4.44.0/src/transformers/generation/beam_search.py"><code>beam_search.py</code></a>).</dd>
+      <dt>Cost</dt><dd>A tuned heuristic. It changes which finished hypothesis wins, not the mode-seeking behavior: likelihood as a decoding objective gives text that is "bland and strangely repetitive" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, abstract]</a>. It also complicates the stopping rule.</dd>
+      <dt>Used by</dt><dd>GNMT (the form above) and Hugging Face <code>generate</code> (the \(\lvert Y\rvert^\alpha\) form).</dd>
+    </dl>
+  </div>
+
+  <h3 id="beam-design">Design points an interviewer will probe</h3>
+  <ul>
+    <li><strong>One live row at the start.</strong> \(b\) copies of BOS make step 1 pick the same best token from each copy, so the beam is \(b\) duplicates and behaves like greedy decoding. The drill checks that the first model call has one row.</li>
+    <li><strong>Record every EOS extension.</strong> It is free (one per live hypothesis). Hugging Face's scorer takes the top \(2b\) candidates and records an EOS candidate only if its rank in that list is below \(b\) (transformers v4.44), which discards some finished hypotheses for narrow beams. The rules agree for wide beams.</li>
+    <li><strong>\(-\infty\) and narrow candidate sets.</strong> Never let a \(-\infty\) candidate into the beam, and take \(\min(b,nV)\) so <code>topk</code> never asks for more entries than exist (a beam wider than \(V\) crashes at step 1).</li>
+    <li><strong>Ties and precision.</strong> <code>torch.topk</code> promises no order among equal values (sort with <code>stable=True</code> if determinism matters). Keep cumulative scores in float32 or float64 even if the model runs in bf16.</li>
+  </ul>
+
+  <h3 id="beam-stop">When to stop, exactly</h3>
+  <p>Running all <code>max_len</code> steps is always correct. Stopping early is easy to get wrong with length normalization, because a live hypothesis that scores poorly now can still win: its normalized score can <em>rise</em> as it grows, when each added token costs little and the divisor \(lp\) increases. A rigorous bound: a live hypothesis with log-probability \(L\le0\) has completions with \(L'\le L\) and length \(n'\le n_{\max}\), so for \(\alpha\ge0\)</p>
+  \[ \frac{L'}{lp(n')}\;\le\;\frac{L}{lp(n')}\;\le\;\frac{L}{lp(n_{\max})}. \]
+  <p>Once \(b\) finished hypotheses are kept, stop if \(\max_{\text{live}}L/lp(n_{\max})\) is strictly below the worst kept score. The drill's <code>early_stop=True</code> implements this and must return exactly what <code>early_stop=False</code> returns. Its tests include a model built to fool the two tempting shortcuts: comparing raw scores, and normalizing by the <em>current</em> length. The second is Hugging Face's default heuristic (<code>early_stopping=False</code>), which its source calls "not entirely accurate" for positive length penalties; its <code>"never"</code> mode uses \(n_{\max}\) like the bound <a href="https://github.com/huggingface/transformers/blob/v4.44.0/src/transformers/generation/beam_search.py">[transformers v4.44, <code>BeamHypotheses.is_done</code>]</a>.</p>
+
+  <h3 id="beam-check">Checking it against brute force</h3>
+  <p><code>exhaustive_search</code> enumerates every finished hypothesis by recursion (121 for \(V=4\), <code>max_len</code> 4) with the same scoring rule. On random recurrent models whose next-token law depends on the whole prefix, the tests assert:</p>
+  <ul>
+    <li>a beam wide enough that nothing is pruned returns exactly the exhaustive top 5, tokens and scores, for \(\alpha\in\{0,0.6,1,2\}\);</li>
+    <li>every returned hypothesis is well formed and its score equals an independent teacher-forced recomputation;</li>
+    <li>no finished hypothesis is fed back to the model, the first call has one row, and no call has more than \(b\) rows;</li>
+    <li>beam 1 scores at least as well as greedy decoding, and the toy above gives the table's orderings;</li>
+    <li>forbidden tokens, a model that never emits EOS, a beam wider than the candidate set, and float32 outputs all behave.</li>
+  </ul>
+  <p>I also ran the suite against deliberately broken solutions (EOS left in the beam, no <code>min(b, nV)</code>, \(-\infty\) kept, length excluding EOS, \(b\) copies of BOS, three wrong early-stop bounds, no trimming). It failed for each.</p>
+
+  <p><strong>Cost.</strong> Each step is one model call on at most \(b\) rows, so FLOPs are \(b\) times a single sequence while weight traffic is shared as in any batch of \(b\). The top-\(k\) over \(bV\) entries is small next to the model. The cache gather is the awkward part, which is why serving systems share prompt blocks and copy on write (<a href="17-inference-serving.html">page 17</a>); a deep-dive question below puts numbers on it.</p>
+
+  <details class="solution" style="border:1px solid var(--border);border-radius:var(--radius);margin:.9rem 0;background:var(--bg)">
+    <summary style="cursor:pointer;padding:9px 14px;font-weight:600;background:var(--bg-soft);border-radius:var(--radius)">Full solution: <code>normalized_score</code>, <code>beam_search</code>, <code>exhaustive_search</code> (attempt it first)</summary>
+    <div style="padding:2px 14px 6px">
+<pre><code class="language-python">from typing import Callable
+import torch
+from torch import Tensor
+
+NEG_INF = float("-inf")
+
+
+def normalized_score(sum_logprob: float, length: int, alpha: float) -&gt; float:
+    return sum_logprob / (((5.0 + length) / 6.0) ** alpha)      # GNMT: lp = ((5 + |Y|) / 6) ** alpha
+
+
+def beam_search(
+    step_logprobs_fn: Callable[[Tensor], Tensor],
+    bos: int,
+    eos: int,
+    beam: int,
+    max_len: int,
+    length_penalty: float = 0.0,
+    early_stop: bool = False,
+) -&gt; list[tuple[list[int], float]]:
+    if beam &lt; 1 or max_len &lt; 1:
+        raise ValueError("beam and max_len must be at least 1")
+    if length_penalty &lt; 0:
+        raise ValueError("length_penalty must be &gt;= 0")
+    alpha = length_penalty
+    prefixes = torch.tensor([[bos]], dtype=torch.long)           # (n, t) live hypotheses, all the same length
+    scores = torch.zeros(1, dtype=torch.float64)                 # (n,) cumulative log-probability
+    finished: list[tuple[float, list[int]]] = []                 # (normalized score, tokens without bos)
+
+    def trim() -&gt; None:
+        finished.sort(key=lambda h: -h[0])                       # stable: earlier finishers win ties
+        del finished[beam:]
+
+    for step in range(1, max_len + 1):                           # step = number of generated tokens so far
+        logp = step_logprobs_fn(prefixes).to(torch.float64)      # (n, V), one model call per step
+        n, V = logp.shape
+        total = scores[:, None] + logp                           # cumulative score of every extension
+        # 1. every EOS extension is a finished hypothesis and is never expanded again
+        for i in range(n):
+            s = total[i, eos].item()
+            if s &gt; NEG_INF:
+                finished.append((normalized_score(s, step, alpha), prefixes[i, 1:].tolist() + [eos]))
+        # 2. the live beam is the top-`beam` non-EOS extensions, ranked by RAW cumulative log-prob
+        #    (all candidates have the same length here, so normalizing would not change the order)
+        total[:, eos] = NEG_INF
+        vals, idx = total.reshape(-1).topk(min(beam, n * V))     # k may exceed n * V for a wide beam
+        keep = vals &gt; NEG_INF                                    # forbidden tokens never enter the beam
+        vals, idx = vals[keep], idx[keep]
+        if vals.numel() == 0:
+            prefixes = prefixes[:0]
+            break
+        parent, tok = idx // V, idx % V                          # flat index -&gt; (which hypothesis, which token)
+        prefixes = torch.cat([prefixes[parent], tok[:, None]], dim=1)   # this gather is the "cache reorder"
+        scores = vals
+        trim()
+        # 3. optional exact stopping rule: no descendant can beat the worst kept finished hypothesis
+        if early_stop and step &lt; max_len and len(finished) == beam:
+            bound = scores.max().item() / (((5.0 + max_len) / 6.0) ** alpha)
+            if bound &lt; finished[-1][0]:
+                prefixes = prefixes[:0]
+                break
+    else:
+        # max_len reached: the survivors are truncated hypotheses (no EOS), scored at length max_len
+        for i in range(prefixes.shape[0]):
+            finished.append((normalized_score(scores[i].item(), max_len, alpha), prefixes[i, 1:].tolist()))
+    trim()
+    return [(toks, s) for s, toks in finished]
+
+
+def exhaustive_search(
+    step_logprobs_fn: Callable[[Tensor], Tensor],
+    bos: int,
+    eos: int,
+    max_len: int,
+    length_penalty: float = 0.0,
+    top_n: int = 1,
+) -&gt; list[tuple[list[int], float]]:
+    results: list[tuple[float, list[int]]] = []
+
+    def dfs(prefix: list[int], logp: float) -&gt; None:
+        row = step_logprobs_fn(torch.tensor([[bos] + prefix]))[0].to(torch.float64)
+        for tok in range(row.shape[0]):
+            lp = row[tok].item()
+            if lp == NEG_INF:
+                continue
+            seq = prefix + [tok]
+            if tok == eos or len(seq) == max_len:                # finished by EOS or truncated at max_len
+                results.append((normalized_score(logp + lp, len(seq), length_penalty), seq))
+            else:
+                dfs(seq, logp + lp)
+
+    dfs([], 0.0)
+    results.sort(key=lambda h: -h[0])
+    return [(toks, s) for s, toks in results[:top_n]]
+</code></pre>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="debug">Debug this training loop</h2>
+  <p>Fixing code that runs but is wrong deserves its own rehearsal. The loop below trains a one-layer causal language model on a synthetic task: each token is the previous one plus a random number in \(\{0,1,2,3\}\), modulo 16. Given the previous token the next is uniform over four values, so <strong>no model can have a loss below \(\ln 4=1.386\) nats</strong>, and a model that knows nothing has \(\ln 16=2.77\). The report: "it trains great, the loss is essentially zero after a few hundred steps." Find the six planted bugs before reading the table.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+V, T, B, D = 16, 32, 32, 64
+
+def make_batches(seed=0):                          # next token = previous + {0,1,2,3} mod V, so the
+    g = torch.Generator().manual_seed(seed)        # best possible loss is ln 4 = 1.386 nats
+    while True:
+        x = torch.randint(0, V, (B, T), generator=g)
+        for t in range(1, T):
+            x[:, t] = (x[:, t - 1] + torch.randint(0, 4, (B,), generator=g)) % V
+        yield x
+
+class TinyLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb, self.pos = nn.Embedding(V, D), nn.Embedding(T, D)
+        self.qkv, self.out = nn.Linear(D, 3 * D, bias=False), nn.Linear(D, V, bias=False)
+        self.drop = nn.Dropout(0.1)
+        self.register_buffer("causal", torch.tril(torch.ones(T, T, dtype=torch.bool)))
+
+    def forward(self, idx):                        # idx: (B, T) -&gt; logits: (B, T, V)
+        x = self.emb(idx) + self.pos(torch.arange(idx.size(1)))
+        q, k, v = self.qkv(x).chunk(3, dim=-1)     # each (B, T, D)
+        att = q @ k.transpose(-1, -2) / D ** 0.5   # (B, T, T)
+        att = att.softmax(-1)
+        att = att.masked_fill(~self.causal, 0.0)
+        return self.out(x + self.drop(att @ v))
+
+model = TinyLM()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+batches, val = make_batches(0), next(make_batches(1))
+for step in range(600):
+    idx = next(batches)
+    logits = model(idx)
+    loss = F.cross_entropy(logits.reshape(-1, V), idx.reshape(-1), reduction="sum")
+    loss.backward()
+    opt.step()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    if step % 100 == 99:
+        vl = F.cross_entropy(model(val)[:, :-1].reshape(-1, V), val[:, 1:].reshape(-1))
+        print(step + 1, loss.item() / idx.numel(), vl.item())
+</code></pre>
+
+  <h3 id="debug-bugs">The six bugs, their symptoms, and the tests that catch them</h3>
+  <p>I injected each bug alone into the fixed loop and ran 600 steps on CPU (seed 0, AdamW at 3e-3, clip at 1.0). The fixed loop ends at validation loss 1.411 with a pre-clip gradient norm near 0.50. "Val" is a held-out batch with the correct shift.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>#</th><th>Bug</th><th>Measured symptom</th><th>Fix and the test that catches it</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>Softmax, then mask.</strong> <code>att.softmax(-1)</code> then <code>masked_fill(~causal, 0.0)</code>.</td><td>Train 0.24 and val 0.22, far <em>below</em> the 1.386 floor. Future keys still sit in the softmax denominator, so each row's weights sum to less than one by an amount that depends on the future. Val uses the same leaky forward, so a train/val gap hides it.</td><td>Fill the scores with \(-\infty\), then softmax. <strong>Causality test:</strong> rewrite the tokens after position \(k\); logits before \(k\) must not change (below).</td></tr>
+      <tr><td>2</td><td><strong>Unshifted labels.</strong> <code>cross_entropy(logits, idx)</code> asks position \(t\) to predict token \(t\), which it can see.</td><td>Train 0.000, honest val 11.1, worse than the uniform guess of 2.77. The model learned to copy its input.</td><td>Compare <code>logits[:, :-1]</code> with <code>idx[:, 1:]</code>. <strong>Test:</strong> the loss at initialization is near \(\ln V\), and no loss may go below the entropy floor. Unit-test the shift on a hand example (<a href="01-big-picture.html">page 01</a> drill).</td></tr>
+      <tr><td>3</td><td><strong>No <code>zero_grad</code>.</strong> Gradients accumulate across steps.</td><td>Val 1.508 against 1.411, pre-clip gradient norm 1.34 against 0.50. Milder than in many setups, where it diverges.</td><td><code>opt.zero_grad(set_to_none=True)</code> each step. <strong>Test:</strong> run two steps on the same batch with learning rate 0; the gradient norm must be identical both times.</td></tr>
+      <tr><td>4</td><td><strong>Wrong reduction.</strong> <code>reduction="sum"</code> where a token mean was meant.</td><td>Val 1.413, unchanged, because AdamW is nearly invariant to gradient scale. But the pre-clip gradient norm is 495, so a clip at 1.0 fires on every step. The log line divides by the token count, which hides the sum.</td><td>Mean over tokens. <strong>Test:</strong> a batch and the same batch duplicated give equal losses. Scale matters for clipping, accumulation over unequal micro-batches, logging and SGD-like optimizers.</td></tr>
+      <tr><td>5</td><td><strong>Validation in train mode.</strong> No <code>model.eval()</code>, no <code>torch.no_grad()</code>.</td><td>Val 1.414 against 1.411: a small, noisy shift here (dropout 0.1 on one branch), plus an autograd graph built for nothing.</td><td><code>model.eval()</code> and <code>no_grad</code>, then <code>model.train()</code>. <strong>Test:</strong> two evaluations of the same batch give bitwise-identical losses.</td></tr>
+      <tr><td>6</td><td><strong>Clip after the step.</strong> <code>opt.step()</code> then <code>clip_grad_norm_</code>.</td><td>No visible effect here: the gradient norm (0.50) never exceeds the threshold. It bites on loss spikes, when an unclipped huge gradient drives the update.</td><td>Backward, clip, then step. <strong>Test:</strong> with plain SGD and a gradient of norm 100, one step must move the parameters by <code>lr</code> times 1 (the clip value), not <code>lr</code> times 100.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">All six together (the listing above, unseeded): train loss below 0.001 per token and val above 10. Digits move between runs and torch versions, so read the pattern, not the digits.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: a quiet loss curve does not clear a bug</div>
+    <p>Bugs 4, 5 and 6 barely move the loss curve here, and bug 3 only nudges it. "The curve looks fine" clears none of them. Say what each line is supposed to do, and check the mechanism (gradient-norm log, double evaluation, SGD micro-test), not the outcome.</p>
+  </aside>
+
+  <h3 id="debug-causal">The one test to memorize: causality</h3>
+  <p>For any decoder-only code, feed a batch, rewrite the tokens from position \(k\) on with random ones, and compare the logits before \(k\). They must be bitwise equal:</p>
+<pre><code class="language-python">def check_causal(model, idx, k=10, vocab=16):
+    model.eval()
+    with torch.no_grad():
+        a = model(idx)
+        idx2 = idx.clone()
+        idx2[:, k:] = torch.randint(0, vocab, idx[:, k:].shape)   # rewrite the future
+        b = model(idx2)
+    return torch.equal(a[:, :k], b[:, :k])
+</code></pre>
+  <p>On the fixed model this returns <code>True</code>; with the softmax-then-mask bug it returns <code>False</code> (the logits differ by about 0.06 at initialization, before any training). It also catches a forgotten mask, wrong polarity, a misaligned KV-cache path, and a packing mask that lets documents see each other.</p>
+
+  <h3 id="debug-order">A diagnosis order that works on real code</h3>
+  <ol>
+    <li><strong>Compare the loss with what is possible.</strong> You rarely know the floor on real data, but you know \(\ln V\) at initialization and roughly what a comparable model reaches. A loss far below that is a leak, never a success.</li>
+    <li><strong>Read the train/val gap.</strong> Train near zero with high val points at the training path (bug 2); both low points at the forward pass (bug 1).</li>
+    <li><strong>Log the pre-clip gradient norm.</strong> One number per step exposes bugs 3, 4 and 6, and later real loss spikes.</li>
+    <li><strong>Overfit one batch.</strong> A healthy loop drives the loss on one tiny batch toward zero; one that cannot has an optimization bug.</li>
+    <li><strong>Run the property tests</strong> (causality, evaluation determinism, batch-size invariance) before hunting by eye.</li>
+  </ol>
+
+  <details class="solution" style="border:1px solid var(--border);border-radius:var(--radius);margin:.9rem 0;background:var(--bg)">
+    <summary style="cursor:pointer;padding:9px 14px;font-weight:600;background:var(--bg-soft);border-radius:var(--radius)">The fixed loop, line by line (attempt the diagnosis first)</summary>
+    <div style="padding:2px 14px 6px">
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+V, T, B, D = 16, 32, 32, 64
+
+def make_batches(seed=0):                          # next token = previous + {0,1,2,3} mod V, so the
+    g = torch.Generator().manual_seed(seed)        # best possible loss is ln 4 = 1.386 nats
+    while True:
+        x = torch.randint(0, V, (B, T), generator=g)
+        for t in range(1, T):
+            x[:, t] = (x[:, t - 1] + torch.randint(0, 4, (B,), generator=g)) % V
+        yield x
+
+class TinyLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb, self.pos = nn.Embedding(V, D), nn.Embedding(T, D)
+        self.qkv, self.out = nn.Linear(D, 3 * D, bias=False), nn.Linear(D, V, bias=False)
+        self.drop = nn.Dropout(0.1)
+        self.register_buffer("causal", torch.tril(torch.ones(T, T, dtype=torch.bool)))
+
+    def forward(self, idx):                        # idx: (B, T) -&gt; logits: (B, T, V)
+        x = self.emb(idx) + self.pos(torch.arange(idx.size(1)))
+        q, k, v = self.qkv(x).chunk(3, dim=-1)     # each (B, T, D)
+        att = q @ k.transpose(-1, -2) / D ** 0.5   # (B, T, T)
+        att = att.masked_fill(~self.causal, float("-inf")).softmax(-1)   # mask the scores, then normalize
+        return self.out(x + self.drop(att @ v))
+
+def lm_loss(logits, idx):                          # position t predicts token t + 1
+    return F.cross_entropy(logits[:, :-1].reshape(-1, V), idx[:, 1:].reshape(-1))   # mean over tokens
+
+model = TinyLM()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+batches, val = make_batches(0), next(make_batches(1))
+for step in range(600):
+    model.train()
+    idx = next(batches)
+    loss = lm_loss(model(idx), idx)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)              # after backward, before step
+    opt.step()
+    if step % 100 == 99:
+        model.eval()
+        with torch.no_grad():
+            vl = lm_loss(model(val), val)
+        print(step + 1, loss.item(), vl.item())
+</code></pre>
+      <p>What changed: the mask is applied to the <em>scores</em> as \(-\infty\) before the softmax (bug 1); <code>lm_loss</code> compares <code>logits[:, :-1]</code> with <code>idx[:, 1:]</code> (bug 2); <code>zero_grad</code> runs each step before <code>backward</code> (bug 3); the loss is a token mean, the default (bug 4); validation switches to <code>eval()</code> under <code>no_grad</code> and returns to <code>train()</code> at the top of the next step (bug 5); <code>clip_grad_norm_</code> sits between <code>backward</code> and <code>step</code> (bug 6). With mixed precision, gradients must also be unscaled before the clip, so the order there is backward, unscale, clip, step.</p>
+    </div>
+  </details>
+</section>
+
+<section>
+  <h2 id="checklist">Common mistakes checklist</h2>
+  <p>Run down this list before you say "done". Each row has a test in the drills or a demonstration above, and the class names are the labels for your practice log.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Class</th><th>The mistake</th><th>The guard</th></tr></thead>
+    <tbody>
+      <tr><td>Shapes</td><td><code>x.exp() / x.exp().sum(-1)</code> without <code>keepdim=True</code> silently divides column \(j\) by row \(j\)'s sum when \(B=V\), and raises otherwise, so it survives a square test. <code>view</code> after <code>transpose</code> raises; <code>gather</code> needs an index of the same rank.</td><td><code>keepdim=True</code>, <code>reshape</code>, <code>lg.gather(-1, lab[..., None]).squeeze(-1)</code>, and test with all-different sizes (2, 3, 5, 7).</td></tr>
+      <tr><td>Mask polarity</td><td>Two conventions in one library: <code>F.scaled_dot_product_attention</code> reads a boolean <code>attn_mask</code> as "<code>True</code> takes part", <code>nn.MultiheadAttention</code> as "<code>True</code> is blocked". Passing <code>tril</code> to the second gives the anti-causal mask (checked on torch 2.14).</td><td>Name the variable for what <code>True</code> means (<code>may_attend</code>) and unit-test a 3 by 3 case.</td></tr>
+      <tr><td>Mask order</td><td>Masking after the softmax (bug 1): the denominator still contains the future.</td><td>Fill scores with \(-\infty\), then softmax. Run the causality test.</td></tr>
+      <tr><td>Decode masks</td><td>Top-left alignment: <code>torch.tril(torch.ones(1, 9))</code> lets one new token see only the <em>first</em> of nine keys. The mask is <code>tril(ones(T, S), diagonal=S-T)</code>. A chunk of \(T>1\) new tokens still needs causality among themselves, and RoPE positions start at the cache length.</td><td>Prefill then decode equals the full forward pass, for several chunk sizes.</td></tr>
+      <tr><td>\(-\infty\) and NaN</td><td>An all-\(-\infty\) row gives a NaN softmax (\(0/0\)). <code>torch.where(x &gt; 0, x.log(), 0)</code> has a NaN gradient at \(x=0\), since the unselected branch adds \(0\cdot\infty\). A 0/1 mask multiplied in turns an overflow into \(0\cdot\infty\).</td><td>Keep one visible key per row or define the masked output. Filter <em>before</em> the risky function ("double where"). Use <code>masked_fill</code>.</td></tr>
+      <tr><td>Dtype</td><td>Softmax, log-sum-exp, norm statistics or the loss in bf16. bf16 has 8 significant bits, so integers above 256 are inexact (257, 259, 1001 become 256, 260, 1000) and RoPE angles built from them are wrong. \(\exp\) overflows near 89 in float32 and 11.1 in float16.</td><td>Upcast before reductions, cast back after. Build RoPE angles from integer positions in float32.</td></tr>
+      <tr><td>Off-by-one</td><td>Label shift (bug 2), and a loss mask not shifted with the labels: with <code>loss_mask[i]</code> describing token \(i\), predicting token \(t+1\) uses <code>loss_mask[:, 1:]</code>. Padding labeled 0 instead of \(-100\).</td><td>Hand-check one short example: the first response token is supervised, the token after EOS is not.</td></tr>
+      <tr><td>In-place ops</td><td><code>sigmoid</code>, <code>relu</code>, <code>softmax</code>, <code>exp</code>, <code>tanh</code> save their <em>output</em>, so editing it in place raises "modified by an inplace operation". In-place edits of a <code>matmul</code> or <code>gelu</code> output are fine, since those save their inputs (I ran each). PyTorch tracks this with a version counter <a href="https://docs.pytorch.org/docs/stable/notes/autograd.html#in-place-correctness-checks">[autograd notes]</a>.</td><td>Write out of place; keep in-place for cache writes under <code>no_grad</code>.</td></tr>
+      <tr><td>Reductions and modes</td><td>Mean over sequences, padding in the mean, dividing by \(B\) not the token count, <code>reduction="sum"</code> (bug 4). Validation with dropout on (bug 5), no <code>zero_grad</code> (bug 3), clip after the step (bug 6).</td><td>Duplicating the batch leaves the loss unchanged; the determinism and SGD micro-tests of the debug section.</td></tr>
+      <tr><td>Randomness</td><td>Tests that depend on the global RNG, or sampling that cannot be seeded.</td><td>Pass a <code>torch.Generator</code>, as the sampling drill does.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Coding rounds test whether you remember the code."</strong> They test whether you produce correct code and can defend it. Recited code fails at the first follow-up ("now with a KV cache", "now in bf16").</li>
+    <li><strong>"It passes my example, so it is right."</strong> One example cannot see mask polarity, an off-by-one, or a broadcast that misbehaves only on square inputs. Test properties, with dimensions that are all different.</li>
+    <li><strong>"A lower training loss means a healthier run."</strong> A loss below what the data allows is a leak. In the debug exercise the leaky loop reports 0.000 while the honest validation loss is about eleven.</li>
+    <li><strong>"The LayerNorm backward is the RMSNorm backward plus a bias gradient."</strong> LayerNorm has an extra \(-\bar u\) term from the mean, and its input gradient sums to zero. Dropping the term passes every shape check.</li>
+    <li><strong>"Beam search returns the highest-probability sequence."</strong> Only if nothing is pruned. Otherwise it returns a good sequence, and the winner among finished hypotheses depends on the length penalty and on conventions (does EOS count toward the length?).</li>
+    <li><strong>"Normalize by length at every step."</strong> Inside a step all candidates have the same length, so it changes nothing, and carrying the normalized value forward corrupts the next step's sums. Normalize only to compare finished hypotheses.</li>
+    <li><strong>"With Adam, the reduction and the clip do not matter."</strong> They barely move a smooth loss curve but matter for spikes, accumulation, logging and other optimizers. A bug with no symptom on one run is still a bug.</li>
+    <li><strong>"Gradcheck works in float32."</strong> It perturbs by \(10^{-6}\) and needs float64 to resolve the difference.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+  <p class="small muted">Ten of the fourteen are "find the bug" or "what would you test" items. Each snippet sits at the top of its answer: read it and think before you read on.</p>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is wrong with this softmax, and which inputs expose each problem?</summary>
+    <div class="answer">
+<pre><code class="language-python">def softmax(x):                 # x: (B, V)
+    e = torch.exp(x)
+    return e / e.sum(-1)
+</code></pre>
+      <p>Two bugs. <code>sum(-1)</code> drops the axis, so \((B,V)/(B,)\) divides column \(j\) by row \(j\)'s sum: an error when \(B\ne V\), silent when \(B=V\) (a random \(4\times4\) input gave row sums 0.47, 1.69, 1.20, 1.99). Fix: <code>keepdim=True</code>. And there is no max subtraction: \(\exp\) overflows above about 88.7 in float32 and 11.09 in float16, then inf/inf is NaN. Subtracting the row max leaves the result unchanged. Tests: a non-square input against <code>torch.softmax</code>; logits of 1000 stay finite; rows sum to one; \(-\infty\) entries get probability 0; a fully \(-\infty\) row needs an explicit rule, because \(-\infty-(-\infty)\) is NaN.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> This SFT loss masks the prompt. What is off by one?</summary>
+    <div class="answer">
+<pre><code class="language-python">ce = F.cross_entropy(logits[:, :-1].transpose(1, 2), ids[:, 1:], reduction="none")   # (B, T-1)
+loss = (ce * loss_mask[:, :-1]).sum() / loss_mask.sum()   # loss_mask[i] = 1 if token i is a response token
+</code></pre>
+      <p><code>ce[:, t]</code> is the loss of predicting token \(t+1\), so its weight is <code>loss_mask[:, t+1]</code>, that is <code>loss_mask[:, 1:]</code>. As written, the last prompt token's position has weight 0, so the <em>first response token is never supervised</em>, and the last response token's position has weight 1 while its target is whatever follows (padding or the next document). The denominator should count <code>loss_mask[:, 1:]</code> as well. EOS is still trained, which hides the bug in samples. Test: a six-token example by hand, asserting which (position, target) pairs get weight (the alignment convention of the <a href="19-sft-distillation.html">page 19</a> drill).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> You have 30 minutes to write causal attention. How do you spend them, and what do you test?</summary>
+    <div class="answer">
+      <p>Follow <a href="#rounds">Figure 1</a> scaled down: 4 minutes to restate inputs and shapes, fix the mask convention and name the tests; 15 for the simplest correct version; 8 to test; 3 for complexity and the follow-up. Tests in order: (1) agreement with <code>F.scaled_dot_product_attention</code> on random inputs with all-different sizes (or a slow per-position loop if no reference is allowed); (2) attention rows sum to one; (3) <strong>causality</strong>: rewrite the future and check that earlier outputs are bitwise unchanged; (4) large logits stay finite; (5) with \(T\) queries and \(S>T\) keys the mask is end-aligned, and one-token decode equals unmasked attention over the cache; (6) a fully masked row has a defined output. Then say what more time would buy: a cache, GQA, a fused kernel.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> This attention passes every test on full sequences and breaks in decoding. What is wrong?</summary>
+    <div class="answer">
+<pre><code class="language-python">def attend(q, k, v):            # q: (B,h,T,d)   k, v: (B,h,S,d), S = cached + T
+    scores = q @ k.transpose(-1, -2) / q.size(-1) ** 0.5
+    mask = torch.tril(torch.ones(q.size(2), k.size(2), dtype=torch.bool))
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return scores.softmax(-1) @ v
+</code></pre>
+      <p>The mask is aligned to the top-left. For \(T=S\) that is right, but in decode (\(T=1\), \(S=9\)) <code>tril(ones(1, 9))</code> is <code>[1, 0, ..., 0]</code>: the new token sees only the first cached key, silently. The new queries are the <em>last</em> \(T\) positions, so the mask is <code>tril(ones(T, S), diagonal=S-T)</code>, as in <a href="07-kv-efficient-attention.html#gqa">page 07</a> and the <a href="03-attention.html">page 03</a> drill. Test: prefill then decode equals the full forward pass for several chunk sizes.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Generation with a KV cache is fluent for a few tokens, then drifts. What is the bug in this decode step?</summary>
+    <div class="answer">
+<pre><code class="language-python">def decode_step(x_t, cache):    # x_t: (B, 1, d)
+    q, k, v = project(x_t)
+    pos = torch.arange(q.size(2))            # tensor([0])
+    q, k = rope(q, pos), rope(k, pos)
+    k_all, v_all = cache.append(k, v)
+    return attend(q, k_all, v_all)
+</code></pre>
+      <p>The new token is rotated as position 0 instead of <code>n_cached</code>, while the cached keys carry their true positions, so every relative offset it sees is wrong (\(-j\) instead of \(n-j\)). That degrades output gradually instead of crashing. Positions must be <code>n_cached + arange(T)</code>. Test: greedy decoding with the cache equals recomputing the whole prefix at each step for 20 or more tokens (<code>cached_greedy_generation_matches_recomputing_everything</code> in the drill), plus the RoPE property that a score depends only on the position difference (<a href="05-positional-encoding.html#rope">page 05</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A bf16 RoPE model matches the reference below about 256 tokens and diverges after. Why?</summary>
+    <div class="answer">
+<pre><code class="language-python">angles = pos.to(x.dtype)[:, None] * inv_freq[None, :]     # x is bf16
+</code></pre>
+      <p>bf16 has 8 significant bits, so integers are exact only up to 256. Above that positions are rounded: 257 becomes 256, 259 becomes 260, 1001 becomes 1000 and 100,000 becomes 99,840 (checked with <code>torch.bfloat16</code>). Neighbors can share a position, which corrupts the relative offsets RoPE depends on, with an error that grows with position. Fix: keep positions as integers, build angles and \(\cos,\sin\) in float32, cast the rotated \(q,k\) afterward. Test: compare the bf16 path with a float64 reference at positions 250 to 300 and near 100,000 (<code>angles_are_computed_before_casting_to_low_precision</code>, <a href="05-positional-encoding.html">page 05</a> drill).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is wrong with this GRPO advantage?</summary>
+    <div class="answer">
+<pre><code class="language-python">adv = (rewards - rewards.mean()) / rewards.std()     # rewards: (P * G,), verifier rewards in {0, 1}
+</code></pre>
+      <p>It normalizes over the whole batch instead of inside each prompt's group of \(G\) samples: an easy prompt whose samples are all correct gets a positive advantage against the batch mean, though its samples say nothing about which answer is better. And a group with identical rewards has zero standard deviation, so per-group normalization gives \(0/0\) without an \(\epsilon\). Fix: <code>r = rewards.view(P, G); adv = (r - r.mean(1, keepdim=True)) / (r.std(1, keepdim=True) + eps)</code>. <code>torch.std</code> divides by \(G-1\), the drill's convention; Dr. GRPO drops the division (<a href="24-rlvr-reasoning.html">page 24</a>). Tests: a uniform group gives exactly zero, groups are independent, each group's advantages have mean zero.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Find the three bugs in this beam search. Which tests catch each?</summary>
+    <div class="answer">
+<pre><code class="language-python">def beam_search(fn, bos, eos, beam, max_len, alpha):
+    seqs = torch.full((beam, 1), bos)                     # (beam, 1)
+    scores = torch.zeros(beam)
+    for t in range(1, max_len + 1):
+        logp = fn(seqs)                                   # (beam, V)
+        cand = (scores[:, None] + logp) / ((5 + t) / 6) ** alpha
+        scores, idx = cand.flatten().topk(beam)
+        parent, tok = idx // logp.size(1), idx % logp.size(1)
+        seqs = torch.cat([seqs[parent], tok[:, None]], dim=1)
+    return seqs[0, 1:].tolist()
+</code></pre>
+      <ol>
+        <li><strong>\(b\) copies of BOS.</strong> The rows are identical at step 1, so the top-\(b\) takes the same best token from each and the beam stays \(b\) duplicates: greedy decoding in disguise. On the drill's toy model with beam 2 and \(\alpha=0\) it returns <code>abEOS</code> (probability 0.2104) instead of <code>bEOS</code> (0.22). Catch: the first model call has one row; beam 2 finds <code>bEOS</code>.</li>
+        <li><strong>Normalizing inside the loop.</strong> <code>scores</code> becomes a normalized value and the next step adds a raw log-probability to it, mixing scales. Catch: wide-beam agreement with exhaustive search for \(\alpha>0\).</li>
+        <li><strong>No EOS handling.</strong> EOS is an ordinary token: hypotheses continue past it, finished ones are never recorded or compared, and the result is the best live row at <code>max_len</code>. Catch: no prefix containing EOS is fed back; returned hypotheses end with EOS or have length <code>max_len</code>.</li>
+      </ol>
+      <p>Also: <code>topk(beam)</code> fails when the beam exceeds the candidate count (use <code>min</code>), and \(-\infty\) log-probs must not enter the beam. A single-answer test at \(\alpha=1\) on this toy passes by luck, because the duplicated greedy path <code>abEOS</code> is also the \(\alpha=1\) winner. Pick cases where the bugs give different answers.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Write a test for your LayerNorm backward that does not use autograd.</summary>
+    <div class="answer">
+      <p>Use properties of the answer. (1) <strong>Shift invariance:</strong> \(\sum_j dx_j=0\) in every row, for any \(\delta\) and \(\epsilon\); it catches a dropped \(-\bar u\) term. (2) <strong>Scale invariance:</strong> at \(\epsilon=0\), \(\sum_j dx_jx_j=0\) for LayerNorm and RMSNorm (RMSNorm's row sum is not zero, and the test should assert that). (3) <strong>Directional finite differences</strong> in float64: for a random \(v\), \(\big(L(x+hv)-L(x-hv)\big)/2h\approx\langle dx,v\rangle\) with \(L=\sum\delta\odot y\), \(h=10^{-6}\). (4) <strong>Reductions:</strong> \(d\beta=\sum_{\text{rows}}\delta\), \(d\gamma=\sum_{\text{rows}}\delta\odot\hat x\), shape \((d,)\) for 1-D, 2-D and 3-D inputs. (5) <strong>Locality:</strong> changing \(\delta\) in one row leaves other rows' \(dx\) unchanged. (6) Two backward calls with the same cache agree. The drill's tests include all of these beside the autograd comparison.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> The LoRA adapter never trains: the loss equals the frozen model's. What is the bug?</summary>
+    <div class="answer">
+<pre><code class="language-python">self.A = nn.Parameter(torch.zeros(r, d_in))
+self.B = nn.Parameter(torch.zeros(d_out, r))
+# y = base(x) + (alpha / r) * x @ self.A.T @ self.B.T
+</code></pre>
+      <p>Both factors start at zero, so both gradients are zero: with \(y=xA^\top B^\top\), \(\partial L/\partial B\propto\delta^\top(xA^\top)=0\) because \(A=0\), and \(\partial L/\partial A\propto B^\top\delta^\top x=0\) because \(B=0\). It is a saddle the optimizer cannot leave. The standard initialization is \(A\) random and \(B=0\): the product is still zero at step 0 (the adapted model equals the base), but \(B\) gets a nonzero gradient on step 1. Tests: adapted output equals base output at init; after one step, \(B\) has changed and \(A\) has not (<code>first_step_reaches_only_B</code>, <a href="20-peft-lora.html">page 20</a> drill).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Calculate the cost of beam search with \(b=4\) on Llama-3-8B at 2K context, and what the cache reorder adds.</summary>
+    <div class="answer">
+      <p>Decode is memory-bound, so estimate bytes over bandwidth (H100 SXM, 3.35 TB/s, as on <a href="34-back-of-envelope.html">page 34</a>). Weights: \(8.03\text{B}\times2\) B \(=16.06\) GB, read once per step at any batch. KV: \(32\cdot2\cdot8\cdot128\cdot2=131{,}072\) B per token, so one sequence at 2,048 tokens reads 0.268 GB and the step takes \((16.06+0.27)/3350=4.87\) ms. Four hypotheses read 1.07 GB: \((16.06+1.07)/3350=5.11\) ms, 4.9% slower, the same as four independent samples. If the reorder copies the whole cache each step (read plus write, \(2\times1.07\) GB), the step moves 19.28 GB and takes 5.76 ms, 18% slower than one sequence. With a paged cache the reorder is a block-table update plus copy-on-write of the newest block, so the extra cost is near zero (<a href="17-inference-serving.html">page 17</a>). Caveats: this ignores compute, and once batching makes the model compute-bound, four hypotheses cost four times the FLOPs and occupy four batch slots, so per-<em>request</em> throughput falls about fourfold.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Estimate the time of a fused LayerNorm backward for 8,192 tokens at \(d=4096\) in bf16, and describe the kernel.</summary>
+    <div class="answer">
+      <p>Traffic per element: read \(x\) (2 B), read \(\delta\) (2 B), write \(dx\) (2 B), so 6 B, plus 8 B of mean and rstd per row. Total \((6\cdot4096+8)\cdot8192\approx201\) MB, about \(60\ \mu\)s at 3.35 TB/s. Arithmetic is roughly 13 FLOPs per element (recompute \(\hat x\), \(u\), two reductions, the correction, the \(d\gamma\) and \(d\beta\) accumulations): \(4.4\times10^8\) FLOPs, about 2 FLOPs per byte against a machine balance near 295, so the kernel is bandwidth-bound and the traffic estimate is the answer. Design: one program per row, so both reductions for \(dx\) stay in registers and \(x\) is read once; float32 statistics; \(\hat x\) recomputed from \(x\), mean and rstd. \(d\gamma\) and \(d\beta\) sum across rows, so accumulate partial sums per group of rows into a small buffer (locks, atomics or two levels) and finish with a second small reduction kernel, as the Triton tutorial does <a href="https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html">[Triton tutorial 05]</a>. Fusing means one pass over \(x\) and \(\delta\) instead of one per elementwise op.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> A run shows training loss 0.3 after 2,000 steps and validation loss 3.1. Give three hypotheses in order and a test for each.</summary>
+    <div class="answer">
+      <p>(1) <strong>Leakage in the training path:</strong> unshifted or misaligned labels, softmax before the mask, a packing mask that lets documents see each other, wrong mask polarity. Tests: the loss at initialization is near \(\ln V\); the causality test; a loss on shuffled targets rises to about \(\ln V\); per-position loss (a leak often collapses the loss at every position, memorization does not). If validation shares the leaky forward path, it looks fine too, as bug 1 above showed. (2) <strong>Contamination or duplication</strong> that makes training easier than validation: identical documents across shards, many repeated epochs. Test: deduplicate against validation, count unique versus seen tokens, and measure loss on fresh data from the same source. (3) <strong>Real memorization</strong> of a small dataset by a large model. Test: unique tokens against parameters and steps; validation loss falls, then rises. Order by cost: the first tests take minutes and rule out the causes that invalidate the whole run.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> The LayerNorm input gradient is orthogonal to the input. What does the same fact imply for the weights that feed a normalization layer?</summary>
+    <div class="answer">
+      <p>Take \(y=\mathrm{LN}(xW)\) with \(\epsilon=0\). Scaling \(W\) by \(c>0\) scales \(xW\) and leaves \(y\) unchanged, so \(L(cW)=L(W)\). Differentiating in \(c\) at \(c=1\) gives \(\langle\nabla_W L,W\rangle=0\), the same orthogonality as \(\sum_j dx_jx_j=0\). For plain SGD, a step \(W\leftarrow W-\eta\nabla L\) has \(\|W'\|^2=\|W\|^2+\eta^2\|\nabla L\|^2\), so the weight norm only grows; and since \(\nabla L\) scales like \(1/\|W\|\), the effective step on the direction of \(W\), roughly \(\eta/\|W\|^2\), shrinks as the norm grows. Weight decay counteracts the growth, and the pair sets an equilibrium effective learning rate. Adam sets update size per coordinate, not by gradient scale, so the details change, though the norm still drifts and the effective rate still depends on it. That is why a norm layer changes how learning rate and weight decay interact. Treat the SGD statements as the derivation and the Adam statement as qualitative.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>LayerNorm and RMSNorm backward.</strong> Implement <code>layernorm_forward</code>, <code>layernorm_backward</code>, <code>rmsnorm_forward</code> and <code>rmsnorm_backward</code>: statistics in at least float32, a cache that survives two backward calls, and \(d\gamma\), \(d\beta\) summed over every batch axis. The 35 tests compare against autograd in float64 for several shapes, run <code>gradcheck</code> through your pair, check the row-sum and orthogonality properties, and check bf16 inputs, degenerate rows and that no autograd or built-in norm appears in your code. An interviewer would expect LayerNorm forward and backward in 25 minutes, RMSNorm in 10 more. <span class="ex-path">exercises/drills/layernorm_backward.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Beam search with length normalization.</strong> Implement <code>normalized_score</code>, <code>beam_search</code> (EOS handling, GNMT length penalty, forbidden tokens, an exact <code>early_stop</code>) and <code>exhaustive_search</code>, the brute-force oracle. The 24 tests compare a wide beam with exhaustive search on random recurrent models, replay the hand-made toy of Figure 3, and check invariants such as "no finished hypothesis is fed back". Budget 30 minutes for <code>beam_search</code> and 10 for the oracle. <span class="ex-path">exercises/drills/beam_search.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>The full index.</strong> Work through <a href="#index">the index</a> with the protocol of <a href="#protocol">the first section</a>. The debug exercise has no file: copy the listing into a script, find the six bugs, then compare with the fixed loop and add the causality test.</p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_layernorm_backward.py exercises/tests/test_beam_search.py</code>; add <code>--solutions</code> to check the reference implementations, or run <code>pytest exercises --solutions</code> for every drill.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/1607.06450">Ba, Kiros and Hinton (2016). Layer Normalization.</a> <span class="why">Why read it: the definition the backward pass differentiates. The RMSNorm paper below shows what can be dropped.</span></li>
+    <li><a href="https://arxiv.org/abs/1910.07467">Zhang and Sennrich (2019). Root Mean Square Layer Normalization.</a> <span class="why">Why read it: RMSNorm, the re-centering argument, and its relation to LayerNorm (see <a href="04-transformer-block.html#rmsnorm">page 04</a>).</span></li>
+    <li><a href="https://arxiv.org/abs/1609.08144">Wu et al. (2016). Google's Neural Machine Translation System.</a> <span class="why">Why read it: §7 defines the length penalty \(lp(Y)=(5+\lvert Y\rvert)^\alpha/(5+1)^\alpha\) (Eq. 14) and reports the \(\alpha,\beta\) sweep in Table 2.</span></li>
+    <li><a href="https://arxiv.org/abs/1904.09751">Holtzman et al. (2019). The Curious Case of Neural Text Degeneration.</a> <span class="why">Why read it: the evidence that likelihood as a decoding objective gives bland, repetitive text, which is why chat models sample (numbers on <a href="06-decoding-kv-cache.html#beam-search">page 06</a>).</span></li>
+    <li><a href="https://arxiv.org/abs/1706.03872">Koehn and Knowles (2017). Six Challenges for Neural Machine Translation.</a> <span class="why">Why read it: the "beam search curse", larger beams that translate worse.</span></li>
+    <li><a href="https://arxiv.org/abs/1908.10090">Stahlberg and Byrne (2019). On NMT Search Errors and Model Errors: Cat Got Your Tongue?</a> <span class="why">Why read it: exact search often returns the empty output, so beam search works partly because it makes search errors.</span></li>
+    <li><a href="https://github.com/huggingface/transformers/blob/v4.44.0/src/transformers/generation/beam_search.py">Hugging Face transformers v4.44.0, <code>generation/beam_search.py</code>.</a> <span class="why">Why read it: a production beam scorer: the \(2b\) candidates, the EOS rank rule, <code>length ** length_penalty</code>, and the three early-stopping modes. Later releases restructured this code.</span></li>
+    <li><a href="https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html">Triton documentation, tutorial 05: Layer Normalization.</a> <span class="why">Why read it: a fused forward and backward kernel, with the partial-sum reduction for \(d\gamma\) and \(d\beta\).</span></li>
+    <li><a href="https://docs.pytorch.org/docs/stable/notes/autograd.html">PyTorch documentation, Autograd mechanics.</a> <span class="why">Why read it: the version-counter check behind the in-place errors and how saved tensors work.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Protocol:</strong> timebox to the index target, no references, run the tests (first failure only), compare with the reference, log the mistake class, redo in 2 to 3 days at half the time, explain it aloud.</li>
+      <li><strong>Tier 1 (9):</strong> <code>attention</code> 25 min, <code>kv_cache</code> 30, <code>rope</code> 20, <code>sampling</code> 20, <code>lm_loss</code> 15, <code>bpe</code> 35, <code>lora</code> 20, <code>dpo</code> 20, <code>grpo</code> 15+25. Tier 2 (13) and Tier 3 (16) are in the index. Frequency tiers are a judgment, not survey data.</li>
+      <li><strong>LayerNorm backward:</strong> \(u=\gamma\odot\delta\), \(dx=r\,(u-\bar u-\hat x\,\overline{u\hat x})\), \(d\gamma=\sum_{\text{rows}}\delta\hat x\), \(d\beta=\sum_{\text{rows}}\delta\). RMSNorm: drop \(\bar u\) and \(\beta\). Jacobian at \(\epsilon=0\): \(r\times\) a projection of rank \(d-2\) (LayerNorm) or \(d-1\) (RMSNorm).</li>
+      <li><strong>Reference-free tests:</strong> \(\sum_j dx_j=0\) (LayerNorm only), \(\sum_j dx_jx_j=0\) at \(\epsilon=0\) (both), directional finite differences in float64, backward twice gives the same answer. Use <code>reshape(-1, d).sum(0)</code>, since <code>sum(dim=())</code> reduces everything.</li>
+      <li><strong>Beam search:</strong> one live row at start; each step one model call, flat top-\(\min(b,nV)\) over non-EOS candidates ranked by raw log-prob, parent \(=f//V\), token \(=f\%V\), drop \(-\infty\); every EOS extension goes to finished and is never expanded; survivors at <code>max_len</code> are truncated; rank finished by \(\log P/((5+n)/6)^\alpha\).</li>
+      <li><strong>Exact early stop:</strong> stop if \(b\) finished are kept and \(\max_{\text{live}}L/lp(n_{\max})<\) the worst kept score. Comparing raw scores, or normalizing by the current length (Hugging Face's default heuristic), can stop too early when \(\alpha>0\).</li>
+      <li><strong>Beam cost:</strong> Llama-3-8B, \(b=4\), 2K context: 5.11 ms against 4.87 ms per decode step (+4.9%); a full cache copy per step makes it 5.76 ms (+18%).</li>
+      <li><strong>Debug loop:</strong> floor \(\ln 4=1.386\), uniform \(\ln 16=2.77\). Softmax-then-mask: train and val 0.22. Unshifted labels: train 0.000, val 11. No <code>zero_grad</code>: val 1.51. Sum reduction: grad norm 495, val unchanged. Eval in train mode: +0.003. Clip after step: invisible unless the gradient spikes.</li>
+      <li><strong>Always run:</strong> the causality test (rewrite the future, earlier logits identical), the loss at initialization (\(\approx\ln V\)), and decode-equals-prefill.</li>
+      <li><strong>Numbers:</strong> bf16 represents integers exactly up to 256; \(\exp\) overflows at 89 (float32) and 11.1 (float16); <code>gradcheck</code> needs float64; boolean masks: SDPA <code>True</code> = attend, <code>nn.MultiheadAttention</code> <code>True</code> = blocked; the decode mask is <code>tril(ones(T, S), diagonal=S-T)</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

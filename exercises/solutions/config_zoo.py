@@ -95,16 +95,13 @@ def params(s: Spec, active_embeddings: str = "both") -> Tuple[int, int]:
     if s.n_local + _global_layers(s) != s.n_layers and not _is_mla(s):
         raise NotImplementedError("linear-attention layers are not modeled")
     n_glob = _global_layers(s)
+    total = n_glob * _attn_params(s, True) + s.n_local * _attn_params(s, False) + s.n_layers * s.norms_per_layer * s.d
     moe = set(s.moe_layers)
-    total = 0
     idle = 0                                                     # expert weights a token does not touch
     for i in range(s.n_layers):
-        # which kind is layer i does not change the counts, only how many of each there are
-        is_global = i < n_glob
-        total += _attn_params(s, is_global) + s.norms_per_layer * s.d
         if i in moe:
-            expert = 3 * s.d * s.d_expert
-            total += s.d * s.n_experts + s.n_experts * expert + 3 * s.d * s.d_shared
+            expert = 3 * s.d * s.d_expert                        # SwiGLU: gate, up, down
+            total += s.d * s.n_experts + s.n_experts * expert + 3 * s.d * s.d_shared   # router, routed, always-on branch
             idle += (s.n_experts - s.top_k) * expert
         else:
             total += 3 * s.d * s.d_ff
@@ -145,20 +142,22 @@ def _avg_keys(T: int, window: Optional[int]) -> float:
     return window - window**2 / (2 * T)
 
 
-def flops_per_token(s: Spec, T: int) -> float:
-    """Forward FLOPs per token at sequence length T: 2 * (matmul parameters) + attention scores and values."""
-    matmul = params(s, "head")[1] if s.n_local + _global_layers(s) == s.n_layers else None
-    if matmul is None:
-        raise NotImplementedError("linear-attention layers are not modeled")
+def attention_flops_per_token(s: Spec, T: int) -> float:
+    """Softmax-attention FLOPs per token at sequence length T (scores and value mixing, all softmax layers)."""
     def per_layer(is_global: bool) -> float:
         if _is_mla(s):
             d_qk, d_v = s.qk_nope_dim + s.qk_rope_dim, s.v_dim     # decompressed ("MHA mode") shapes
         else:
-            hd = _gqa_shape(s, is_global)[1]
-            d_qk = d_v = hd
+            d_qk = d_v = _gqa_shape(s, is_global)[1]
+        # 2 FLOPs per multiply-add; QK^T uses d_qk numbers per key, the weighted sum uses d_v
         return 2 * s.n_heads * (d_qk + d_v) * _avg_keys(T, None if is_global else s.window)
-    attn = _global_layers(s) * per_layer(True) + s.n_local * per_layer(False)
-    return 2 * matmul + attn
+    return _global_layers(s) * per_layer(True) + s.n_local * per_layer(False)
+
+
+def flops_per_token(s: Spec, T: int) -> float:
+    """Forward FLOPs per token at sequence length T: 2 * (matmul parameters) + attention."""
+    matmul = params(s, "head")[1]                                # activated, input embedding is a lookup, head is a matmul
+    return 2 * matmul + attention_flops_per_token(s, T)
 
 
 def load_config(cfg: Mapping) -> Spec:
@@ -167,7 +166,7 @@ def load_config(cfg: Mapping) -> Spec:
     mt = c.get("model_type", cfg.get("model_type", ""))
     L, d, V = c["num_hidden_layers"], c["hidden_size"], c["vocab_size"]
     n_h = c["num_attention_heads"]
-    kw = dict(n_layers=L, d=d, vocab=V, tie_embeddings=c.get("tie_word_embeddings", True),   # HF default is tied
+    kw = dict(n_layers=L, d=d, vocab=V, tie_embeddings=c.get("tie_word_embeddings", cfg.get("tie_word_embeddings", True)),   # HF default is tied
               n_heads=n_h, n_kv_heads=c.get("num_key_value_heads") or n_h)
     # attention
     if c.get("kv_lora_rank"):
@@ -175,14 +174,16 @@ def load_config(cfg: Mapping) -> Spec:
                   qk_nope_dim=c["qk_nope_head_dim"], qk_rope_dim=c["qk_rope_head_dim"], v_dim=c["v_head_dim"])
     else:
         kw["head_dim"] = c.get("head_dim") or d // n_h
-    if mt in ("qwen2", "glm4_moe"):
-        kw["qkv_bias"] = bool(c.get("attention_bias", mt == "qwen2"))
+    if mt == "qwen2":
+        kw["qkv_bias"] = True                                    # always, the config has no key for it
+    elif mt == "glm4_moe":
+        kw["qkv_bias"] = bool(c.get("attention_bias"))           # q, k, v only
     elif c.get("attention_bias"):
         kw["qkv_bias"] = kw["o_bias"] = True
-    if mt in ("qwen3", "qwen3_moe", "gemma3_text", "gemma4_text") or c.get("use_qk_norm") and mt == "glm4_moe":
+    if mt in ("qwen3", "qwen3_moe", "gemma3_text", "gemma4_text") or (mt == "glm4_moe" and c.get("use_qk_norm")):
         kw["qk_norm"] = "head"
     elif mt in ("olmo2", "minimax_m2"):
-        kw["qk_norm"] = "full"
+        kw["qk_norm"] = "full"                                   # norm over the whole projected width, before the head split
     if mt.startswith("gemma"):
         kw["norms_per_layer"] = 4
     # FFN and experts
@@ -220,6 +221,11 @@ def load_config(cfg: Mapping) -> Spec:
         kw.update(n_global=n_glob, n_local=L - n_glob, window=c["sliding_window"])
     elif c.get("sliding_window") and mt == "mistral":            # every layer windowed
         kw.update(n_global=0, n_local=L, window=c["sliding_window"])
+    elif c.get("sliding_window") and mt == "gemma2":             # local and global layers alternate 1:1
+        kw.update(n_global=L // 2, n_local=L - L // 2, window=c["sliding_window"])
+    elif mt == "llama4_text":                                    # NoPE layers are global, the rest see 8,192-token chunks
+        n_glob = sum(1 for r in c["no_rope_layers"] if not r)
+        kw.update(n_global=n_glob, n_local=L - n_glob, window=c["attention_chunk_size"])
     elif c.get("full_attention_interval"):                       # Qwen3-Next: 1 softmax layer per interval
         kw.update(n_global=L // c["full_attention_interval"])
     if mt.startswith("gemma4") and c.get("global_head_dim"):

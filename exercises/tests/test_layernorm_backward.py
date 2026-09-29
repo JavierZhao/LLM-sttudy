@@ -153,6 +153,42 @@ def test_scale_and_shift_invariance_of_forward(impl):
     torch.testing.assert_close(r1, -r2, atol=1e-10, rtol=1e-10)      # scale invariant (sign flips y)
 
 
+@pytest.mark.parametrize("kind", ["layernorm", "rmsnorm"])
+def test_dx_is_row_local(impl, kind):
+    x, g, b, dy = _data((3, 4), 6)
+    if kind == "layernorm":
+        _, cache = impl.layernorm_forward(x, g, b, 1e-5)
+        backward = lambda d: impl.layernorm_backward(d, cache)[0]
+    else:
+        _, cache = impl.rmsnorm_forward(x, g, 1e-6)
+        backward = lambda d: impl.rmsnorm_backward(d, cache)[0]
+    dx1 = backward(dy)
+    dy2 = dy.clone()
+    dy2[1, 2] += torch.randn(6, dtype=D64)                 # change the incoming gradient of ONE row
+    dx2 = backward(dy2)
+    moved = (dx1 - dx2).abs().sum(-1)
+    assert moved[1, 2] > 1e-6
+    moved[1, 2] = 0.0
+    assert moved.sum() == 0.0                              # every other row is untouched
+
+
+@pytest.mark.parametrize("kind", ["layernorm", "rmsnorm"])
+def test_directional_finite_differences(impl, kind):
+    x, g, b, dy = _data((2, 3), 8)
+    v = torch.randn_like(x)
+    h = 1e-6
+    if kind == "layernorm":
+        fwd = lambda z: impl.layernorm_forward(z, g, b, 1e-5)
+        dx = lambda cache: impl.layernorm_backward(dy, cache)[0]
+    else:
+        fwd = lambda z: impl.rmsnorm_forward(z, g, 1e-6)
+        dx = lambda cache: impl.rmsnorm_backward(dy, cache)[0]
+    loss = lambda z: (dy * fwd(z)[0]).sum()
+    fd = (loss(x + h * v) - loss(x - h * v)) / (2 * h)     # directional derivative of L = sum(dy * y)
+    analytic = (dx(fwd(x)[1]) * v).sum()
+    assert fd.item() == pytest.approx(analytic.item(), rel=1e-6, abs=1e-8)
+
+
 # ---------------------------------------------------------------- contract details
 def test_inputs_are_not_modified_and_cache_can_be_reused(impl):
     x, g, b, dy = _data((3,), 8)

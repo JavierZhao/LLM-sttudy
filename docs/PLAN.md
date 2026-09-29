@@ -70,7 +70,7 @@ VI (26–33) → VII (34–37).
 | 4 | 22–25 | done: written, fact-checked; 22 (PPO) and 24 (GRPO) audited by coordinator |
 | 5 | 26–28 | done: written, fact-checked; 28 extended to V4.1-Flash (Sep 2026) |
 | 6 | 29, 30, 34 | done: written, fact-checked |
-| 7 | 31–33, 35–37 | 31 done; 32 and 35 in fact-check; 33 being written (resumed after a container restart); then 36, 37 |
+| 7 | 31–33, 35–37 | 31 done. PAUSED by user: 32 and 35 drafts await fact-check; 33 drill done, page not yet assembled (scratch in /tmp/w33); 36, 37 not started |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),
 02 (4 errors: digit grouping, Unigram unk, vocab-extension count, byte-level claim),

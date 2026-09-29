@@ -71,7 +71,7 @@ window.LLM_MANIFEST = {
     {
       id: "V", title: "Reinforcement learning",
       pages: [
-        { n: "22", drills: ["pg"], slug: "22-rl-foundations", title: "RL foundations for LLMs: policy gradient to PPO", tier: "P0", minutes: 70, status: "planned",
+        { n: "22", drills: ["pg"], slug: "22-rl-foundations", title: "RL foundations for LLMs: policy gradient to PPO", tier: "P0", minutes: 70, status: "written",
           desc: "Token-level MDP, REINFORCE, baselines, GAE, importance sampling, the PPO clip, KL estimators." },
         { n: "23", drills: ["rlhf"], slug: "23-rlhf", title: "RLHF in practice", tier: "P0", minutes: 50, status: "written",
           desc: "The InstructGPT pipeline, 4-model memory footprint, reward hacking, length bias, RLAIF, PRMs vs ORMs." },

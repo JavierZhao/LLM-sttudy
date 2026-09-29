@@ -174,7 +174,7 @@
 
   <aside class="callout bridge">
     <div class="callout-title">From your jet tagger</div>
-    <p>If you have worked with triggers, the bias is a dynamic threshold: raise the cut on the expert that fires too often, lower it on the one that fires too rarely, and keep the physics (the gate values, the output) untouched. Like a prescale, it holds the rate flat on average without telling you anything about a single event, which is the gap the sequence-wise loss covers.</p>
+    <p>If you have worked with triggers, the bias is a dynamic threshold: raise the cut on the expert that fires too often, lower it on the one that fires too rarely, and keep the physics (the gate values, the output) untouched. Like any rate-stabilizing threshold, it holds the average rate flat without controlling any single event, which is the gap the sequence-wise loss covers.</p>
   </aside>
 
   <div class="decision">
@@ -233,6 +233,18 @@
     <li><strong>The GEMMs are already small.</strong> An expert has width 2048, and splitting its matrices further would shrink per-GPU tiles and tensor-core efficiency.</li>
     <li><strong>The memory it would save is not needed.</strong> Expert parallelism shards 97% of the weights, ZeRO-1 shards optimizer states, recomputation trims activations, and BF16 Adam moments shrink the rest.</li>
   </ul>
+
+  <div class="decision">
+    <div class="decision-title">No tensor parallelism: PP16 × EP64 with ZeRO-1</div>
+    <dl>
+      <dt>Problem</dt><dd>Fit 671B parameters and their optimizer state on 2,048 GPUs whose NVLink is already busy with expert traffic.</dd>
+      <dt>Idea</dt><dd>Shard by depth (16 stages) and by expert (64 ways), shard optimizer state with ZeRO-1, and make activations cheap with recomputation and FP8 storage.</dd>
+      <dt>Why it works</dt><dd>Experts are 97% of the weights and shard cleanly, leaving about 1.7B parameters per GPU, and the remaining traffic (all-to-all, pipeline sends) can be overlapped.</dd>
+      <dt>Evidence</dt><dd>The run itself: 180K GPU-hours per trillion tokens, no tensor parallelism (report §1, §3.2); no comparison run with TP is reported.</dd>
+      <dt>Cost</dt><dd>A dense part (attention, dense FFNs, shared experts) replicated across 128 GPUs, and heavy engineering (DualPipe, custom kernels).</dd>
+      <dt>Used by</dt><dd>DeepSeek-V2, V3 and V4's training framework (<a href="15-distributed-training.html#plan-c">page 15</a>).</dd>
+    </dl>
+  </div>
 
   <h3 id="dualpipe">DualPipe: hiding the all-to-all inside the pipeline schedule</h3>
   <p>Cross-node expert parallelism makes the ratio of computation to communication "approximately 1:1", which the report calls inefficient <a href="https://arxiv.org/abs/2412.19437">[§3.2.1]</a>. Three ideas combine to fix it.</p>

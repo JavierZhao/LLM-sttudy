@@ -237,6 +237,13 @@ def test_mxfp4_power_of_two_scale_and_clamping(impl):
     assert torch.equal(impl.mxfp4_quantize(torch.zeros(64)), torch.zeros(64))
 
 
+def test_mxfp4_block_argument_is_respected(impl):
+    # two blocks of 4: the first has max 6 (X = 1), the second max 48 (X = 8)
+    x = torch.tensor([6.0, 0.7, 0.2, -1.2, 48.0, 3.0, 25.0, -13.0])
+    expected = torch.tensor([6.0, 0.5, 0.0, -1.0, 48.0, 4.0, 24.0, -12.0])
+    torch.testing.assert_close(impl.mxfp4_quantize(x, block=4), expected)
+
+
 def test_mxfp4_blocks_are_independent_and_error_is_bounded(impl):
     torch.manual_seed(0)
     x = torch.randn(4, 64) * torch.tensor([1.0, 10.0, 0.01, 100.0]).view(4, 1)

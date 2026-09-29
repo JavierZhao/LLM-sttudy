@@ -116,6 +116,8 @@ def mxfp4_quantize(x: Tensor, block: int = 32) -> Tensor:
     X = 2 ** (floor(log2(max|block|)) - 2); the exponent 2 is emax of the E2M1 element format.
     Each element v is stored as the nearest E2M1 value to v / X (magnitudes
     0, 0.5, 1, 1.5, 2, 3, 4, 6, with sign; values beyond 6 are clamped to 6, not rounded up).
+    A value exactly midway between two grid points may go to either neighbor (the tests avoid
+    ties; the microscaling paper's experiments used round-half-to-nearest-even).
     An all-zero block returns zeros. Return the dequantized tensor X * P, same shape and dtype.
 
     Args:

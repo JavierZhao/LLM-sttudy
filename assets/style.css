@@ -408,3 +408,50 @@ svg text.s-ta { fill: var(--s-a); } svg text.s-tb { fill: var(--s-b); } svg text
   #content { padding: 0; max-width: none; }
   details.qa { break-inside: avoid; }
 }
+
+/* ---------- mock interview scenarios (page 36) ---------- */
+.sc-lead { margin-bottom: .6rem; }
+.scenario-card { border-top: 1px solid var(--border); margin-top: 1.7rem; padding-top: .2rem; }
+.scenario-card h3 { margin-bottom: .35rem; }
+.sc-tag {
+  display: inline-block; margin-right: 8px; vertical-align: 2px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  border-radius: 999px; padding: 0 8px; border: 1px solid currentColor; line-height: 1.6;
+}
+.sc-tag.research { color: var(--lens); }
+.sc-tag.debug { color: var(--warn); }
+.sc-tag.systems { color: var(--key); }
+.sc-tag.paper { color: var(--note); }
+.sc-tag.behav { color: var(--bridge); }
+.sc-meta { color: var(--fg-muted); font-size: .88rem; margin: .1rem 0 .6rem; }
+.sc-prompt {
+  border-left: 4px solid var(--accent); background: var(--accent-soft);
+  padding: 8px 14px; margin: .5rem 0 .7rem; border-radius: 0 var(--radius) var(--radius) 0;
+}
+.sc-prompt .sc-who { font-weight: 700; margin-right: .3em; }
+details.scenario { border: 1px solid var(--border); border-radius: var(--radius); margin: .5rem 0 1rem; background: var(--bg); }
+details.scenario > summary {
+  cursor: pointer; padding: 10px 14px 10px 34px; list-style: none; font-weight: 600; line-height: 1.5;
+  display: block; position: relative;
+}
+details.scenario > summary::-webkit-details-marker { display: none; }
+details.scenario > summary::before {
+  content: "\25B8"; color: var(--fg-muted); position: absolute; left: 14px; top: 10px; transition: transform .15s;
+}
+details.scenario[open] > summary::before { transform: rotate(90deg); }
+details.scenario .scenario-body { padding: 2px 16px 12px 24px; border-top: 1px dashed var(--border); }
+details.scenario .scenario-body h4 { margin: 1.1rem 0 .3rem; font-size: .95rem; }
+details.scenario .scenario-body h4:first-child { margin-top: .8rem; }
+details.scenario .scenario-body ul, details.scenario .scenario-body ol { padding-left: 1.2rem; }
+details.scenario .scenario-body li { margin: .3rem 0; }
+
+/* ---------- question bank (page 36) ---------- */
+.qb-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: .6rem 0 .4rem; }
+.qb-controls select, .qb-controls input {
+  font: inherit; font-size: .9rem; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; max-width: 100%;
+}
+.qb-controls input { flex: 1 1 180px; min-width: 0; }
+.qb-count { color: var(--fg-muted); font-size: .9rem; margin: .2rem 0 1rem; }
+.qb-src { font-size: .85rem; color: var(--fg-muted); margin: .4rem 0 0; }
+.qb-part[hidden] { display: none; }

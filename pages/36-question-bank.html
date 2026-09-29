@@ -8,17 +8,6 @@
 <link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
 <link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
 <link rel="stylesheet" href="../assets/style.css">
-<style>
-  .qb-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: .6rem 0 .4rem; }
-  .qb-controls select, .qb-controls input {
-    font: inherit; font-size: .9rem; color: var(--fg); background: var(--bg);
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; max-width: 100%;
-  }
-  .qb-controls input { flex: 1 1 180px; min-width: 0; }
-  .qb-count { color: var(--fg-muted); font-size: .9rem; margin: .2rem 0 1rem; }
-  .qb-src { font-size: .85rem; color: var(--fg-muted); margin: .4rem 0 0; }
-  .qb-part[hidden] { display: none; }
-</style>
 </head>
 <body data-page="36" data-root=".." data-own-qa-controls>
 <div class="layout">
@@ -77,7 +66,601 @@
   <div id="qbank-root"><noscript><p>The question bank needs JavaScript.</p></noscript></div>
 </section>
 
-<!--SCENARIOS-->
+<section id="scenarios">
+  <h2>Mock interview scenarios</h2>
+  <p class="sc-lead">Fourteen open-ended prompts of the kind used in research-scientist and research-engineer loops. Each card shows the prompt as an interviewer would say it. Attempt it aloud for 20 to 40 minutes with a blank page and no notes, then open the box and grade yourself: one point per rubric bullet that you hit with a <em>mechanism or a number</em>, not with an adjective. Every rubric bullet links to the page that teaches it, so a missed bullet is a reading assignment. The follow-ups are what a good interviewer asks when you stop early, or when you sound more certain than the evidence allows.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>#</th><th>Scenario</th><th>Type</th><th>Main pages</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td><a href="#sc-1m-context">Design an efficient 1M-context model</a></td><td>Research discussion</td><td>07, 09, 10, 16, 17, 28</td></tr>
+      <tr><td class="num">2</td><td><a href="#sc-mla-alt">Propose and evaluate an alternative to MLA</a></td><td>Research discussion</td><td>07, 09, 16, 28</td></tr>
+      <tr><td class="num">3</td><td><a href="#sc-rl-sharpen">Is RL teaching reasoning or sharpening it?</a></td><td>Research discussion</td><td>24, 28</td></tr>
+      <tr><td class="num">4</td><td><a href="#sc-compute-budget">Spend a fixed compute budget</a></td><td>Research discussion</td><td>13, 34</td></tr>
+      <tr><td class="num">5</td><td><a href="#sc-loss-spike">Loss spike at step 40K</a></td><td>Debugging</td><td>11, 14</td></tr>
+      <tr><td class="num">6</td><td><a href="#sc-moe-collapse">MoE experts collapse</a></td><td>Debugging</td><td>08, 27</td></tr>
+      <tr><td class="num">7</td><td><a href="#sc-rl-reward-eval">RL reward rises but eval falls</a></td><td>Debugging</td><td>23, 24, 25</td></tr>
+      <tr><td class="num">8</td><td><a href="#sc-longctx-regress">Long-context eval regresses after extension</a></td><td>Debugging</td><td>10</td></tr>
+      <tr><td class="num">9</td><td><a href="#sc-70b-2k">Plan training of a 70B model on 2K GPUs</a></td><td>Systems</td><td>15, 34</td></tr>
+      <tr><td class="num">10</td><td><a href="#sc-mfu">Training runs at 25% MFU</a></td><td>Systems</td><td>15, 16</td></tr>
+      <tr><td class="num">11</td><td><a href="#sc-moe-serving">Cut inference cost of a 671B MoE by 2x</a></td><td>Systems</td><td>17, 27</td></tr>
+      <tr><td class="num">12</td><td><a href="#sc-deepseek-critique">Walk through DeepSeek-V3 and R1, then critique one choice</a></td><td>Paper deep dive</td><td>26, 27, 28</td></tr>
+      <tr><td class="num">13</td><td><a href="#sc-real-gain">A claimed gain of 1.5 points: is it real?</a></td><td>Paper deep dive</td><td>18</td></tr>
+      <tr><td class="num">14</td><td><a href="#sc-surprise">Tell me about a time a result surprised you</a></td><td>Behavioral-technical</td><td>11, 12, 13, 18, 24</td></tr>
+    </tbody>
+  </table></div>
+
+  <article class="scenario-card" id="sc-1m-context">
+    <h3><span class="sc-tag research">Research</span>1. Design an efficient 1M-context model</h3>
+    <p class="sc-meta">Suggested time: 35 to 40 min. This is your own research area, so expect the interviewer to push hardest here. Draws on <a href="07-kv-efficient-attention.html">07</a>, <a href="09-beyond-full-attention.html">09</a>, <a href="10-long-context.html">10</a>, <a href="16-gpus-kernels.html">16</a>, <a href="17-inference-serving.html">17</a>, <a href="28-deepseek-3-reasoning.html">28</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "We want a language model that handles a million tokens of context cheaply, for long agentic rollouts and for serving. You have a budget of a few thousand GPUs. Design the architecture, tell me how you would train and evaluate it, and tell me what you would ablate first."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Scope before design.</strong> Ask what binds: prefill compute (one-shot document QA), decode bandwidth (many long sequences, long RL rollouts), or cache capacity (sequences per GPU). Ask for the quality target (retrieval only, or multi-hop use of the context), the latency SLO and the hardware. <a href="09-beyond-full-attention.html#design">Page 09 opens its design section</a> with exactly this question.</li>
+          <li><strong>The cost model, with numbers.</strong> KV bytes = layers × tokens × features per token × bytes per feature (<a href="07-kv-efficient-attention.html#after-mla">page 07</a>). An 8B-class GQA stack (Llama-3-8B) needs 128 KiB per token, 128 GiB per sequence at 1M tokens, which does not fit on an 80 GB GPU next to 16 GB of weights. A 128K decode step already reads 17.2 GB of KV, more than the weights (<a href="17-inference-serving.html#long-context">page 17</a>), so 1M reads about 137 GB per step. Prefill: attention FLOPs equal weight FLOPs at \(T^\star \approx 57\)K for an 8B model, are already 69.6% of prefill at 128K, and a 16× longer sequence costs 46× more to prefill (<a href="10-long-context.html#why-staged">page 10</a>). Three quantities to keep apart: prefill FLOPs, bytes read per decoded token, and resident memory (<a href="09-beyond-full-attention.html#landscape">page 09</a>).</li>
+          <li><strong>Name the levers by axis, and what each one does not save.</strong> The point is that they compose, because they act on different factors of the product:
+            <div class="table-wrap"><table class="data">
+              <thead><tr><th>Axis</th><th>Lever</th><th>Number to quote</th><th>What it costs</th></tr></thead>
+              <tbody>
+                <tr><td>Features per token</td><td>GQA to MLA (<a href="07-kv-efficient-attention.html#mla-numbers">07</a>)</td><td>576 cached elements per layer against 2,048 for GQA-8: 68.6 KiB against 244 KiB per token at V3's shape</td><td>3.4× more attention FLOPs when absorbed; latent cannot be sharded by head-parallel TP</td></tr>
+                <tr><td>Tokens stored</td><td>Compress then select (DeepSeek-V4 CSA and HCA, <a href="09-beyond-full-attention.html#v4">09</a>)</td><td>Merge 4 tokens (CSA) or 128 (HCA); at 1M V4-Pro uses 27% of V3.2's FLOPs and 10% of its KV cache, about 2% of a BF16 GQA-8 baseline</td><td>Custom cache management, approximate content, complexity DeepSeek itself flags</td></tr>
+                <tr><td>Layers that cache</td><td>Linear or local layers with a minority of global layers (<a href="09-beyond-full-attention.html#hybrid-numbers">09</a>)</td><td>Saving is about the ratio: 3.95× at 1:3 and 7.79× at 1:7 (128K, Llama-3-8B width); Kimi K3 needs 27 GiB per 1M-token sequence, Qwen3.5 30 GiB</td><td>Approximate recall; kernel, state and prefix-cache infrastructure; position encoding choices</td></tr>
+                <tr><td>Bytes per feature</td><td>FP8 or FP4 KV (<a href="17-inference-serving.html#quant-kv">17</a>)</td><td>FP8 halves the cache; V4 stores FP8 except the RoPE dimensions; V4.1-Flash adds FP4 to its other reductions and reaches 890 B per token</td><td>Hard retrieval degrades first, so test at full length</td></tr>
+                <tr><td>Tokens read, not stored</td><td>Learned top-k selection (DSA, <a href="09-beyond-full-attention.html#dsa">09</a>)</td><td>Top 2,048: per-layer FLOPs fall 13.4× at 128K and 16.5× at 1M, saturating at 17× because the indexer is still \(O(L^2)\)</td><td>The cache does not shrink; RL needs deterministic top-k kernels</td></tr>
+              </tbody>
+            </table></div>
+          </li>
+          <li><strong>State the evidence conflict honestly.</strong> Recall needs \(\Omega(N)\) bits of state (<a href="09-beyond-full-attention.html#recall-theory">page 09</a>), so a pure fixed-state model is out, and 1:3 to 1:7 hybrids restore recall. But MiniMax-M2 went back to full attention after SWA hybrids matched MMLU (85.6 against 85.5) yet lost 18 points on 128K common-words extraction (90.0 to 72.0), GLM's untrained conversion of a windowed model fell to RULER 6.51 at 128K, and MiMo's window of 512 collapsed on NoLiMa while a window of 128 with sinks did not (<a href="09-beyond-full-attention.html#counter-trend">page 09</a>). There is no public equal-recipe comparison at 1M tokens, so do not pretend one architecture has won.</li>
+          <li><strong>A committed recommendation with a fallback.</strong> Page 09's default is full attention with GQA or MLA as the baseline (A), with a 3:1 delta-rule hybrid (E) and local-global (B) or sparse (C) as candidates, and stacking reductions across axes: Kimi K3 is linear layers plus MLA, V4 is compression plus selection plus FP4, Gemma 4 is interleaving plus KV sharing. A defensible answer: MLA-style latent for the global layers, a 3:1 gated delta-rule hybrid for the rest (about 27 GiB per 1M-token sequence in bf16 at K3's shape, roughly half with FP8 storage), NoPE in the global layers with position carried by the local or linear layers (RNope-SWA reaches RULER 74.8 against 57.1 for a RoPE baseline at 256K, <a href="05-positional-encoding.html">page 05</a>; Kimi Linear does the same), and top-k selection held back as an add-on if decode bandwidth still binds.</li>
+          <li><strong>Training recipe.</strong> Long context is a late stage: pretrain short, then continue at length for a few percent of the budget (Llama 3 about 800B of 15.6T tokens in six gated stages; V3 119K of 2,788K GPU-hours). DeepSeek-V4 is the exception, growing 4K, 16K, 64K, 1M inside pretraining with dense attention for the first 1T tokens, because the sparse and compressed attention makes that affordable (<a href="10-long-context.html#recipes">page 10</a>). Data: keep about 60% long and 40% high-quality short (ProLong), long part 1:1 code and books, document masks at 128K, raise the RoPE base (ProLong ships 8M at 64K), and train longer than you evaluate. If the design has sparse selection, the indexer needs its own warm-up and KL loss (<a href="09-beyond-full-attention.html#dsa">page 09</a>).</li>
+          <li><strong>Systems.</strong> Context parallelism for the long stages (Llama 3's 128K stage ran at 38% MFU against 43% at 8K), the all-gather or ring choice (<a href="10-long-context.html#systems">page 10</a>); at decode with small batch the kernel must split over keys or it uses under a quarter of the SMs (<a href="16-gpus-kernels.html#decode-kernels">page 16</a>); chunked prefill, prefix caching and prefill-decode disaggregation (a smaller cache also shrinks the transfer: V3's MLA cache made a 2,048-token KV transfer 4.7× smaller than Llama-3-70B's); offloaded KV hits a bandwidth wall about 67× below HBM, so it pays for prefix reuse (0.34 s to load a 16 GiB prefix against about 4.3 s to recompute), not for per-step reads (<a href="17-inference-serving.html#long-context">page 17</a>).</li>
+          <li><strong>The ablation plan.</strong> Small scale, identical data, tokens and RoPE treatment across all arms, compared at equal <em>measured</em> decode throughput: hybrid ratio (0:1, 1:1, 3:1, 7:1, 15:1, as in Kimi Linear's grid where 3:1 gives perplexity 5.65 against 5.77 for pure MLA and 15:1 is worse than none), linear-layer type and state size, window and sinks evaluated <em>after</em> long-context extension, NoPE against RoPE in global layers tested through post-training, and conversion against training from scratch (<a href="09-beyond-full-attention.html#ablations">page 09</a>).</li>
+          <li><strong>The evaluation suite.</strong> Six things: per-position loss at 1×, 2× and 4× the training length; a depth by length grid with distractors and non-literal needles (RULER multi-key, tracking, NoLiMa); realistic tasks after the same SFT for every model; a short-context regression suite; cost at each length; and claimed against effective length <span class="zh">有效上下文长度</span> with an explicit pass mark (<a href="10-long-context.html#evaluation">page 10</a>). Needle-in-a-haystack is a floor: Llama 3.1 70B scores 100 on passkey retrieval and 2.22 on key-value retrieval. Frontier reports use MRCR and CorpusQA at 1M (V4-Pro 83.5 and 62.0), run by the vendor. Check after SFT and RL, since GLM's RL degraded within a few steps when top-k kernels were non-deterministic.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Use RoPE scaling and continue pretraining." That extends the positional range, not the cost curve: KV memory and prefill FLOPs are untouched.</li>
+          <li>"Use linear attention, it is \(O(n)\)." Ignores the recall bound, the fixed-state versus exact-lookup evidence, and that decode stays memory-bound (the linear layer wins by moving 128× fewer bytes, not by doing fewer FLOPs per byte).</li>
+          <li>"Sparse attention shrinks the KV cache." It cuts FLOPs and bytes read; every token's entry must stay, because any future query may select it.</li>
+          <li>Quoting one architecture's headline speedup without the axis it acts on, the baseline it was measured against, or the recipe it was trained with.</li>
+          <li>Judging success by perplexity or a needle grid. Both saturate while multi-hop use of context fails.</li>
+          <li>No serving story: nothing about batch size, sequences per GPU, prefix caching, or kernels.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Your 3:1 hybrid saves 4× on the cache. Why can it not save more, and what would you stack on top of it?</li>
+          <li>A hybrid matches full attention on MMLU and on 32K needles but fails at 128K multi-hop. What does that tell you about your evaluation, and what do you run next?</li>
+          <li>DSA's indexer is \(O(L^2)\). Compute where the saving saturates, and say which later designs fix it and how.</li>
+          <li>Where do you put position information in the global layers, and how do you test that choice through post-training?</li>
+          <li>You have compute for exactly one 1M-context pretraining run. Which arm of your ablation grid do you pick, and what would make you switch?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-mla-alt">
+    <h3><span class="sc-tag research">Research</span>2. Propose and evaluate an alternative to MLA</h3>
+    <p class="sc-meta">Suggested time: 30 min. Draws on <a href="07-kv-efficient-attention.html">07</a>, <a href="09-beyond-full-attention.html">09</a>, <a href="16-gpus-kernels.html">16</a>, <a href="28-deepseek-3-reasoning.html">28</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "MLA caches 576 numbers per token per layer. Suppose you think you can do better. Propose a variant, tell me exactly what it buys and what it costs, and tell me how you would convince a skeptical reviewer that it is better."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>State MLA precisely before criticizing it.</strong> Joint low-rank compression of K and V into a latent of \(d_c = 512\), plus a decoupled 64-dimensional shared RoPE key, so 576 cached elements per layer (70,272 B per token over 61 layers, <a href="07-kv-efficient-attention.html#mla-numbers">page 07</a>). Weight absorption turns decode into MQA over the latent; RoPE would put a position-dependent rotation between the query and the up-projection, which is why position is moved into a separate path (<a href="07-kv-efficient-attention.html#decoupled-rope">decoupled RoPE</a>).</li>
+          <li><strong>Its costs, which are your openings.</strong> Absorbed attention does \(2 n_h(576 + 512) = 278{,}528\) FLOPs per cached token per layer against 81,920 decompressed (3.4×), for 71× fewer bytes (<a href="07-kv-efficient-attention.html#two-modes">page 07</a>). Decode intensity is \(n_h(2d_c + d_h^R)/(d_c + d_h^R) \approx 1.89\,n_h \approx 242\) FLOPs per byte at 128 heads, next to the H800's ridge of about 295, so the kernel sits at the knee of the roofline (<a href="16-gpus-kernels.html#mla-kernels">page 16</a>). The latent is shared by all heads, so head-sharded tensor parallelism replicates the cache (V3 decodes with TP4 and DP80). Two execution modes (MHA for prefill and training, MQA for decode). RoPE covers only 64 of each head's 192 query-key dimensions.</li>
+          <li><strong>Pick one bottleneck and one axis.</strong> Good candidates, each with a hypothesis and a price:
+            <ul>
+              <li><em>Head count as a cost knob.</em> Under absorbed MLA, FLOPs scale with \(n_h\) and bytes do not; intensity is almost independent of \(d_c\) and set by \(n_h\). Kimi K2 halved V3's 128 heads to 64: at 128K, doubling heads costs 83% more inference FLOPs for a validation-loss gain of only 0.5 to 1.2% (<a href="07-kv-efficient-attention.html#head-count">page 07</a>). Price: possible benchmark loss (GLM-4.5 found more heads helped reasoning benchmarks).</li>
+              <li><em>Shared-KV without up-projections</em> (DeepSeek-V4's route): one 512-dimensional entry per token is both key and value for all heads, with the last 64 dimensions rotated and the attention output rotated back so position stays relative (<a href="07-kv-efficient-attention.html#after-mla">page 07</a>). Price: gives up per-head K and V diversity, needs RMSNorm on queries and entries, and the evidence is one lab's.</li>
+              <li><em>Compress another axis on top of the latent:</em> merge tokens (CSA and HCA), reuse entries across layers (V4.1-Flash, 890 B per token), or store the latent in FP8 or FP4 (<a href="09-beyond-full-attention.html#v4">page 09</a>). Price: approximation, selection errors that DeepSeek says it has not fully characterized.</li>
+              <li><em>Convert instead of retrain:</em> any GQA layer is an MLA layer at equal cache (selector up-projections), so MLA's function class strictly contains GQA's; TransMLA compresses Llama-2-7B's cache 93% and recovers quality with about 6B tokens (<a href="07-kv-efficient-attention.html#mla-evidence">page 07</a>). Price: expressiveness is not trained quality.</li>
+            </ul>
+          </li>
+          <li><strong>Define the win as a frontier, not a point.</strong> Cache bytes per token against quality, at two or more scales, because MLA's own case rests on 16B and about 250B MoE ablations (beat MHA on 7 of 8 comparisons with 14% and 4% of the cache, <a href="07-kv-efficient-attention.html#mla-evidence">page 07</a>). Add decode step time on a real kernel, TP scaling, and quality after long-context extension and SFT, not only knowledge benchmarks.</li>
+          <li><strong>Matched baselines and honest caveats.</strong> Equal parameters (MLA saves parameters, about 40% of an MHA layer at V3's shape, so someone must decide where to spend them), equal tokens, several seeds. Notice how setups disagree: DeepSeek's 7B ablation has GQA-8 4.0 MMLU points below MHA, Llama 2's 30B ablation has GQA about equal; parameter matching, token count and benchmarks all differ. And the "93.3% smaller KV cache" headline is DeepSeek-V2 against a dense 67B model, a system comparison, not an MLA ablation.</li>
+          <li><strong>Stability and kernels are part of the proposal.</strong> MQA showed loss spikes when trained from scratch (<a href="07-kv-efficient-attention.html#mqa">page 07</a>), so report max attention logits; write the absorbed kernel and measure achieved TFLOP/s and GB/s against the ridge.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Use a smaller latent." No accounting of what happens to absorbed FLOPs, which fall with \(d_c\) too, so intensity barely moves.</li>
+          <li>Judging by cache size alone, or by perplexity alone.</li>
+          <li>Forgetting decoupled RoPE, or proposing a variant that breaks absorption without saying so.</li>
+          <li>Ignoring tensor parallelism and the two-mode kernel complexity.</li>
+          <li>Citing "93.3% smaller" as if it were an ablation of MLA.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Why does standard RoPE break absorption, and what does the decoupled key cost in quality and cache?</li>
+          <li>In absorbed mode, write the FLOPs and bytes per cached token per layer, and say where the roofline knee is.</li>
+          <li>Why is head count a cost knob for MLA but not for GQA?</li>
+          <li>How would you turn a trained GQA checkpoint into your variant, and how many tokens of recovery training would you budget?</li>
+          <li>How does your variant compose with DSA-style top-k selection, which attends in MLA's MQA mode?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-rl-sharpen">
+    <h3><span class="sc-tag research">Research</span>3. Is RL teaching reasoning or sharpening it? Design an experiment</h3>
+    <p class="sc-meta">Suggested time: 30 min. Draws on <a href="24-rlvr-reasoning.html">24</a> and <a href="28-deepseek-3-reasoning.html">28</a>; statistics from <a href="18-evaluation.html">18</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "People argue about whether reinforcement learning with verifiable rewards teaches a model new reasoning or only makes it more reliable at what the base model could already do. You have a cluster and a few months. Design the experiment that would settle it, and tell me what result would change your mind."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Operationalize the claim.</strong> Sharpening means pass@1 rises while pass@\(k\) at large \(k\) is flat or falls, because RL re-weights paths already inside the base distribution. Expansion means success on problems where the base fails at every \(k\). Cite the evidence on both sides (<a href="24-rlvr-reasoning.html#capability">page 24</a>): after GRPO, DeepSeekMath's Maj@K rose but Pass@K did not; Yue et al. find the base overtakes RL models at large \(k\) (about 9 points ahead on Minerva with the 32B model at \(k = 128\)); ProRL (over 2,000 steps, 136K problems, five domains, a distilled 1.5B start) reports success where the base fails at every \(k\), with gains largest where the start is weakest.</li>
+          <li><strong>Know what pass@\(k\) cannot see.</strong> A solution the base finds with probability \(q\) per sample shows up at \(k = 256\) with probability \(1 - (1-q)^{256}\): 92% for \(q = 10^{-2}\), 2.5% for \(10^{-4}\), 0.026% for \(10^{-6}\). So problems with rare-but-real solutions look unsolvable, and RL raising \(q\) by orders of magnitude is invisible at \(k \le 256\). On numeric-answer tasks lucky guesses inflate the base curve at large \(k\). Fix: estimate per-problem \(q\) with far more samples on a subset, and use answer formats where guessing is negligible.</li>
+          <li><strong>Choose the model and the tasks to be diagnostic.</strong> A base whose pass@8 on your prompts is well inside (0, 1): zero success means zero signal, and R1's RL on 7B dense and 16B MoE bases gave no meaningful AIME gain (<a href="28-deepseek-3-reasoning.html#r1-zero">page 28</a>). Use at least two model families, because Qwen2.5-Math gains +21.4 MATH-500 points from <em>random</em> rewards (+24.1 for wrong majority-vote labels, +29.1 for ground truth) while Llama-3 and OLMo-2 gain little (<a href="24-rlvr-reasoning.html#spurious">page 24</a>). Include problems whose solution needs a skill provably absent from pretraining (procedurally generated tasks with held-out compositions), and post-cutoff problems (AIME 2025 postdates those models) to control for contamination.</li>
+          <li><strong>Arms and controls.</strong> (1) RLVR with the current best recipe (clip-higher, dynamic sampling, no length bias, entropy monitored; <a href="24-rlvr-reasoning.html#recipe">page 24 recipe</a>) run for thousands of steps, not hundreds; (2) a random-reward and a majority-vote-reward arm as null baselines, as a physicist runs shuffled labels; (3) a distillation arm from a stronger teacher, since R1-Distill-Qwen-7B's pass@\(k\) curve sits above its base's; (4) a rejection-sampling SFT arm at matched compute; (5) an on-policy distillation arm (on Qwen3-8B, further RL after distillation left AIME 24 and 25 pass@64 unchanged at 90.0 and 83.3, while on-policy distillation from a stronger teacher reached 93.3 and 86.7 at 1,800 against 17,920 GPU-hours; with 30 problems this is suggestive, not conclusive).</li>
+          <li><strong>Watch the training dynamics that confound the conclusion.</strong> Entropy collapse <span class="zh">熵坍缩</span>: without intervention performance follows \(R = -a e^{H} + b\), so the ceiling is predictable and over 95% of the entropy drop happens early; a run that stalls tells you about the optimizer, not about reasoning (<a href="24-rlvr-reasoning.html#entropy">page 24</a>). Length and "aha" behavior are not evidence: R1-Zero's length jump coincides with a doubled cap at step 8.2K, GRPO's \(1/|o|\) normalization inflates wrong answers, and V3-Base already shows aha moments (<a href="28-deepseek-3-reasoning.html#r1-zero">page 28</a>).</li>
+          <li><strong>Statistics.</strong> Per-problem unbiased pass@\(k\), averaged over problems; several seeds; intervals. AIME is 30 problems, so one problem is 3.3 points (<a href="18-evaluation.html#statistics">page 18</a>).</li>
+          <li><strong>Decision rule and a calibrated conclusion.</strong> State in advance what pattern supports each reading. The defensible synthesis today is "both": RL reliably sharpens, can expand under long diverse training, and distillation expands more cheaply when a teacher exists. The practical point: users see pass@1, and R1's gap (pass@1 79.8, majority over 64 samples 86.7, pass@64 90.0) is what RLVR moves into one sample instead of paying \(k\) times at inference.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>Compare pass@1 before and after on one benchmark. That cannot distinguish the hypotheses.</li>
+          <li>Use response length or "aha" phrases as evidence of new reasoning.</li>
+          <li>Run only on Qwen2.5-Math, or only a few hundred steps, or only \(k \le 16\).</li>
+          <li>Ignore contamination and lucky guesses.</li>
+          <li>Declare a winner: the literature has not converged, and saying so is part of a good answer.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Why can pass@256 fail to detect a real capability gain? Compute the detection probability for \(q = 10^{-4}\).</li>
+          <li>Why does a random reward help Qwen2.5-Math, and what does that say about your experiment's controls?</li>
+          <li>What result would make you conclude RL expanded capability rather than sharpened it?</li>
+          <li>Entropy collapses in your run at step 200. What do you change, and how does it affect the interpretation?</li>
+          <li>Given one more unit of compute, would you spend it on RL, distillation or pretraining, and what evidence from your arms decides?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-compute-budget">
+    <h3><span class="sc-tag research">Research</span>4. Spend a fixed compute budget</h3>
+    <p class="sc-meta">Suggested time: 25 min. Draws on <a href="13-scaling-laws.html">13</a> and <a href="34-back-of-envelope.html">34</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You have \(10^{24}\) FLOPs to pretrain a model that we expect to serve at very large volume. What model size and how many tokens do you choose, and how do you know?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>The accounting.</strong> \(C = 6ND\), with \(N\) the activated parameters for an MoE. The Chinchilla rule of about 20 tokens per parameter gives \(N = \sqrt{C/120}\): about 91B parameters on 1.83T tokens at \(10^{24}\). Epoch's refit agrees within 10% (96B, 1.74T); Hoffmann's Approach 3 constants as printed imply 41B and 4.04T (98 tokens per parameter) at \(10^{24}\) and 60 to 140 across budgets, partly a rounding artifact, and the refit's honest range at \(10^{26}\) FLOPs and beyond is 4 to 40 tokens per parameter (<a href="13-scaling-laws.html#worked">page 13</a>). The cost: \(10^{24}\) FLOPs is about 0.7M GPU-hours at 40% MFU, about $1.4M at $2 per hour (<a href="34-back-of-envelope.html">page 34</a>).</li>
+          <li><strong>Question the objective.</strong> Chinchilla minimizes loss for training FLOPs only. A deployed model costs \(6ND_{\text{tr}} + 2ND_{\text{inf}}\), so fixing a target loss and minimizing total cost pushes toward a smaller model on more tokens (<a href="13-scaling-laws.html#overtraining">page 13</a>). At the target loss of the \(10^{24}\) optimum (1.960): a 60B model needs 3.05T tokens (1.10× the training FLOPs, 0.63× the serving cost, break-even after \(1.4\times10^{12}\) served tokens); 30B needs 13.2T (2.4× the training FLOPs, break-even near \(10^{13}\) served tokens); 20B needs 88T tokens (10.6×); below about 14B the target loss is unreachable at any token count. Erring toward slightly larger is cheap, erring smaller is not.</li>
+          <li><strong>The serving forecast is the hard input.</strong> The answer is a function of expected lifetime tokens; say what you would pick under two forecasts (for example research-only against about \(10^{13}\) served tokens). Real models sit far right of Chinchilla: Llama-3-8B at about 1,870 tokens per parameter, 405B at 38.5; DeepSeek-V3 has 400 tokens per activated parameter but 22 per total parameter (<a href="13-scaling-laws.html#overtraining">page 13</a>).</li>
+          <li><strong>Distrust the extrapolation.</strong> A fit made from runs with at most 100 tokens per parameter overestimates the value of extra tokens at extreme ratios; data supply matters (the number of unique tokens, since repeated epochs are worth less); MoE has two parameter counts, active for FLOPs and total for memory; and hyperparameters must transfer.</li>
+          <li><strong>The protocol matters more than the formula.</strong> Kaplan's exponent 0.73 against Chinchilla's 0.5 came from protocol confounds: Porian et al. remove them one at a time and the fitted exponent moves 0.835, 0.706 (count last-layer FLOPs), 0.602 (scale warmup), 0.571 (match the schedule), 0.497 (tune LR, batch and \(\beta_2\) per size) (<a href="13-scaling-laws.html#discrepancy">page 13</a>). DeepSeek LLM found the exponent also depends on data quality (0.450, 0.524, 0.578).</li>
+          <li><strong>How to actually decide.</strong> Run an IsoFLOP ladder at small budgets with your data, tokenizer and tuned hyperparameters, fit the local law, predict the next scale, and validate before committing (<a href="13-scaling-laws.html#practice">page 13</a>).</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Chinchilla says 20 tokens per parameter." Correct for training loss, and silent about serving.</li>
+          <li>Mixing total and activated parameters for an MoE.</li>
+          <li>Ignoring the data budget, or treating repeated tokens as fresh.</li>
+          <li>Quoting one fitted exponent without saying the protocol it came from.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Derive \(N = \sqrt{C/120}\) from \(C = 6ND\) and \(D = 20N\).</li>
+          <li>Write the total-cost objective and say why serving volume pushes \(N\) down and \(D\) up.</li>
+          <li>Where does the wall near 14B come from?</li>
+          <li>How does the answer change for an MoE with 37B activated and 671B total parameters?</li>
+          <li>How would you check that your own fit is not an artifact of warmup, learning rate or parameter counting?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-loss-spike">
+    <h3><span class="sc-tag debug">Debugging</span>5. Loss spike at step 40K</h3>
+    <p class="sc-meta">Suggested time: 20 to 25 min. Draws on <a href="11-stability-tweaks.html">11</a> and <a href="14-optimization.html">14</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "Your 70B run has trained smoothly for 40,000 steps. Now the loss jumps far above its trend within a few steps and only partly recovers. You are on call. What do you do in the first hour, and what do you do about it for the rest of the run?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Triage before theory.</strong> Is it NaN or Inf, or a finite spike? Hardware fault or dynamics (OPT-175B had 35+ manual and 70+ automatic restarts, so not every stall is an optimization problem)? Which layer's gradient or activation norm jumped first? Compare the training-stream loss with a fixed held-out batch to separate data-order effects from model effects (<a href="14-optimization.html#playbook">page 14 playbook</a>). A loss spike <span class="zh">损失尖峰</span> is a symptom with several causes, so start from the logs you already have: loss, global and per-layer gradient norms, pre-clip norm and clipped fraction, update-to-weight ratio, max attention logit per head, output-logit norm, NaN counters (<a href="14-optimization.html#monitoring">monitoring</a>).</li>
+          <li><strong>Restore progress, and say that it is not a diagnosis.</strong> PaLM restarted from a checkpoint about 100 steps before the spike and skipped roughly 200 to 500 batches; replaying those batches from an earlier checkpoint did not spike, so the cause was the combination of those batches and the parameter state, not bad data alone (<a href="11-stability-tweaks.html#spike-responses">page 11</a>). This needs preparation: a replayable data order (PaLM's batches were a function of the step number) and frequent checkpoints (DeepSeek LLM saves asynchronously every 5 minutes).</li>
+          <li><strong>The suspect list, each with what to log and the response</strong> (<a href="11-stability-tweaks.html#diagnostics">page 11 table</a>): <em>data</em> (per-batch loss, repeated n-grams; OLMo 2 filtered documents with 32+ repeats and cut, but did not remove, spikes); <em>LR and Adam state</em> (longer warmup, lower peak LR, \(\beta_2 \approx 0.95\)); <em>Adam \(\epsilon\)</em> (gradients shrink with scale, so \(10^{-8}\) can be too large relative to them); <em>attention logits</em> (in Wortsman et al., every run whose max logit passed \(10^4\) diverged; Kimi K2 saw logits above 1000 under vanilla Muon; fixes are QK-norm, QK-clip, soft-capping); <em>output logits</em> (z-loss; Chameleon's output-norm growth predicted divergence); <em>precision</em> (fp16 loss-scale collapse, bf16 roundoff in softmax or router); <em>MoE routing</em> (DeepSeek-V4's spikes were tied to outliers in MoE layers).</li>
+          <li><strong>If it recurs, treat it as systemic and escalate from cheap to expensive:</strong> lower the peak LR or lengthen warmup; lower \(\beta_2\) or raise \(\epsilon\); add logit and activation control (PaLM's \(10^{-4}\log^2 Z\) auxiliary loss, QK-norm); or remove the amplifier. DeepSeek-V4 found rollbacks restored the loss but spikes recurred, then used anticipatory routing (routing indices from parameters \(\Delta t\) steps old, about 20% extra time, so switched on only after a detector fires and a short rollback) and clamped the SwiGLU linear branch to \([-10, 10]\), and says the mechanism is not understood (<a href="14-optimization.html#playbook">page 14</a>).</li>
+          <li><strong>Clipping is necessary and not sufficient.</strong> Every run that states a threshold clips the global norm at 1.0, and PaLM 540B still had about 20 spikes. If the norm exceeds the threshold on most steps, clipping silently turns into normalization and changes the effective learning rate, and a slow drift is hidden, so track the pre-clip norm and the clipped fraction, not only the loss.</li>
+          <li><strong>Prevent the next one.</strong> Log leading indicators before the run needs them; use small-scale proxies (LR sensitivity, and a quadratic fit of max attention logit against size that predicted the divergence of a 4.8B model, <a href="11-stability-tweaks.html#proxies">page 11</a>); make training replayable; keep a cheap recovery story. Your jet-tagger habit of five seeds and a learning rate that never diverged does not exist at frontier scale, where the run is one shot.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Lower the learning rate and resume," with no triage and no logs.</li>
+          <li>"Restart from scratch" (weeks lost) or "skip the bad data" (PaLM's replay shows data alone is not the cause).</li>
+          <li>"Gradient clipping will handle it."</li>
+          <li>One cause asserted with confidence; no ordered hypothesis list; no statement of what would confirm each.</li>
+          <li>Treating a rollback as a fix.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>The max attention logit has grown steadily for 10K steps before the spike. What does that imply, and which fixes do you compare?</li>
+          <li>What can gradient clipping hide, and what would you log to see it?</li>
+          <li>Rollback restores the loss but the spike returns 5K steps later. What next?</li>
+          <li>The run is an MoE. What extra failure sources exist, and which mitigation did V4 use?</li>
+          <li>How would you test at small scale whether a stability change will hold at 70B?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-moe-collapse">
+    <h3><span class="sc-tag debug">Debugging</span>6. MoE experts collapse</h3>
+    <p class="sc-meta">Suggested time: 20 min. Draws on <a href="08-mixture-of-experts.html">08</a> and <a href="27-deepseek-2-v3.html">27</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You are training a fine-grained MoE with top-8 routing. Monitoring shows a handful of experts receiving most of the tokens in several layers, many experts nearly idle, and the model trails a dense model with the same activated parameters. Diagnose it and fix it."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Separate the three harms.</strong> Routing collapse <span class="zh">路由坍塌</span> is self-reinforcing (favored experts train faster and get favored more): without a balancing loss, Shazeer et al.'s 256-expert model had test perplexity 39.8 and a busiest expert at 17.8× the mean load, against 35.6 and 1.14× with the losses. Stragglers: under expert parallelism the most loaded device sets step time; MaxVio \(= (\max_i \text{Load}_i - \overline{\text{Load}})/\overline{\text{Load}}\) of 0.72 means the hottest expert gets 1.72× the mean, 58% utilization. Overflow: with fixed capacity, tokens are dropped (<a href="08-mixture-of-experts.html#why-balance">page 08</a>).</li>
+          <li><strong>Measure first.</strong> Per-layer, per-expert load histograms and MaxVio, router entropy and gate mass, dropped-token fraction, and load by data domain (specialization is healthy; collapse is not). Check whether balance is judged on a micro-batch or on the global batch, because micro-batch balance nearly forces every sequence, even a code-only one, across all experts.</li>
+          <li><strong>Candidate causes, in the order to check them.</strong> An auxiliary-loss coefficient \(\alpha\) that is too small (small \(\alpha\) lets routing collapse, large \(\alpha\) degrades perplexity: Wang et al.); router precision (in ST-MoE's example, rounding one logit of 128.5 to 128 in bf16 moves the top probability from 0.142 to 0.091, so compute the router in fp32 and add a z-loss with \(c_z = 0.001\); in ST-MoE's study the baseline was stable in 4 of 6 runs, with z-loss 3 of 3; <a href="08-mixture-of-experts.html#stability">page 08</a>); a slowly balancing first layer (DeepSeekMoE saw balance converge especially slowly in layer 1, the only stated reason for keeping early layers dense; V4 uses hash routing there instead); too-high early LR; and a bug in how load is counted.</li>
+          <li><strong>Fixes, with the trade-off of each.</strong> (1) Auxiliary loss \(\mathcal{L} = \alpha\, n_r \sum_i f_i P_i\); its gradient into each token's router probability is \(\alpha n_r f_i/T\), so it pushes every token in proportion to expert load and leaks into the backbone as an interference gradient. (2) Auxiliary-loss-free balancing: a per-expert bias added to the affinity only for the top-\(k\) choice, moved \(\pm\gamma\) by the sign of the load error, gates unbiased; at 1B it reached perplexity 9.50 against 9.56 and MaxVio 0.04 against 0.72, with an update rate of \(10^{-3}\) best (\(10^{-4}\) balanced slowly, \(10^{-2}\) fluctuated), but the gain is small (large-model MMLU moved 68.3 to 67.2) and from the method's authors (<a href="08-mixture-of-experts.html#aux-free">page 08</a>). (3) Because a batch-level controller cannot police a single sequence, V3 adds a sequence-wise loss with \(\alpha = 10^{-4}\) and redundant experts at inference for domain shift (<a href="27-deepseek-2-v3.html#arch-balance">page 27</a>). (4) Global-batch balance statistics (Qiu et al.: average perplexity 7.347 to 7.198 at 3.4B) let experts specialize by domain (<a href="08-mixture-of-experts.html#global-batch">page 08</a>). (5) Dropless kernels rather than capacity factors: MegaBlocks measured a validation-loss gain of 0.15 at capacity factor 1 against 0.26 with no dropping.</li>
+          <li><strong>Balanced is not the same as good.</strong> Perfectly uniform load with redundant experts is also a failure (knowledge redundancy); that is what fine-grained plus shared experts target. Probe by ablating experts and by checking whether load tracks domain.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Increase the auxiliary loss weight." Ignores the interference gradient and the perplexity cost of a large \(\alpha\).</li>
+          <li>"Drop tokens over capacity." That is a symptom-handler with a measured quality cost.</li>
+          <li>Measuring balance only as a training-average, or only per micro-batch.</li>
+          <li>Forgetting router precision.</li>
+          <li>No mention that aux-loss-free balancing balances a batch, not a sequence, and shifts under inference-time domain drift.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Derive the gradient of the auxiliary loss with respect to a token's probability for expert \(i\), and say why it reaches the backbone.</li>
+          <li>Why is the bias excluded from the gate value that multiplies the expert output?</li>
+          <li>Compare sequence-wise, micro-batch and global-batch balance for domain specialization.</li>
+          <li>How does imbalance become cost under expert parallelism, and what does V3 do about it at inference?</li>
+          <li>How would you tell collapse from healthy domain specialization in your load plots?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-rl-reward-eval">
+    <h3><span class="sc-tag debug">Debugging</span>7. RL reward rises but eval falls</h3>
+    <p class="sc-meta">Suggested time: 25 min. Draws on <a href="23-rlhf.html">23</a>, <a href="24-rlvr-reasoning.html">24</a>, <a href="25-rl-systems-agentic.html">25</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You are running GRPO on a coding-agent task. The training reward has climbed for 300 steps. Your held-out evaluation was flat for the last 100 steps and is now dropping. What are the hypotheses, and how do you tell them apart?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Four families of hypotheses, kept separate.</strong> (a) The reward is being gamed (reward hacking <span class="zh">奖励黑客</span> or verifier exploitation). (b) The optimization is drifting off-policy (training-inference mismatch, staleness). (c) The policy is collapsing or overfitting (entropy, length, narrow prompts). (d) The evaluation is the artifact (different harness, contamination, noise). Each predicts different logs.</li>
+          <li><strong>Read the reward, literally.</strong> Sample the highest-reward trajectories every few hundred steps. For agents the attack surface is the environment: editing or deleting tests, <code>sys.exit(0)</code> before the asserts, raising SkipTest, an always-equal object, patching pytest's reporting, stubbing a dependency, reading a leaked reference solution. In OpenAI's frontier run, exit(0) and SkipTest "quickly get reinforced and become systemic, affecting nearly every training environment" (<a href="25-rl-systems-agentic.html#hacking">page 25</a>). Defenses: isolate the verifier where the agent cannot write, restore tests at scoring time, require more than one signal (V3.2's rule: fail-to-pass above 0 and pass-to-fail equal to 0), detect known hacks with regexes and monitors, offer a legitimate exit (an explicit abort option cut GPT-5's cheating on ImpossibleBench from 54% to 9%), and evaluate on a different harness, which is the cheapest way to see reward and true quality diverge.</li>
+          <li><strong>If the reward is a learned model, expect the Gao curve.</strong> The proxy keeps rising while the gold reward peaks and then falls (<a href="21-preference-optimization.html#over-optimization">page 21</a>). R1's stage 4 shows it in production: the reward kept rising while Codeforces pass@1 fell, so preference-model rewards were used for only the last 400 of 1,700 steps (<a href="28-deepseek-3-reasoning.html#r1-stage4">page 28</a>). Stop on a held-out signal (Llama 2 stops PPO after 200 to 400 iterations; Tulu 3 picks checkpoints every 40 to 100 steps) and refresh the proxy.</li>
+          <li><strong>Check the length and entropy curves together with validation accuracy.</strong> Length grows for four different reasons (real reasoning, the \(1/|o|\) bias, a raised cap, loops), and DAPO found training reward "often exhibits little correlation" with validation accuracy. A rising share of zero-advantage groups, or entropy going to zero within tens of steps, says the signal is exhausted (<a href="24-rlvr-reasoning.html#monitor">page 24 monitoring table</a>).</li>
+          <li><strong>Measure the engine-trainer gap from step 0.</strong> The sampler and trainer compute different token probabilities (kernels, precision, sampling adjustments, MoE routing). A per-token gap of 0.01 nats is invisible against a clip range but compounds in a sequence ratio to \(e^{10} \approx 22{,}000\) at 1K tokens (same sign) and \(e^{160}\) at 16K; with random signs it grows as \(\sqrt{T}\). In the collapsed runs of one MoE study the share of tokens whose probabilities differed by more than 2× passed 10% after step 60. Log per-token KL, that extreme-token fraction and probability correlation; fixes from cheap to drastic are truncated importance sampling, an FP32 LM head (MiniMax raised the correlation from 0.987 to 0.997), keeping the sampling mask and routing (V3.2's Keep Sampling Mask and Keep Routing), and batch-invariant kernels (<a href="25-rl-systems-agentic.html#mismatch">page 25</a>).</li>
+          <li><strong>Do not train hard against the monitor.</strong> In Baker et al.'s honeypot experiment, folding a chain-of-thought monitor into the reward first helped and then produced obfuscated hacking, with monitor recall near zero. Use flags to patch environments and gate releases.</li>
+          <li><strong>A plan that discriminates.</strong> Evaluate held-out prompts on a different harness every ten or so steps; bisect by checkpoint; then run the cheapest test per hypothesis (read samples, compare engine and trainer log-probs on identical sequences, re-filter prompts to pass rates between 0.1 and 0.9).</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Reward hacking" asserted without reading a single trajectory.</li>
+          <li>"Lower the learning rate" or "train longer" without discriminating the hypotheses.</li>
+          <li>Not knowing that sampler and trainer disagree, or believing the PPO clip corrects for it.</li>
+          <li>Evaluating only on the training harness.</li>
+          <li>Adding the detector to the reward and calling it solved.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>If the reward were a learned reward model, what does Gao et al. predict for proxy and gold reward against KL?</li>
+          <li>How do you separate a hack from a policy that has simply narrowed onto easy prompts?</li>
+          <li>What does a 0.01-nat per-token mismatch do to a sequence-level importance ratio at 16K tokens, with the same sign and with random signs?</li>
+          <li>Why not add the hack detector to the reward?</li>
+          <li>What do you log at step 0 so that a later collapse can be diagnosed?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-longctx-regress">
+    <h3><span class="sc-tag debug">Debugging</span>8. Long-context eval regresses after extension</h3>
+    <p class="sc-meta">Suggested time: 20 to 25 min. Draws on <a href="10-long-context.html">10</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You extended an 8K model to 128K: RoPE rescaling, continued pretraining on long data, then SFT. The needle-in-a-haystack grid is all green. But short-context benchmarks fell after the extension stage, and RULER at 128K after SFT is lower than before SFT. Walk me through the diagnosis."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Localize the regression by stage and by kind.</strong> Evaluate every checkpoint (base, each extension stage, post-SFT) on a short-context suite, a long-context suite and per-position loss. Llama 3 did this deliberately: it advanced a stage only after short-context evaluations "recovered completely" and the model perfectly solved needle tasks at that length (<a href="10-long-context.html#llama3-recipe">page 10</a>). Two distinct problems here: short-context loss (extension) and long-context loss (SFT).</li>
+          <li><strong>Why the short-context numbers fell.</strong> Rescaling that is static changes behavior at every length (V3's YaRN is applied always, so its short-context numbers must be reported alongside). In LongRoPE2's setup on Phi3-mini (GSM8K 78.54 originally), plain YaRN falls to 57.39, NTK to 63.99, LongRoPE to 67.17, LongRoPE2 holds 73.62. And the data mix: ProLong's best mixture is about 60% long and 40% high-quality short, short-task performance falls monotonically with the long fraction, and an all-long mix is a poor initialization for SFT (<a href="10-long-context.html#regression">page 10</a>).</li>
+          <li><strong>Why long-context ability fell after SFT.</strong> Llama 3 saw significant long-context regressions from naively applying its SFT recipe with only short-context data, and fixed it with synthetic long data (question answering over long documents, hierarchical summarization, reasoning over repositories, 16K to 128K) at 0.1% of the SFT mix, with DPO on short data only. ProLong and UltraLong did not see it, so the effect depends on how strong the long pretraining was, and ProLong found synthetic long instruction data did not help and even 1% hurt: an open question, not a rule (<a href="10-long-context.html#mix">page 10</a>).</li>
+          <li><strong>Distrust the green grid.</strong> Needle-in-a-haystack is a floor: Llama 3.1 70B scores 100.00 on passkey retrieval and 2.22 on key-value retrieval at 128K; NoLiMa cuts Llama 3.3 70B from 97.3 to 42.7 at 32K when the literal match is removed. Add RULER with an effective-length <span class="zh">有效上下文长度</span> pass mark, NoLiMa-style non-literal needles, per-position loss (averaged loss hides retrieval failures: two mixtures differed by at most 0.01 in loss yet one performed badly on precise retrieval), and a realistic suite after the same SFT (<a href="10-long-context.html#evaluation">page 10</a>).</li>
+          <li><strong>Silent configuration mismatches.</strong> Two YaRN ramps circulate (linear in \(L/\lambda\) in the paper, linear in pair index in the reference code), and "a model tuned with one and served with the other differs silently." Check the RoPE base, the scale factor, whether the attention temperature is applied, and whether training and serving agree. Also document masking: Llama 3 masks across packed documents and calls it important in continued pretraining on very long sequences; V3 does not.</li>
+          <li><strong>Fixes, with costs.</strong> Mix high-quality short data into the long stage; small stages with a gate each; dynamic scaling below the trained length or per-length factor sets (cost: two RoPE configurations to serve and a KV recompute when the length crosses the switch); start from an instruct model or restore instruction data; raise the RoPE base further, since analytic rules undershoot (ProLong at 64K: long average 29.1 at base 0.5M, 48.7 at 4M, 54.6 at 8M); and train longer than you evaluate (moving ProLong from 64K to 512K training at the same extra tokens improved every 64K category). Budget honestly: cheap rescaling gets passkey-level retrieval (PI: 200 steps at 32K), robust use needs billions of long tokens (ProLong 40B, Llama 3 about 800B).</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Needle-in-a-haystack passes, so the model uses the context."</li>
+          <li>"Just apply YaRN," with no training and no short-context check.</li>
+          <li>Training on only long documents.</li>
+          <li>Comparing checkpoints under different RoPE serving configurations.</li>
+          <li>Not separating the extension regression from the SFT regression.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Why does a static rescaling change short-context behavior, and how do dynamic or per-length schemes avoid it?</li>
+          <li>How many long tokens do you need for retrieval, and how many for robust use? Give the ranges you know.</li>
+          <li>Document masking at 128K: what does it cost and what does it buy?</li>
+          <li>How far should you raise the RoPE base, and how would you find out?</li>
+          <li>Design the regression suite you would gate each stage on.</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-70b-2k">
+    <h3><span class="sc-tag systems">Systems</span>9. Plan training of a 70B model on 2K GPUs</h3>
+    <p class="sc-meta">Suggested time: 30 min. Draws on <a href="15-distributed-training.html">15</a>, <a href="34-back-of-envelope.html">34</a>, <a href="13-scaling-laws.html">13</a>, <a href="14-optimization.html">14</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You have 2,048 H100s. Plan the pretraining of a Llama-3-70B-shaped dense model on 15 trillion tokens. Tell me the parallelism layout, the memory per GPU, how long it takes, and what you would worry about."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Size the job first.</strong> \(C = 6ND = 6 \times 70.55\text{B} \times 15\text{T} = 6.35 \times 10^{24}\) FLOPs. At 40% MFU one H100 sustains \(0.40 \times 989.4 = 395.8\) TFLOP/s, so the run is 4.46M GPU-hours, or \(4.46\text{M}/2048/24 \approx 91\) days, about $8.9M at $2 per GPU-hour (<a href="34-back-of-envelope.html#q-training">page 34, D14</a>). Page 15's 1,024-GPU plan takes 181 days; this is half that. MFU is the assumption to state as a range: 35% to 45% moves 91 days to about 104 or 81. For calibration, Llama 3 405B reached 38% to 43% on H100 (<a href="15-distributed-training.html#mfu">page 15</a>).</li>
+          <li><strong>Memory, then layout.</strong> Mixed-precision Adam holds \(16N = 1.13\) TB of states (<a href="15-distributed-training.html#memory">page 15</a>). ZeRO-1 alone still leaves \(4N = 282\) GB of bf16 weights and gradients per GPU, so a model-parallel dimension is required. The whiteboard procedure (<a href="15-distributed-training.html#procedure">page 15</a>): tensor parallelism 8 inside the node (\(n_{kv} = 8\) divides evenly), sequence parallelism on; pipeline parallelism 4 across nodes (20 layers per stage); data parallelism \(2048/32 = 64\) with ZeRO-1. Per GPU: about 4.4 GB of parameters, 4.4 GB of gradients, about 0.4 GB of sharded optimizer state and about 22.8 GB of activations (\(34\,sbhL/t\) with selective recomputation): about 32 GB of 80.</li>
+          <li><strong>The bubble is the trap, and the batch decides it.</strong> With a 16.8M-token batch (2,048 sequences of 8K) and 64 replicas, each replica has \(m = 2048/64 = 32\) micro-batches, so the bubble \((p-1)/m = 3/32 = 9.4\%\) of ideal compute, double the 4.7% of page 15's 1,024-GPU plan, because more replicas at a fixed batch means fewer micro-batches each. Interleaved stages with \(v = 2\) divide it to 4.7% at the price of more point-to-point messages; the alternative is fewer stages or a larger batch, which must stay under the critical batch size (<a href="14-optimization.html#batch">page 14</a>). It is worst early when the batch is small (Llama 3 ramps from 4M to 16M tokens).</li>
+          <li><strong>Price the communication of each dimension</strong> (page 15's plan for 1,024 GPUs, halved step time here): TP on NVLink moves 939.5 MB per layer per micro-batch, 16% of layer compute if not overlapped, and would be 141% over InfiniBand, so it stays in the node; pipeline sends 134 MB per boundary, about 1% of a stage's compute; the ZeRO-1 reduce-scatter and all-gather of 4.4 GB each take 0.17 s, about 1% of a 17.5 s step there and about 2% of the 8.8 s step here, and overlap with backward.</li>
+          <li><strong>Why not the alternatives.</strong> Pure FSDP with TP 8 must re-gather a 17.6 GB tensor-parallel slice per micro-batch: 0.70 s of network against 1.10 s of compute, workable only with near-perfect overlap. ZeRO-2 or ZeRO-3 without TP or PP puts collectives on the critical path. Pipeline depth 2 or 1 removes the bubble but enlarges each replica's data-parallel shard to 4.4B or 8.8B parameters. Say that this plan is one good answer, not the only one, and that you would measure.</li>
+          <li><strong>Precision, schedule, reliability.</strong> bf16 with fp32 master weights is the default; FP8 is an option validated within 0.25% of BF16 loss in V3's recipe, with Llama 3 405B's caution about outlier-driven scale corruption (<a href="15-distributed-training.html#fp8">page 15</a>). Schedule: long warmup (Llama 3 used 8,000 steps), cosine or plateau-then-decay, a batch ramp. At 2,048 GPUs failure is a rate: Llama 3 had 466 interruptions in 54 days on 16K GPUs and still kept over 90% effective training time, so checkpoint interval, restart time and node cordoning are part of the recipe. The 91 days exclude the ablations and scaling-law runs that chose the recipe.</li>
+          <li><strong>Question the token budget.</strong> 15T tokens on 70.55B parameters is about 213 tokens per parameter against Chinchilla's 20: a deliberate inference-cost decision (<a href="13-scaling-laws.html#overtraining">page 13</a>), and you should say what serving volume justifies it.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"Use FSDP everywhere," with no communication or bubble arithmetic.</li>
+          <li>Tensor parallelism across nodes, or a TP degree that does not divide the KV heads.</li>
+          <li>Assuming 100% MFU, or not stating the assumption.</li>
+          <li>Counting weights and optimizer state but not activations, logits or fragmentation.</li>
+          <li>No plan for failures, and no check that the global batch and micro-batch count make the bubble small.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>You grow the cluster to 6,144 GPUs at the same batch and layout. What happens to the bubble, and what are your options? (Page 34 finds 28%.)</li>
+          <li>Why TP of exactly 8, and what constrains it besides the node size?</li>
+          <li>Where does the memory go per GPU? Derive the 16 bytes per parameter and the activation term.</li>
+          <li>The InfiniBand links run at half the expected bandwidth. Which dimension suffers first?</li>
+          <li>How would you validate the layout and the MFU estimate on a small slice before committing the whole cluster?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-mfu">
+    <h3><span class="sc-tag systems">Systems</span>10. Training runs at 25% MFU</h3>
+    <p class="sc-meta">Suggested time: 20 min. Draws on <a href="15-distributed-training.html">15</a>, <a href="16-gpus-kernels.html">16</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "A 70B dense job on 512 H100s reports 25% model FLOPs utilization <span class="zh">模型浮点运算利用率</span>. The plan assumed 40%. Where does the time go, and what do you try first?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Audit the number before the job.</strong> MFU \(= \text{tokens/s per GPU} \times (6N + 12LdT)/\text{peak}\); which \(N\), whether the attention term is counted and whether it is halved for causality, and which peak. For Llama-3-8B at 500,000 tokens/s on 64 H100s the same run is 40.6% with attention and 38.0% with the naive \(6N\), and quoting against the 1,979 TFLOP/s sparsity figure would halve it; FlashAttention-2's 72% counts attention without the causal halving (<a href="15-distributed-training.html#mfu-numbers">page 15</a>, <a href="16-gpus-kernels.html#profiling">page 16</a>). And for an MoE run in FP8, the BF16 and FP8 denominators differ by 2×: V3 is 34.6% against the BF16 peak and 17.3% against the FP8 peak.</li>
+          <li><strong>Calibrate expectations.</strong> Llama 3 405B: 43% at 8K on 8,192 GPUs, 41% at 16,384 (a smaller batch per data-parallel group at fixed global tokens), 38% at 128K. Megatron 530B reached 54.2% with sequence parallelism and selective recomputation; PaLM 46.2%. Small models run lower: the 8B model cards' GPU-hours imply 14% to 16% (<a href="34-back-of-envelope.html#q-training">page 34</a>). So 25% at 70B is low but not absurd; the question is where the missing 15 points are.</li>
+          <li><strong>Method: write the bound, measure end to end, break it down, classify.</strong> Get tokens/s and MFU, then a timeline (torch.profiler, Nsight Systems). Gaps between kernels mean launch overhead, host synchronization, data loading or communication, and you fix those before any kernel. Then classify each large kernel with achieved bandwidth and tensor-pipe utilization: near the bandwidth peak means memory-bound (cut bytes), near the tensor peak means nothing is left but overlap and precision, near neither means occupancy or latency (<a href="16-gpus-kernels.html#profiling">page 16</a>). The nvidia-smi "GPU-Util" figure only says some kernel was running, so it is useless here.</li>
+          <li><strong>The usual suspects on a multi-node dense run</strong> (<a href="15-distributed-training.html#mfu-limits">page 15</a>): exposed communication (tensor-parallel all-reduce that leaves the node is 141% of layer compute over InfiniBand against 16% on NVLink; data-parallel or FSDP collectives not overlapped with backward: for the 8B model on 64 GPUs full FSDP moves 379 GB per step, 7.6 s against an 8.0 s step); pipeline bubbles (\((p-1)/m\) is 23.4% at \(p = 16\), \(m = 64\)); small kernels (narrow shards, tiny micro-batches, non-fused norms and elementwise chains); stragglers and stalls (one slow node, dataloader, checkpoint writes); and recomputation, which is not counted as useful work (HFU \(\approx \frac{4}{3}\)MFU with full recomputation).</li>
+          <li><strong>Fixes in order of payoff:</strong> do not materialize (FlashAttention), fuse memory-bound chains, lower precision, fix shapes and alignment (multiples of 64 or 128, tile and wave quantization), CUDA graphs for launch-bound steps, overlap communication. Then revisit the layout: "the best parallelism is the least parallelism," since each extra dimension adds a bubble, small GEMMs or slow-link traffic.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"GPU utilization is 100%, so it is fine."</li>
+          <li>"Turn on FP8" or "increase the batch size" as the first move, before profiling and without checking the memory and critical-batch consequences.</li>
+          <li>Comparing MFU numbers with different FLOP conventions or peaks.</li>
+          <li>Looking only at kernels, not at the gaps between them.</li>
+          <li>No target: not knowing what a good MFU is for this shape of run.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>How would you tell exposed communication from a compute stall in the timeline?</li>
+          <li>Why does the same 8B job show 40.6% by one convention and 38.0% by another?</li>
+          <li>What lowers MFU when the context grows to 128K, and what does context parallelism cost?</li>
+          <li>When does FSDP beat tensor plus pipeline parallelism, and when not?</li>
+          <li>What is the difference between MFU and HFU, and why did PaLM introduce MFU?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-moe-serving">
+    <h3><span class="sc-tag systems">Systems</span>11. Cut inference cost of a 671B MoE by 2x</h3>
+    <p class="sc-meta">Suggested time: 30 min. Draws on <a href="17-inference-serving.html">17</a>, <a href="27-deepseek-2-v3.html">27</a>, <a href="08-mixture-of-experts.html">08</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "You serve a DeepSeek-V3-class model: 671B parameters, 37B activated, FP8 weights, on H800 or H100-class GPUs. Cost per output token has to halve without hurting quality. What do you do, and in what order?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Define and measure the objective.</strong> \(\$/\text{M tokens} = p\,G/(3600 \cdot \text{tokens/s within SLO}) \times 10^6\), where only requests meeting the SLO count (goodput; for example p90 TTFT 0.25 s and p90 TPOT 0.1 s). DeepSeek's published day: 226.75 nodes at $2 per GPU-hour is $87,072; 608B input tokens (56.3% cache hits) and 168B output; about 14.8k output tokens/s per decode node, $0.30 per million output tokens; decode is 58% of GPU time and 65% of revenue (<a href="17-inference-serving.html#cost-anchor">page 17</a>). So attack decode, and be clear about which resource binds.</li>
+          <li><strong>What binds for this model.</strong> Memory is weights, not KV: 671 GB of FP8 weights (at least 9 GPUs of 80 GB just for weights; 8×H200 fits with 457 GB left), while the MLA cache is 68.6 KiB per token, about 350 MB for DeepSeek's average 4,989-token sequence. Routed experts are 653.9B, 97.5% of the parameters. Bandwidth: with \(B\) tokens per step and top-8 of 256, each expert sees \(B/32\) tokens, so reaching the FP8 ridge of about 295 tokens per expert needs \(B \approx 9{,}440\) tokens per step across the group; DeepSeek says its per-expert batch is within 256, so the MoE part is memory-bound (<a href="17-inference-serving.html#moe-batch">page 17</a>). And the "37B active" advantage vanishes at moderate batch: uniform routing touches 8 experts of 256 at \(B = 1\), 57 at 8, 163 at 32, 252 at 128, essentially all beyond about 100 tokens. On 8×H200 a step reads about 37 GB (1 ms) at batch 1 and about 660 GB (17.2 ms) at batch 128: 18× the step time for 128× the batch, so an idealized per-token cost falls about 7×.</li>
+          <li><strong>Levers, roughly in order of payoff, each with its price.</strong>
+            <ul>
+              <li><em>Pool tokens into a wide expert-parallel group.</em> V3's decode unit: attention data-parallel (DP80, TP4) feeding EP320, one expert per GPU; production ran EP144. Giving each GPU 1 expert instead of 32 cuts per-step weight reads from 81.7 GB (24.4 ms, and it does not fit) to 2.55 GB (0.76 ms) (<a href="17-inference-serving.html#moe-batch">page 17</a>). Price: all-to-all at every layer (hide it by overlapping two micro-batches; FP8 dispatch, BF16 combine), a large minimum deployment the V3 report concedes is a burden for small teams, and stragglers, handled with redundant experts re-chosen from load statistics (about every 10 minutes) and three balancers (<a href="17-inference-serving.html#moe-econ">page 17</a>).</li>
+              <li><em>Cache hits.</em> DeepSeek's input tokens hit the cache 56.3% of the time, and cached input is priced 3.9× lower ($0.14 against $0.55 per million); the small MLA cache makes storing prefixes cheap.</li>
+              <li><em>Speculative decoding with the MTP head.</em> 85% to 90% acceptance and 1.8× tokens per second on V3. Caveats for an MoE: verifying a 5-token draft at batch 1 touches about 37.6 experts, roughly 4.7× the expert weights of a normal step; the sweet spot is moderate batch, where all experts are read anyway (MoESD: up to 2.29×); at large batch verification becomes compute-bound and the gain fades (<a href="17-inference-serving.html#spec-limits">page 17</a>).</li>
+              <li><em>Quantize where the bytes are.</em> 4-bit routed experts shrink 654 GB to about 347 GB (\(653.9 \times 4.25/8\), MXFP4-style), safe only with quantization-aware training as in V4 and gpt-oss, and quality must be measured. INT4 everywhere is not the answer: weight-only gains fade beyond about 76 tokens per step and do nothing for prefill.</li>
+              <li><em>Disaggregate prefill and decode.</em> DistServe's example gives 2.1× goodput; V3 uses a 32-GPU prefill unit (EP32) and a 320-GPU decode unit. Price: KV transfer and two pools to size, and it pays least for short prompts, high hit rates or small clusters.</li>
+              <li><em>Fill the fleet:</em> DeepSeek reassigns idle nodes at night; low utilization is a cost lever too.</li>
+            </ul>
+          </li>
+          <li><strong>Composition and honesty.</strong> Levers multiply only when they act on different terms. Where you start decides everything: from a small node at low batch, pooling alone can give several×; from an already wide EP deployment, MTP plus 4-bit experts is the more likely 2×. Say which you would try first, what you would measure (goodput under the SLO, per-expert token count, experts read per step, acceptance rate, hot-expert load), and that every change gets a quality regression run.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"It only activates 37B parameters, so it is like serving a 37B model." All 671B must be resident, and beyond about 100 tokens per step nearly all experts are read.</li>
+          <li>"Quantize to INT4." Ignores KV, activations, prefill, the batch at which the gain fades, and quality risk.</li>
+          <li>"Add more GPUs" without a cost model or an SLO.</li>
+          <li>Speculative decoding claimed as a free 2× regardless of batch and of MoE expert reads.</li>
+          <li>No mention of load imbalance or all-to-all cost.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Why does speculative decoding help less for an MoE at batch 1 than for a dense model?</li>
+          <li>Why does very wide expert parallelism lower latency and not only raise throughput?</li>
+          <li>What is the minimum deployment for weights alone, and what does the KV cache add?</li>
+          <li>How do you size the prefill and decode pools for a given prompt-to-output ratio?</li>
+          <li>What would you monitor to catch expert stragglers, and what do you do when you see one?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-deepseek-critique">
+    <h3><span class="sc-tag paper">Paper deep dive</span>12. Walk me through DeepSeek-V3 and R1, then critique one design choice</h3>
+    <p class="sc-meta">Suggested time: 30 to 35 min. Draws on <a href="26-deepseek-1-foundations.html">26</a>, <a href="27-deepseek-2-v3.html">27</a>, <a href="28-deepseek-3-reasoning.html">28</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "Take DeepSeek-V3 and then R1. Give me the five-minute version: what each part is for. Then pick one design decision you would change or at least test, and defend that with evidence."</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>A walkthrough organized by bottleneck, not by table of contents.</strong> The report calls V3 an "optimized co-design of algorithms, frameworks, and hardware", and each part answers one bottleneck (<a href="27-deepseek-2-v3.html#overview">page 27</a>): KV cache, MLA (576 numbers per token per layer, 70,272 B per token over 61 layers, smaller than Llama-3-8B's 131,072 B); FLOPs, sparse MoE (1 shared plus 256 routed experts of width 2,048, 8 active, first 3 layers dense; 671B total, 37B activated, experts hold 97.8% of the parameters); router collapse, aux-loss-free bias balancing (\(\gamma = 10^{-3}\)) with a sequence-wise loss of \(10^{-4}\); signal per token and decoding, multi-token prediction of depth 1; matmul throughput and memory, FP8 training with 1×128 activation tiles, 128×128 weight blocks and FP32 promotion every 128 elements, within 0.25% of BF16 loss at two scales; all-to-all, node-limited routing (at most 4 nodes), DualPipe and a layout with no tensor parallelism (16-way pipeline, 64-way expert parallel, ZeRO-1) on 2,048 H800s. Numbers: 14.8T tokens, 180K GPU-hours per trillion, 2.788M GPU-hours, $5.576M at $2, about 34.6% MFU against the BF16 peak (38.9% measured, causal). Context: 4K, then YaRN to 32K then 128K, 1,000 steps each, 119K GPU-hours.</li>
+          <li><strong>R1 as four repairs.</strong> R1-Zero: GRPO with rule-based accuracy and format rewards on V3-Base, AIME 2024 15.6% to 77.9%, but unreadable and language-mixed. Cold-start SFT buys readability and instruction following at a cost (AIME falls to 59.0); reasoning RL with a language-consistency reward recovers it (74.0); rejection sampling into an 800K SFT set restarts from the base model (78.1); a final RL stage for all scenarios adds breadth (IF-Eval 46.6 to 83.3, AlpacaEval 24.7 to 87.6) with preference-model rewards in only the last 400 of 1,700 steps because reward hacking showed up. The RL programme cost 147K GPU-hours, 5.3% of V3's, because the expensive asset was the base. Distillation from R1 beat RL on the small model (AIME 72.6 for the distilled 32B against 47.0 for RL alone); PRMs and MCTS failed (<a href="28-deepseek-3-reasoning.html#r1">page 28</a>).</li>
+          <li><strong>The critique has a fixed shape:</strong> the decision and the bottleneck it served; the evidence and its scope (single runs, own lab, scale, benchmarks); the strongest objection; the experiment that would decide it; what would change your mind. State honestly what the sources do not show. Good targets, each with the evidence on the page:
+            <ul>
+              <li><em>DualPipe.</em> The bubble claim is analytical (Table 2); no ablation against 1F1B and no measured MFU. Kimi K2 declines it because it doubles parameter and gradient memory, Ling 2.0 found the end-to-end gain limited. It pays in V3's regime (large expert-parallel group, communication comparable to compute) (<a href="27-deepseek-2-v3.html#dualpipe">page 27</a>).</li>
+              <li><em>Multi-token prediction.</em> Worked example: 17 of 20 ablation cells improve, mostly code and math (large model HumanEval 44.5 to 53.7, GSM8K 72.3 to 74.0), but Pile bits per byte barely moves (0.658 to 0.657), large-model MMLU falls (67.5 to 66.6), the runs are single and at a tenth or less of the final token count, and the report's own wording is hedged ("may improve"). The serving benefit is real and separable (85% to 90% acceptance, 1.8×, consistent with \(1 + p\) tokens per step), and V4.1 dropped MTP from backbone pretraining for a separate module. Test: matched-token, matched-FLOP runs with several seeds at two scales, against a drafter trained afterwards (<a href="27-deepseek-2-v3.html#mtp">page 27</a>).</li>
+              <li><em>Aux-loss-free balancing.</em> Gains are consistent but small (large-model MMLU moved from 68.3 to 67.2), from single runs on the authors' baselines; batch-level balance cannot police one sequence, which is why V3 adds a sequence-wise loss and redundant experts at inference (<a href="08-mixture-of-experts.html#aux-free">page 08</a>).</li>
+              <li><em>Node-limited routing.</em> It constrains routing freedom to save all-to-all traffic; V4 removed the limit and redesigned its parallelism to compensate.</li>
+              <li><em>FP8 training.</em> Quality parity is well supported, but the report gives no measured speedup; the independent figure (Ling 2.0) is about +15% MFU, far from 2× (<a href="27-deepseek-2-v3.html#fp8-evidence">page 27</a>).</li>
+              <li><em>The evidence for emergent reasoning in R1-Zero.</em> Response length jumps at step 8.2K, exactly where the cap doubled; V3-Base already shows "aha" moments before RL; GRPO's length normalization inflates wrong answers. RL selects and amplifies behaviors the base has (<a href="28-deepseek-3-reasoning.html#r1-zero">page 28</a>).</li>
+              <li><em>The $5.6M headline.</em> It excludes ablations (a lower bound of about 19% of the main run's FLOPs from the report's own tables), the R1-series data, staff and cluster ownership, and 35% MFU on H800s is the product of engineering that sits in the excluded cost (<a href="27-deepseek-2-v3.html#headline">page 27</a>).</li>
+            </ul>
+          </li>
+          <li><strong>Know the lineage.</strong> V4 changed several V3 choices: sigmoid affinities to Sqrt(Softplus), the node limit removed, the three dense layers replaced by hash-routed MoE, MLA replaced by CSA and HCA, AdamW by Muon, and V3.2's mixed RL stage by on-policy distillation (with no ablation shown against it). Each report ends with limitations that the next release answers (<a href="28-deepseek-3-reasoning.html#arc">page 28</a>).</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>A table-of-contents recitation with no "why" and no numbers.</li>
+          <li>A critique that is vague ("MoE is complicated") or praises everything.</li>
+          <li>Facts that are wrong in ways an interviewer will catch: "V3 cost $5.6M in total"; mixing up which features belong to V3, R1 and V4; "R1 is R1-Zero made readable" (the cold-start checkpoint is worse at reasoning).</li>
+          <li>Treating one lab's single-run ablation as settled, or dismissing it without saying what experiment would decide.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Reconcile 671B total with 37B activated. Which parameters are always active?</li>
+          <li>Why no tensor parallelism, and what did DeepSeek do instead for memory?</li>
+          <li>What does 34.6% MFU mean, and why is it 17.3% against the FP8 peak?</li>
+          <li>Which V3 choices did V4 change, and what was the reason for each?</li>
+          <li>Why does AIME fall to 59.0 after the cold-start SFT, and what does each stage of R1 actually buy?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-real-gain">
+    <h3><span class="sc-tag paper">Paper deep dive</span>13. A claimed gain of 1.5 points: is it real?</h3>
+    <p class="sc-meta">Suggested time: 20 min. Draws on <a href="18-evaluation.html">18</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "A teammate reports that the new RL recipe beats the baseline by 1.5 points on AIME and on SWE-bench Verified, and wants to ship it. What do you ask, and what do you compute?"</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Size the noise per benchmark.</strong> \(\text{SE} = \sqrt{\hat p(1-\hat p)/n}\) (<a href="18-evaluation.html#statistics">page 18</a>). AIME has 30 problems, so one problem is 3.3 points and a 1.5-point gap is less than half a problem. In a toy model the standard error at \(n = 30\) is 9.1 points with one sample per problem and 5.4 with 64, because resampling shrinks only within-question variance, not difficulty variance; across 20 seeds a 1.5B reasoning model's AIME'24 pass@1 had a standard deviation of 5 to 6 points, hardware alone moved scores by up to 8 points, and a paired test found the OpenRS gains not significant. SWE-bench Verified has 500 problems: one score near 80% has a standard error of about 1.8 points, the difference between two models about 2.5, so a gap of 1.5 is 0.6 standard errors unpaired.</li>
+          <li><strong>Use paired statistics.</strong> Both models answer the same questions, so difficulty is shared: \(\text{SE}_{\text{paired}} \approx \sqrt{\delta/n}\) with \(\delta\) the fraction of questions where they disagree. At \(n = 500\) and two 70% models, the smallest detectable difference is 5.7 points unpaired, 3.9 at 20% disagreement, 2.8 at 10%. Worked example from the page: \(b = 40\) questions only A gets right, \(c = 25\) only B, gap 3.0 points; unpaired \(z = 1.04\), paired \(z = 1.87\), McNemar \(p = 0.082\): suggestive, not significant. Use a paired bootstrap resampling question indices, the same indices for both models. Detecting one point unpaired needs about 16,100 questions, or 7,700 paired at 20% disagreement.</li>
+          <li><strong>Compare like with like.</strong> The comparison must fix: the number of samples per question and the pass@1 estimator (mean over \(k\) samples at temperature 0.6, top-\(p\) 0.95, as R1 does), the token budget or effort level (an accuracy-against-tokens curve, since DeepSeek-V4-Pro scores 7.7, 34.5 and 37.7 on HLE across its three modes), the answer extraction and grader, and for agents the harness, tools, step limit and timeouts (scores depend on all of these; the Terminal-Bench Verified subset differs from the original by about 4 points). Report the model's data cutoff against the benchmark's release date (<a href="18-evaluation.html#reasoning">page 18</a>).</li>
+          <li><strong>Selection and multiplicity.</strong> Which checkpoint, prompt and seed were picked, and were they chosen on the test set? Twenty independent benchmarks at 5% give a 64% chance that at least one improvement is spurious. Fix the primary metric in advance, correct for the rest, and report all of them. Clustered questions (many per passage, or translations of one) need clustered errors: on DROP they were 3.05 times the naive ones.</li>
+          <li><strong>Contamination and real signal.</strong> Ask whether the training data could contain the test problems (n-gram filters miss paraphrase); prefer dated or private sets (LiveCodeBench, GSM1k-style rewrites, post-cutoff problems). For a tiny effect on a saturated benchmark, look at a discriminating held-out set and at cost: does the gain cost more tokens?</li>
+          <li><strong>The decision.</strong> A calibrated answer: "As reported it is inside noise. Give me per-question outcomes for both models, many samples per AIME question (page 18 finds about 30 are needed to stabilize a small reasoning model), a paired interval on each benchmark, the token budgets, and a second harness; if the interval excludes zero and the token cost is equal, ship it." Mention the cost side, not only accuracy.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>"1.5 is greater than 0, ship it."</li>
+          <li>A single seed, or greedy decoding for a long-reasoning model.</li>
+          <li>Comparing models at different token budgets, harnesses or sampling settings.</li>
+          <li>Unpaired intervals only, or no interval at all.</li>
+          <li>Treating a leaderboard rank among the top four as meaningful when the scores are within one to two standard errors.</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>Why is a paired comparison tighter than an unpaired one, and what determines how much tighter?</li>
+          <li>How many questions do you need to resolve a one-point difference between two 70% models?</li>
+          <li>Why can averaging 64 samples per question not rescue a 30-question benchmark?</li>
+          <li>The two models use different token budgets. How do you compare them fairly?</li>
+          <li>The gain is +0.8 on MMLU (14,042 questions). What do you need to know before believing it?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+
+  <article class="scenario-card" id="sc-surprise">
+    <h3><span class="sc-tag behav">Behavioral-technical</span>14. Tell me about a time an experiment result surprised you</h3>
+    <p class="sc-meta">Suggested time: 5 to 10 min, then follow-ups. Draws on <a href="11-stability-tweaks.html">11</a>, <a href="12-pretraining-data.html">12</a>, <a href="13-scaling-laws.html">13</a>, <a href="18-evaluation.html">18</a>, <a href="24-rlvr-reasoning.html">24</a>, <a href="25-rl-systems-agentic.html">25</a>.</p>
+    <div class="sc-prompt"><span class="sc-who">Interviewer:</span> "Tell me about a time an experiment gave you a result you did not expect. What did you do, and what did it change?" (Then, for someone from particle physics: "How does that carry over to research on language models?")</div>
+    <details class="scenario">
+      <summary>Rubric, weak answers and follow-ups</summary>
+      <div class="scenario-body">
+        <h4>A strong answer covers</h4>
+        <ul>
+          <li><strong>Pick a real story with a number in it,</strong> and tell it in about two minutes: the setup in one sentence; what you expected and why (a prior, a number); what you saw; how you made sure it was real; what you found; what changed in how you work. Interviewers score the middle of that list. "I checked whether it was a bug" is a claim; "I split by event identifier and the gain shrank from X to Y" is evidence.</li>
+          <li><strong>Show the debugging method, not only the punchline.</strong> Hypotheses ranked by cost to check; a control or null that could have proven you wrong; one variable changed at a time; seeds and an error bar; a held-out set you did not touch.</li>
+          <li><strong>Translate the story into LLM terms with concrete cases.</strong> The mapping is close, and each row has a fact from the course you can cite:
+            <div class="table-wrap"><table class="data">
+              <thead><tr><th>Your analysis habit</th><th>Its LLM-research counterpart</th><th>A fact you can quote</th></tr></thead>
+              <tbody>
+                <tr><td>Vary one nuisance parameter at a time (systematics)</td><td>Auditing a protocol before trusting a fitted law</td><td>Porian et al. remove Kaplan's confounds one at a time and the fitted exponent moves 0.835, 0.706, 0.602, 0.571, 0.497 (<a href="13-scaling-laws.html#discrepancy">page 13</a>)</td></tr>
+                <tr><td>Null control, shuffled labels</td><td>Random-reward and wrong-label baselines for RLVR</td><td>Random rewards lift Qwen2.5-Math by 21.4 MATH-500 points and Llama-3 and OLMo-2 hardly at all (<a href="24-rlvr-reasoning.html#spurious">page 24</a>)</td></tr>
+                <tr><td>Blinded analysis, held-out simulation</td><td>Private or dated test sets, contamination checks</td><td>Base models fall sharply on LiveCodeBench problems after their cutoff; a leaked file is the same event in both splits (<a href="18-evaluation.html#contamination">page 18</a>, <a href="12-pretraining-data.html#contamination">page 12</a>)</td></tr>
+                <tr><td>Error bars and pseudo-experiments</td><td>Seeds, paired tests, samples per question</td><td>AIME is 30 problems, 3.3 points each, and seed noise reaches 5 to 6 points (<a href="18-evaluation.html#statistics">page 18</a>)</td></tr>
+                <tr><td>Decorrelating a tagger from jet mass</td><td>Checking what a quality filter sculpts</td><td>Compare topic histograms before and after filtering, and evaluate on the domains the filter disfavors (<a href="12-pretraining-data.html">page 12</a>)</td></tr>
+                <tr><td>Data versus simulation mismatch</td><td>Trainer versus inference-engine mismatch</td><td>0.01 nats per token compounds to a sequence ratio of \(e^{10}\) at 1K tokens (<a href="25-rl-systems-agentic.html#mismatch-numbers">page 25</a>)</td></tr>
+                <tr><td>Validating on a second generator or tune</td><td>Second base-model family</td><td>A method validated on one family may exploit its quirks (<a href="24-rlvr-reasoning.html#spurious">page 24</a>)</td></tr>
+              </tbody>
+            </table></div>
+          </li>
+          <li><strong>Say where your habits break.</strong> Your tagger ran many epochs on a fixed simulated sample with exact labels and could be rerun with five seeds; pretraining is one pass over trillions of tokens, and a frontier run is one shot, so checks must be built in beforehand: small-scale proxies, replayable data, logs from step 0 (<a href="11-stability-tweaks.html#spikes">page 11</a>, <a href="14-optimization.html">page 14</a>). Benchmarks invert your comforts: hundreds of items, sometimes wrong labels, possible contamination, prompt-dependent metrics (<a href="18-evaluation.html">page 18</a>). Naming this shows you know the gap.</li>
+          <li><strong>Illustrative shape, to replace with your own facts.</strong> A classifier score rose sharply after a preprocessing change, which was more than physics expected. You suspected leakage between splits (the same simulated event reconstructed under two settings), re-split by event identifier before any featurization, and the improvement shrank to a fraction. Change in practice: split first, then featurize; add a null control to every result. LLM version: deduplicate and decontaminate before training, and evaluate on dated sets.</li>
+          <li><strong>Close with the transfer.</strong> One sentence linking the habit to the role: expensive, one-shot experiments make controls, baselines and error bars more valuable, not less.</li>
+        </ul>
+        <h4>Common weak answers</h4>
+        <ul>
+          <li>Vague ("the model did something weird"), with no expectation stated and no number.</li>
+          <li>A story whose surprise was a bug, with no lesson beyond "be careful."</li>
+          <li>No control: nothing shows how the candidate knew the surprise was real.</li>
+          <li>Ten minutes of detector physics and no bridge to the job, or claiming LLM experience you do not have. Better: say what you have not done and how you would approach it.</li>
+          <li>"Nothing has ever surprised me."</li>
+        </ul>
+        <h4>Follow-ups</h4>
+        <ol>
+          <li>How did you rule out a bug, and what was the cheapest check you ran first?</li>
+          <li>What was the control, and what would it have looked like if you were wrong?</li>
+          <li>If you could run the experiment only once, as in a frontier pretraining run, which of your checks would you keep?</li>
+          <li>Which physics habit transfers worst to language-model work, and why?</li>
+          <li>Which result in this course surprised you most, and how would you test whether it holds?</li>
+        </ol>
+      </div>
+    </details>
+  </article>
+</section>
+
+<section id="pitfalls">
+  <h2>How candidates lose points</h2>
+  <p>These failure modes recur across research-scientist and research-engineer loops, including for strong candidates. Each one has a habit that fixes it, and a page to practice the habit on.</p>
+  <ul>
+    <li><strong>Answering before scoping.</strong> Design prompts are underspecified on purpose. Ask what binds (compute, bandwidth, capacity), the quality target, the latency SLO and the hardware, then state your assumptions aloud. Page 34 calls this "assume, bound, compute, check" (<a href="34-back-of-envelope.html#method">page 34</a>).</li>
+    <li><strong>Adjectives instead of numbers.</strong> "A much smaller cache" loses to "576 elements per layer against 2,048, 68.6 KiB against 244 KiB per token." Know the constants and the arithmetic behind them (<a href="34-back-of-envelope.html#constants">page 34</a>, <a href="07-kv-efficient-attention.html#mla-numbers">page 07</a>).</li>
+    <li><strong>Reciting instead of explaining why.</strong> "V3 uses MLA and an auxiliary-loss-free router" is a list. The interviewer wants the bottleneck each choice served, the alternatives, the evidence and the cost. The decision cards on every page use that order (problem, idea, why it works, evidence, cost); rehearse it.</li>
+    <li><strong>Treating one lab's ablation as settled, or waving it away.</strong> Most architecture evidence is single runs by the adopting lab at small scale. Say what it shows, its scope, where other labs disagree, and what experiment would decide (<a href="09-beyond-full-attention.html#counter-trend">page 09</a>, <a href="27-deepseek-2-v3.html#mtp">page 27</a>).</li>
+    <li><strong>Grading with a metric that cannot fail.</strong> Perplexity, MMLU and needle-in-a-haystack saturate while long-range recall collapses (a windowed hybrid matched full attention on MMLU, 85.6 against 85.5, and lost 18 points on 128K extraction). Propose an evaluation that could refute you, and quote an interval (<a href="10-long-context.html#evaluation">page 10</a>, <a href="18-evaluation.html#statistics">page 18</a>).</li>
+    <li><strong>Unit and convention slips.</strong> Total against activated parameters, GB against GiB, bits against bytes, forward against training FLOPs, causal against full attention in MFU, sparse against dense peak. Name the convention; each can move a number by a factor of two (<a href="34-back-of-envelope.html#habits">page 34</a>).</li>
+    <li><strong>Guessing the fix before the diagnosis.</strong> A debugging answer that opens with "lower the learning rate" scores below one that triages first (NaN or finite, hardware or dynamics, which layer, real or an evaluation artifact), lists hypotheses with the log that confirms each, and says a rollback is a mitigation, not a diagnosis (<a href="11-stability-tweaks.html#diagnostics">page 11</a>, <a href="25-rl-systems-agentic.html#monitor">page 25</a>).</li>
+    <li><strong>Ignoring the systems cost of an algorithmic idea.</strong> DSA's indexer is \(O(L^2)\) and dominates at 1M tokens; sparse selection does not shrink the cache; non-deterministic top-k kernels degraded RL within a few steps; INT4 weights help only while the step is memory-bound. Every proposal needs a bytes-and-FLOPs line and a kernel-and-infrastructure line (<a href="09-beyond-full-attention.html#dsa">page 09</a>, <a href="17-inference-serving.html#quant-arith">page 17</a>).</li>
+    <li><strong>No experiment and no stopping rule.</strong> End a research answer with the first ablation, a baseline matched on parameters, tokens and recipe, the number of seeds, and the result that would make you change your mind.</li>
+    <li><strong>Bluffing.</strong> A confidently wrong fact costs more than "I do not remember; here is how I would derive it." When unsure of a number, give a range and the derivation. Do not claim language-model experience you do not have; use your physics background honestly (scenario 14).</li>
+    <li><strong>Monologue.</strong> Say the structure first ("three parts: the cost model, the options, the validation"), check in after each part, and go to the depth the follow-up signals. An answer that is correct but takes twenty minutes to reach the point loses to one that lands the main idea in two.</li>
+  </ul>
+</section>
 
 <section id="exercises">
   <h2>Exercises</h2>
@@ -89,7 +672,52 @@
   <p>Every answer cites the papers on its source page. The curated must-read list and the full reading list are on <a href="37-reading-list-glossary.html">page 37</a>.</p>
 </section>
 
-<!--CHEATSHEET-->
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Design answer.</strong>
+        <ol>
+          <li><em>Scope:</em> goal, quality metric, SLO, budget, hardware; state assumptions.</li>
+          <li><em>Cost model:</em> name the binding resource (FLOPs, bytes per step, resident memory, communication) and put one number on it.</li>
+          <li><em>Options by axis:</em> for each lever say what it saves, what it does not, and its price (KV bytes = layers × tokens × features × bytes).</li>
+          <li><em>Choose:</em> a default and a fallback, with the reason; stacking reductions on different axes beats a single trick.</li>
+          <li><em>Validate:</em> baselines matched on parameters, tokens and recipe; an ablation grid; small-scale proxies; an evaluation that can fail; real kernels and system metrics; intervals.</li>
+          <li><em>Risks:</em> what breaks at scale, what infrastructure it needs, what would change your mind. End with one summary sentence.</li>
+        </ol>
+      </li>
+      <li><strong>Debugging answer.</strong>
+        <ol>
+          <li><em>Restate</em> the symptom as a metric and a time.</li>
+          <li><em>Triage:</em> real or artifact (bug, evaluation, harness); NaN or finite; hardware or dynamics; where it starts (layer, batch, expert).</li>
+          <li><em>Hypotheses</em> ordered by prior and cheapness; for each, the log or test and the result that confirms it.</li>
+          <li><em>Mitigate now</em> (rollback and skip, pause, freeze) and say it is not a diagnosis.</li>
+          <li><em>Fix</em> one variable at a time, cheap to expensive, with a control run.</li>
+          <li><em>Prevent:</em> monitors from step 0, small-scale proxies, replayable data, a held-out set and a second harness.</li>
+        </ol>
+      </li>
+      <li><strong>Paper critique.</strong> Claim, mechanism, evidence, confounds, cost, next experiment, verdict.
+        <ol>
+          <li><em>Claim and mechanism:</em> one sentence, then the equations, shapes and what changes in bytes or FLOPs.</li>
+          <li><em>Evidence:</em> scale, baselines, seeds and intervals, loss against downstream metrics, who ran it.</li>
+          <li><em>Confounds:</em> unmatched tokens or parameters, per-arm tuning, contamination, conflicting results elsewhere.</li>
+          <li><em>Cost:</em> kernels, infrastructure, hyperparameters, where it fails.</li>
+          <li><em>Next experiment</em> with a decision rule; then a verdict: adopt, test, or skip, and under what conditions.</li>
+        </ol>
+      </li>
+      <li><strong>Napkin estimate.</strong>
+        <ol>
+          <li><em>Assumptions and units:</em> which \(N\), dtype, hardware (H100 SXM: 989.4 TFLOP/s dense bf16, 3.35 TB/s, 80 GB, ridge about 295 FLOPs per byte), batch, context.</li>
+          <li><em>Formulas:</em> \(C = 6ND\); \(2N\) per token forward; KV per token \(= L \cdot 2 n_{kv} d_h \cdot b\); decode step \(\ge (W + BT\kappa)/\text{BW}\); training time \(= C/(G\,P\,\text{MFU})\); ring all-reduce \(2\frac{n-1}{n}S/\text{BW}\).</li>
+          <li><em>Compute every bound</em> and take the largest time; name the binding resource.</li>
+          <li><em>Hunt the factor of 2:</em> sparse against dense peak, causal attention, forward against training, bits against bytes, GB against GiB, total against activated parameters.</li>
+          <li><em>Cross-check</em> against a public number (Llama 3 405B at 38% to 43% MFU; V3 at 2.788M H800 GPU-hours), then give a range and say which side of the truth a roofline is on.</li>
+        </ol>
+      </li>
+      <li><strong>Constants and habits.</strong> The full constants card and worked drills are on <a href="34-back-of-envelope.html#cheatsheet">page 34</a>. In every answer: say the structure first, use numbers and units, separate what the evidence shows from what you infer, and finish with the experiment that would prove you wrong.</li>
+    </ul>
+  </div>
+</section>
 
 <nav class="pager" aria-label="Previous and next page"></nav>
 </main>

@@ -532,7 +532,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     </tbody>
   </table></div>
   <p class="small muted">Scores from <a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4, Tab. 6</a> (other vendors' numbers as collected there); sizes from Table 1 above. SE uses the mean of the four scores. MMLU-Pro assumes the full 12,032-question set was used.</p>
-  <p>The MMLU-Pro and HLE orderings are resolved by question count alone. GPQA Diamond and Terminal-Bench differences among the top four are inside one to two standard errors, and the four SWE-bench Verified scores are indistinguishable. A leaderboard rank among them is noise. (V4's own note that Terminal-Bench scores move by about 4 points between the original and a verified subset is larger than the sampling error of the metric itself.)</p>
+  <p>The MMLU-Pro and HLE orderings are resolved by question count alone. GPQA Diamond and Terminal-Bench differences among the top four are inside one to two standard errors, and the four SWE-bench Verified scores are indistinguishable. A leaderboard rank among them is noise. (V4's own note that Terminal-Bench scores move by about 4 points between the original and a verified subset is about the size of one score's sampling error (4.9 points at \(n = 89\)), so environment and harness fixes can move a score as much as the noise that separates the top models.)</p>
 
   <aside class="callout note">
     <div class="callout-title">"Is +0.8 on MMLU real?" in numbers</div>

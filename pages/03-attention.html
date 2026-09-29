@@ -616,13 +616,11 @@ class CausalMHA(nn.Module):
 <path class="s-line-a" d="M440,222 L470,222"/><text x="478" y="226" class="s-small">linear layers: 2PT (P = 218.1M)</text>
 <path class="s-line-b" d="M440,242 L470,242"/><text x="478" y="246" class="s-small">attention scores and AV: 4T²d</text>
 <path class="s-line-b s-dash" d="M440,262 L470,262"/><text x="478" y="266" class="s-small">same, masked blocks skipped: 2T²d</text>
-<rect class="s-plain" x="108" y="66" width="352" height="116" rx="6"/>
-<text x="120" y="84" class="s-small s-bold s-td">Crossovers (purple dots)</text>
-<text x="120" y="100" class="s-small">T* = P / (2d) = 26,624 tokens (full 4T²d)</text>
-<text x="120" y="116" class="s-small">T* = P / d = 53,248 tokens (causal skipping)</text>
-<text x="120" y="140" class="s-small s-bold">Dots at T = 8K and 128K (attention / linear)</text>
-<text x="120" y="156" class="s-small">8K: 1.10 / 3.57 TFLOP, ratio 0.31</text>
-<text x="120" y="172" class="s-small">128K: 281 / 57.2 TFLOP, ratio 4.9</text>
+<rect class="s-plain" x="108" y="60" width="290" height="82" rx="6"/>
+<text x="120" y="78" class="s-small s-bold s-td">Crossovers (purple dots)</text>
+<text x="120" y="94" class="s-small">T* = P / (2d) = 26,624 tokens (full 4T²d)</text>
+<text x="120" y="110" class="s-small">T* = P / d = 53,248 tokens (causal skipping)</text>
+<text x="120" y="130" class="s-small">Small dots: T = 8K and 128K (ratios 0.31, 4.9)</text>
 </svg>
     <figcaption><b>Figure 3.</b> Forward FLOPs per layer per sequence at Llama-3-8B width, log-log. The linear layers grow with slope 1, attention with slope 2. At 8K attention is a third of the linear cost; at 128K it is nearly five times larger. The dashed line assumes a kernel that skips masked blocks.</figcaption>
   </figure>

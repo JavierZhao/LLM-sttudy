@@ -200,7 +200,7 @@
     <li><strong>It does not remove warm-up in practice.</strong> Llama 1 warms up for 2,000 steps <a href="https://arxiv.org/abs/2302.13971">[§2.3]</a> and Llama 3 405B for 8,000 steps <a href="https://arxiv.org/abs/2407.21783">[§3.4.1]</a>. Xiong et al. show warm-up <em>can</em> be dropped on their tasks, and note that the benefit of warm-up has also been attributed to variance in Adam's early adaptive learning rates <a href="https://arxiv.org/abs/2002.04745">[Related work]</a>.</li>
   </ul>
 
-  <h3 id="norm-variants">Newer variants (<a href="11-stability-tweaks.html">page 11</a> has the full treatment)</h3>
+  <h3 id="norm-variants">Newer variants (page 11 has the full treatment)</h3>
   <p>Two recent open recipes keep the norm out of the residual path but add norms elsewhere. <strong>Gemma 2</strong> applies RMSNorm to both the input and the output of every sublayer, \(x + \RMSNorm(F(\RMSNorm(x)))\) <a href="https://arxiv.org/abs/2408.00118">[Gemma Team 2024, §2, Table 1]</a>. <strong>OLMo 2</strong> drops the input norm and instead normalizes the sublayer <em>outputs</em>, \(h = x + \RMSNorm(\text{Attn}(x))\) and \(x' = h + \RMSNorm(\text{FFN}(h))\), together with QK-norm. In their ablation neither change helped alone, but together they cut the gradient-norm "spike score" from 0.108 to 0.069 <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1, §3.3.2]</a>. Both are consistent with He et al.'s principle: the norm only rescales what a branch adds, and the bus stays clean.</p>
 
   <figure class="fig">
@@ -340,9 +340,9 @@ class RMSNorm(nn.Module):
     <dl>
       <dt>Problem</dt><dd>LayerNorm's mean and bias add a reduction and parameters to every normalization, and normalization is applied twice per block.</dd>
       <dt>Idea</dt><dd>Normalize by the root mean square only, keep a per-channel gain, drop the mean subtraction and the bias.</dd>
-      <dt>Why it works</dt><dd>Re-scaling invariance, not re-centering, is what stabilizes training. The dropped direction (the all-ones vector) can be ignored by the next linear layer.</dd>
+      <dt>Why it works</dt><dd>Zhang and Sennrich hypothesize that re-scaling invariance, not re-centering, is what stabilizes training. <span class="unverified" title="My reasoning, not a result from the paper; the evidence for RMSNorm is empirical.">The dropped direction (the all-ones vector) can be ignored by the next linear layer.</span></dd>
       <dt>Evidence</dt><dd>Transformer-base WMT14: 26.8 vs 26.6 BLEU, 6.9% faster <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, Tab. 4]</a>. OLMo 2: no difference from the LayerNorm variant it replaced <a href="https://arxiv.org/abs/2501.00656">[§3.3.1]</a>.</dd>
-      <dt>Cost</dt><dd>Loses invariance to a constant shift of the input. Any effect on quality is too small to have been measured cleanly, and LayerNorm remains fine (PaLM used it).</dd>
+      <dt>Cost</dt><dd>Loses invariance to a constant shift of the input. The ablations cited above found no quality loss, and LayerNorm remains fine (PaLM used it).</dd>
       <dt>Used by</dt><dd>Llama 1 and 3, Qwen2 and Qwen3, OLMo 2, Gemma (Gemma 2 adds post-norms).</dd>
     </dl>
   </div>
@@ -387,7 +387,7 @@ llama_ffn_dim(4096, 1024, 1.3)   # 10922 -> 14198 -> 14336  (Llama-3-8B)
   <p>With Llama-3-8B's settings, <code>multiple_of = 1024</code> and <code>ffn_dim_multiplier = 1.3</code> (both listed for Llama 3 8B in Meta's <a href="https://github.com/meta-llama/llama-models/blob/main/models/sku_list.py">llama-models repository</a>, since the official <code>params.json</code> is gated), the chain is \(16384 \to 10922 \to 14198 \to 14336 = 14 \times 1024\), which matches Table 3 of the Llama 3 paper <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024, Table 3]</a>. Two lessons follow.</p>
   <ul>
     <li><strong>Llama 3 does not use \(\tfrac83 d\).</strong> Its FFN widths are 14,336, 28,672 and 53,248 for 8B, 70B and 405B, i.e. \(3.5d\), \(3.5d\) and \(3.25d\). The MLP has \(3 \cdot 3.5\,d^2 = 10.5\,d^2\) weights per layer: 31% more than the classical \(8d^2\) and 12.5% less than PaLM's \(12d^2\). The 8/3 rule is what you derive when asked to <em>match</em> a 4d MLP, not a law.</li>
-    <li><strong>The rounding is for hardware.</strong> OLMo 2 states the same practice ("approximately \(\tfrac83 d\), but increased to the closest multiple of 128 (11,008 for our 7B model) to improve throughput") <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1]</a>. The usual reasons are GEMM tile sizes and divisibility by the tensor-parallel degree (14,336 = \(2^{11} \cdot 7\)); the sources above give the practice and the throughput motive, not a breakdown.</li>
+    <li><strong>The rounding is for hardware.</strong> OLMo 2 states the same practice ("approximately \(\tfrac83 d\), but increased to the closest multiple of 128 (11,008 for our 7B model) to improve throughput") <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1]</a>. <span class="unverified" title="A common explanation; OLMo 2 states only that the rounding improves throughput.">The usual reasons are GEMM tile sizes and divisibility by the tensor-parallel degree</span> (14,336 = \(2^{11} \cdot 7\)); the sources above give the practice and the throughput motive, not a breakdown.</li>
   </ul>
 
   <h3 id="glu-evidence">The evidence for gating</h3>
@@ -625,8 +625,8 @@ class SwiGLU(nn.Module):
   <p><strong>Cross-checks against public numbers.</strong> (a) Llama 3 405B: \(6 \times 405 \times 10^9 \times 15.6 \times 10^{12} = 3.79 \times 10^{25}\), matching the paper's "\(3.8 \times 10^{25}\) FLOPs" <a href="https://arxiv.org/abs/2407.21783">[§1]</a>. (b) Llama 1 65B: 380 tokens/s/GPU on 2,048 A100s <a href="https://arxiv.org/abs/2302.13971">[§2.4]</a> means \(6 \times 65.2 \times 10^9 \times 380 = 148.7\) TFLOP/s per GPU, 47.6% of the A100's 312 TFLOP/s peak (the figure PaLM's appendix uses), and \(1.4 \times 10^{12} / (380 \times 2048) = 20.8\) days, matching "approximately 21 days." (c) Llama 3 8B: the model card lists 1.3M H100-hours for pre-training ("over 15 trillion tokens"). That implies \(7.23 \times 10^{23} / (1.3 \times 10^6 \times 3600) = 154\) TFLOP/s per GPU, or 15.6% of peak. The card reports only GPU-hours (I found no MFU or breakdown in it), so a 40% assumption predicts 2.6 times fewer hours than were reported. Either the small model ran at much lower utilization than the 405B (whose 30.84M hours in the 3.1 card imply 34.5% by the same arithmetic), or the hours include overheads, and the card does not say which. The lesson for an interview: state your MFU assumption, know that 30% to 45% is what large dense runs achieve, and expect lower for small models.</p>
   <p>The more accurate per-token count (matmuls plus causal attention at \(T = 8192\)) is 51.47 GFLOPs against \(6N = 48.18\) GFLOPs, 6.8% higher: the omitted attention term outweighs the input embedding table that \(6N\) counts but does not use.</p>
 
-  <h3 id="act-mem">Activation memory (preview of <a href="15-distributed-training.html">page 15</a>)</h3>
-  <p>Backpropagation needs what the forward pass computed. Per layer, the stored tensors are the inputs of each matmul, the norm inputs, the gated FFN intermediates, and (with naive attention) the attention probabilities. Korthikanti et al. count, for a GPT-style block with 16-bit activations, dropout masks included, <span class="zh">激活值</span></p>
+  <h3 id="act-mem">Activation memory (preview of page 15)</h3>
+  <p>Backpropagation needs what the forward pass computed. Per layer, the stored tensors are the inputs of each matmul, the norm inputs, the gated FFN intermediates, and (with naive attention) the attention probabilities. Korthikanti et al. count the memory of these activations <span class="zh">激活值</span> per layer, for a GPT-style block with 16-bit values and dropout masks included:</p>
 
   \[ \text{activation memory per layer} = s\,b\,h\left(34 + 5\,\frac{a\,s}{h}\right) \ \text{bytes} \]
 

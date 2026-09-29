@@ -39,6 +39,16 @@ def test_rmsnorm_scale_invariant_and_no_mean_subtraction(impl):
     torch.testing.assert_close(y.pow(2).mean(-1), torch.ones(3), atol=1e-5, rtol=1e-5)
 
 
+def test_rmsnorm_statistics_in_float32(impl):
+    # bf16 input, unit gain: the result must equal "do everything in fp32, round once at the end".
+    # An all-bf16 implementation (squares, mean and rsqrt each rounded to 8 bits) misses this by
+    # more than one bf16 ulp on a few percent of the elements at this width.
+    x = torch.randn(2, 4, 4096).bfloat16()
+    xf = x.float()
+    expected = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16().float()
+    torch.testing.assert_close(impl.RMSNorm(4096, eps=1e-5)(x).float(), expected, rtol=2 ** -7, atol=1e-6)
+
+
 def test_rmsnorm_dtype_and_zero_input(impl):
     m = impl.RMSNorm(16)
     xb = torch.randn(2, 4, 16).bfloat16()

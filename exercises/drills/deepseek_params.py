@@ -31,8 +31,12 @@ What is counted (all matrices have no bias; every FFN and expert is SwiGLU with 
     3 d * moe_intermediate_size, plus a router matrix d x n_routed.
   * Input embedding V x d and LM head V x d.
   * NOT counted: the multi-token-prediction module of V3, V3's aux-loss-free routing bias, buffers.
+
+Assumptions: every layer after the first `first_k_dense_replace` is MoE (the config's
+`moe_layer_freq` = 1); `num_experts_per_tok` counts routed experts only, and the shared experts
+are always active; head sizes are given explicitly, so `d_h` is not derived from `hidden_size`.
 """
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Tuple
 
 
 def mla_params(cfg: Mapping) -> int:

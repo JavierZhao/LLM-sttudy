@@ -84,7 +84,7 @@ window.LLM_MANIFEST = {
     {
       id: "VI", title: "Model case studies",
       pages: [
-        { n: "26", drills: ["deepseek_params"], slug: "26-deepseek-1-foundations", title: "DeepSeek I: LLM, MoE, Math, V2", tier: "P0", minutes: 60, status: "planned",
+        { n: "26", drills: ["deepseek_params"], slug: "26-deepseek-1-foundations", title: "DeepSeek I: LLM, MoE, Math, V2", tier: "P0", minutes: 60, status: "written",
           desc: "DeepSeek LLM hyperparameter scaling, DeepSeekMoE, DeepSeekMath and GRPO, DeepSeek-V2." },
         { n: "27", drills: ["fp8"], slug: "27-deepseek-2-v3", title: "DeepSeek II: V3 end to end", tier: "P0", minutes: 75, status: "planned",
           desc: "V3 architecture, aux-loss-free MoE, MTP, FP8 training, DualPipe, the cost accounting." },

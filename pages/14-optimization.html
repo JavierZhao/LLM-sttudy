@@ -157,7 +157,7 @@ def adamw_step(p, g, m, v, t, lr, betas=(0.9, 0.95), eps=1e-8, wd=0.1):
 <section>
   <h2 id="schedules">Warmup and learning-rate schedules</h2>
 
-  <p>A learning-rate schedule <span class="zh">学习率调度</span> has up to three phases: warmup, a hold at the peak, and a decay. Recipes differ mostly in the hold and the decay, and that choice decides whether a run can be continued or reused.</p>
+  <p>A learning-rate schedule has up to three phases: warmup, a hold at the peak, and a decay. Recipes differ mostly in the hold and the decay, and that choice decides whether a run can be continued or reused.</p>
 
   <h3 id="warmup">Warmup</h3>
   <p>Every run in the tables below ramps the learning rate linearly (warmup <span class="zh">学习率预热</span>) from about zero to the peak: 2,000 steps for Llama 2, DeepSeek LLM, V2, V3 and V4-Flash; 500 for Kimi K2; 8,000 for Llama 3 405B; 375M tokens for GPT-3 and Cerebras-GPT. In tokens that is small: Llama 2 7B, \(2000\times 4\text{M} = 8\)B tokens, 0.4% of 2T; DeepSeek-V3, at least \(2000\times 3072\times 4096 = 25.2\)B tokens and about 33B (0.22% of 14.8T) if the batch ramps linearly in steps, an assumption the report does not state. There are two explanations for why warmup is needed, and they make different predictions.</p>

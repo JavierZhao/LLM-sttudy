@@ -244,8 +244,6 @@
     <figcaption><b>Figure 1.</b> The toy corpus before training and after 3 and 5 merges. Frequent strings (<em>est·</em>, <em>low</em>) become single tokens, and each merge removes as many tokens as its count.</figcaption>
   </figure>
 
-  <p class="small muted">The tie rule is part of the specification. Sennrich's Figure 1 also prints merges (<em>r·, lo, low, er·</em>) for the dictionary in its caption ({low, lowest, newer, wider}), not the one its code uses; we ran the code and it prints <em>es, est, est·, lo, low</em>.</p>
-
   <h3 id="bpe-encoding">Encoding new text</h3>
   <p>Split a word into base symbols and apply the merges <strong>in rank order</strong>, not "longest match". <em>lowest</em> (unseen) becomes <code>l o w e s t ·</code>, then after <em>es, est, est·, lo, low</em> the tokens <code>low</code> and <code>est·</code>. <em>wider</em> has no applicable merge and stays as characters. In a byte-level tokenizer the new token's id is <code>256 + rank</code>. A token made by merge \(k\) can only join merges of rank above \(k\), so "always apply the lowest-rank pair present" replays training order.</p>
 
@@ -416,7 +414,7 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
   <p>The best segmentation is \(x^*=\arg\max_{x\in S(X)}P(x)\) by Viterbi. Being probabilistic, it can also <em>sample</em> segmentations, with probability \(\propto P(x)^\alpha\) among the \(l\) best. Training on fresh samples is <strong>subword regularization</strong> <span class="zh">子词正则化</span>, worth about +1 to 2 BLEU on most pairs and more in low-resource settings (English to Vietnamese 25.61 to 27.68). Without sampling, BPE and Unigram tie on WMT14 English to German (24.53 versus 24.50) <a href="https://arxiv.org/abs/1804.10959">[Kudo 2018, Tables 3 and 5]</a>. BPE's counterpart is BPE-dropout, which randomly skips merges.</p>
 
   <h3 id="sentencepiece">SentencePiece</h3>
-  <p>SentencePiece is a <em>library</em>: raw Unicode input with no language-specific pre-tokenizer, whitespace escaped to the symbol <code>▁</code> (U+2581), hence <strong>lossless</strong> tokenization (<code>''.join(tokens).replace('▁',' ')</code>), which matters for Chinese and Japanese. It implements BPE and Unigram, takes the final vocabulary size (not a number of merges), reserves ids for <code>&lt;unk&gt;</code>, <code>&lt;s&gt;</code>, <code>&lt;/s&gt;</code>, <code>&lt;pad&gt;</code>, defaults to NFKC, and ships a self-contained model file <a href="https://arxiv.org/abs/1808.06226">[Kudo &amp; Richardson 2018, §3]</a>. Llama 1 and 2 use it in BPE mode with single digits and byte fallback for unknown characters <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §2.2]</a>; Gemma uses it with split digits, preserved whitespace and byte encodings <a href="https://arxiv.org/abs/2403.08295">[Gemma 2024, §3]</a>.</p>
+  <p>SentencePiece is a <em>library</em>: raw Unicode input with no language-specific pre-tokenizer, whitespace escaped to <code>▁</code> (U+2581), hence <strong>lossless</strong> tokenization (<code>''.join(tokens).replace('▁',' ')</code>), which matters for Chinese and Japanese. It implements BPE and Unigram, takes the final vocabulary size (not a merge count), reserves ids for <code>&lt;unk&gt;</code>, <code>&lt;s&gt;</code>, <code>&lt;/s&gt;</code>, <code>&lt;pad&gt;</code>, and defaults to NFKC <a href="https://arxiv.org/abs/1808.06226">[Kudo &amp; Richardson 2018, §3]</a>. Llama 1 and 2 use it in BPE mode with single digits and byte fallback <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §2.2]</a>; so does Gemma, with split digits and byte encodings <a href="https://arxiv.org/abs/2403.08295">[Gemma 2024, §3]</a>.</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th></th><th>BPE</th><th>WordPiece</th><th>Unigram LM</th></tr></thead>
@@ -427,7 +425,7 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
       <tr><td>Unknown tokens</td><td>None if byte-level</td><td><code>[UNK]</code></td><td>None</td></tr>
     </tbody>
   </table></div>
-  <p>Unigram is the main alternative to BPE, and although some work finds it better, it is not in common use for LLMs <a href="https://arxiv.org/abs/2405.05417">[Land &amp; Bartolo 2024, §1]</a>. The algorithm matters less than vocabulary size, the pre-tokenizer, the digit rule and the tokenizer's training data.</p>
+  <p>Unigram is the main alternative to BPE, and although some work finds it better, it is not in common use for LLMs <a href="https://arxiv.org/abs/2405.05417">[Land &amp; Bartolo 2024, §1]</a>.</p>
 </section>
 
 <section>
@@ -441,7 +439,7 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
   <p><strong>Llama-3-8B</strong> (\(V=128{,}256\), \(d=4096\), untied): each matrix has \(128{,}256\cdot4096=525{,}336{,}576\) entries, so 1,050,673,152 together, <strong>13.1%</strong> of the 8,030,261,248 parameters (we recomputed the total from the config).</p>
   <p><strong>Gemma 2B</strong> (\(d=2048\), tied): 524,550,144 embedding and 1,981,884,416 non-embedding parameters <a href="https://arxiv.org/abs/2403.08295">[Gemma 2024, Table 2]</a>. The first is exactly \(256{,}128\times2048\), and Table 1 lists a vocabulary of 256,128 (a multiple of 128, presumably padded from "256k"). That is <strong>20.9%</strong> of the parameters even with tying, from inheriting Gemini's multilingual vocabulary.</p>
   <p><strong>Logit FLOPs at \(d=4096\).</strong> \(V=128{,}256\): \(2\cdot128{,}256\cdot4096=1.05\) GFLOPs per token. \(V=32{,}000\): 0.26 GFLOPs, 4.0 times less. Llama-3-8B's 6.98B other parameters cost \(2\cdot6.98\text{B}=13.96\) GFLOPs per token (attention over context excluded), so the LM head is 7.0% of the matmul FLOPs at 128K and 1.8% at 32K. Logits for a micro-batch of 8,192 tokens take \(8192\cdot128{,}256\) numbers, 4.2 GB in fp32, which is why loss kernels work in chunks.</p>
-  <p><strong>Net effect.</strong> Llama 3's tokenizer compresses English from 3.17 to 3.94 characters per token <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>, 19.5% fewer tokens. Holding the 6.98B body fixed as an illustration, a token costs \(13.96+0.26=14.22\) GFLOPs at 32K and \(13.96+1.05=15.01\) at 128K, but per character it is \(14.22/3.17=4.49\) versus \(15.01/3.94=3.81\): <strong>15% cheaper per character</strong> despite a 4 times costlier LM head. (The compression figures come from Meta's sample, not ours, and the body is hypothetical: an order-of-magnitude argument.)</p>
+  <p><strong>Net effect.</strong> Llama 3's tokenizer compresses English from 3.17 to 3.94 characters per token <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>, 19.5% fewer tokens. Holding the 6.98B body fixed, a 4 times costlier LM head still leaves the bigger vocabulary about <strong>15% cheaper per character</strong> (worked in the questions below).</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 318" role="img" aria-labelledby="fig-02-3-title">
@@ -488,16 +486,15 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
     <tbody>
       <tr><td>GPT-2 (2019)</td><td class="num">50,257</td><td class="num">50,257</td><td><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[GPT-2 §2.3]</a></td></tr>
       <tr><td>GPT-4 (<code>cl100k</code>)</td><td class="num">100,277 ids</td><td class="num">not published</td><td><a href="https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py">tiktoken</a></td></tr>
-      <tr><td>GPT-4o (<code>o200k</code>)</td><td class="num">200,019 ids</td><td class="num">not published</td><td>tiktoken</td></tr>
       <tr><td>Llama 1, Llama 2</td><td class="num">32,000</td><td class="num">32,000</td><td><a href="https://arxiv.org/abs/2307.09288">[Llama 2 §2.2]</a></td></tr>
       <tr><td>Mistral 7B v0.1</td><td class="num">32,000</td><td class="num">32,000</td><td>official config</td></tr>
       <tr><td>Llama 3, 3.1</td><td class="num">128,000 + 256 special</td><td class="num">128,256</td><td><a href="https://arxiv.org/abs/2407.21783">[Table 3]</a>: 100K tiktoken + 28K non-English</td></tr>
       <tr><td>DeepSeek-V3</td><td class="num">128K BPE (128,815 ids)</td><td class="num">129,280</td><td><a href="https://arxiv.org/abs/2412.19437">[§4.1]</a>, tokenizer.json, config</td></tr>
-      <tr><td>Qwen2.5</td><td class="num">151,665</td><td class="num">151,936 / 152,064</td><td><a href="https://arxiv.org/abs/2412.15115">[§2]</a>: 151,643 regular + 22 control; configs of 0.5B and 7B, 72B</td></tr>
+      <tr><td>Qwen2.5</td><td class="num">151,665</td><td class="num">151,936 / 152,064</td><td><a href="https://arxiv.org/abs/2412.15115">[§2]</a>, configs (0.5B; 7B, 72B)</td></tr>
       <tr><td>Gemma 1</td><td class="num">256k</td><td class="num">256,128</td><td><a href="https://arxiv.org/abs/2403.08295">[Table 1]</a></td></tr>
       <tr><td>Gemma 3</td><td class="num">262k</td><td class="num">n/a</td><td><a href="https://arxiv.org/abs/2503.19786">[§2.2]</a></td></tr>
       <tr><td>gpt-oss</td><td class="num">201,088 ids</td><td class="num">201,088</td><td>tiktoken <code>o200k_harmony</code>, config</td></tr>
-      <tr class="hl"><td>Qwen3.5-397B-A17B (2026)</td><td class="num">248,070 ids</td><td class="num">248,320</td><td><a href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B">model card</a> ("Padded"); tokenizer.json: 248,044 + 26</td></tr>
+      <tr class="hl"><td>Qwen3.5-397B-A17B (2026)</td><td class="num">248,070 ids</td><td class="num">248,320</td><td><a href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B">model card</a> ("Padded")</td></tr>
     </tbody>
   </table></div>
   <p class="small muted">As of September 2026, from the sources shown; newer releases may differ. Counts of tokenizer files and config values were read by us from the official repositories, except Gemma (papers).</p>
@@ -507,7 +504,7 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
   <h3 id="choosing-v">Choosing \(V\)</h3>
   <p>A larger \(V\) buys shorter sequences and better coverage of scripts, code and long words. It costs LM-head parameters, FLOPs and logit memory, and thins the tail. Returns on compression diminish: on English we measure 4.91 bytes per token for GPT-2's 50K vocabulary, 4.90 for Llama 3's 128K and 4.95 for a 200K one, so growth bought multilingual and code coverage, not English compression. With a third of <code>cl100k</code>'s vocabulary, English sequences get only 10% longer <a href="https://arxiv.org/abs/2305.15425">[Petrov et al. 2023, Fig. 3]</a>.</p>
   <p>The tail matters because token frequencies are Zipfian: a rarely seen row is rarely updated. Land and Bartolo find 0.1% to 1% of a vocabulary "severely under-trained" in tested models <a href="https://arxiv.org/abs/2405.05417">[Land &amp; Bartolo 2024, §5]</a> (<a href="#glitch">below</a>).</p>
-  <p>Tao et al. fit the compute-optimal \(V\) with a vocabulary-insensitive loss (raw loss is not comparable across \(V\), as page 01 showed for perplexity) on models up to 3B non-vocabulary parameters. Vocabulary parameters should grow more slowly than the rest, \(N_v^{\text{opt}}\propto N_{nv}^{0.83}\), and typical models are under-vocabularized: at least 216K for Llama-2-70B against its 32K. At 3B and \(2.3\times10^{21}\) FLOPs, 32K to 43K raised ARC-Challenge from 29.1 to 32.0 <a href="https://arxiv.org/abs/2407.13623">[Tao et al. 2024, Abstract, Tables 1 and 3]</a>. Caveats: the fits are extrapolated beyond 3B, and the optimum falls when data is scarce (16K to 10K at 302M).</p>
+  <p>Tao et al. fit the compute-optimal \(V\) with a vocabulary-insensitive loss (raw loss is not comparable across \(V\), as page 01 showed for perplexity) on models up to 3B non-vocabulary parameters. Vocabulary parameters should grow more slowly than the rest, \(N_v^{\text{opt}}\propto N_{nv}^{0.83}\), and typical models are under-vocabularized: at least 216K for Llama-2-70B against its 32K. At 3B and \(2.3\times10^{21}\) FLOPs, 32K to 43K raised ARC-Challenge from 29.1 to 32.0 <a href="https://arxiv.org/abs/2407.13623">[Tao et al. 2024, Abstract, Tables 1 and 3]</a>. Caveat: the fits are extrapolated beyond 3B, and the optimum falls when data is scarce.</p>
 
   <div class="decision">
     <div class="decision-title">Vocabulary size</div>
@@ -552,9 +549,8 @@ bytes_per_token = len(text_english.encode("utf-8")) / n_tokens(text_english)
 </code></pre>
 
   <ul>
-    <li><strong>English compression saturated early</strong> at about 4.9 bytes per token (Llama 2's 32K vocabulary needs 15% more tokens). English-heavy byte-level BPE is expensive elsewhere: GPT-2 spends about one token per byte on Tamil (733,427 tokens for 736,936 bytes).</li>
+    <li><strong>English compression saturated early</strong> at about 4.9 bytes per token (Llama 2's 32K vocabulary needs 15% more tokens), while GPT-2 spends about one token per byte on Tamil. At 248K to 256K, every listed language is within 4.5 times of English.</li>
     <li><strong>Llama 3's 28K added tokens were targeted.</strong> Relative to <code>cl100k</code>, Llama 3 needs about half the tokens for Hindi (226,860 to 119,869) and Thai (206,987 to 104,392) and 27% to 45% fewer for Arabic, Korean, Vietnamese and Turkish, but nothing changes for Tamil, Bengali or Amharic. It needs 13.5% more tokens than Llama 2 for Tamil (362,255 versus 319,147), presumably because Llama 2 held single Tamil characters that the tiktoken base lacks.</li>
-    <li><strong>Bigger and more multilingual is fairer:</strong> at 248K to 256K, every listed language is within 4.4 times of English and most within 2.6.</li>
   </ul>
   <p>To compare models with different tokenizers, normalize loss per byte (bits per byte, <a href="01-big-picture.html">page 01</a>), not per token.</p>
 </section>
@@ -569,7 +565,6 @@ bytes_per_token = len(text_english.encode("utf-8")) / n_tokens(text_english)
     <tbody>
       <tr><td>GPT-2</td><td><code>&lt;|endoftext|&gt;</code> (50256), a document separator</td></tr>
       <tr><td>Llama 3</td><td><code>&lt;|begin_of_text|&gt;</code> (128000), <code>&lt;|end_of_text|&gt;</code> (128001), <code>&lt;|start_header_id|&gt;</code> (128006), <code>&lt;|end_header_id|&gt;</code> (128007), <code>&lt;|eot_id|&gt;</code> (128009)</td></tr>
-      <tr><td>Qwen2.5</td><td><code>&lt;|endoftext|&gt;</code> (151643), <code>&lt;|im_start|&gt;</code> (151644), <code>&lt;|im_end|&gt;</code> (151645)</td></tr>
       <tr><td>Gemma</td><td><code>&lt;start_of_turn&gt;</code>, <code>&lt;end_of_turn&gt;</code> <a href="https://arxiv.org/abs/2403.08295">[Gemma 2024, Tables 3-4]</a>, <code>[BOS]</code> <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, Table 4]</a></td></tr>
     </tbody>
   </table></div>
@@ -615,11 +610,8 @@ What is 2+2?&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id
   <h3 id="letters">Letter counting: "how many r's in strawberry?"</h3>
   <p>The model gets one id per token and no view of the characters inside. The popular explanation, "strawberry is split into <em>str | aw | berry</em>", is only half right. We checked: without a leading space, GPT-2, <code>o200k</code> and DeepSeek-V3 give <em>st | raw | berry</em>, <code>cl100k</code>, Llama 3 and Qwen2.5 give <em>str | aw | berry</em>, Llama 2 <em>▁st | raw | berry</em>, Mistral 7B <em>▁straw | berry</em>, Gemma 2 one token. But in the sentence "How many r's are in the word strawberry?", GPT-2, <code>cl100k</code>, <code>o200k</code> and Llama 3 encode the last word as <strong>one token</strong> (<code> strawberry</code>, shown as <code>Ġstrawberry</code> in Hugging Face vocabularies). The model must recall that an opaque id contains three r's; even <em>raw</em> is an id whose letters must be memorized. Counting needs two steps, spell then count, so "spell it first" prompts help. Byte-level models remove the obstacle: on CUTE, an 8B Byte Latent Transformer scores 99.9 on spelling and inverse spelling against 1.1 and 30.1 for Llama 3 8B trained on the same 1T tokens <a href="https://arxiv.org/abs/2412.09871">[Pagnoni et al. 2024, Table 3]</a>.</p>
 
-  <h3 id="spaces">Leading spaces and case</h3>
-  <p>Because a space is glued to the next word, one word has several unrelated ids. In GPT-2: <code>hello</code> is 31373, <code> hello</code> 23748, <code>Hello</code> 15496, <code> Hello</code> 18435, and <code>HELLO</code> three tokens (13909, 3069, 46). Nothing in the embedding table says these are the same word, so unusual spacing in a prompt lands on rarer ids and changes behavior.</p>
-
-  <h3 id="trailing">Trailing whitespace and token boundaries</h3>
-  <p>The prompt <code>The capital of France is </code> (trailing space) encodes in GPT-2 as [464, 3139, 286, 4881, 318, 220], ending in a lone space token. In training text the next token would have been <code> Paris</code> (6342), with its space built in. The model now sees a context that rarely precedes a word. More generally, <strong>BPE is not incremental</strong>: the same prefix can tokenize differently depending on what follows, so tokenizing prompt and completion separately differs from tokenizing the concatenation <a href="https://arxiv.org/abs/2412.09871">[Pagnoni et al. 2024, §2.4]</a>. This token-boundary bias also hurts code completion, constrained decoding and languages without spaces.</p>
+  <h3 id="trailing">Leading and trailing spaces, token boundaries</h3>
+  <p>Because a space is glued to the next word, one word has several unrelated ids: in GPT-2 <code>hello</code> is 31373, <code> hello</code> 23748, <code>Hello</code> 15496 and <code>HELLO</code> three tokens. Now take the prompt <code>The capital of France is </code> (trailing space). GPT-2 encodes it as [464, 3139, 286, 4881, 318, 220], ending in a lone space token, whereas in training the next token would have been <code> Paris</code> (6342), with its space built in. The model sees a context that rarely precedes a word. More generally, <strong>BPE is not incremental</strong>: the same prefix can tokenize differently depending on what follows, so tokenizing prompt and completion separately differs from tokenizing the concatenation <a href="https://arxiv.org/abs/2412.09871">[Pagnoni et al. 2024, §2.4]</a>. This token-boundary bias also hurts code completion, constrained decoding and languages without spaces.</p>
   <p>Mitigations: at inference, <em>token healing</em> (remove the last token or two of the prompt and let the model complete them <a href="https://arxiv.org/abs/2402.14903">[described in Singh &amp; Strouse §7]</a>) or exact byte-level probabilities. At training time, expose alternatives: DeepSeek-V3 merges punctuation with line breaks, which risks boundary bias in multi-line few-shot prompts without a final newline, so it randomly splits a proportion of those tokens <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.1]</a>. Chat models largely avoid the problem because special tokens separate user text from the answer <a href="https://arxiv.org/abs/2503.13423">[Liu et al. 2025, App. C.3]</a>.</p>
 
   <h3 id="glitch">Glitch tokens and under-trained tokens</h3>
@@ -822,15 +814,12 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
     <ul>
       <li>BPE: count pairs, merge the most frequent (deterministic ties), record; a merge with count \(c\) removes \(c\) tokens. Encode by lowest rank first. Training \(O(NV)\) naive, about \(O((N+V)\log N)\) incremental.</li>
       <li>Byte-level: 256 base tokens, no unknown token. GPT-2 = 256 + 50,000 + 1 = 50,257. Bytes-to-unicode: 188 bytes map to themselves, 68 go to 256+, space becomes <code>Ġ</code>.</li>
-      <li>Regex pre-tokenization splits letters, digits, punctuation; the space glues to the next word. Digits: GPT-2 unbounded; cl100k, Llama 3, DeepSeek-V3 up to 3; Qwen, Gemma, Llama 1/2 single.</li>
       <li>WordPiece: score about \(n_{ab}/(n_a n_b)\), longest match, <code>[UNK]</code>. Unigram: prune by likelihood loss (keep 80%, keep characters), Viterbi or sampling. SentencePiece: raw text, <code>▁</code>, NFKC.</li>
       <li>Vocabulary cost: \(Vd\) (tied) or \(2Vd\) (untied) parameters, \(2Vd\) FLOPs per token, \(BTV\) logits. Llama-3-8B: 1.05B (13.1%), 1.05 GFLOPs per token. Gemma 2B: 20.9%.</li>
       <li>Sizes: 32K Llama 2, 50K GPT-2, 100K cl100k, 128K Llama 3 and DeepSeek-V3, 200K o200k, 256K Gemma, 248K Qwen3.5; config sizes padded to multiples of 128.</li>
       <li>Llama 3: 100K tiktoken + 28K non-English; English 3.17 to 3.94 characters per token (19.5% fewer tokens, about 15% fewer FLOPs per character). English compression is about 4.9 bytes per token from 50K up.</li>
-      <li>Tao et al.: \(N_v^{\text{opt}}\propto N_{nv}^{0.83}\); at least 216K for Llama-2-70B; smaller optimum when data is scarce.</li>
       <li>Fertility: premium = tokens(language) / tokens(English). GPT-2: Tamil 15.5 times; Gemma 2 and Qwen3.5: at most 4.4 times. Compare tokenizers with bits per byte.</li>
       <li>Failures: opaque ids (letters); left-anchored digit groups (75.6% versus 97.8% with right-to-left commas); leading and trailing spaces; glitch tokens (0.1% to 1%; embedding norm or cosine distance, verify by repetition); extended vocabularies (new rows untrained).</li>
-      <li>Special tokens are matched before BPE; never parse user text with them enabled; the template is part of the model.</li>
       <li>Beyond: ByT5 (4 times longer, up to 10 times slower), BLT (parity at 8B, up to 50% fewer inference FLOPs), H-Net (1.3B-equivalent), SuperBPE (+4.0 points, 27% less inference compute).</li>
     </ul>
   </div>

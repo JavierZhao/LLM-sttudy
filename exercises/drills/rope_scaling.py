@@ -11,7 +11,7 @@ Conventions
 * Every method here is a rule "new frequencies from old frequencies". Inputs and outputs are
   float64 tensors of shape (d_head // 2,); no positions and no model are involved.
 * s = L' / L is the scale factor: target context over the context the model was trained on
-  (`orig_ctx`). Every method must return the vanilla frequencies exactly when s = 1.
+  (`orig_ctx`). Every method must return the vanilla frequencies when s = 1 (up to floating-point rounding).
 """
 import math
 from typing import NamedTuple, Sequence

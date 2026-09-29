@@ -32,7 +32,7 @@ window.LLM_MANIFEST = {
           desc: "Routing, load balancing (aux loss and aux-loss-free), fine-grained and shared experts, capacity, expert parallelism." },
         { n: "09", drills: ["efficient_attention"], slug: "09-beyond-full-attention", title: "Beyond full attention: sparse, linear, SSM, hybrid", tier: "P1", minutes: 75, status: "planned",
           desc: "Sliding window, sparse attention (NSA, DSA), DeepSeek-V4 compressed attention (CSA/HCA), linear attention, Mamba, Gated DeltaNet, and hybrid stacks." },
-        { n: "10", drills: ["rope_scaling"], slug: "10-long-context", title: "Long context: extension & evaluation", tier: "P0", minutes: 60, status: "planned",
+        { n: "10", drills: ["rope_scaling"], slug: "10-long-context", title: "Long context: extension & evaluation", tier: "P0", minutes: 60, status: "written",
           desc: "RoPE scaling (PI, NTK, YaRN), staged context extension, long-context data, attention sinks, NIAH and RULER." },
         { n: "11", drills: ["stability"], slug: "11-stability-tweaks", title: "Training stability & modern tweaks", tier: "P1", minutes: 50, status: "written",
           desc: "Loss spikes, QK-norm, z-loss, logit softcapping, norm placement, gated attention, multi-token prediction." }

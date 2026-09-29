@@ -10,7 +10,8 @@ Conventions shared by all functions
     `mask` is a (B, T) tensor of 0/1 (or bool): 1 on real response tokens, 0 on padding.
     Real tokens of a row are contiguous from position 0. Under `mask` the episode of row i
     ends after its last real token (the EOS token), and all padded positions must
-    contribute exactly zero to every loss and gradient.
+    contribute exactly zero to every loss and gradient. Entries at padded positions may hold
+    any value, including NaN or inf: no result and no gradient may depend on them.
 """
 import torch
 from torch import Tensor

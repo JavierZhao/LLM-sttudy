@@ -1,0 +1,1240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>28 · DeepSeek III: R1 to V4 · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="28" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VI · Model case studies · Page 28</div>
+  <h1>DeepSeek III: R1 to V4</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~65 min</span>
+    <span>Prereqs: <a href="09-beyond-full-attention.html">09 Beyond full attention</a>, <a href="24-rlvr-reasoning.html">24 RLVR &amp; GRPO</a>, <a href="27-deepseek-2-v3.html">27 DeepSeek II: V3</a></span>
+  </div>
+  <p class="lede">Between January 2025 and September 2026 DeepSeek shipped a reasoning recipe (R1), folded it into a hybrid chat model (V3.1), made long context cheap twice (V3.2's sparse attention, V4's compressed attention), replaced mixed RL with on-policy distillation, and pushed KV-cache cost down again in V4.1. This page tells that story as a chain of diagnoses: what each release measured as broken, what it changed, and what the primary sources actually say.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The R1 pipeline as reasoning, not trivia:</strong> what R1-Zero proved, what it broke (readability, language mixing, weak general ability), and which of the four R1 stages repairs which failure, with the data sizes (thousands of cold-start examples, about 600K + 200K SFT samples, 800K for distillation).</li>
+    <li><strong>Distillation versus RL:</strong> why 800K SFT samples beat large-scale RL on a 32B student, and what that evidence does <em>not</em> show.</li>
+    <li><strong>DeepSeek Sparse Attention end to end:</strong> the indexer formula, why it is trained by KL to the dense attention, the dense warm-up and sparse stages with their token counts, and a cost model that says where the saving comes from and where it stops.</li>
+    <li><strong>How post-training evolved:</strong> rule-based GRPO, then specialists plus one mixed RL stage (V3.2), then specialists plus on-policy distillation (V4), with the reward types, stability fixes, agentic environment synthesis and reasoning-effort control.</li>
+    <li><strong>What V4 and V4.1 change in the architecture</strong> (CSA/HCA, mHC, Muon, hash routing, causal encoder-decoder, cross-layer KV reuse) and a skeptical reading of self-reported benchmarks and stated limitations.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Reconstruct the R1-Zero and R1 pipelines with their rewards, data sizes and per-stage benchmark movements, and compute R1's reported training cost (147K H800 GPU-hours) and SFT data composition from the tables.</li>
+    <li>Explain V3.1's hybrid thinking (a chat-template switch on one checkpoint), its long-context extension budgets, and the UE8M0 scale format.</li>
+    <li>Describe DSA as implemented in V3.2, implement the indexer, the top-k MQA-mode attention and the indexer KL loss, and compute its per-layer FLOP ratio (13.4× at 128K), break-even length (2,176 tokens) and ceiling (17×).</li>
+    <li>Contrast R1, V3.2, V4 and V4.1 post-training: what was rule-based, what was distilled, what was merged, and how effort control and agent tasks were added.</li>
+    <li>List the architecture and optimizer changes in V4 and V4.1-Flash, and reconstruct V4.1-Flash's 890 bytes of global KV per token from its configuration.</li>
+    <li>State each release's own stated limitations, and name the open questions that remain.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="arc">The arc: a diagnosis, a fix, a new limit</h2>
+  <p>Read the release list as a loop. Each model report ends with limitations, and the next release is a direct response. R1's report says it cannot use tools, overthinks easy questions and mixes languages, and the next three releases add function calling, agent post-training and language-consistency fixes. V3.2's report says its knowledge is narrow and its tokens are expensive, and V4 answers with a 1.6T-parameter model and effort modes. The mechanisms are treated on other pages; this page keeps the causal chain.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 488" role="img" aria-labelledby="fig-28-1-title">
+<title id="fig-28-1-title">Timeline of DeepSeek model releases and research papers from January 2025 to September 2026</title>
+<circle class="s-fill-a" cx="128" cy="16" r="5"/><text x="140" y="20" class="s-small">model release</text>
+<circle class="s-fill-c" cx="250" cy="16" r="5"/><text x="262" y="20" class="s-small">research paper</text>
+<text x="420" y="20" class="s-small s-muted">rows follow dates but are not to scale</text>
+<line class="s-line" x1="128" y1="38" x2="128" y2="458.5"/>
+<text x="114" y="48.0" text-anchor="end" class="s-small s-muted">Jan 20, 2025</text>
+<circle class="s-fill-a" cx="128" cy="44.0" r="5"/>
+<text x="144" y="48.5" class="s-bold">R1-Zero, R1</text>
+<text x="318" y="48.0" class="s-small s-muted">pure RL, then a four-stage pipeline; six distilled models</text>
+<text x="114" y="69.5" text-anchor="end" class="s-small s-muted">Feb 16, 2025</text>
+<circle class="s-fill-c" cx="128" cy="65.5" r="5"/>
+<text x="144" y="70.0">NSA</text>
+<text x="318" y="69.5" class="s-small s-muted">natively trainable sparse attention: the precursor of DSA</text>
+<text x="114" y="91.0" text-anchor="end" class="s-small s-muted">Mar 24, 2025</text>
+<circle class="s-fill-a" cx="128" cy="87.0" r="5"/>
+<text x="144" y="91.5" class="s-bold">V3-0324</text>
+<text x="318" y="91.0" class="s-small s-muted">post-training refresh; Keep Routing adopted in RL</text>
+<text x="114" y="112.5" text-anchor="end" class="s-small s-muted">May 28, 2025</text>
+<circle class="s-fill-a" cx="128" cy="108.5" r="5"/>
+<text x="144" y="113.0" class="s-bold">R1-0528</text>
+<text x="318" y="112.5" class="s-small s-muted">more RL compute: AIME'25 70.0 to 87.5, 12K to 23K tokens</text>
+<text x="114" y="134.0" text-anchor="end" class="s-small s-muted">Aug 21, 2025</text>
+<circle class="s-fill-a" cx="128" cy="130.0" r="5"/>
+<text x="144" y="134.5" class="s-bold">V3.1</text>
+<text x="318" y="134.0" class="s-small s-muted">hybrid thinking and non-thinking in one model; agent post-training</text>
+<text x="114" y="155.5" text-anchor="end" class="s-small s-muted">Sep 17, 2025</text>
+<circle class="s-fill-c" cx="128" cy="151.5" r="5"/>
+<text x="144" y="156.0">R1 in Nature</text>
+<text x="318" y="155.5" class="s-small s-muted">peer-reviewed version; cost, data and safety disclosures</text>
+<text x="114" y="177.0" text-anchor="end" class="s-small s-muted">Sep 22, 2025</text>
+<circle class="s-fill-a" cx="128" cy="173.0" r="5"/>
+<text x="144" y="177.5" class="s-bold">V3.1-Terminus</text>
+<text x="318" y="177.0" class="s-small s-muted">language consistency; stronger code and search agents</text>
+<text x="114" y="198.5" text-anchor="end" class="s-small s-muted">Sep 29, 2025</text>
+<circle class="s-fill-a" cx="128" cy="194.5" r="5"/>
+<text x="144" y="199.0" class="s-bold">V3.2-Exp</text>
+<text x="318" y="198.5" class="s-small s-muted">DeepSeek Sparse Attention by continued training; API prices cut 50%+</text>
+<text x="114" y="220.0" text-anchor="end" class="s-small s-muted">Oct 21, 2025</text>
+<circle class="s-fill-c" cx="128" cy="216.0" r="5"/>
+<text x="144" y="220.5">DeepSeek-OCR</text>
+<text x="318" y="220.0" class="s-small s-muted">optical compression of text: 97% precision below 10x</text>
+<text x="114" y="241.5" text-anchor="end" class="s-small s-muted">Nov 27, 2025</text>
+<circle class="s-fill-c" cx="128" cy="237.5" r="5"/>
+<text x="144" y="242.0">DeepSeekMath-V2</text>
+<text x="318" y="241.5" class="s-small s-muted">self-verifiable proofs: a verifier trained as the reward model</text>
+<text x="114" y="263.0" text-anchor="end" class="s-small s-muted">Dec 1, 2025</text>
+<circle class="s-fill-a" cx="128" cy="259.0" r="5"/>
+<text x="144" y="263.5" class="s-bold">V3.2, Speciale</text>
+<text x="318" y="263.0" class="s-small s-muted">scaled RL, agent task synthesis; gold at IMO, IOI, ICPC WF</text>
+<text x="114" y="284.5" text-anchor="end" class="s-small s-muted">Dec 31, 2025</text>
+<circle class="s-fill-c" cx="128" cy="280.5" r="5"/>
+<text x="144" y="285.0">mHC</text>
+<text x="318" y="284.5" class="s-small s-muted">manifold-constrained hyper-connections</text>
+<line class="s-line s-dash" x1="30" y1="291.2" x2="710" y2="291.2"/>
+<text x="114" y="306.0" text-anchor="end" class="s-small s-muted">Jan 12, 2026</text>
+<circle class="s-fill-c" cx="128" cy="302.0" r="5"/>
+<text x="144" y="306.5">Engram</text>
+<text x="318" y="306.0" class="s-small s-muted">conditional memory: O(1) n-gram lookup as a sparsity axis</text>
+<text x="114" y="327.5" text-anchor="end" class="s-small s-muted">Jan 28, 2026</text>
+<circle class="s-fill-c" cx="128" cy="323.5" r="5"/>
+<text x="144" y="328.0">DeepSeek-OCR 2</text>
+<text x="318" y="327.5" class="s-small s-muted">causal reordering of visual tokens</text>
+<text x="114" y="349.0" text-anchor="end" class="s-small s-muted">Apr 24, 2026</text>
+<circle class="s-fill-a" cx="128" cy="345.0" r="5"/>
+<text x="144" y="349.5" class="s-bold">V4 preview</text>
+<text x="318" y="349.0" class="s-small s-muted">Pro 1.6T/49B, Flash 284B/13B; 1M context; CSA/HCA, mHC, Muon</text>
+<text x="114" y="370.5" text-anchor="end" class="s-small s-muted">Jul 6, 2026</text>
+<circle class="s-fill-c" cx="128" cy="366.5" r="5"/>
+<text x="144" y="371.0">DSpark</text>
+<text x="318" y="370.5" class="s-small s-muted">confidence-scheduled speculative decoding (arXiv date)</text>
+<text x="114" y="392.0" text-anchor="end" class="s-small s-muted">Jul 31, 2026</text>
+<circle class="s-fill-a" cx="128" cy="388.0" r="5"/>
+<text x="144" y="392.5" class="s-bold">V4-Flash-0731</text>
+<text x="318" y="392.0" class="s-small s-muted">same architecture, re-post-trained for agents</text>
+<text x="114" y="413.5" text-anchor="end" class="s-small s-muted">Aug 13, 2026</text>
+<circle class="s-fill-a" cx="128" cy="409.5" r="5"/>
+<text x="144" y="414.0" class="s-bold">V4-Pro-0813</text>
+<text x="318" y="413.5" class="s-small s-muted">same architecture, re-post-trained; low, high, max effort</text>
+<text x="114" y="435.0" text-anchor="end" class="s-small s-muted">Aug 21, 2026</text>
+<circle class="s-fill-a" cx="128" cy="431.0" r="5"/>
+<text x="144" y="435.5" class="s-bold">V4-Flash-Vision-Exp</text>
+<text x="318" y="435.0" class="s-small s-muted">V4-Flash plus visual modules (experimental)</text>
+<text x="114" y="456.5" text-anchor="end" class="s-small s-muted">Sep 10, 2026</text>
+<circle class="s-fill-a" cx="128" cy="452.5" r="5"/>
+<text x="144" y="457.0" class="s-bold">V4.1-Flash</text>
+<text x="318" y="456.5" class="s-small s-muted">552B multimodal; causal encoder-decoder; 890 B of KV per token</text>
+</svg>
+    <figcaption><b>Figure 1.</b> DeepSeek releases (blue, bold) and research papers (green), January 2025 to September 2026. Dates are the official release-note dates, Crossref for Nature and arXiv submission dates for papers. Note the cadence: the architecture changes twice (V3.2's DSA, V4's compressed attention) while most intermediate releases (R1-0528, V3.1, Terminus, V4-Flash-0731, V4-Pro-0813) are post-training refreshes of an existing architecture.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 1. Each release as an answer to a stated limitation (sources in the sections below).</caption>
+    <thead><tr><th>Release</th><th>Headline change</th><th>The limitation it answers</th></tr></thead>
+    <tbody>
+      <tr><td>R1-Zero, R1 (Jan 2025)</td><td>RL on V3-Base with rule-based rewards; four-stage pipeline</td><td>No public recipe for o1-style reasoning</td></tr>
+      <tr><td>R1-0528 (May 2025)</td><td>More RL compute, longer thoughts, function calling</td><td>R1 weaker on the hardest problems, no tools or JSON</td></tr>
+      <tr><td>V3.1 (Aug 2025)</td><td>Hybrid thinking in one model; agent post-training; longer context extension</td><td>Two models to serve; R1 poor at agent tasks</td></tr>
+      <tr><td>V3.2-Exp, V3.2 (Sep, Dec 2025)</td><td>DSA; scaled RL (over 10% of pretraining cost); synthetic agent environments</td><td>Cost of long contexts; open-versus-closed gap on agents</td></tr>
+      <tr><td>V4 preview (Apr 2026)</td><td>CSA/HCA, mHC, Muon, 1.6T parameters, on-policy distillation</td><td>1M-token cost; narrow world knowledge; mixed-RL interference</td></tr>
+      <tr><td>V4-Flash-0731, V4-Pro-0813 (Jul, Aug 2026)</td><td>Same architectures, re-post-trained; low/high/max effort</td><td>Agentic capability of the preview models</td></tr>
+      <tr><td>V4.1-Flash (Sep 2026)</td><td>Causal encoder-decoder, CSA2, FP4 KV, Engram, DSpark, vision</td><td>KV-cache footprint and prefill cost of agent workloads</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="r1-zero">R1-Zero: reinforcement learning directly on the base model</h2>
+
+  <p>By late 2024 the outline of test-time scaling was public (a model that thinks longer solves more problems) but the training recipe was not. DeepSeek's bet in R1-Zero was minimal: take the pretrained <a href="27-deepseek-2-v3.html">V3-Base</a> (671B parameters, 37B active), give it a verifiable reward, and run <a href="24-rlvr-reasoning.html#grpo">GRPO</a> at scale with no supervised reasoning data at all <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2]</a>. Reinforcement learning <span class="zh">强化学习</span> here plays the role that imitation played in earlier chain-of-thought work: the model is not shown how to reason, it is only rewarded when the final answer checks out.</p>
+
+  <p>The reward is deliberately dumb. Accuracy is a rule: the final answer in a box is compared with the reference for math, and code is run against test cases. Format is a second rule: the reasoning must sit inside <code>&lt;think&gt;</code> tags. The two are summed with equal weight <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2.2, Eq. 4]</a>:</p>
+
+  <div class="eq-box">
+  \[ R_{\text{rule}} = R_{\text{acc}} + R_{\text{format}} \]
+  <div class="eq-label">No neural reward model for reasoning: the authors observed that learned reward models "are susceptible to reward hacking during large-scale reinforcement learning"</div>
+  </div>
+
+  <p>The prompt is a short template ("A conversation between User and Assistant. … The assistant first thinks about the reasoning process in the mind and then provides the user with the answer", followed by the two tag pairs). The authors "intentionally limit our constraints to this structural format, avoiding any content-specific biases", so that whatever behavior appears is the model's own. The training recipe in the revised paper (arXiv v2, January 2026) is precise enough to reconstruct:</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 2. R1-Zero training setup <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, §2.1]</a>.</caption>
+    <thead><tr><th>Item</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Algorithm and settings</td><td>GRPO; learning rate \(3\times10^{-6}\); KL coefficient 0.001; rollout temperature 1</td></tr>
+      <tr><td>Group and batch</td><td>16 samples per question; 32 questions per step, so 512 responses per step</td></tr>
+      <tr><td>Rollout organization</td><td>each rollout generates 8,192 outputs, split into 16 mini-batches, one inner epoch; the reference model is replaced by the latest policy every 400 steps</td></tr>
+      <tr><td>Length cap</td><td>32,768 tokens before step 8.2K, 65,536 afterwards</td></tr>
+      <tr><td>Duration</td><td>10,400 steps, 1.6 epochs</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The bookkeeping is worth doing once. A rollout of 8,192 outputs is 512 questions times 16 samples, and it feeds 16 mini-batches of 512 responses (32 questions each), so one rollout pays for 16 policy updates, all but the first slightly off-policy. Over 10,400 steps that is \(10{,}400/16 = 650\) rollouts and \(10{,}400 \times 32 = 332{,}800\) question draws. At 1.6 epochs that implies about \(332{,}800/1.6 = 208{,}000\) distinct prompts, more than the 80K reasoning prompts listed for R1's later RL stages below, so the R1-Zero prompt set was evidently a different, larger one (the paper does not list it). The 400-step reference reset means the KL term anchors the policy to a recent checkpoint rather than to the base model (the paper does not explain the choice).</p>
+
+  <h3 id="zero-results">What happened</h3>
+  <p>AIME 2024 pass@1 rose from 15.6% to 77.9% during training, and to 86.7% with self-consistency (majority voting), while the average response length grew steadily <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, §2.3, Fig. 1]</a>. Quote the version you mean: the January 2025 paper reported 71.0% pass@1 and 86.7% with majority voting over 64 samples, and compared the latter with OpenAI-o1-0912 <a href="https://arxiv.org/abs/2501.12948v1">[DeepSeek-R1 v1, §2.2.4]</a>. The revised run used a larger length cap after step 8.2K, and the paper itself says that "both the performance and response length of DeepSeek-R1-Zero exhibit a significant jump at the 8.2k step", the step where the cap doubled. Part of the length growth is therefore a budget effect, not pure emergence.</p>
+
+  <p>The paper's most-quoted moment is the "aha moment": an intermediate checkpoint writes "Wait, wait. Wait. That's an aha moment I can flag here" and re-derives a solution. The revised paper backs this with counts instead of anecdote: representative reflective words ("wait", "mistake", "verify", "check", and others chosen by three human experts) rise 5 to 7 times over training, and "wait" is nearly absent early in training, used occasionally between steps 4,000 and 7,000, and spikes after step 8,000 <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, Supp. C.2, Fig. 9]</a>. Read this critically. An independent study found that DeepSeek-V3-Base already produces "aha" moments before any RL, and that GRPO's length normalization inflates the length of incorrect answers, so rising length is not by itself evidence of rising skill <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025]</a> (the bias is derived on page <a href="24-rlvr-reasoning.html">24</a>). The defensible reading is that RL <em>selects and amplifies</em> reflection behaviors the base model already has, because they pay off under an outcome reward.</p>
+
+  <h3 id="zero-problems">What broke, and what it required</h3>
+  <p>R1-Zero's outputs were hard to read and mixed languages, "as DeepSeek-V3-Base is trained on multiple languages, especially English and Chinese" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, §3]</a>. Its general ability was also weak (Table 3 below: IF-Eval 46.6, AlpacaEval 2.0 24.7). Two further findings shape everything that follows. First, <strong>the base model must be big enough</strong>: with a 7B dense model and a 16B MoE, RL "consistently failed to yield meaningful improvements" on AIME, the models drifted into repetition and could not use long chains of thought, so the team moved to 32B dense, 230B MoE and 671B MoE bases <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, Supp. G.1]</a>. Second, <strong>the verifier is the product</strong>: rule-based checkers and LLM judging against a ground-truth answer served as "robust mechanisms" against reward hacking on well-defined answers, while learned reward models did not <a href="https://arxiv.org/abs/2501.12948">[Supp. G.1]</a>, and the LLM judge generalizes poorly to open-ended writing.</p>
+
+  <div class="decision">
+    <div class="decision-title">Pure RL from a base model (R1-Zero)</div>
+    <dl>
+      <dt>Problem</dt><dd>Human-written reasoning traces are expensive, cap the model at human strategies, and were not available at scale for hard problems.</dd>
+      <dt>Idea</dt><dd>Reward only checkable final answers (plus a format rule) and let GRPO discover long chains of thought on a strong base model.</dd>
+      <dt>Why it works</dt><dd>Long deliberation, self-checking and backtracking raise the probability of a correct final answer, so an outcome reward reinforces them. GRPO needs no critic, so the memory cost of RL on a 671B model stays manageable.</dd>
+      <dt>Evidence</dt><dd>AIME'24 15.6% to 77.9% pass@1 <a href="https://arxiv.org/abs/2501.12948">[R1 v2, Fig. 1]</a>; the same recipe fails on 7B and 16B bases <a href="https://arxiv.org/abs/2501.12948">[Supp. G.1]</a>.</dd>
+      <dt>Cost</dt><dd>Unreadable, language-mixed output; weak general ability; only works where a reliable verifier exists; response length is partly a budget and normalization artifact.</dd>
+      <dt>Used by</dt><dd>Starting point of R1; the template for RLVR reasoning models generally (<a href="24-rlvr-reasoning.html">page 24</a>).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="r1">R1: four stages, each a repair</h2>
+
+  <p>R1 is R1-Zero plus the minimum human structure needed to make it usable. The useful way to remember the pipeline is as four repairs, each aimed at a failure that the previous stage showed. The revised paper reports the benchmark table after every stage, which is what makes the causal reading possible <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, §4, Table 3]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 498" role="img" aria-labelledby="fig-28-2-title">
+<title id="fig-28-2-title">R1-Zero pipeline (left) and the four-stage R1 pipeline (right) with AIME 2024 pass@1 after each stage</title>
+<defs><marker id="arrow-28-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="110" y="20" text-anchor="middle" class="s-big">R1-Zero</text>
+<text x="470" y="20" text-anchor="middle" class="s-big">R1</text>
+
+<rect class="s-box" x="20" y="36" width="180" height="42" rx="6"/>
+<text x="110" y="55" text-anchor="middle" class="s-bold">DeepSeek-V3-Base</text>
+<text x="110" y="70" text-anchor="middle" class="s-small s-muted">671B total, 37B active</text>
+<path class="s-line" d="M110,78 L110,104" marker-end="url(#arrow-28-2)"/>
+<rect class="s-b" x="20" y="104" width="180" height="158" rx="6"/>
+<text x="110" y="124" text-anchor="middle" class="s-bold">Large-scale RL (GRPO)</text>
+<text x="110" y="145" text-anchor="middle" class="s-small">reward = accuracy + format,</text>
+<text x="110" y="159" text-anchor="middle" class="s-small">both rule-based, equal weight</text>
+<text x="110" y="180" text-anchor="middle" class="s-small">template: think, then answer</text>
+<text x="110" y="194" text-anchor="middle" class="s-small">no SFT, no neural reward model</text>
+<text x="110" y="215" text-anchor="middle" class="s-small">16 samples per question</text>
+<text x="110" y="229" text-anchor="middle" class="s-small">10,400 steps, 1.6 epochs</text>
+<text x="110" y="250" text-anchor="middle" class="s-small s-muted">length cap 32K, then 64K</text>
+<path class="s-line" d="M110,262 L110,288" marker-end="url(#arrow-28-2)"/>
+<rect class="s-a" x="20" y="288" width="180" height="70" rx="6"/>
+<text x="110" y="308" text-anchor="middle" class="s-bold">R1-Zero</text>
+<text x="110" y="326" text-anchor="middle" class="s-small">AIME'24 pass@1: 15.6 to 77.9</text>
+<text x="110" y="341" text-anchor="middle" class="s-small">IF-Eval 46.6, AlpacaEval 24.7</text>
+<rect class="s-plain s-dash" x="20" y="378" width="180" height="86" rx="6"/>
+<text x="110" y="397" text-anchor="middle" class="s-bold s-small">Diagnosed problems</text>
+<text x="110" y="414" text-anchor="middle" class="s-small">poor readability</text>
+<text x="110" y="429" text-anchor="middle" class="s-small">language mixing</text>
+<text x="110" y="444" text-anchor="middle" class="s-small">weak instruction following</text>
+<text x="110" y="458" text-anchor="middle" class="s-small">and general tasks</text>
+
+<rect class="s-box" x="240" y="36" width="170" height="36" rx="6"/>
+<text x="325" y="59" text-anchor="middle" class="s-bold">DeepSeek-V3-Base</text>
+
+<path class="s-line" d="M325,72 L325,88" marker-end="url(#arrow-28-2)"/>
+<rect class="s-c" x="240" y="88" width="300" height="62" rx="6"/>
+<text x="250" y="106" class="s-bold">1. Cold-start SFT</text>
+<text x="250" y="122" class="s-small">thousands of long-CoT examples: R1-Zero outputs,</text>
+<text x="250" y="136" class="s-small">filtered, rewritten readable, human-checked</text>
+<text x="555" y="107" class="s-small s-muted">Dev1</text>
+<text x="555" y="123" class="s-small">AIME 59.0</text>
+<text x="555" y="138" class="s-small">IF-Eval 71.7</text>
+
+<path class="s-line" d="M390,150 L390,166" marker-end="url(#arrow-28-2)"/>
+<rect class="s-b" x="240" y="166" width="300" height="62" rx="6"/>
+<text x="250" y="184" class="s-bold">2. Reasoning RL</text>
+<text x="250" y="200" class="s-small">GRPO as in R1-Zero, rule rewards plus a</text>
+<text x="250" y="214" class="s-small">language-consistency reward on the CoT</text>
+<text x="555" y="185" class="s-small s-muted">Dev2</text>
+<text x="555" y="201" class="s-small">AIME 74.0</text>
+<text x="555" y="216" class="s-small">Codeforces 1687</text>
+
+<path class="s-line" d="M390,228 L390,244" marker-end="url(#arrow-28-2)"/>
+<rect class="s-c" x="240" y="244" width="300" height="76" rx="6"/>
+<text x="250" y="262" class="s-bold">3. Rejection sampling + SFT</text>
+<text x="250" y="278" class="s-small">about 600K reasoning samples (correct only) +</text>
+<text x="250" y="292" class="s-small">about 200K non-reasoning = 804,745 samples,</text>
+<text x="250" y="306" class="s-small">fine-tune V3-Base again for 2 to 3 epochs</text>
+<text x="555" y="263" class="s-small s-muted">Dev3</text>
+<text x="555" y="279" class="s-small">AIME 78.1</text>
+<text x="555" y="294" class="s-small">Aider 44.8</text>
+
+<path class="s-line" d="M390,320 L390,336" marker-end="url(#arrow-28-2)"/>
+<rect class="s-b" x="240" y="336" width="300" height="76" rx="6"/>
+<text x="250" y="354" class="s-bold">4. RL for all scenarios</text>
+<text x="250" y="370" class="s-small">1,700 steps: rules for reasoning; helpfulness and</text>
+<text x="250" y="384" class="s-small">safety reward models for general data, only in</text>
+<text x="250" y="398" class="s-small">the last 400 steps; temperature 0.7</text>
+<text x="555" y="355" class="s-small s-muted">R1</text>
+<text x="555" y="371" class="s-small">AIME 79.8</text>
+<text x="555" y="386" class="s-small">AlpacaEval 87.6</text>
+
+<path class="s-line s-dash" d="M540,314 L700,314 L700,450 L500,450" marker-end="url(#arrow-28-2)"/>
+<rect class="s-a" x="240" y="424" width="260" height="52" rx="6"/>
+<text x="370" y="443" text-anchor="middle" class="s-bold">Distillation: SFT only, no RL</text>
+<text x="370" y="459" text-anchor="middle" class="s-small">the 800K samples into six Qwen and Llama students</text>
+<text x="370" y="472" text-anchor="middle" class="s-small s-muted">e.g. Qwen2.5-32B: AIME 72.6</text>
+<path class="s-line s-dash" d="M200,420 L226,420 L226,120 L240,120" marker-end="url(#arrow-28-2)"/>
+<text x="556" y="332" class="s-small s-muted">the same samples as stage 3</text>
+</svg>
+    <figcaption><b>Figure 2.</b> R1-Zero (left) and R1 (right). Numbers beside each R1 stage are the checkpoint's benchmark scores from the paper (R1 Dev1, Dev2, Dev3 are the paper's names for the intermediate models). Note that stage 3 restarts SFT from V3-Base, not from the RL checkpoint, and that the same 800K samples train both R1's stage 3 and the distilled students.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 3. Benchmark movement across the R1 stages (pass@1 unless noted) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, Table 3]</a>.</caption>
+    <thead><tr><th>Checkpoint</th><th class="num">AIME 2024</th><th class="num">GPQA Diamond</th><th class="num">IF-Eval</th><th class="num">AlpacaEval 2.0</th><th class="num">Codeforces rating</th><th class="num">Aider-Polyglot</th></tr></thead>
+    <tbody>
+      <tr><td>R1-Zero</td><td class="num">77.9</td><td class="num">75.8</td><td class="num">46.6</td><td class="num">24.7</td><td class="num">1444</td><td class="num">12.2</td></tr>
+      <tr><td>Dev1 (after cold-start SFT)</td><td class="num">59.0</td><td class="num">66.1</td><td class="num">71.7</td><td class="num">50.1</td><td class="num">1534</td><td class="num">6.7</td></tr>
+      <tr><td>Dev2 (after reasoning RL)</td><td class="num">74.0</td><td class="num">70.7</td><td class="num">72.0</td><td class="num">55.8</td><td class="num">1687</td><td class="num">25.6</td></tr>
+      <tr><td>Dev3 (after rejection-sampling SFT)</td><td class="num">78.1</td><td class="num">71.2</td><td class="num">78.1</td><td class="num">62.1</td><td class="num">1746</td><td class="num">44.8</td></tr>
+      <tr class="hl"><td>R1 (after RL for all scenarios)</td><td class="num">79.8</td><td class="num">71.5</td><td class="num">83.3</td><td class="num">87.6</td><td class="num">2029</td><td class="num">53.3</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="r1-stage1">Stage 1: cold start, to fix readability and give RL a better initial policy</h3>
+  <p>The cold-start <span class="zh">冷启动</span> data are "thousands" of long chain-of-thought examples. The supplement describes how they were made: sample R1-Zero at temperature 1.0 on thousands of reasoning prompts, keep only correct and readable outputs (answers parsed with sympy, plus repetition and language-mixing filters), have DeepSeek-V3 refine the reasoning and translate it into the question's language, and have annotators rewrite a seed set in a conversational first-person style, use it as examples for an LLM to rewrite the rest, and verify the result a second time <a href="https://arxiv.org/abs/2501.12948">[Supp. B.3.2]</a>. The motivation is stated as "primarily product-driven": users find first-person, conversational reasoning with a summary more intuitive. The original paper adds a second reason, avoiding "the early unstable cold start phase of RL training from the base model" <a href="https://arxiv.org/abs/2501.12948v1">[R1 v1, §2.3.1]</a>.</p>
+  <p>The table shows the price. Cold-start SFT lifts IF-Eval from 46.6 to 71.7 and AlpacaEval from 24.7 to 50.1, but AIME falls from 77.9 to 59.0 and GPQA from 75.8 to 66.1. The paper attributes the reasoning drop to "the limited size of the cold-start dataset". Cold start buys readability and instruction-following, not reasoning, and the next stage has to win the reasoning back.</p>
+
+  <h3 id="r1-stage2">Stage 2: reasoning RL with a language-consistency reward</h3>
+  <p>The same GRPO recipe as R1-Zero, started from the cold-start checkpoint, with one extra term: a language-consistency reward equal to the proportion of target-language words in the chain of thought, added to the rule reward. Ablations on a distilled 7B model show that without it consistency "gradually deteriorates" during RL, and with it accuracy drops slightly (a small loss on coding), which the authors accept because the reward "aligns with human preferences, making it more readable" <a href="https://arxiv.org/abs/2501.12948">[Supp. B.6, Fig. 7]</a>. Two settings deserve a note: the GRPO clip ratio \(\varepsilon\) is set to 10 (the paper says a smaller value "can lead to the truncation of gradients for a significant number of tokens", and credits a large-clipping strategy to one of the authors), and the run reuses the R1-Zero learning rate, KL coefficient, 16 samples and 32K cap <a href="https://arxiv.org/abs/2501.12948">[§3.2.1, Author contributions]</a>. AIME recovers from 59.0 to 74.0 and the Codeforces rating from 1534 to 1687.</p>
+
+  <h3 id="r1-stage3">Stage 3: rejection sampling and SFT, to restore general ability and add non-reasoning skills</h3>
+  <p>When reasoning RL converges, its checkpoint is used to generate the next SFT set by rejection sampling <span class="zh">拒绝采样</span>: several responses per prompt, keep only the correct ones. Prompts whose answers a rule cannot check are judged by DeepSeek-V3 as a generative reward model, and outputs with mixed languages, long paragraphs or code blocks are filtered out for readability. This yields about 600K reasoning samples. About 200K non-reasoning samples (writing, factual QA, self-cognition, translation, plus software-engineering data in the revised paper) come from the V3 post-training pipeline, with V3 generating a chain of thought for some of them and none for trivial queries such as "hello". V3-Base is fine-tuned on the combined 800K samples for 2 to 3 epochs (cosine learning rate from \(5\times10^{-5}\) to \(5\times10^{-6}\), batch 128, 32K context) <a href="https://arxiv.org/abs/2501.12948">[Supp. B.3.3, B.4.2]</a>. The report gives no reason for restarting from the base rather than continuing the RL checkpoint. Table 4 gives the composition, which the paper reports exactly.</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 4. The SFT set of stage 3 (also the distillation set) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, Supp. B.3.3, Table 5]</a>. The last two columns are our arithmetic.</caption>
+    <thead><tr><th>Domain</th><th class="num">Samples</th><th class="num">Mean tokens</th><th class="num">Share of samples</th><th class="num">Tokens (billions)</th></tr></thead>
+    <tbody>
+      <tr><td>Math</td><td class="num">395,285</td><td class="num">6,094.2</td><td class="num">49.1%</td><td class="num">2.41</td></tr>
+      <tr><td>Code</td><td class="num">211,129</td><td class="num">7,435.7</td><td class="num">26.2%</td><td class="num">1.57</td></tr>
+      <tr><td>STEM</td><td class="num">10,124</td><td class="num">4,928.8</td><td class="num">1.3%</td><td class="num">0.05</td></tr>
+      <tr><td>Logic</td><td class="num">10,395</td><td class="num">2,739.0</td><td class="num">1.3%</td><td class="num">0.03</td></tr>
+      <tr><td>General</td><td class="num">177,812</td><td class="num">1,419.8</td><td class="num">22.1%</td><td class="num">0.25</td></tr>
+      <tr class="hl"><td>Total</td><td class="num">804,745</td><td class="num">5,355.3</td><td class="num">100%</td><td class="num">4.31</td></tr>
+    </tbody>
+  </table></div>
+  <p>The four reasoning domains sum to \(395{,}285 + 211{,}129 + 10{,}124 + 10{,}395 = 626{,}933\) samples (the "about 600K"), and general is 177,812 (the "about 200K"). By tokens the set is 94% reasoning (\(4.06/4.31\)) and 56% math. The paper notes that most samples are single-turn, "which may limit the multi-turn conversational capabilities" of R1.</p>
+
+  <h3 id="r1-stage4">Stage 4: RL for all scenarios, to align with human preferences without losing reasoning</h3>
+  <p>The second RL stage mixes prompt types. Reasoning prompts keep rule-based rewards. General prompts use reward models: a helpfulness model trained on 66K preference pairs (judged four times by DeepSeek-V3 with positions shuffled, keeping pairs whose score gap exceeds 1, with response lengths matched to limit length bias) that scores only the final summary, and a point-wise safety model trained on 106K safe/unsafe-labeled prompts that scores the whole response including the reasoning <a href="https://arxiv.org/abs/2501.12948">[§3.1]</a>. The stage runs 1,700 steps at temperature 0.7 (higher temperatures gave incoherent text), and the preference-based rewards are used only in the last 400 steps, because "more training steps with the model based preference reward signal may lead to reward hacking": in the paper's Figure 6 the reward keeps rising while Codeforces pass@1 falls <a href="https://arxiv.org/abs/2501.12948">[§3.2.2, Supp. B.5]</a>. This is the clearest statement in the report of why reasoning RL used rules and only a short, late RL phase used learned rewards. The gains land where expected: AlpacaEval 62.1 to 87.6 and Arena-Hard 75.6 to 92.3, with math and code nearly flat (AIME 78.1 to 79.8).</p>
+
+  <h3 id="r1-results">Results against o1, and the accounting</h3>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 5. DeepSeek-R1 against OpenAI-o1-1217 (DeepSeek reports o1 numbers "based on official reports", since its API was hard to access) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1 v2, Supp. D.2, Table 8]</a>.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">o1-1217</th><th class="num">R1</th></tr></thead>
+    <tbody>
+      <tr><td>AIME 2024 (pass@1)</td><td class="num">79.2</td><td class="num">79.8</td></tr>
+      <tr><td>MATH-500</td><td class="num">96.4</td><td class="num">97.3</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">75.7</td><td class="num">71.5</td></tr>
+      <tr><td>Codeforces rating (percentile)</td><td class="num">2061 (96.6)</td><td class="num">2029 (96.3)</td></tr>
+      <tr><td>LiveCodeBench (pass@1, CoT)</td><td class="num">63.4</td><td class="num">65.9</td></tr>
+      <tr><td>SWE-bench Verified</td><td class="num">48.9</td><td class="num">49.2</td></tr>
+      <tr><td>Aider-Polyglot</td><td class="num">61.7</td><td class="num">53.3</td></tr>
+      <tr><td>MMLU</td><td class="num">91.8</td><td class="num">90.8</td></tr>
+      <tr><td>SimpleQA</td><td class="num">47.0</td><td class="num">30.1</td></tr>
+    </tbody>
+  </table></div>
+  <p>The pattern is what the pipeline predicts: parity on verifiable reasoning (math, competitive code), behind on knowledge (SimpleQA 30.1 against 47.0) and engineering-style coding (Aider 53.3 against 61.7), both areas where RL data were thin. The evaluation protocol matters for interviews: generation capped at 32,768 tokens, temperature 0.6 with top-p 0.95, and pass@1 estimated from \(k\) samples (\(k=64\) for AIME and GPQA), because greedy decoding of long-output reasoning models "results in higher repetition rates and significant variability across different checkpoints" <a href="https://arxiv.org/abs/2501.12948">[Supp. D.1]</a>.</p>
+
+  <p><strong>The cost accounting.</strong> The revised paper (and press coverage of the Nature version, <span class="unverified" title="The Nature article itself was not accessible to us; the figures come from arXiv v2 Table 7, and the press reports of $294K match it">which reported the same $294,000</span>) gives the compute of the R1 research <a href="https://arxiv.org/abs/2501.12948">[Supp. B.4.4, Table 7]</a>. Both runs used \(64 \times 8 = 512\) H800 GPUs. R1-Zero took about 198 hours and R1 about 80 hours:</p>
+  <div class="eq-box">
+  \[ 512 \times 198 = 101{,}376 \approx 101\text{K},\qquad 512 \times 80 = 40{,}960 \approx 41\text{K},\qquad 101 + 5 + 41 = 147\text{K GPU-hours} \]
+  <div class="eq-label">At the paper's assumed $2 per H800 GPU-hour: $202K + $10K (5K GPU-hours to create SFT data) + $82K = $294K</div>
+  </div>
+  <p>Against V3's own 2,788K GPU-hours ($5.576M) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Table 1]</a>, the R1 RL programme is \(147/2788 = 5.3\%\). Two caveats: the table does not include the base model, and it does not include the earlier A100 experiments on a 30B model. It is the marginal cost of turning a strong base into a reasoner, and its smallness is the point: the expensive asset was V3-Base.</p>
+
+  <h3 id="r1-negative">What did not work, and why it is informative</h3>
+  <p>The report lists two failures <a href="https://arxiv.org/abs/2501.12948">[Supp. G.2]</a>. <strong>Process reward models</strong> failed on three counts: it is hard to define a fine-grained "step" in general reasoning, hard to decide whether an intermediate step is right (automated annotation is poor, manual annotation does not scale), and any model-based PRM invites reward hacking and needs retraining, complicating the pipeline. The authors note that a PRM is still useful for reranking top-N answers. <strong>Monte Carlo tree search</strong>, inspired by AlphaGo, needs a value model that guides each step, but token generation has an exponentially larger search space than chess (capping node expansion led to local optima), and a fine-grained value model was "inherently difficult" to train. Both failures point the same way as the rest of the recipe: keep the reward simple and verifiable, and let a single long sample do the searching. The authors add that this "does not imply that these approaches are incapable" of producing reasoning models.</p>
+
+  <h3 id="r1-distill">Distillation beats RL at small scale, with caveats</h3>
+  <p>The 800K samples were also used to fine-tune six open models with plain SFT (no RL): Qwen2.5-Math-1.5B and 7B, Qwen2.5-14B and 32B, Llama-3.1-8B and Llama-3.3-70B-Instruct <a href="https://arxiv.org/abs/2501.12948">[Supp. F, Table 15]</a>. Distillation <span class="zh">蒸馏</span> is treated in depth on page <a href="19-sft-distillation.html#r1-distill">19</a>; the R1-specific evidence is one controlled comparison on Qwen2.5-32B <a href="https://arxiv.org/abs/2501.12948">[Supp. F.1, Table 16]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>32B model</th><th class="num">AIME 2024</th><th class="num">MATH-500</th><th class="num">GPQA Diamond</th><th class="num">LiveCodeBench</th></tr></thead>
+    <tbody>
+      <tr><td>QwQ-32B-Preview</td><td class="num">50.0</td><td class="num">90.6</td><td class="num">54.5</td><td class="num">41.9</td></tr>
+      <tr><td>Qwen2.5-32B-Zero (RL only, over 10K steps)</td><td class="num">47.0</td><td class="num">91.6</td><td class="num">55.0</td><td class="num">40.2</td></tr>
+      <tr class="hl"><td>R1-Distill-Qwen-32B (SFT on 800K)</td><td class="num">72.6</td><td class="num">94.3</td><td class="num">62.1</td><td class="num">57.2</td></tr>
+    </tbody>
+  </table></div>
+  <p>RL on the small base matches QwQ-32B-Preview (47.0 against 50.0 on AIME), while distillation from R1 is 25.6 AIME points better. The authors' conclusions are two: distilling a stronger model into a smaller one works very well, whereas small models trained by large-scale RL "require enormous computational power and may not even achieve the performance of distillation"; and going beyond the teacher "may still require more powerful base models and larger-scale reinforcement learning". Keep the limits in view (page 19 lists them): the comparison is not compute-matched, uses one recipe on one student, and the teacher's cost is excluded.</p>
+
+  <h3 id="r1-nature">The Nature version, and what the disclosures add</h3>
+  <p>R1 was published in Nature on 17 September 2025 (volume 645, pages 633 to 638, DOI 10.1038/s41586-025-09422-z, per Crossref). <span class="unverified" title="Inferred from matching content and from the V3.2 report citing Nature 645(8081):633-638; we could not open the Nature article itself">The expanded arXiv v2 carries the material of the Nature version</span> and adds what the January 2025 paper lacked: the per-stage table above, the RL data recipe (math 26K, code 17K, STEM 22K, logic 15K prompts in Table 4 of the paper, plus 66K helpfulness and 12K harmlessness prompts; the text adds 8K bug-fixing problems to code), the cost table, decontamination details (10-gram matching against evaluation data, roughly six million potential pre-training texts removed in math alone, and RL prompts and math SFT data drawn only from pre-2023 competitions, with the caveat that n-gram filters cannot catch paraphrases), a safety report (the paper concludes R1's inherent safety is "generally at a moderate level" comparable to GPT-4o of May 2024, raised by an external risk-control system whose review prompt is published in the supplement), and a frank limitations section: structured output and tool use, token efficiency ("overthinking" on easy questions), language mixing, prompt sensitivity (few-shot prompting hurts), software engineering, and reward hacking for tasks without reliable rewards <a href="https://arxiv.org/abs/2501.12948">[R1 v2, §5, §6, Supp. B.3.1, D.3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">The four-stage R1 pipeline</div>
+    <dl>
+      <dt>Problem</dt><dd>R1-Zero reasons well but is unreadable, mixes languages and is weak at general tasks; pure SFT on human traces was not the goal.</dd>
+      <dt>Idea</dt><dd>Alternate small, high-quality human structure with large-scale RL: cold-start SFT, reasoning RL, rejection-sampled SFT on reasoning plus general data, then RL over all scenarios.</dd>
+      <dt>Why it works</dt><dd>Each stage repairs the failure the previous one exposed: readability (1), reasoning strength and language (2), breadth (3), preference alignment with a hack-limited short RL phase (4). Rejection sampling turns RL's discoveries into supervised data that also transfers to students.</dd>
+      <dt>Evidence</dt><dd>Stagewise table: IF-Eval 46.6 to 83.3, AlpacaEval 24.7 to 87.6, Codeforces 1444 to 2029, AIME 77.9 to 79.8 <a href="https://arxiv.org/abs/2501.12948">[R1 v2, Table 3]</a>.</dd>
+      <dt>Cost</dt><dd>A more complex pipeline than R1-Zero (four stages, two data-generation steps, human filtering); AIME dips after cold start; limited multi-turn, tool and structured-output ability, which the next releases had to fix.</dd>
+      <dt>Used by</dt><dd>R1; Qwen3's four-stage flagship pipeline has the same shape (<a href="19-sft-distillation.html">page 19</a>, <a href="24-rlvr-reasoning.html">page 24</a>).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="updates">R1-0528, V3.1 and Terminus: closing the gaps R1 listed</h2>
+
+  <p>After the R1 paper, the intermediate releases are documented mainly by model cards and release notes rather than by papers, so what follows is limited to what those state. (There is no model called R2 in DeepSeek's changelog, which runs through 10 September 2026.)</p>
+
+  <h3 id="r1-0528">R1-0528: the same recipe with more compute</h3>
+  <p>The May 2025 update keeps the architecture and, per its model card, gains from "increased computational resources and introducing algorithmic optimization mechanisms during post-training" <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">[R1-0528 model card]</a>. No paper or recipe accompanies it. The reported effect is what test-time scaling predicts: deeper reasoning and better scores together.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 6. R1 against R1-0528, pass@1, 64K generation cap, temperature 0.6, 16 samples per query <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">[R1-0528 model card]</a>.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">R1</th><th class="num">R1-0528</th></tr></thead>
+    <tbody>
+      <tr><td>AIME 2025</td><td class="num">70.0</td><td class="num">87.5</td></tr>
+      <tr><td>AIME 2024</td><td class="num">79.8</td><td class="num">91.4</td></tr>
+      <tr><td>HMMT Feb 2025</td><td class="num">41.7</td><td class="num">79.4</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">71.5</td><td class="num">81.0</td></tr>
+      <tr><td>Humanity's Last Exam (text)</td><td class="num">8.5</td><td class="num">17.7</td></tr>
+      <tr><td>LiveCodeBench (2408-2505)</td><td class="num">63.5</td><td class="num">73.3</td></tr>
+      <tr><td>SWE-bench Verified (Agentless)</td><td class="num">49.2</td><td class="num">57.6</td></tr>
+      <tr><td>Aider-Polyglot</td><td class="num">53.3</td><td class="num">71.6</td></tr>
+    </tbody>
+  </table></div>
+  <p>The card attributes the gain to "enhanced thinking depth": on the AIME test set the previous model used about 12K tokens per question and the new one about 23K, a factor of \(23/12 \approx 1.9\). Read that as a warning about comparing reasoning models: a 17.5-point AIME 2025 gain came with nearly twice the tokens, so any comparison that ignores output length conflates a better model with a longer budget (the V3.2 report reports token counts next to accuracy for this reason). R1-0528 also adds system-prompt support, no forced "&lt;think&gt;" prefix, JSON output and function calling (Tau-bench 53.5 airline, 63.9 retail), and DeepSeek distilled its chains of thought into Qwen3-8B-Base, giving R1-0528-Qwen3-8B (AIME 2024 86.0 against Qwen3-8B's 76.0) <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">[model card]</a>. The release note lists JSON output and function calling as new <a href="https://api-docs.deepseek.com/updates/">[change log, 2025-05-28]</a>.</p>
+
+  <h3 id="v31">V3.1: hybrid thinking in one checkpoint</h3>
+  <p>V3.1 (21 August 2025) answers a serving problem. Until then the API exposed two models, <code>deepseek-chat</code> (V3-0324) and <code>deepseek-reasoner</code> (R1-0528). V3.1 is "a hybrid model that supports both thinking mode and non-thinking mode", <em>selected by the chat template</em> <span class="zh">混合思考模式</span>: the same weights, a different prompt suffix <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1">[V3.1 model card]</a>.</p>
+<pre><code>non-thinking : ...&lt;|User|&gt;{query}&lt;|Assistant|&gt;&lt;/think&gt;         # the reasoning block is pre-closed
+thinking     : ...&lt;|User|&gt;{query}&lt;|Assistant|&gt;&lt;think&gt;          # the model continues inside the block
+multi-turn   : earlier turns keep only "&lt;/think&gt;{response}"; earlier reasoning is dropped
+</code></pre>
+  <p>Non-thinking mode is implemented by starting the assistant turn with a closed think block, so the model has learned that after <code>&lt;/think&gt;</code> it answers directly. The multi-turn rule keeps <code>&lt;/think&gt;</code> in every earlier turn so the context stays in-distribution while the old reasoning is discarded, the same discard-on-new-turn policy that V3.2 later refines for tool use. Tool calls were supported in non-thinking mode; thinking mode got a dedicated search-agent trajectory format. Why merge the two? One checkpoint means one deployment and no routing between models, and the prompt is identical in both modes up to the assistant tag, so a prefix cache can in principle be shared (our inference); the model card claims V3.1-Think reaches answer quality "comparable to DeepSeek-R1-0528, while responding more quickly". The agent numbers are the larger change:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 7. V3.1 thinking mode against R1-0528 <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1">[V3.1 model card, Evaluation]</a>. The V3.1 SWE-bench and Terminal-bench figures are the non-thinking model in agent mode.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">R1-0528</th><th class="num">V3.1</th></tr></thead>
+    <tbody>
+      <tr><td>AIME 2024 / AIME 2025 (thinking)</td><td class="num">91.4 / 87.5</td><td class="num">93.1 / 88.4</td></tr>
+      <tr><td>GPQA Diamond (thinking)</td><td class="num">81.0</td><td class="num">80.1</td></tr>
+      <tr><td>BrowseComp (search agent)</td><td class="num">8.9</td><td class="num">30.0</td></tr>
+      <tr><td>SWE-bench Verified (agent mode)</td><td class="num">44.6</td><td class="num">66.0</td></tr>
+      <tr><td>Terminal-bench (agent mode)</td><td class="num">5.7</td><td class="num">31.3</td></tr>
+    </tbody>
+  </table></div>
+  <p>Reasoning is at parity while agent skills jump. This is the R1 report's admitted weakness ("cannot leverage tools", software engineering "not demonstrated a huge improvement") being repaired by agent-focused post-training on top of the V3 base rather than by any change to the reasoning recipe.</p>
+
+  <h3 id="v31-context">Long-context budgets and the UE8M0 format</h3>
+  <p>V3.1-Base extends V3's context in the same two phases (32K then 128K), with far more data: the 32K phase "has been increased 10-fold to 630B tokens, while the 128K extension phase has been extended by 3.3x to 209B tokens" <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1">[V3.1 model card]</a>. The multipliers refer to V3's phases, which the V3 report specifies as 1,000 steps each, at batch 1,920 sequences of 32K and batch 480 sequences of 128K <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.3]</a>. Both phases were therefore \(1000 \times 1920 \times 32768 = 1000 \times 480 \times 131072 = 62.9\)B tokens, and \(630/62.9 = 10.0\) and \(209/62.9 = 3.3\) check out. (The 630B and 209B are also the natural size to compare with V3.2's sparse stage below.)</p>
+  <p>V3.1 also "is trained using the UE8M0 FP8 scale data format on both model weights and activations to ensure compatibility with microscaling data formats" (<a href="15-distributed-training.html">page 15</a> covers FP8 training). UE8M0 stores the per-block scale as an unsigned 8-bit exponent with no mantissa, so every scale is a power of two, as in the OCP microscaling (MX) formats that new accelerators support natively. Power-of-two scales make rescaling exact and cheap; the price is coarser scale granularity than an FP32 scale. The V3.1-Terminus card is candid about an imperfection: "the parameters of <code>self_attn.o_proj</code> do not conform to the UE8M0 FP8 scale data format. This is a known issue and will be corrected in future model releases" <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus">[Terminus model card]</a>. The checkpoints of V3.2 and later (the config files list <code>scale_fmt: ue8m0</code>) carry the format forward.</p>
+
+  <h3 id="terminus">V3.1-Terminus: fixing what users reported</h3>
+  <p>Terminus (22 September 2025) keeps the model structure and targets two complaints: mixed Chinese-English text and stray characters, and code-agent and search-agent quality <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus">[Terminus model card]</a>. Language mixing is the problem R1's language-consistency reward attacked, and its return as a user complaint in a later release shows that a reward-side patch did not remove it. Gains: BrowseComp 30.0 to 38.5, SWE-bench Verified 66.0 to 68.4, Terminal-bench 31.3 to 36.7, Humanity's Last Exam 15.9 to 21.7, SimpleQA 93.4 to 96.8; regressions on BrowseComp-zh (49.2 to 45.0) and Codeforces (2091 to 2046). Terminus matters for the next section because it is the <em>parity baseline</em> for DSA: V3.2-Exp was trained from it with everything else held fixed.</p>
+</section>
+
+<section>
+  <h2 id="v32">V3.2: sparse attention and scaled RL</h2>
+
+  <p>The V3.2 report opens with a diagnosis of why open models were falling behind proprietary ones: architecturally, reliance on vanilla attention "severely constrains efficiency for long sequences", open models "suffer from insufficient computational investment during the post-training phase", and they "demonstrate a marked lag in generalization and instruction-following" in agent settings <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §1]</a>. The three contributions map one to one: DeepSeek Sparse Attention, a scaled RL protocol, and a synthetic agent-task pipeline. The report ties the first to the other two: attention inefficiency is "a substantial obstacle to both scalable deployment and effective post-training", since RL rollouts are long.</p>
+
+  <h3 id="dsa">DSA: convert a dense checkpoint, do not train a sparse model from scratch</h3>
+  <p>Page <a href="09-beyond-full-attention.html#dsa">09</a> derives the mechanism: a <em>lightning indexer</em> <span class="zh">闪电索引器</span> computes \(I_{t,s} = \sum_{j=1}^{H^I} w^I_{t,j}\,\operatorname{ReLU}(q^I_{t,j}\cdot k^I_s)\), a top-\(k\) selector keeps \(k = 2048\) earlier tokens, and core attention runs over only those entries. This page adds the parts that matter for reproducing it: what the released code does, how the conversion was trained and why, what it cost, and what it buys.</p>
+
+  <p>DSA is instantiated in the <strong>MQA mode of MLA</strong> (<a href="07-kv-efficient-attention.html#two-modes">page 07</a>): each cached latent \([c_s; k^R_s]\) is shared by all 128 query heads, since "at the kernel level, each key-value entry must be shared across multiple queries for computational efficiency" <a href="https://arxiv.org/abs/2512.02556">[V3.2, §2.1]</a> (the argument NSA made for sharing selections across a GQA group). The only architectural change from V3.1-Terminus is the indexer. The released reference implementation pins down the indexer's details <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py">[V3.2-Exp, inference/model.py]</a>, and the config gives its size (<code>index_n_heads</code> 64, <code>index_head_dim</code> 128, <code>index_topk</code> 2048):</p>
+  <ul>
+    <li><strong>Queries and weights.</strong> The 64 indexer queries of width 128 come from the same 1,536-dim query latent \(c^Q_t\) as MLA's queries; the 64 head weights \(w^I_{t,j}\) are a linear map of \(h_t\), so they are per-token, per-head, and may be negative.</li>
+    <li><strong>Keys.</strong> One 128-dim key per token from \(h_t\), followed by a LayerNorm, cached in FP8 with one FP32 scale per token. That is \(128 + 4 = 132\) bytes per token per layer on top of MLA's latent.</li>
+    <li><strong>Position and precision.</strong> RoPE is applied to 64 of the 128 dimensions in the <em>non-interleaved</em> layout, while MLA uses the interleaved layout. Both queries and keys pass through an orthogonal Hadamard rotation before FP8 quantization, which leaves dot products unchanged but (our reading) spreads outliers across channels so the quantizer wastes less range.</li>
+  </ul>
+  <p>The layout difference is not a footnote: on 17 November 2025 DeepSeek reported that earlier demo code applied the wrong RoPE layout in the indexer, "potentially leading to degraded model performance" <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">[V3.2-Exp model card, Update]</a>. An indexer that ranks with mis-rotated keys still produces plausible scores, which is why such bugs survive.</p>
+
+  <h3 id="dsa-training">How the conversion was trained</h3>
+  <p>Top-\(k\) selection has no gradient, so the indexer needs a target that does not come from the language-modeling loss. DeepSeek's answer is to distill the model's own dense attention into it, in two stages from the 128K-context V3.1-Terminus checkpoint, with data "totally aligned with the 128K long context extension data used for DeepSeek-V3.1-Terminus" <a href="https://arxiv.org/abs/2512.02556">[V3.2, §2.1.1, Eqs. 3-4]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 8. The two stages of continued pre-training (arithmetic in the last two rows is ours).</caption>
+    <thead><tr><th></th><th>Dense warm-up</th><th>Sparse training</th></tr></thead>
+    <tbody>
+      <tr><td>Trainable</td><td>indexer only</td><td>everything; the indexer receives only \(\mathcal{L}^I\), the main model only the LM loss</td></tr>
+      <tr><td>Core attention</td><td>dense</td><td>top-2048 selection</td></tr>
+      <tr><td>Indexer loss</td><td>\(\sum_t D_{\mathrm{KL}}(p_{t,:}\,\|\,\softmax(I_{t,:}))\) over all \(s \le t\)</td><td>the same KL restricted to the selected set \(\mathcal{S}_t\)</td></tr>
+      <tr><td>Learning rate</td><td class="num">\(10^{-3}\)</td><td class="num">\(7.3\times10^{-6}\)</td></tr>
+      <tr><td>Steps × sequences × length</td><td class="num">1,000 × 16 × 128K</td><td class="num">15,000 × 480 × 128K</td></tr>
+      <tr><td>Tokens</td><td class="num">2.1B</td><td class="num">943.7B</td></tr>
+      <tr><td>Share of V3's 14.8T pre-training tokens</td><td class="num">0.01%</td><td class="num">6.4% (both stages: 945.8B)</td></tr>
+      <tr><td>Relation to V3's own 128K extension</td><td>none</td><td>same 480-sequence batch and same \(7.3\times10^{-6}\) rate, 15× more steps</td></tr>
+    </tbody>
+  </table></div>
+  <p>Here \(p_{t,:}\) is the main attention distribution summed over heads and L1-normalized along the sequence. Check the arithmetic: \(1000 \cdot 16 \cdot 131072 = 2.10\)B and \(15000 \cdot 480 \cdot 131072 = 943.7\)B, so the conversion costs 6.4% of V3's pre-training tokens. Three design choices deserve a stated reason.</p>
+  <ul>
+    <li><strong>A dense warm-up first.</strong> With a randomly initialized indexer the top-2048 would be arbitrary, and switching on selection would remove most of the context the model relies on. Training only the indexer against the frozen dense attention costs 2.1B tokens and gives selection a sensible starting point.</li>
+    <li><strong>The detach.</strong> "We detach the indexer input from the computational graph for separate optimization": \(\mathcal{L}^I\) shapes the indexer, the LM loss shapes the main model. Our reading: without it the KL would pull the main attention toward the indexer as well as the reverse, and the indexer's cheap ReLU scores would constrain what attention may learn.</li>
+    <li><strong>A KL restricted to the selected set.</strong> In the sparse stage the main model computes attention only over \(\mathcal{S}_t\), so the target exists only there. Our reading: this loss can sharpen the ranking inside the selected set but cannot see a key the indexer wrongly excluded, which is one reason the dense stage precedes it.</li>
+  </ul>
+  <p>The sparse stage is best read as a longer continuation of V3's 128K extension (same batch, same rate), not as new pre-training. That is also why the conversion is testable: the V3.2-Exp card says the team "deliberately aligned the training configurations of DeepSeek-V3.2-Exp with V3.1-Terminus" so that any difference is due to sparse attention <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">[V3.2-Exp model card]</a>. The report's own account of the result is "we do not observe substantial performance degradation", supported by ChatbotArena Elo scores that were "closely matched" (measured 10 November 2025) and, on the independent AA-LCR long-context benchmark, a four-point gain for V3.2-Exp in reasoning mode <a href="https://arxiv.org/abs/2512.02556">[V3.2, §2.2]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 9. Parity check, V3.1-Terminus against V3.2-Exp (same recipe, reasoning mode without tools) <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">[V3.2-Exp model card]</a>.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">V3.1-Terminus</th><th class="num">V3.2-Exp</th></tr></thead>
+    <tbody>
+      <tr><td>MMLU-Pro</td><td class="num">85.0</td><td class="num">85.0</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">80.7</td><td class="num">79.9</td></tr>
+      <tr><td>Humanity's Last Exam</td><td class="num">21.7</td><td class="num">19.8</td></tr>
+      <tr><td>AIME 2025</td><td class="num">88.4</td><td class="num">89.3</td></tr>
+      <tr><td>HMMT 2025</td><td class="num">86.1</td><td class="num">83.6</td></tr>
+      <tr><td>Codeforces (rating)</td><td class="num">2046</td><td class="num">2121</td></tr>
+      <tr><td>BrowseComp</td><td class="num">38.5</td><td class="num">40.1</td></tr>
+      <tr><td>SWE-bench Verified</td><td class="num">68.4</td><td class="num">67.8</td></tr>
+    </tbody>
+  </table></div>
+  <p>Read it as parity within evaluation noise, not identity: four of the eight rows are lower, and the largest drops (HLE 1.9 points, HMMT 2.5) are the kind a single-seed comparison cannot resolve.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 512" role="img" aria-labelledby="fig-28-3-title">
+<title id="fig-28-3-title">DeepSeek Sparse Attention inside MLA's MQA mode: the lightning indexer scores all earlier tokens, top-k picks 2048 latents, and core attention reads only those</title>
+<defs><marker id="arrow-28-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+
+<rect class="s-box" x="10" y="98" width="78" height="52" rx="6"/>
+<text x="49" y="120" text-anchor="middle" class="s-bold">h<tspan baseline-shift="sub" font-size="9">t</tspan></text>
+<text x="49" y="138" text-anchor="middle" class="s-small s-muted">d = 7168</text>
+
+<rect class="s-d" x="120" y="28" width="200" height="84" rx="6"/>
+<text x="220" y="47" text-anchor="middle" class="s-bold">Lightning indexer</text>
+<text x="220" y="65" text-anchor="middle" class="s-small">q<tspan baseline-shift="super" font-size="8">I</tspan>: 64 heads × 128 (from c<tspan baseline-shift="super" font-size="8">Q</tspan>)</text>
+<text x="220" y="80" text-anchor="middle" class="s-small">w<tspan baseline-shift="super" font-size="8">I</tspan>: 64 weights (from h<tspan baseline-shift="sub" font-size="8">t</tspan>)</text>
+<text x="220" y="95" text-anchor="middle" class="s-small">k<tspan baseline-shift="super" font-size="8">I</tspan>: 128 per token, cached in FP8</text>
+
+<rect class="s-d" x="350" y="28" width="170" height="84" rx="6"/>
+<text x="435" y="47" text-anchor="middle" class="s-bold">Index scores</text>
+<text x="435" y="68" text-anchor="middle" class="s-mono">Σ<tspan baseline-shift="sub" font-size="9">j</tspan> w<tspan baseline-shift="sub" font-size="9">j</tspan> ReLU(q<tspan baseline-shift="sub" font-size="9">j</tspan>·k<tspan baseline-shift="sub" font-size="9">s</tspan>)</text>
+<text x="435" y="86" text-anchor="middle" class="s-small">every s ≤ t</text>
+<text x="435" y="100" text-anchor="middle" class="s-small s-muted">cost grows with L</text>
+
+<rect class="s-d" x="550" y="28" width="160" height="84" rx="6"/>
+<text x="630" y="47" text-anchor="middle" class="s-bold">Top-k, k = 2048</text>
+<text x="630" y="68" text-anchor="middle" class="s-small">one selected set per query,</text>
+<text x="630" y="83" text-anchor="middle" class="s-small">shared by all 128 heads</text>
+<text x="630" y="100" text-anchor="middle" class="s-small s-muted">not differentiable</text>
+
+<rect class="s-b" x="120" y="170" width="200" height="84" rx="6"/>
+<text x="220" y="189" text-anchor="middle" class="s-bold">MLA projections (unchanged)</text>
+<text x="220" y="207" text-anchor="middle" class="s-small">c<tspan baseline-shift="super" font-size="8">KV</tspan> 512 + k<tspan baseline-shift="super" font-size="8">R</tspan> 64 go to the cache</text>
+<text x="220" y="222" text-anchor="middle" class="s-small">c<tspan baseline-shift="super" font-size="8">Q</tspan> 1536 → q<tspan baseline-shift="super" font-size="8">C</tspan>, q<tspan baseline-shift="super" font-size="8">R</tspan> (128 heads)</text>
+<text x="220" y="237" text-anchor="middle" class="s-small">absorbed q̃ = q<tspan baseline-shift="super" font-size="8">C</tspan>W<tspan baseline-shift="super" font-size="8">UK</tspan>: 128 × 512</text>
+
+<rect class="s-a" x="350" y="170" width="170" height="84" rx="6"/>
+<text x="435" y="189" text-anchor="middle" class="s-bold">KV cache</text>
+<text x="435" y="207" text-anchor="middle" class="s-small">per token: [c<tspan baseline-shift="sub" font-size="8">s</tspan>; k<tspan baseline-shift="super" font-size="8">R</tspan><tspan baseline-shift="sub" font-size="8">s</tspan>]</text>
+<text x="435" y="222" text-anchor="middle" class="s-small">576 numbers, all s ≤ t kept</text>
+<text x="435" y="237" text-anchor="middle" class="s-small s-muted">DSA does not shrink it</text>
+
+<rect class="s-a" x="550" y="170" width="160" height="84" rx="6"/>
+<text x="630" y="189" text-anchor="middle" class="s-bold">Gather selected</text>
+<text x="630" y="210" text-anchor="middle" class="s-small">2048 × 576 latents</text>
+<text x="630" y="225" text-anchor="middle" class="s-small">read instead of L × 576</text>
+
+<rect class="s-c" x="350" y="300" width="170" height="92" rx="6"/>
+<text x="435" y="319" text-anchor="middle" class="s-bold">Core attention, MQA mode</text>
+<text x="435" y="338" text-anchor="middle" class="s-small">128 query heads share the</text>
+<text x="435" y="353" text-anchor="middle" class="s-small">k selected latents</text>
+<text x="435" y="371" text-anchor="middle" class="s-small">score dim 576, value dim 512</text>
+
+<rect class="s-box" x="550" y="300" width="160" height="92" rx="6"/>
+<text x="630" y="319" text-anchor="middle" class="s-bold">o<tspan baseline-shift="super" font-size="8">C</tspan>: 128 × 512</text>
+<text x="630" y="338" text-anchor="middle" class="s-small">× W<tspan baseline-shift="super" font-size="8">UV</tspan> per head (512 → 128)</text>
+<text x="630" y="353" text-anchor="middle" class="s-small">→ W<tspan baseline-shift="super" font-size="8">O</tspan> → u<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+
+<rect class="s-plain" x="10" y="300" width="272" height="92" rx="6"/>
+<text x="20" y="319" class="s-bold s-small">Per-layer cost, one decoded token</text>
+<text x="20" y="338" class="s-small">core: 2·128·1088 = 278,528 FLOPs per key</text>
+<text x="20" y="353" class="s-small">indexer: 2·64·128 = 16,384 FLOPs per key</text>
+<text x="20" y="371" class="s-small">total: core × k + indexer × L, not core × L</text>
+
+<path class="s-line" d="M88,118 L120,90" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M88,132 L120,196" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M320,70 L350,70" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M520,70 L550,70" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M320,212 L350,212" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M520,212 L550,212" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M630,112 L630,170" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M630,254 L630,276 L435,276 L435,300" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M302,254 L302,346 L350,346" marker-end="url(#arrow-28-3)"/>
+<path class="s-line" d="M520,346 L550,346" marker-end="url(#arrow-28-3)"/>
+
+<line class="s-line s-dash" x1="10" y1="408" x2="710" y2="408"/>
+<text x="10" y="426" class="s-bold">Training the indexer (KL to the dense attention)</text>
+<rect class="s-plain" x="10" y="436" width="300" height="56" rx="6"/>
+<text x="20" y="454" class="s-bold s-small">Target p<tspan baseline-shift="sub" font-size="8">t</tspan> (a constant)</text>
+<text x="20" y="469" class="s-small">main attention summed over heads, L1-normalized</text>
+<text x="20" y="484" class="s-small s-muted">warm-up: all s ≤ t; sparse stage: only the top-k</text>
+<rect class="s-d" x="410" y="436" width="300" height="56" rx="6"/>
+<text x="420" y="454" class="s-bold s-small">softmax(I<tspan baseline-shift="sub" font-size="8">t</tspan>), the trained student</text>
+<text x="420" y="469" class="s-small s-mono">L<tspan baseline-shift="super" font-size="8">I</tspan> = Σ<tspan baseline-shift="sub" font-size="8">t</tspan> KL(p<tspan baseline-shift="sub" font-size="8">t</tspan> ‖ softmax(I<tspan baseline-shift="sub" font-size="8">t</tspan>))</text>
+<text x="420" y="484" class="s-small s-muted">gradient reaches only the indexer</text>
+<path class="s-line s-dash" d="M310,464 L410,464" marker-start="url(#arrow-28-3)" marker-end="url(#arrow-28-3)"/>
+<text x="360" y="458" text-anchor="middle" class="s-small s-bold">KL</text>
+</svg>
+    <figcaption><b>Figure 3.</b> DSA inside MLA's MQA mode for one query token. Top row: the indexer scores every earlier token and top-k picks 2048. Middle: the cache still holds all 576 numbers per token. Bottom: core attention reads only the gathered latents, so the FLOPs of the expensive part scale with k. The indexer is trained by a KL to the dense attention (bottom strip), and that loss never reaches the main model.</figcaption>
+  </figure>
+
+<pre><code class="language-python">import torch
+
+def dsa_core(q_lat, q_rope, c, kr, scores, k, scale):
+    """q_lat (B,T,H,512) q_rope (B,T,H,64) c (B,S,512) kr (B,S,64) scores (B,T,S), -inf on the future."""
+    top, idx = scores.topk(min(k, scores.shape[-1]), dim=-1)      # (B,T,k): one selection per query
+    ok = torch.isfinite(top)                                      # filler picks when fewer than k keys exist
+    b = torch.arange(c.shape[0])[:, None, None]
+    c_sel, kr_sel = c[b, idx], kr[b, idx]                         # (B,T,k,512), (B,T,k,64): gather, not a dense mask
+    logit = (torch.einsum("bthc,btkc->bthk", q_lat, c_sel)
+             + torch.einsum("bthr,btkr->bthk", q_rope, kr_sel)) * scale
+    p = logit.masked_fill(~ok[:, :, None], float("-inf")).softmax(-1)
+    return torch.einsum("bthk,btkc->bthc", p, c_sel)              # latent-space output; W^UV is applied by the caller
+
+def indexer_kl(attn, scores, selected=None):
+    """attn (B,H,T,S) dense attention probs; selected (B,T,S) bool, or None for the warm-up stage."""
+    m = torch.isfinite(scores) if selected is None else selected &amp; torch.isfinite(scores)
+    p = attn.detach().sum(1).masked_fill(~m, 0.0)                 # sum over heads; a constant target
+    p = p / p.sum(-1, keepdim=True)                               # L1-normalize on the set
+    logq = scores.masked_fill(~m, float("-inf")).log_softmax(-1).masked_fill(~m, 0.0)
+    kl = torch.where(p &gt; 0, p * (p.clamp_min(1e-30).log() - logq), torch.zeros_like(p))
+    return kl.sum((1, 2)).mean()                                  # sum over t, mean over batch
+</code></pre>
+
+  <h3 id="dsa-cost">What DSA saves, as a cost model</h3>
+  <p>The report's accounting is that core attention falls "from \(O(L^2)\) to \(O(Lk)\)" while the indexer "still has a complexity of \(O(L^2)\)" but "requires much less computation" <a href="https://arxiv.org/abs/2512.02556">[V3.2, §2.3]</a>. Take the configuration (\(n_h = 128\), latent \(d_c = 512\), RoPE key \(d_r = 64\), \(H^I = 64\), \(d^I = 128\), \(k = 2048\)) and count FLOPs per layer for one decoded token, two FLOPs per multiply-add. In absorbed MQA mode each key costs a 576-dim score and a 512-dim weighted sum in every head, and the indexer costs one 128-dim dot product per head:</p>
+  <div class="eq-box">
+  \[ c_{\text{core}} = 2 n_h\big[(d_c + d_r) + d_c\big] = 2\cdot128\cdot1088 = 278{,}528, \qquad c_{\text{idx}} = 2 H^I d^I = 2\cdot64\cdot128 = 16{,}384 \ \text{FLOPs per key} \]
+  \[ \text{ratio}(L) = \frac{c_{\text{core}}\,L}{c_{\text{core}}\,k + c_{\text{idx}}\,L}, \qquad \lim_{L\to\infty}\text{ratio} = \frac{c_{\text{core}}}{c_{\text{idx}}} = 17, \qquad L^* = \frac{c_{\text{core}}\,k}{c_{\text{core}} - c_{\text{idx}}} = 2{,}176 \]
+  <div class="eq-label">Dense core cost \(c_{\text{core}} L\) against DSA cost \(c_{\text{core}} k + c_{\text{idx}} L\); break-even length \(L^*\) and the 17× ceiling (the drill <code>dsa_decode_flops</code> computes these)</div>
+  </div>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 10. Per-layer FLOPs to decode one token, V3.2 shapes, \(k = 2048\). Our estimate, not a reported figure (page 09 gives the same 128K and 1M rows).</caption>
+    <thead><tr><th>Context \(L\)</th><th class="num">Dense core (GFLOP)</th><th class="num">Sparse core</th><th class="num">Indexer</th><th class="num">Ratio</th></tr></thead>
+    <tbody>
+      <tr><td>8K</td><td class="num">2.28</td><td class="num">0.570</td><td class="num">0.134</td><td class="num">3.2×</td></tr>
+      <tr><td>32K</td><td class="num">9.13</td><td class="num">0.570</td><td class="num">0.537</td><td class="num">8.2×</td></tr>
+      <tr class="hl"><td>128K</td><td class="num">36.51</td><td class="num">0.570</td><td class="num">2.147</td><td class="num">13.4×</td></tr>
+      <tr><td>1M</td><td class="num">292.06</td><td class="num">0.570</td><td class="num">17.180</td><td class="num">16.5×</td></tr>
+    </tbody>
+  </table></div>
+  <p>At 128K the dense core is \(278{,}528 \times 131{,}072 = 36.51\) GFLOP; the sparse core is \(278{,}528 \times 2048 = 0.570\) GFLOP (a 64× cut, the ratio \(L/k\)), and the indexer adds \(16{,}384 \times 131{,}072 = 2.147\) GFLOP, so the total falls 13.4×, not 64×. Four consequences are worth stating aloud.</p>
+  <ol>
+    <li><strong>The indexer is most of what remains.</strong> At 128K it is \(2.147/(2.147+0.570) = 79\%\) of the sparse layer's attention FLOPs, and at 1M it is 30 times the sparse core. FP8 and few heads keep \(c_{\text{idx}}\) at 5.9% of \(c_{\text{core}}\), but it is still linear in \(L\): this is the wall that V4 attacks by compressing before indexing.</li>
+    <li><strong>Below about 2K tokens DSA costs more, not less.</strong> \(L^* = 2{,}176\). That is why the paper "specially implement[s] a masked MHA mode to simulate DSA" for short-sequence prefill: run ordinary attention and mask.</li>
+    <li><strong>Attention dominates decode at length.</strong> Across 61 layers, dense absorbed attention at 128K costs \(61 \times 36.51 = 2{,}227\) GFLOP per decoded token, against about \(2 \times 37\text{B} = 74\) GFLOP for all the active weights: 30 times more. DSA brings it to \(61 \times 2.717 = 166\) GFLOP, still 2.2 times the weights. This is the arithmetic behind V3.2's price cut (API prices "cut by 50%+" at the V3.2-Exp launch <a href="https://api-docs.deepseek.com/news/news250929">[release note]</a>). The report's Figure 3 measures cost per million tokens for V3.1-Terminus and V3.2 on H800 clusters at $2 per GPU-hour. Read off the plot (approximate): at a token position of 128K, decoding costs about $2.2 for V3.1-Terminus against about $0.25 for V3.2 (roughly 8×), and prefilling about $0.7 against $0.2 (roughly 3×); the curves cross within the first few thousand tokens, as the break-even length predicts. The measured 8× is below our 13.4× attention-FLOP ratio because the MoE and projection costs do not shrink.</li>
+    <li><strong>The cache is not smaller.</strong> Every token's latent and indexer key must stay resident because any future query may select it (page 09). DSA saves compute and bytes <em>read</em>, not capacity.</li>
+  </ol>
+  <aside class="callout warn"><div class="callout-title">Pitfall: sparse attention and RL</div>
+    <p>RL on a DSA model samples with an inference kernel and trains with another, so any disagreement in the <em>selection</em> is a train-inference mismatch that dense models do not have. GLM-5 traced RL degradation on DSA to non-deterministic CUDA and TileLang top-k kernels, cured by a deterministic <code>torch.topk</code>, and not to top-k being discontinuous (page <a href="09-beyond-full-attention.html#dsa">09</a>). DeepSeek's V4 report similarly replaces atomic-add gradient accumulation in sparse-attention backward with per-SM buffers and a deterministic reduction <a href="https://arxiv.org/abs/2606.19348">[V4, §3.3]</a>. Expert routing has the same problem, which the V3.2 report handles with "Keep Routing", below.</p></aside>
+
+  <div class="decision">
+    <div class="decision-title">Sparse attention by continued training (DSA in V3.2)</div>
+    <dl>
+      <dt>Problem</dt><dd>At 128K and beyond, core attention dominates the cost of both serving and RL rollouts, yet most keys get negligible weight.</dd>
+      <dt>Idea</dt><dd>Add a cheap learned indexer to a dense 128K checkpoint, distill the dense attention into it with a KL loss, then train everything with top-2048 selection, keeping data and post-training identical to the dense parent.</dd>
+      <dt>Why it works</dt><dd>Attention is empirically sparse, the indexer is a distilled proxy of the model's own attention, and a 6.4%-of-V3 continued-training budget avoids pre-training sparse from scratch. Identical data isolates the effect of sparsity.</dd>
+      <dt>Evidence</dt><dd>Parity with V3.1-Terminus on benchmarks, Elo and AA-LCR <a href="https://arxiv.org/abs/2512.02556">[V3.2, §2.2]</a>; 13.4× fewer per-layer decode FLOPs at 128K by our count.</dd>
+      <dt>Cost</dt><dd>Indexer is \(O(L)\) per query and dominates at 1M; the full cache is kept; break-even near 2K tokens; kernel, RoPE-layout and determinism pitfalls.</dd>
+      <dt>Used by</dt><dd>V3.2 and V3.2-Exp; GLM-5; ancestors of V4's CSA and V4.1's CSA2 (<a href="09-beyond-full-attention.html#dsa">page 09</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="v32-post">Post-training: specialists, then one mixed RL stage</h3>
+  <p>V3.2's recipe differs from R1's in structure, not only scale. Instead of one model climbing through a chain of stages, DeepSeek first trains <strong>specialists</strong>, one per domain: mathematics, programming, general logical reasoning, general agent, agentic coding and agentic search, plus writing and general question answering, each supporting thinking and non-thinking modes and each fine-tuned from the same pretrained checkpoint with large-scale RL <a href="https://arxiv.org/abs/2512.02556">[V3.2, §3]</a>. The specialists generate the domain data (separate models for long-CoT and for direct answers) that trains the final checkpoint, and "models trained on the distilled data achieve performance levels only marginally below those of domain-specific specialists, with the performance gap being effectively eliminated through subsequent RL training". Then one <strong>mixed RL</strong> stage "merge[s] reasoning, agent, and human alignment training into one RL stage", chosen because it "effectively balances performance across diverse domains while circumventing the catastrophic forgetting issues commonly associated with multi-stage training" <a href="https://arxiv.org/abs/2512.02556">[§3]</a>. Reasoning and agent tasks use a rule-based outcome reward, a length penalty and a language-consistency reward; general tasks use a generative reward model with per-prompt rubrics.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 11. What changed in post-training from R1 to V3.2 (R1 v2 and V3.2 reports).</caption>
+    <thead><tr><th></th><th>R1 (Jan 2025)</th><th>V3.2 (Dec 2025)</th></tr></thead>
+    <tbody>
+      <tr><td>Structure</td><td>Chain: cold-start SFT, reasoning RL, rejection-sampled SFT, all-scenario RL</td><td>Parallel specialists per domain, distilled into one checkpoint, then one mixed RL stage</td></tr>
+      <tr><td>Rewards</td><td>Rules (accuracy, format) plus language consistency; reward models only in the last 400 of 1,700 steps of stage 4</td><td>Rule-based outcome reward, length penalty, language consistency; rubric-based generative reward model for general tasks</td></tr>
+      <tr><td>Advantage</td><td>Reward minus group mean, divided by group standard deviation (Eq. 3)</td><td>Reward minus group mean (no division by the standard deviation)</td></tr>
+      <tr><td>RL compute</td><td>147K GPU-hours for the whole programme</td><td>"exceeds 10% of the pre-training cost"</td></tr>
+      <tr><td>Tools and agents</td><td>None (a stated limitation)</td><td>Thinking inside tool use; synthetic environments; 1,827 general-agent environments</td></tr>
+      <tr><td>Thinking modes</td><td>Separate reasoning model</td><td>Both modes, in every domain, in one model</td></tr>
+      <tr><td>Context</td><td>32K generation cap</td><td>128K, with context management for long agent runs</td></tr>
+    </tbody>
+  </table></div>
+  <p>For scale, 10% of V3's 2,664K pre-training GPU-hours is 266K, about 1.8 times R1's entire 147K (assuming V3.2's pre-training cost is of V3's order; the paper does not give a figure). The compute went into making RL stable, described in four fixes that are best understood as removing sources of train-inference and policy mismatch <a href="https://arxiv.org/abs/2512.02556">[V3.2, §3.1]</a>:</p>
+  <ul>
+    <li><strong>Unbiased KL estimate.</strong> The K3 estimator is sampled from the old policy, so its gradient is biased. Multiplying by the importance ratio \(\pi_\theta/\pi_{\text{old}}\) makes it unbiased, and matters when a sampled token has \(\pi_\theta \ll \pi_{\text{ref}}\), where K3's gradient gives "disproportionately large, unbounded weights". Strength is tuned per domain: for mathematics a weak KL, "or even omitting it entirely", can help.</li>
+    <li><strong>Off-policy sequence masking.</strong> Rollouts are split into mini-batches and generated by a differently optimized inference engine, so training is off-policy. Sequences whose advantage is negative and whose mean log-ratio exceeds a threshold \(\delta\) are dropped: \(M_{i,t} = 0\) if \(\hat A_{i,t} &lt; 0\) and \(\frac{1}{|o_i|}\sum_t \log\frac{\pi_{\text{old}}(o_{i,t})}{\pi_\theta(o_{i,t})} &gt; \delta\), else 1. Only negative samples are masked: "the model benefits the most by learning from its own mistakes, whereas highly off-policy negative samples can be detrimental".</li>
+    <li><strong>Keep Routing.</strong> The experts chosen during sampling are recorded and forced during training, because routing can differ between inference and training code and after each update, shifting "the active parameter subspace". "Adopted in our RL training pipeline since DeepSeek-V3-0324".</li>
+    <li><strong>Keep Sampling Mask.</strong> Top-p and top-k truncation during sampling create an action space for \(\pi_{\text{old}}\) that \(\pi_\theta\) does not share, violating importance sampling; the masks are stored and reapplied. Combined with top-p sampling this "effectively preserves language consistency".</li>
+  </ul>
+  <p>The algebra of GRPO and these variants is on page <a href="24-rlvr-reasoning.html">24</a>; the infrastructure view (rollout, staleness, mismatch) is on page <a href="25-rl-systems-agentic.html">25</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Specialists plus a single mixed RL stage (V3.2)</div>
+    <dl>
+      <dt>Problem</dt><dd>A sequence of RL stages per capability (reasoning, then agents, then alignment) forgets earlier stages, and one giant run mixing every domain from the start is hard to tune.</dd>
+      <dt>Idea</dt><dd>Train domain specialists with large RL budgets, distill them into one checkpoint by SFT on their outputs, then run one RL stage over reasoning, agent and alignment data together.</dd>
+      <dt>Why it works</dt><dd>Specialists reach high peaks without compromise; distillation transfers most of it cheaply; the final mixed RL closes the remaining gap while the domains constrain each other.</dd>
+      <dt>Evidence</dt><dd>Distilled model "marginally below" specialists, gap removed by RL; parity with GPT-5-class models on reasoning <a href="https://arxiv.org/abs/2512.02556">[V3.2, §3, §4.1]</a>.</dd>
+      <dt>Cost</dt><dd>Many training runs; the mixed stage is unstable without the four fixes; no ablation against a single-stage recipe is shown.</dd>
+      <dt>Used by</dt><dd>V3.2; superseded in V4 by on-policy distillation of the same kind of specialists (below).</dd>
+    </dl>
+  </div>
+
+  <h3 id="v32-agents">Agents: environments at scale, and thinking inside tool use</h3>
+  <p>Two problems had to be solved to make an R1-style reasoner useful as an agent. The first is <strong>context</strong> <a href="https://arxiv.org/abs/2512.02556">[V3.2, §3.2.1]</a>. R1-style handling discards the reasoning whenever a new message arrives. In a tool loop, where each tool result is a new message, that forces the model to "redundantly re-reason through the entire problem for each subsequent tool call". V3.2's rule: historical reasoning is dropped only when a new <em>user</em> message arrives, is retained through tool outputs, and the history of tool calls and results is always kept. Frameworks that simulate tool results as user messages (Roo Code, Terminus) defeat the rule, and the report recommends non-thinking mode for them. The cold start uses only prompting: three system prompts (reasoning with the think tag, tool use without reasoning, and reasoning interleaved with tool calls) produce occasional good trajectories that RL then amplifies (Tables 6 to 8 of the report).</p>
+  <p>The second is <strong>task supply</strong> <a href="https://arxiv.org/abs/2512.02556">[V3.2, §3.2.3, Table 1]</a>. Verifiable agent tasks are scarce, so DeepSeek synthesizes them:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 12. Agent RL tasks in V3.2 (Table 1 of the report; the total is our sum, matching "over 85,000 prompts").</caption>
+    <thead><tr><th>Agent</th><th class="num">Tasks</th><th>Environment</th><th>Prompts</th></tr></thead>
+    <tbody>
+      <tr><td>Code agent</td><td class="num">24,667</td><td>real (built from millions of GitHub issue and pull-request pairs)</td><td>extracted</td></tr>
+      <tr><td>Search agent</td><td class="num">50,275</td><td>real (web search API)</td><td>synthesized</td></tr>
+      <tr><td>General agent</td><td class="num">4,417</td><td>synthesized (1,827 environments)</td><td>synthesized</td></tr>
+      <tr><td>Code interpreter</td><td class="num">5,908</td><td>real (Jupyter)</td><td>extracted</td></tr>
+      <tr class="hl"><td>Total</td><td class="num">85,267</td><td></td><td></td></tr>
+    </tbody>
+  </table></div>
+  <p>The general-agent pipeline is the interesting one, because the task is built <em>hard to solve, easy to verify</em>: an agent first fills a sandbox database from the web, writes task-specific tool functions, proposes a simple task with a solution function and a verification function, and iteratively raises the difficulty (adding tools if needed). The result is thousands of \(\langle\)environment, tools, task, verifier\(\rangle\) tuples, filtered to keep only instances with non-zero pass@100 under V3.2, which yields the 1,827 environments and 4,417 tasks. On a random sample of 50 of them, V3.2-Exp solved 12% while frontier closed models reached at most 62% (GPT-5-Thinking), so the tasks are hard <a href="https://arxiv.org/abs/2512.02556">[§4.3, Table 5]</a>. They also transfer: RL only on the synthetic general-agent tasks (non-thinking mode) improved τ²-Bench, MCP-Mark and MCP-Universe, whereas RL restricted to code and search environments did not (Figure 5), evidence that breadth of environments, not depth in a few, drives out-of-domain agent skill.</p>
+
+  <h3 id="v32-results">Results, Speciale, and the limits DeepSeek states</h3>
+  <p>The report compares V3.2 in thinking mode with GPT-5 High, Gemini-3.0-Pro and Claude-4.5-Sonnet (as reported by DeepSeek, single harness) <a href="https://arxiv.org/abs/2512.02556">[V3.2, §4.1, Table 2]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 13. V3.2 (thinking) against frontier models, as reported in the V3.2 report. Speciale is in the next table.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">Claude-4.5-Sonnet</th><th class="num">GPT-5 High</th><th class="num">Gemini-3.0-Pro</th><th class="num">V3.2</th></tr></thead>
+    <tbody>
+      <tr><td>AIME 2025</td><td class="num">87.0</td><td class="num">94.6</td><td class="num">95.0</td><td class="num">93.1</td></tr>
+      <tr><td>HMMT Feb 2025</td><td class="num">79.2</td><td class="num">88.3</td><td class="num">97.5</td><td class="num">92.5</td></tr>
+      <tr><td>HLE (text)</td><td class="num">13.7</td><td class="num">26.3</td><td class="num">37.7</td><td class="num">25.1</td></tr>
+      <tr><td>Codeforces rating</td><td class="num">1480</td><td class="num">2537</td><td class="num">2708</td><td class="num">2386</td></tr>
+      <tr><td>SWE-bench Verified</td><td class="num">77.2</td><td class="num">74.9</td><td class="num">76.2</td><td class="num">73.1</td></tr>
+      <tr><td>Terminal Bench 2.0</td><td class="num">42.8</td><td class="num">35.2</td><td class="num">54.2</td><td class="num">46.4</td></tr>
+      <tr><td>BrowseComp (with context management)</td><td class="num">24.1</td><td class="num">54.9</td><td class="num">n/a</td><td class="num">51.4 (67.6)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The high-compute variant <strong>V3.2-Speciale</strong> answers a different question: what if the length constraint is relaxed? It was "trained exclusively on reasoning data with a reduced length penalty during RL", plus the dataset and reward method of DeepSeekMath-V2 (below) for proofs, and it has no tool calling <a href="https://arxiv.org/abs/2512.02556">[§3]</a>. Its results include gold-level scores at IMO 2025 (35/42), CMO 2025 (102/126), IOI 2025 (492/600, 10th place) and ICPC World Finals 2025 (10/12, 2nd place) <a href="https://arxiv.org/abs/2512.02556">[§4.2, Table 4]</a>. The report is honest about the cost, and its Table 3 puts output tokens next to accuracy, which lets us compute the price of the last points:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 14. Accuracy and output tokens (thousands) <a href="https://arxiv.org/abs/2512.02556">[V3.2, Table 3]</a>. The token ratios are our arithmetic.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">Gemini-3.0-Pro</th><th class="num">V3.2</th><th class="num">Speciale</th><th class="num">Speciale / V3.2 tokens</th><th class="num">Speciale / Gemini tokens</th></tr></thead>
+    <tbody>
+      <tr><td>AIME 2025</td><td class="num">95.0 (15k)</td><td class="num">93.1 (16k)</td><td class="num">96.0 (23k)</td><td class="num">1.44×</td><td class="num">1.53×</td></tr>
+      <tr><td>HMMT Feb 2025</td><td class="num">97.5 (16k)</td><td class="num">92.5 (19k)</td><td class="num">99.2 (27k)</td><td class="num">1.42×</td><td class="num">1.69×</td></tr>
+      <tr><td>Codeforces rating</td><td class="num">2708 (22k)</td><td class="num">2386 (42k)</td><td class="num">2701 (77k)</td><td class="num">1.83×</td><td class="num">3.50×</td></tr>
+      <tr><td>HLE (text)</td><td class="num">37.7 (15k)</td><td class="num">25.1 (21k)</td><td class="num">30.6 (35k)</td><td class="num">1.67×</td><td class="num">2.33×</td></tr>
+    </tbody>
+  </table></div>
+  <p>Speciale matches Gemini-3.0-Pro on Codeforces (2701 against 2708) but with 3.5 times the tokens, and the report concedes that "the token efficiency of DeepSeek-V3.2-Speciale remains significantly inferior to that of Gemini-3.0-Pro"; official V3.2 was given stricter token constraints "to mitigate deployment costs and latency". Speciale was served only through a temporary endpoint that expired on 15 December 2025 <a href="https://api-docs.deepseek.com/updates/">[change log, 2025-12-01]</a>. Official V3.2 does use fewer tokens than Kimi-K2-Thinking at comparable accuracy: AIME 2025 93.1 in 16K tokens against Kimi's 94.5 in 24K (Table 3 of the report).</p>
+  <p><strong>Limitations stated by DeepSeek</strong> <a href="https://arxiv.org/abs/2512.02556">[V3.2, §5]</a>: (1) "due to fewer total training FLOPs, the breadth of world knowledge in DeepSeek-V3.2 still lags behind that of leading proprietary models", to be addressed by scaling pre-training; (2) token efficiency: it "typically requires longer generation trajectories" than Gemini-3.0-Pro to match quality; (3) complex tasks remain inferior to frontier models. The evaluation sections add operational ones: the 128K context limit caused over 20% of BrowseComp cases to overflow, so scores use context management (51.4 without, 60.2 with the Summary strategy, 67.6 with Discard-all, which drops all previous tool history when usage passes 80% of the window <a href="https://arxiv.org/abs/2512.02556">[§4.4]</a>); the model "frequently engages in redundant self-verification", exceeding 128K on MCP-Mark tasks; the context-management rule is incompatible with Terminus, so Terminal Bench 2.0 is reported under the Claude Code framework (46.4; 39.3 with Terminus in non-thinking mode); and the official-template HLE score is 23.9 against 25.1 with DeepSeek's template, a small reminder that prompts move benchmarks.</p>
+</section>
+
+<section>
+  <h2 id="research">Adjacent research that fed the releases</h2>
+  <p>DeepSeek's papers between releases are not side projects: three of them (NSA, mHC, Engram) reappear inside the flagship models, one (DeepSeekMath-V2) supplied data and rewards to V3.2-Speciale, and one (DSpark) is in the V4 serving stack. One verified paragraph each.</p>
+
+  <p><strong>Native Sparse Attention (NSA), February 2025.</strong> NSA trains sparse attention from the start, with compressed, selected and sliding-window branches mixed by learned gates, on block-level selections shared across a GQA group <a href="https://arxiv.org/abs/2502.11089">[Yuan et al. 2025]</a> (details on page <a href="09-beyond-full-attention.html#learned-sparse">09</a>). DSA is its pragmatic sibling: instead of a new sparse architecture trained natively, it converts a dense checkpoint with a token-level indexer, keeping MLA, and the V3.2 card calls this "fine-grained sparse attention for the first time" <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">[V3.2-Exp model card]</a>. Why it matters: NSA supplied the kernel-level insight (share each selected entry across many query heads) that decided DSA's MQA-mode instantiation.</p>
+
+  <p><strong>DeepSeekMath-V2, November 2025.</strong> Rewarding correct final answers cannot train theorem proving (there is no numeric answer) and does not guarantee correct reasoning. V2 trains an LLM <em>verifier</em> that writes an issue analysis and scores a proof 0, 0.5 or 1 against a rubric, adds a <em>meta-verifier</em> that checks whether the issues the verifier cites really exist (raising the mean quality score of analyses on a validation split from 0.85 to 0.96), then uses the verifier as the reward model for a proof generator that must also write its own self-analysis (reward weights 0.76 for the proof, 0.24 for an accurate self-score). To keep the generation-verification gap open, it scales verification compute to auto-label hard new proofs, and in the last two iterations this replaced human annotation entirely. Built on DeepSeek-V3.2-Exp-Base, it reports gold-level IMO 2025 and CMO 2024 results and 118/120 on Putnam 2024 with scaled test-time compute <a href="https://arxiv.org/abs/2511.22570">[Shao et al. 2025, Abstract, §2, §3.3.3]</a>. Why it matters: it is the answer to R1's stated limitation that rule-based rewards do not cover tasks without a checkable answer, and its dataset and reward method went into Speciale.</p>
+
+  <p><strong>DeepSeek-OCR and OCR 2, October 2025 and January 2026.</strong> OCR treats long context as an image-compression problem: a text page rendered as an image needs far fewer vision tokens than text tokens. A DeepEncoder feeds a 3B-parameter MoE decoder (570M active). At under 10× text-to-vision compression it decodes at about 97% precision, and at 20× still about 60%; on OmniDocBench it beats GOT-OCR2.0 with 100 vision tokens against 256, and MinerU2.0 with under 800 tokens against 6,000+; one A100-40G generates over 200K pages of training data per day <a href="https://arxiv.org/abs/2510.18234">[Wei et al. 2025, Abstract]</a>. The authors pitch the lossy 10 to 20× regime as a model of memory forgetting for old context. OCR 2 replaces the CLIP component with an LLM-style encoder whose causal learnable queries reorder visual tokens by content rather than raster order <a href="https://arxiv.org/abs/2601.20552">[Wei et al. 2026]</a>. Why it matters: it explores compression along the modality axis, whereas V4 compresses along the token axis with learned pooling; neither is a lossless cache.</p>
+
+  <p><strong>mHC, December 2025.</strong> Hyper-connections widen the residual stream into \(n\) parallel streams mixed by learned matrices, which improves quality but breaks the identity-mapping property of residual connections and destabilizes deep stacks. Manifold-Constrained Hyper-Connections project the residual mixing matrix onto the doubly stochastic matrices (Sinkhorn-Knopp, so rows and columns sum to 1), restoring a bounded, non-expansive map. With \(n = 4\), the 27B experiments show a final training-loss reduction of 0.021 against the baseline, and the fused implementation adds 6.7% training time <a href="https://arxiv.org/abs/2512.24880">[Xie et al. 2026, Introduction and 27B experiments]</a>. It is derived on page <a href="11-stability-tweaks.html">11</a>; V4 uses \(n_{hc} = 4\) and 20 Sinkhorn iterations.</p>
+
+  <p><strong>Engram, January 2026.</strong> MoE adds capacity by conditional <em>computation</em>; Engram adds conditional <em>memory</em> <span class="zh">条件记忆</span>, a hashed n-gram embedding table with O(1) lookup that relieves early layers of reconstructing static patterns. Allocating parameters between experts and memory gives a U-shaped loss curve with the optimum at roughly 75 to 80% of the sparse budget in experts. At 27B total parameters Engram beats an iso-parameter, iso-FLOP MoE by BBH +5.0, MMLU +3.4 and HumanEval +3.0, and raises Multi-Query NIAH from 84.2 to 97.0. Its addresses are deterministic, so tables can be prefetched from host memory, and offloading a 100B-parameter table costs under 3% <a href="https://arxiv.org/abs/2601.07372">[Cheng et al. 2026, Abstract, §1]</a>. The V4 report lists more sparse embedding modules as future work, and V4.1-Flash ships a 196B-parameter Engram (below).</p>
+
+  <p><strong>DSpark, July 2026.</strong> A speculative-decoding framework (<a href="17-inference-serving.html">page 17</a> covers the basics) that drafts a block of tokens in one pass with a semi-autoregressive drafter (a parallel backbone plus a light sequential module to restore dependence between drafted tokens) and verifies with a length chosen per request from estimated prefix survival probabilities and the engine's throughput profile. In the V4 serving system under live traffic it accelerated per-user generation by 60% to 85% at matched throughput against the MTP-1 baseline <a href="https://arxiv.org/abs/2607.05147">[Cheng et al. 2026, Abstract]</a>. Separate DSpark-equipped copies of the V4 preview models appeared in late June 2026, and the official V4-Flash-0731 and V4-Pro-0813 releases ship with the module attached <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813">[V4-Pro-0813 model card]</a>.</p>
+</section>
+
+<section>
+  <h2 id="v4">V4: the million-token model</h2>
+
+  <p>The V4 report (arXiv 2606.19348, submitted 26 April 2026 for the preview released on 24 April) starts from the same diagnosis as V3.2 but pushes it to a stated goal: test-time scaling and long-horizon agents are "fundamentally constrained by the quadratic computational complexity of the vanilla attention mechanism", so make a 1M-token context routine <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §1]</a>. Everything else in V4 is either a stability fix for a model that large or a way to make the new attention cheap to train and serve. It also answers V3.2's other stated limitation, narrow world knowledge, with scale: V4-Pro-Base beats V3.2-Base on SimpleQA-Verified 55.2 against 28.3 and FACTS Parametric 62.6 against 27.1 (the model card's base-model table).</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 15. V3.2 against the V4 preview models <a href="https://arxiv.org/abs/2606.19348">[V4, §4.2.1, §4.2.2]</a>, cross-checked with the released <code>config.json</code> files.</caption>
+    <thead><tr><th></th><th>V3.2</th><th>V4-Flash</th><th>V4-Pro</th></tr></thead>
+    <tbody>
+      <tr><td>Layers, hidden size</td><td class="num">61, 7168</td><td class="num">43, 4096</td><td class="num">61, 7168</td></tr>
+      <tr><td>Total / active parameters</td><td class="num">671B / 37B</td><td class="num">284B / 13B</td><td class="num">1.6T / 49B</td></tr>
+      <tr><td>Routed experts (active per token) + shared</td><td class="num">256 (8) + 1</td><td class="num">256 (6) + 1</td><td class="num">384 (6) + 1</td></tr>
+      <tr><td>Expert hidden size</td><td class="num">2048</td><td class="num">2048</td><td class="num">3072</td></tr>
+      <tr><td>First layers</td><td>3 dense FFN</td><td>3 hash-routed MoE</td><td>3 hash-routed MoE</td></tr>
+      <tr><td>Expert affinity, routing limit</td><td>sigmoid; 4 of 8 groups</td><td>Sqrt(Softplus); no node limit</td><td>Sqrt(Softplus); no node limit</td></tr>
+      <tr><td>Attention</td><td>MLA + DSA, top-2048</td><td>2 SWA layers, then CSA (top-512) and HCA</td><td>2 HCA, then CSA (top-1024) and HCA</td></tr>
+      <tr><td>Residual stream / optimizer</td><td>plain / AdamW</td><td>mHC, \(n_{hc}=4\) / Muon</td><td>mHC, \(n_{hc}=4\) / Muon</td></tr>
+      <tr><td>Expert weight precision</td><td>FP8</td><td>FP4 (QAT)</td><td>FP4 (QAT)</td></tr>
+      <tr><td>Pre-training tokens</td><td>14.8T + extension stages</td><td>32T</td><td>33T</td></tr>
+      <tr><td>Context</td><td>128K</td><td>1M</td><td>1M</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="v4-attn">Attention: compress first, then select</h3>
+  <p>CSA and HCA are derived on page <a href="09-beyond-full-attention.html#v4">09</a>, including the reconstruction of V4-Pro's cache (5.18 GB, 1.98% of a BF16 GQA-8 baseline). What that page leaves open is <em>why</em> V4 abandoned MLA plus DSA, and the count of entries a query touches shows it. At \(L = 2^{20}\) tokens:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 16. What one query reads at 1M tokens, per layer (our counts from the configurations).</caption>
+    <thead><tr><th>Model</th><th>Indexer layers</th><th class="num">Entries the indexer scores</th><th class="num">Entries core attention reads</th></tr></thead>
+    <tbody>
+      <tr><td>V3.2</td><td class="num">61</td><td class="num">1,048,576 (every token)</td><td class="num">2,048</td></tr>
+      <tr><td>V4-Pro CSA (30 layers)</td><td class="num">30</td><td class="num">262,144 (\(L/4\) compressed)</td><td class="num">1,024 + 128 window</td></tr>
+      <tr><td>V4-Pro HCA (31 layers)</td><td class="num">0</td><td class="num">none</td><td class="num">8,192 (\(L/128\)) + 128 window</td></tr>
+      <tr><td>V4-Flash CSA (21 layers)</td><td class="num">21</td><td class="num">262,144</td><td class="num">512 + 128 window</td></tr>
+    </tbody>
+  </table></div>
+  <p>V3.2's cost at 1M was dominated by the indexer's scan of a million keys (page 09: 30 times the sparse core). V4 attacks the scan directly: it compresses 4 tokens into one entry <em>before</em> indexing, so the indexer sees a quarter as many keys, and it computes the indexer in FP4. Because each CSA entry summarizes 4 tokens, the top-k can shrink to 1,024 or 512 (the report notes the smaller top-k improves short and medium contexts) while still covering 4,096 or 2,048 tokens, plus a 128-token sliding window for the local detail a compressed block cannot give. Layers of HCA, at a 128-fold compression, skip selection and attend densely to 8,192 entries. Our reconstruction of the headline numbers from the configurations (unit costs as in Table 10, attention and active-weight FLOPs only, precision weighting ignored) lands close to what the report states:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 17. Reconstructing the reported 1M-token savings against V3.2. Reported values from <a href="https://arxiv.org/abs/2606.19348">[V4, §1]</a>; the KV byte counts use 656 B per V3.2 latent entry (as on page 09) plus 132 B for its indexer key.</caption>
+    <thead><tr><th></th><th class="num">V3.2</th><th class="num">V4-Pro</th><th class="num">V4-Flash</th></tr></thead>
+    <tbody>
+      <tr><td>Attention GFLOP per token (all layers)</td><td class="num">1,083</td><td class="num">206</td><td class="num">114</td></tr>
+      <tr><td>Plus active weights \(2N_{\text{act}}\) (GFLOP)</td><td class="num">74</td><td class="num">98</td><td class="num">26</td></tr>
+      <tr><td>Total, relative to V3.2 (ours / reported)</td><td class="num">100%</td><td class="num">26% / 27%</td><td class="num">12% / 10%</td></tr>
+      <tr><td>KV cache bytes per token</td><td class="num">48,068</td><td class="num">4,970</td><td class="num">3,471</td></tr>
+      <tr class="hl"><td>KV relative to V3.2 (ours / reported)</td><td class="num">100%</td><td class="num">10.3% / 10%</td><td class="num">7.2% / 7%</td></tr>
+    </tbody>
+  </table></div>
+  <p>The V3.2 cache is \(61 \times (656 + 132) = 48{,}068\) bytes per token, which is 50.4 GB at \(2^{20}\) tokens. The FLOP total for V3.2 (1,157 GFLOP, or 1.16 TFLOP) and this cache size agree with the endpoints of the V3.2 curves in the report's Figure 1 (about 1.2 TFLOP per token and close to 50 GB, read off the plot). For V4-Pro a CSA layer stores \(576 + 68 = 644\) bytes per compressed entry (448 FP8 bytes plus 64 BF16 RoPE dimensions of 2 bytes, plus an assumed 64 B of 4-bit indexer key and 4 B of scale), so \(30 \times 644/4 + 31 \times 576/128 = 4{,}970\) bytes per token. The FLOP reconstruction is rougher for Flash (12% against 10%) because it ignores that the FP4 indexer is cheaper than its FLOP count.</p>
+  <p>Sparse attention is also trained differently. V3.2 converted a finished dense model (dense warm-up 2.1B tokens, then sparse). V4 trains from scratch at 4K, 16K and 64K, then 1M, uses dense attention for the first 1T tokens (V4-Pro longer), introduces sparsity at the 64K stage after "a short stage to warm up the lightning indexer in CSA", and keeps it for the rest <a href="https://arxiv.org/abs/2606.19348">[V4, §4.2.2]</a>. The same pattern of doing selection natively is pushed further in V4.1 below.</p>
+
+  <h3 id="v4-arch">MoE, mHC, Muon and stability fixes</h3>
+  <ul>
+    <li><strong>MoE</strong> (page <a href="08-mixture-of-experts.html">08</a>). The affinity function changes from Sigmoid to Sqrt(Softplus); balancing stays auxiliary-loss-free (bias update speed 0.001) with a sequence-wise balance loss of weight 0.0001; the constraint on the number of nodes a token may reach is removed, with the parallelism strategy redesigned to compensate (page <a href="27-deepseek-2-v3.html">27</a> explains why V3 had it); and the first three layers, which were dense FFNs in V3, become MoE layers with <strong>hash routing</strong>, where a fixed hash of the token ID picks the experts <a href="https://arxiv.org/abs/2606.19348">[V4, §2.1]</a>. The report does not give a reason for hash routing. MTP is unchanged (depth 1).</li>
+    <li><strong>mHC</strong> (page <a href="11-stability-tweaks.html">11</a>): \(n_{hc}=4\) residual streams whose mixing matrix is projected to doubly stochastic by 20 Sinkhorn iterations. An engineering note: the mHC coefficient matmul has an output dimension of only 24 (\(4 + 4 + 16\)), which forces split-K at small batch, so a deterministic reduction is needed <a href="https://arxiv.org/abs/2606.19348">[V4, §2.2, §3.3]</a>.</li>
+    <li><strong>Muon</strong> (page <a href="14-optimization.html">14</a>): used for most matrices, with AdamW kept for embeddings, the head, RMSNorm weights and mHC's static biases and gates. Newton-Schulz runs 10 iterations in two stages (8 with \((a,b,c) = (3.4445, -4.7750, 2.0315)\), then 2 with \((2, -1.5, 0.5)\)), update RMS is rescaled to 0.18 to reuse AdamW's learning rates, momentum 0.95, weight decay 0.1. Because RMSNorm is applied to queries and KV entries directly, V4 needs no QK-Clip <a href="https://arxiv.org/abs/2606.19348">[V4, §2.4, §4.2.2]</a>.</li>
+    <li><strong>Loss spikes.</strong> Rollbacks restored state but spikes recurred, consistently "tied to outliers in the MoE layers", which routing amplified. Two fixes, both admitted to be poorly understood: <em>Anticipatory Routing</em> computes routing indices with parameters from \(\Delta t\) steps earlier (data fetched ahead), costing about 20% extra time, so it is switched on only for a while after a spike is detected and a short rollback; and <em>SwiGLU clamping</em> restricts the linear branch to \([-10, 10]\) and the gate to at most 10 <a href="https://arxiv.org/abs/2606.19348">[V4, §4.2.3]</a>.</li>
+  </ul>
+
+  <h3 id="v4-infra">Infrastructure that the architecture depends on</h3>
+  <p>Three systems items explain why V4 is deployable. (1) A <strong>fused MoE kernel</strong> that splits experts into waves so that dispatch, the two GEMMs and combine overlap in one pipeline; communication is fully hidden when the compute-to-bandwidth ratio satisfies \(C/B \le 2d = 6144\) FLOPs per byte for V4-Pro (\(d = 3072\)), and the kernel gives 1.50 to 1.73× over non-fused baselines, up to 1.96× for RL rollouts, and was open-sourced as MegaMoE in DeepGEMM <a href="https://arxiv.org/abs/2606.19348">[V4, §3.1]</a>. (2) <strong>Batch-invariant and deterministic kernels</strong> for bitwise agreement between training, RL rollouts and serving: no split-KV in decode attention (a dual-kernel design recovers utilization), no split-K in most GEMMs, per-SM accumulation buffers in sparse-attention backward <a href="https://arxiv.org/abs/2606.19348">[§3.3]</a>. This is what makes on-policy RL on a sparse MoE debuggable (page <a href="15-distributed-training.html">15</a>). (3) A heterogeneous <strong>on-disk KV cache</strong>: compressed CSA and HCA entries are stored to SSD for prefix reuse, while the uncompressed sliding-window KV, about 8 times larger, gets one of three policies (full caching, periodic checkpoints, or none with recomputation of the last \(n_{win} L\) tokens) <a href="https://arxiv.org/abs/2606.19348">[§3.5.2]</a>; page <a href="17-inference-serving.html">17</a> covers serving.</p>
+
+  <h3 id="v4-post">Post-training: specialists, then on-policy distillation</h3>
+  <p>The report says the pipeline "largely mirrored that of DeepSeek-V3.2" with one substitution: "the mixed Reinforcement Learning (RL) stage was entirely replaced by On-Policy Distillation (OPD)" <a href="https://arxiv.org/abs/2606.19348">[V4, §5.1]</a>. Specialists are still trained per domain (SFT, then GRPO with hyper-parameters "closely aligned" to earlier work). The merge is now a distillation: the student samples its own trajectories, and each sample is scored against the teacher for its domain by a reverse KL.</p>
+  <div class="eq-box">
+  \[ \mathcal{L}_{\text{OPD}}(\theta) = \sum_{i=1}^{N} w_i \, D_{\mathrm{KL}}\big(\pi_\theta \,\|\, \pi_{E_i}\big) \]
+  <div class="eq-label">Student \(\pi_\theta\), expert teachers \(\pi_{E_i}\), weights \(w_i\); trajectories sampled from the student (on-policy); more than ten teachers</div>
+  </div>
+  <p>Two details matter. First, the KL uses the <strong>full vocabulary</strong>: earlier on-policy distillation reuses the RL machinery with the per-token log-ratio \(\operatorname{sg}[\log \pi_E/\pi_\theta]\) as an advantage, which is cheap but "leads to high variance in gradient estimation and often causes training instability". Second, full-vocabulary logits for ten or more trillion-parameter teachers cannot be materialized, so the system caches only each teacher's last-layer hidden states, reloads the teacher's prediction head on demand, orders samples by teacher so one head is resident at a time, and computes the exact KL in a TileLang kernel <a href="https://arxiv.org/abs/2606.19348">[V4, §5.2.2]</a>. The stated reason to prefer OPD over mixed RL is that it consolidates distinct expert weights "via logits-level alignment, practically circumventing the performance degradation often encountered in traditional weight-merging or mixed RL techniques". We could find no head-to-head ablation of OPD against V3.2's mixed RL in the report, so treat the claim as motivated but not shown (page <a href="19-sft-distillation.html">19</a> covers on-policy distillation more broadly).</p>
+  <p>Other post-training changes in V4:</p>
+  <ul>
+    <li><strong>Reasoning effort as three trained modes</strong> <a href="https://arxiv.org/abs/2606.19348">[V4, §5.1.1, Tables 2-3]</a>. Non-think answers after an empty think block; Think High reasons then answers; Think Max adds an injected system instruction ("Reasoning Effort: Absolute maximum with no shortcuts permitted...") and a bigger budget. Specialists for each mode are trained with distinct length penalties and context windows (evaluation windows 8K, 128K and 384K tokens). This turns V3.2's single length penalty into a controllable product feature.</li>
+    <li><strong>A generative reward model that is the actor itself.</strong> For hard-to-verify tasks V4 drops scalar reward models: it curates rubric-guided data and evaluates trajectories with a generative reward model, and applies RL "directly to the GRM itself", so the actor "natively functions as the GRM" and judging and generating skills are optimized jointly, with few human annotations. That is R1's stage-4 problem (reward hacking of learned RMs) attacked from the other side: make the judge reason.</li>
+    <li><strong>Thinking management.</strong> V3.2 dropped reasoning at each new user message; with 1M tokens V4 keeps the whole reasoning history across user turns in tool-calling conversations, and keeps V3.2's discard rule for plain chat. Tool calls use an XML schema with a special <code>|DSML|</code> token, chosen because it "effectively mitigates escaping failures and reduces tool-call errors" (<a href="https://arxiv.org/abs/2606.19348">§5.1.1</a>).</li>
+    <li><strong>FP4 quantization-aware training</strong> for expert weights and the indexer's QK path, done in post-training so teacher, reference and student all see it. FP4-to-FP8 dequantization is lossless when the ratio of the largest to smallest FP4 sub-block scale inside an FP8 block stays bounded (E4M3 has two more exponent bits than E2M1), so QAT reuses the FP8 training stack; quantizing the index scores from FP32 to BF16 doubles top-k speed while keeping 99.7% recall <a href="https://arxiv.org/abs/2606.19348">[§5.2.1]</a>.</li>
+    <li><strong>Rollouts that survive preemption.</strong> A token-granular write-ahead log lets an interrupted generation resume. Regenerating unfinished requests from scratch is "mathematically incorrect", because short responses are likelier to finish before an interruption, so restarts bias the model toward shorter outputs <a href="https://arxiv.org/abs/2606.19348">[§5.2.3]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">On-policy distillation instead of mixed RL (V4)</div>
+    <dl>
+      <dt>Problem</dt><dd>Merging many domain specialists into one model by weight merging or one mixed RL stage degrades some capabilities and is hard to balance.</dd>
+      <dt>Idea</dt><dd>Train specialists independently, then train one student on its own samples to minimize the (weighted) full-vocabulary reverse KL to the relevant teacher.</dd>
+      <dt>Why it works</dt><dd>The teacher provides a dense per-token signal on the student's own distribution, so there is no exposure bias of SFT and no sparse-reward credit assignment of RL, and the domain of each sample selects the right teacher.</dd>
+      <dt>Evidence</dt><dd>Reported to be the primary technique that merged more than ten teachers into V4 <a href="https://arxiv.org/abs/2606.19348">[V4, §5.1.2]</a>; the frontier-competitive results below. No ablation against mixed RL is shown.</dd>
+      <dt>Cost</dt><dd>Needs all teachers resident or reloadable and full-vocabulary logits; bounded by teacher quality; teachers themselves still need RL with verifiers.</dd>
+      <dt>Used by</dt><dd>V4 and V4.1 (over 40 teachers); the same idea in Qwen3's small models (<a href="19-sft-distillation.html">page 19</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="v4-results">Results, and the limitations DeepSeek states</h3>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 18. V4-Pro-Max against frontier models, as reported by DeepSeek (effort settings: Opus-4.6 Max, GPT-5.4 xHigh, Gemini-3.1-Pro High) <a href="https://arxiv.org/abs/2606.19348">[V4, §5.3, Table 6]</a>. A dash means not reported.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">Opus-4.6</th><th class="num">GPT-5.4</th><th class="num">Gemini-3.1-Pro</th><th class="num">V4-Pro-Max</th></tr></thead>
+    <tbody>
+      <tr><td>SimpleQA-Verified</td><td class="num">46.2</td><td class="num">45.3</td><td class="num">75.6</td><td class="num">57.9</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">91.3</td><td class="num">93.0</td><td class="num">94.3</td><td class="num">90.1</td></tr>
+      <tr><td>HLE (no tools)</td><td class="num">40.0</td><td class="num">39.8</td><td class="num">44.4</td><td class="num">37.7</td></tr>
+      <tr><td>LiveCodeBench</td><td class="num">88.8</td><td class="num">-</td><td class="num">91.7</td><td class="num">93.5</td></tr>
+      <tr><td>Codeforces rating</td><td class="num">-</td><td class="num">3168</td><td class="num">3052</td><td class="num">3206</td></tr>
+      <tr><td>HMMT 2026 Feb</td><td class="num">96.2</td><td class="num">97.7</td><td class="num">94.7</td><td class="num">95.2</td></tr>
+      <tr><td>SWE-bench Verified</td><td class="num">80.8</td><td class="num">-</td><td class="num">80.6</td><td class="num">80.6</td></tr>
+      <tr><td>Terminal Bench 2.0</td><td class="num">65.4</td><td class="num">75.1</td><td class="num">68.5</td><td class="num">67.9</td></tr>
+      <tr><td>BrowseComp</td><td class="num">83.7</td><td class="num">82.7</td><td class="num">85.9</td><td class="num">83.4</td></tr>
+      <tr><td>MRCR 1M</td><td class="num">92.9</td><td class="num">-</td><td class="num">76.3</td><td class="num">83.5</td></tr>
+    </tbody>
+  </table></div>
+  <p>The report's own summary is measured: V4-Pro-Max leads open models on knowledge (about 20 points on SimpleQA-Verified), is comparable to GPT-5.4 on competitive coding (Codeforces rating 3206, rank 23rd among human participants on the live leaderboard), and is on par with Kimi-K2.6 and GLM-5.1 on agent tasks but "slightly worse than frontier closed models". On reasoning it "falls marginally short of GPT-5.4 and Gemini-3.1-Pro, suggesting a developmental trajectory that trails state-of-the-art frontier models by approximately 3 to 6 months" <a href="https://arxiv.org/abs/2606.19348">[V4, §1]</a>. In a compute-heavy hybrid formal-informal pipeline it also reports a perfect 120/120 on Putnam 2025 (§5.3.2).</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 19. Effort mode against model size <a href="https://arxiv.org/abs/2606.19348">[V4, Table 7]</a>.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">Flash non-think</th><th class="num">Flash high</th><th class="num">Flash max</th><th class="num">Pro non-think</th><th class="num">Pro high</th><th class="num">Pro max</th></tr></thead>
+    <tbody>
+      <tr><td>HMMT 2026 Feb</td><td class="num">40.8</td><td class="num">91.9</td><td class="num">94.8</td><td class="num">31.7</td><td class="num">94.0</td><td class="num">95.2</td></tr>
+      <tr><td>LiveCodeBench</td><td class="num">55.2</td><td class="num">88.4</td><td class="num">91.6</td><td class="num">56.8</td><td class="num">89.8</td><td class="num">93.5</td></tr>
+      <tr><td>HLE</td><td class="num">8.1</td><td class="num">29.4</td><td class="num">34.8</td><td class="num">7.7</td><td class="num">34.5</td><td class="num">37.7</td></tr>
+      <tr><td>SimpleQA-Verified</td><td class="num">23.1</td><td class="num">28.9</td><td class="num">34.1</td><td class="num">45.0</td><td class="num">46.2</td><td class="num">57.9</td></tr>
+      <tr><td>Terminal Bench 2.0</td><td class="num">49.1</td><td class="num">56.6</td><td class="num">56.9</td><td class="num">59.1</td><td class="num">63.3</td><td class="num">67.9</td></tr>
+    </tbody>
+  </table></div>
+  <p>The table separates two levers. Competition reasoning is bought with tokens: HMMT goes from 40.8 to 94.8 on Flash between non-think and max, and Flash-Max (94.8) nearly equals Pro-Max (95.2) despite a fifth of the active parameters. Knowledge is bought with parameters: SimpleQA-Verified is 34.1 for Flash-Max and 57.9 for Pro-Max, a factor of 1.7 that no effort setting closes. Agentic tasks depend on both.</p>
+  <p><strong>Limitations stated by DeepSeek</strong> <a href="https://arxiv.org/abs/2606.19348">[V4, §6]</a>: the architecture is "relatively complex" because many "preliminarily validated components and tricks" were retained to minimize risk, and the plan is to distill it to "its most essential designs"; Anticipatory Routing and SwiGLU clamping work but "their underlying principles remain insufficiently understood"; future work includes sparser embedding modules (Engram-like), low-latency architectures, long-horizon multi-round agents, multimodality and better data synthesis. It is labeled a preview.</p>
+</section>
+
+<section>
+  <h2 id="v4-later">After the preview: re-post-training and V4.1-Flash</h2>
+  <p>Everything in this section comes from DeepSeek's release notes, model cards and, for V4.1-Flash, a technical report posted on the model's Hugging Face page (there is no arXiv identifier for it as of 29 September 2026), so numbers are DeepSeek-reported and not independently reproduced.</p>
+
+  <h3 id="v4-refresh">V4-Flash-0731 and V4-Pro-0813: the same architecture, a new post-training run</h3>
+  <p>On 31 July and 13 August 2026 DeepSeek released the "official" V4-Flash and V4-Pro. The cards say the first "keeps the same model architecture and size" as the preview and "was only re-post-trained"; the second is "built on the DeepSeek-V4-Pro (Preview) model structure, with a DSpark speculative decoding module attached" <a href="https://api-docs.deepseek.com/updates/">[change log, 2026-07-31 and 2026-08-13]</a>, <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813">[V4-Pro-0813 model card]</a>. The reported effect is large:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 20. Agentic benchmarks, preview against official releases, as reported in the V4-Pro-0813 model card (DeepSeek Harness minimal mode, max effort; the card does not say whether the preview column was re-run under the same harness).</caption>
+    <thead><tr><th>Benchmark</th><th class="num">Flash preview</th><th class="num">Flash-0731</th><th class="num">Pro preview</th><th class="num">Pro-0813</th></tr></thead>
+    <tbody>
+      <tr><td>Terminal Bench 2.1</td><td class="num">61.8</td><td class="num">82.7</td><td class="num">72.1</td><td class="num">87.9</td></tr>
+      <tr><td>DeepSWE</td><td class="num">7.3</td><td class="num">54.4</td><td class="num">12.8</td><td class="num">62.7</td></tr>
+      <tr><td>NL2Repo</td><td class="num">39.4</td><td class="num">54.2</td><td class="num">38.5</td><td class="num">61.5</td></tr>
+      <tr><td>Toolathlon-Verified</td><td class="num">49.7</td><td class="num">70.3</td><td class="num">55.9</td><td class="num">74.1</td></tr>
+      <tr><td>HLE without / with tools</td><td class="num">34.8 / 45.1</td><td class="num">37.8 / 51.5</td><td class="num">37.7 / 48.2</td><td class="num">42.7 / 60.0</td></tr>
+    </tbody>
+  </table></div>
+  <p>The 13B-active Flash-0731 beats the 49B-active Pro preview on every row the card lists. With the architecture fixed, the lesson is where the capability came from: post-training data and environments. The V4.1 report says so in as many words, below. Both official cards expose reasoning effort as a public three-level setting (low, high, max), and the release notes add native support for the OpenAI Responses API. In between, V4-Flash-Vision-Exp (21 August, API) added visual modules to the Flash architecture with continued training, reporting text-agent scores "comparable" to Flash-0731 and gains on multimodal agent tasks <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp">[model card]</a>.</p>
+
+  <h3 id="v41">V4.1-Flash: attack the deployment bill</h3>
+  <p>V4.1-Flash (10 September 2026, MIT license, technical report "Pushing the Limits of KV Cache Compression") is described as "the smallest model in our new architecture family, with native multimodal visual understanding" <a href="https://api-docs.deepseek.com/updates/">[change log, 2026-09-10]</a>, <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">[model card]</a>. Its premise is a change in workload: long-horizon agents make inputs dominate (tool outputs, growing histories), so the cost that matters is prefill compute when the cache misses, and the HBM, SSD and bandwidth needed to hold and move KV caches <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf">[V4.1 report, §1]</a>. The model has 552B backbone parameters (plus a 196B Engram table), 40 layers, hidden size 5,120, 384 routed and 1 shared experts with 6 active, and activates 8B parameters per token in prefill and 16B in decode. It reduces each cost with a separate mechanism:</p>
+  <ul>
+    <li><strong>Causal Encoder-Decoder (CED)</strong> (§2.2), inspired by YOCO. The bottom \(L/2\) layers form a causal encoder. In the upper half the global KV entries are not computed from each layer's own hidden state; they are projected from the encoder's last hidden state, \(C_l = H_{L/2} W^{KV}_l\) for \(l > L/2\) (with layer-specific weights). A prompt token therefore needs only the encoder half in prefill, which cuts prefill from \(O(NL)\) to about \(O(NL/2)\), and is why active parameters are 8B in prefill against 16B in decode. Sliding-window KV is still computed layer by layer.</li>
+    <li><strong>Compressed Sparse Attention 2 (CSA2)</strong> (§2.3). Compression along the layer axis, on top of V4's along the token axis: each layer is statically one of <em>Full</em> (computes its own global KV and indexer K, runs the indexer), <em>Reindex</em> (reuses an earlier layer's KV and indexer K but scores them with its own indexer queries for fresh top-K), or <em>Reuse</em> (reuses both KV and the top-K indices, runs no indexer). CSA2 also drops CSA's overlapping compression windows and absolute positional embedding, derives the indexer key by projecting the main KV entry instead of a separate compression path, and uses pure CSA2 with no HCA layers.</li>
+    <li><strong>Hierarchical Sparse Indexer</strong> (§2.3.2), decoder only. The first Full layer scores every position, then builds a candidate pool from the highest-scoring blocks (2,048 blocks of 8 positions, up to 16,384 positions). Later Reindex layers re-rank only that pool, so their cost per query is bounded independent of context length. It is applied identically in training and inference (introduced in post-training) so deeper indexers are optimized on the domain they use.</li>
+    <li><strong>FP4 main KV cache</strong> (§2.4.4): E2M1 values with one E4M3 scale per 16 channels (NVFP4-like, without the second-level global scale, since the RMS-normalized 512-channel latent is bounded by about \(\sqrt{512} \approx 22.6\) and the observed maximum is near 10), applied by quantization-aware training after RoPE. Sliding-window KV stays FP8 for its sensitivity.</li>
+    <li><strong>SWA Bounded Replay</strong> (§3.2.2). V4's zero-SWA-caching option recomputes sliding-window KV, which exactly requires replaying \(L \times n_{win}\) tokens, a cost the V4.1 report calls "prohibitive in production deployments". V4.1 replays only the last \(n_{win}\) tokens and accepts approximate states ("negligible" quality loss reported), so the persistent SSD or host-memory cache holds only global KV: about 1/8 of V4-Flash's persistent footprint.</li>
+    <li><strong>Also</strong>: Single-Pass mHC (shift the input-mixing coefficients by one block so a fused kernel reads the residual once, halving activation traffic from \((4n+4)d\) to \((2n+2)d\)); Engram conditional memory (196B parameters in two modules at layers 1 and 14, n-gram orders 2, 3, 4, 8 hash heads, tables prefetched from host memory); DSpark speculative decoding (MTP is dropped from backbone pre-training); modality-specific expert-bias balancing; and a from-scratch vision encoder (DeepSeek-ViT with 2D-RoPE and 3×3 pixel unshuffle).</li>
+  </ul>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 332" role="img" aria-labelledby="fig-28-4-title">
+<title id="fig-28-4-title">Layer layout of DeepSeek-V4.1-Flash: 40 layers split into a causal encoder and a decoder, with four Full, four Reindex and thirty Reuse CSA2 layers</title>
+<defs><marker id="arrow-28-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="189.0" y="20" text-anchor="middle" class="s-bold">Causal encoder, layers 0 to 19</text>
+<text x="529.0" y="20" text-anchor="middle" class="s-bold">Decoder, layers 20 to 39</text>
+<line class="s-line" x1="20" y1="30" x2="358" y2="30"/><line class="s-line" x1="360" y1="30" x2="698" y2="30"/>
+<text x="189.0" y="46" text-anchor="middle" class="s-small s-muted">the only layers a prompt token runs in prefill</text>
+<text x="529.0" y="46" text-anchor="middle" class="s-small s-muted">global KV projected from layer 19 output</text>
+<rect class="s-plain" x="20" y="56" width="15" height="26" rx="3"/>
+<text x="27.5" y="96" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-plain" x="37" y="56" width="15" height="26" rx="3"/>
+<text x="44.5" y="96" text-anchor="middle" class="s-small s-muted">1</text>
+<rect class="s-a" x="54" y="56" width="15" height="26" rx="3"/>
+<text x="61.5" y="74" text-anchor="middle" class="s-small s-bold">F</text>
+<text x="61.5" y="96" text-anchor="middle" class="s-small s-muted">2</text>
+<rect class="s-box" x="71" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="88" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="105" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="122" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="139" y="56" width="15" height="26" rx="3"/>
+<rect class="s-a" x="156" y="56" width="15" height="26" rx="3"/>
+<text x="163.5" y="74" text-anchor="middle" class="s-small s-bold">F</text>
+<text x="163.5" y="96" text-anchor="middle" class="s-small s-muted">8</text>
+<rect class="s-box" x="173" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="190" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="207" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="224" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="241" y="56" width="15" height="26" rx="3"/>
+<rect class="s-a" x="258" y="56" width="15" height="26" rx="3"/>
+<text x="265.5" y="74" text-anchor="middle" class="s-small s-bold">F</text>
+<text x="265.5" y="96" text-anchor="middle" class="s-small s-muted">14</text>
+<rect class="s-box" x="275" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="292" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="309" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="326" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="343" y="56" width="15" height="26" rx="3"/>
+<rect class="s-a" x="360" y="56" width="15" height="26" rx="3"/>
+<text x="367.5" y="74" text-anchor="middle" class="s-small s-bold">F</text>
+<text x="367.5" y="96" text-anchor="middle" class="s-small s-muted">20</text>
+<rect class="s-box" x="377" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="394" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="411" y="56" width="15" height="26" rx="3"/>
+<rect class="s-c" x="428" y="56" width="15" height="26" rx="3"/>
+<text x="435.5" y="74" text-anchor="middle" class="s-small s-bold">R</text>
+<text x="435.5" y="96" text-anchor="middle" class="s-small s-muted">24</text>
+<rect class="s-box" x="445" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="462" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="479" y="56" width="15" height="26" rx="3"/>
+<rect class="s-c" x="496" y="56" width="15" height="26" rx="3"/>
+<text x="503.5" y="74" text-anchor="middle" class="s-small s-bold">R</text>
+<text x="503.5" y="96" text-anchor="middle" class="s-small s-muted">28</text>
+<rect class="s-box" x="513" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="530" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="547" y="56" width="15" height="26" rx="3"/>
+<rect class="s-c" x="564" y="56" width="15" height="26" rx="3"/>
+<text x="571.5" y="74" text-anchor="middle" class="s-small s-bold">R</text>
+<text x="571.5" y="96" text-anchor="middle" class="s-small s-muted">32</text>
+<rect class="s-box" x="581" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="598" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="615" y="56" width="15" height="26" rx="3"/>
+<rect class="s-c" x="632" y="56" width="15" height="26" rx="3"/>
+<text x="639.5" y="74" text-anchor="middle" class="s-small s-bold">R</text>
+<text x="639.5" y="96" text-anchor="middle" class="s-small s-muted">36</text>
+<rect class="s-box" x="649" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="666" y="56" width="15" height="26" rx="3"/>
+<rect class="s-box" x="683" y="56" width="15" height="26" rx="3"/>
+<path class="s-line" d="M54,104 L54,108 L358,108 L358,104"/>
+<text x="206.0" y="122" text-anchor="middle" class="s-small">18 CSA2 layers, compression m = 2: in 3 groups of 6 (1 Full + 5 Reuse)</text>
+<path class="s-line" d="M360,104 L360,108 L698,108 L698,104"/>
+<text x="529.0" y="122" text-anchor="middle" class="s-small">20 CSA2 layers, m = 1: 1 Full + 3 Reuse, then 4 groups of 1 Reindex + 3 Reuse</text>
+<path class="s-line-c" d="M367.5,138 Q401.5,162.4 435.5,138" marker-end="url(#arrow-28-4)"/>
+<path class="s-line-c" d="M367.5,138 Q435.5,172.8 503.5,138" marker-end="url(#arrow-28-4)"/>
+<path class="s-line-c" d="M367.5,138 Q469.5,183.2 571.5,138" marker-end="url(#arrow-28-4)"/>
+<path class="s-line-c" d="M367.5,138 Q503.5,193.6 639.5,138" marker-end="url(#arrow-28-4)"/>
+<text x="20" y="200" class="s-small">Hierarchical Sparse Indexer: layer 20 scores every position and builds a candidate pool</text>
+<text x="20" y="215" class="s-small">(2,048 blocks of 8 = 16,384 positions); layers 24, 28, 32, 36 re-rank only that pool</text>
+<rect class="s-plain" x="20" y="234" width="14" height="12" rx="2"/><text x="40" y="244" class="s-small">SWA only (layers 0, 1)</text>
+<rect class="s-a" x="370" y="234" width="14" height="12" rx="2"/><text x="390" y="244" class="s-small">Full: own global KV and indexer, fresh top-512 (F)</text>
+<rect class="s-c" x="20" y="254" width="14" height="12" rx="2"/><text x="40" y="264" class="s-small">Reindex: shared KV and indexer K, fresh top-512 (R)</text>
+<rect class="s-box" x="370" y="254" width="14" height="12" rx="2"/><text x="390" y="264" class="s-small">Reuse: shared KV and the same top-K, no indexer (30 layers)</text>
+<text x="20" y="296" class="s-small">Global KV entries per token: 3 encoder Full layers × 1/2 (m = 2) + 1 decoder Full layer × 1 = 2.5 entries.</text>
+<text x="20" y="312" class="s-small">Bytes: 2.5 × (288 B FP4 main KV + 68 B FP4 indexer key) = 890 B per token.</text>
+</svg>
+    <figcaption><b>Figure 4.</b> Layer layout of V4.1-Flash (from the paper's setup and <code>config.json</code>: <code>kv_source_layer_ids</code> [2, 8, 14, 20], <code>index_source_layer_ids</code> [2, 8, 14, 20, 24, 28, 32, 36]). Only four layers own global KV and only eight run an indexer (four Full layers scan everything, four Reindex layers scan a bounded pool). Layers 0 and 1 are sliding-window only.</figcaption>
+  </figure>
+
+  <p><strong>Worked number: 890 bytes per token.</strong> The paper states the global KV cache footprint as 890 B per token, "roughly 1/4" of V4-Flash. We can reconstruct it. The four Full layers own the caches: three in the encoder at compression \(m = 2\) (each holds \(1/2\) entry per token) and one in the decoder at \(m = 1\) (1 entry per token), so \(3 \times \tfrac12 + 1 = 2.5\) entries per token. A main-KV entry has 512 channels: 4 bits each is 256 B, plus one E4M3 scale byte per 16 channels (32 B), so 288 B. An indexer key has 128 channels: 64 B plus (our assumption: MXFP4, one 8-bit scale per 32 channels) 4 B, so 68 B. Then</p>
+  <div class="eq-box">
+  \[ 2.5 \times (288 + 68) = 2.5 \times 356 = 890 \text{ bytes per token} \]
+  <div class="eq-label">Reproduces the reported value exactly under these assumptions; the sliding-window KV (FP8, bounded by \(n_{win} = 128\)) is not part of the growing global footprint</div>
+  </div>
+  <p>Two cross-checks support the accounting. The V4-Flash reconstruction of Table 17 gives 3,471 bytes per token, and \(3{,}471/890 = 3.9\), the reported "roughly 1/4". And the figure's "437-fold reduction relative to DeepSeek-V1" is \(437 \times 890 = 388{,}930\) bytes, essentially the BF16 GQA-8 cache of DeepSeek LLM 67B (95 layers, 8 KV heads, head dimension 128): \(95 \times 2 \times 8 \times 128 \times 2 = 389{,}120\) bytes, and \(389{,}120/890 = 437.2\). (We take "V1" to mean that model; the report does not name it.) The trajectory in global-KV bytes per token: 389 KB (V1, GQA, BF16), 70.3 KB (V3, MLA, BF16, page 07), 48.1 KB (V3.2, FP8 latents plus indexer keys, our estimate), about 5.0 KB (V4-Pro, average at 1M tokens, our estimate), 890 B (V4.1-Flash), each step attacking a different factor of layers × tokens × features × bytes.</p>
+
+  <h3 id="v41-train">Training, post-training and the effort knob</h3>
+  <p>V4.1-Flash is trained from scratch on 45T multimodal tokens with sparse attention "trained from scratch at a sequence length of 64K, without any dense attention warmup stages", extended to 1M at 34T tokens, at a fixed batch of 100.6M tokens and a peak learning rate of \(2.6\times10^{-4}\) held to 28T tokens, then decayed to \(2.6\times10^{-5}\) by 40T <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf">[V4.1 report, §1, §4.2]</a>. Sparse-attention training has therefore moved from a converted dense model (V3.2: 2.1B warm-up tokens), to a dense first 1T tokens then a short indexer warm-up (V4), to none at all (V4.1). The optimizer uses head-wise Muon (queries split by head before orthogonalization) and a Sinkhorn-balanced update for embeddings and the head, with the Engram learning rate scaled 5×. The report says the run had "no instability", a notable contrast with the loss-spike fixes V4 needed.</p>
+  <p>Post-training "introduces no algorithmic innovation": SFT, then RL, then on-policy distillation over more than 40 teachers (V4: more than ten; teachers may differ architecturally from the student). Instead, in the report's words, "All substantive changes lie instead in the data pipeline": models help construct tasks (a task is a problem, an environment and a verification system, scored for difficulty and correctness and iteratively improved), general-agent environments are mocked from real tool interfaces observed in employee and partner workflows, and coding environments come from sessions and starred repositories, built and quality-checked by cooperating agents. The authors' conclusion: "at the current stage, the marginal return of engineering the data and environment pipeline substantially exceeds that of algorithmic novelty in post-training" <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf">[V4.1 report, §5.1]</a>. RL is asynchronous, with two guards against its side effects: limiting per-dataset concurrency and discarding early short samples to counter a length bias (short rollouts finish first), and bounding staleness with a mask on tokens that are too old.</p>
+  <p>Effort control becomes continuous. A scalar \(b \in \{1,\dots,100\}\) is written into the system prompt during RL, responses at different \(b\) form separate advantage subgroups (rewards are mean-centered within a subgroup, so different efforts are never compared), and the length component of the reward depends on \(b\):</p>
+  <div class="eq-box">
+  \[ r^{\text{len}}_{b,j} = -\min\!\Big(C_{\max},\; k(b)\,\frac{\ell_{b,j}}{L_{\text{norm}}}\Big), \qquad k(b) = k_0 \exp\!\Big(-\frac{b - b_{\min}}{\tau}\Big),\ \ \tau = \lambda \Delta b \]
+  <div class="eq-label">\(\ell\) is the number of reasoning tokens; raising the requested effort by \(\tau\) multiplies the penalty coefficient by \(e^{-1} \approx 0.37\)</div>
+  </div>
+  <p>Higher requested effort thus makes tokens cheaper, and one checkpoint can trade cost for accuracy at deployment, including interpolated values. The public API's three tiers map to \(b = 100\) (max), 75 (high) and 50 (low) <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf">[V4.1 report, §5.1.4]</a>. Compare V3.2, one length penalty and one operating point; V4, three separately trained modes; V4.1, a smooth dial.</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 21. Selected V4.1-Flash results, max effort, as reported by DeepSeek <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">[V4.1-Flash model card]</a> (self-reported; agent benchmarks use DeepSeek Harness minimal mode and up to 1M context). Opus-5.0 is the strongest closed model in DeepSeek's table.</caption>
+    <thead><tr><th>Benchmark</th><th class="num">V4-Flash</th><th class="num">V4-Pro</th><th class="num">V4.1-Flash</th><th class="num">Opus-5.0</th></tr></thead>
+    <tbody>
+      <tr><td>Terminal-Bench 2.1</td><td class="num">82.7</td><td class="num">87.9</td><td class="num">90.6</td><td class="num">89.1</td></tr>
+      <tr><td>DeepSWE v1.1</td><td class="num">54.4</td><td class="num">62.7</td><td class="num">74.2</td><td class="num">74.0</td></tr>
+      <tr><td>AutomationBench</td><td class="num">37.7</td><td class="num">43.2</td><td class="num">54.8</td><td class="num">50.3</td></tr>
+      <tr><td>GPQA Diamond</td><td class="num">89.9</td><td class="num">92.4</td><td class="num">90.9</td><td class="num">93.4</td></tr>
+      <tr><td>Codeforces rating</td><td class="num">3289</td><td class="num">3348</td><td class="num">3471</td><td class="num">-</td></tr>
+      <tr><td>HLE (DeepSeek columns: text-only subset)</td><td class="num">37.8</td><td class="num">42.7</td><td class="num">39.1</td><td class="num">56.3</td></tr>
+      <tr><td>Terminal-Bench 4.0</td><td class="num">7.0</td><td class="num">12.4</td><td class="num">31.2</td><td class="num">51.8</td></tr>
+    </tbody>
+  </table></div>
+  <p>The pattern repeats what the earlier tables showed. A 552B model with 8B/16B active parameters matches or beats the 1.6T V4-Pro on agentic and competition benchmarks, is behind it on knowledge-heavy ones (HLE), and trails the strongest closed model most on tasks that "require expert-level domain knowledge" such as Terminal-Bench 4.0 (31.2 against 51.8), which the report itself names. The stated limitations are unusually specific: the new architecture "create[s] robustness boundaries that have yet to be fully characterized", and "potential selection errors in CSA2 and approximate state reconstruction in SWA Bounded Replay may still cause capability degradation in untested boundary cases", with planned stress tests on sparse retrieval over long contexts and cache-resumption boundaries. It also warns that near-parity on saturated benchmarks "does not imply that the model matches the frontier capabilities" of closed systems on hard tasks. As for what is next: the September 10 release note says V4-Pro requests would be served by V4.1-Flash "until V4.1-Pro launches", and the change log later states that V4-Pro API service continues after September 14, 2026; we found no V4.1-Pro release in DeepSeek's change log or Hugging Face organization as of 29 September 2026.</p>
+</section>
+
+<section>
+  <h2 id="synthesis">Synthesis: how the reasoning recipe evolved, and what is open</h2>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 22. The reasoning and post-training recipe across releases.</caption>
+    <thead><tr><th></th><th>Learning signal</th><th>How capabilities are combined</th><th>Agent data</th><th>Length and effort</th></tr></thead>
+    <tbody>
+      <tr><td>R1-Zero</td><td>GRPO, rule-based accuracy and format only</td><td>Nothing to combine: RL on the base</td><td>None</td><td>Length emerges (with a cap raise at step 8.2K)</td></tr>
+      <tr><td>R1</td><td>Rules for reasoning, language consistency; reward models only in the last 400 steps</td><td>Alternating SFT and RL over four stages, then distillation</td><td>None; a stated limitation</td><td>Cap 32K; overthinking a stated limitation</td></tr>
+      <tr><td>R1-0528, V3.1</td><td>Undisclosed (more RL compute)</td><td>V3.1: one checkpoint, thinking by template</td><td>Post-training on search and code agents</td><td>Tokens per question 12K to 23K (0528); V3.1 "more quickly"</td></tr>
+      <tr><td>V3.2</td><td>Rules + length penalty + language consistency; rubric-based generative RM; over 10% of pre-training cost</td><td>Specialists, distilled by SFT, then one mixed RL stage</td><td>85K prompts, 1,827 synthetic environments; thinking in tool use</td><td>One length penalty; Speciale relaxes it</td></tr>
+      <tr><td>V4</td><td>As V3.2, plus a generative RM that the actor itself plays</td><td>Specialists merged by full-vocabulary on-policy distillation (10+ teachers)</td><td>DSec sandboxes; interleaved thinking across turns</td><td>Three trained modes: non-think, high, max</td></tr>
+      <tr><td>V4.1</td><td>Same recipe, asynchronous RL</td><td>OPD with 40+ teachers</td><td>Model-built tasks and environments; data pipeline as the main lever</td><td>Continuous effort scalar 1 to 100</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>What stayed constant.</strong> Verifiable, rule-based rewards wherever they exist and GRPO as the optimizer; the V3-family backbone (fine-grained MoE with one shared expert, MTP, then DSpark) with ever lower precision (FP8, UE8M0 scales, FP4 experts, FP4 indexer, FP4 KV); a bias toward cost (every architectural change is justified by a cost curve); and, from R1 on, open weights under the MIT license. <strong>What changed</strong> is the location of the bottleneck. R1's bottleneck was elicitation (a recipe). V3.1's was serving (two models). V3.2's was long-context RL cost, so attention changed. V4's was 1M-token cost and the interference between domain skills, so attention changed again and mixed RL gave way to distillation. V4.1's is the deployment bill of agents, so the cache, prefill and storage changed, and the training recipe was declared settled: "the marginal return of engineering the data and environment pipeline substantially exceeds that of algorithmic novelty".</p>
+
+  <p><strong>Open questions</strong> (each one is visible in the sources above):</p>
+  <ol>
+    <li><strong>Token efficiency.</strong> R1 overthinks easy problems, Speciale buys its last points with 1.4 to 3.5 times the tokens, and effort control (V4's modes, V4.1's dial) manages the cost without removing it. What training signal makes a model think only as long as the problem needs, rather than obeying a requested budget?</li>
+    <li><strong>Reward beyond verifiers.</strong> R1 confined reward-model RL to the last 400 steps because longer runs let the policy exploit it (its Figure 6). V3.2's rubric-based generative reward, V4's actor-as-judge and DeepSeekMath-V2's meta-verified verifier are all attempts at a reward that reasons, but none is shown to resist over-optimization at scale.</li>
+    <li><strong>Distillation against RL for merging.</strong> V4 argues on-policy distillation avoids the degradation of mixed RL, but shows no ablation. Teachers still need verifiers and RL, and the student is bounded by them.</li>
+    <li><strong>Sparse attention that is safe to trust.</strong> Each step, from DSA to CSA to CSA2 with cross-layer reuse and bounded replay, adds approximation. Reported parity is on benchmarks, and V4.1's own limitations paragraph says the boundaries of failure are uncharacterized, especially sparse retrieval over long contexts.</li>
+    <li><strong>Knowledge versus reasoning.</strong> Table 19 shows reasoning is bought with tokens and knowledge with parameters, yet the V4.1-Flash result (552B, 8B/16B active) suggests data quality can substitute for size in agentic ability. Where the boundary lies is open.</li>
+    <li><strong>Independent verification.</strong> Nearly every number after R1 comes from DeepSeek's own harness. R1 was peer reviewed; V3.2, V4 and V4.1 are technical reports, and the V4 and V4.1 comparisons use frontier-model names and versions that change month to month.</li>
+  </ol>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"R1-Zero's growing response length proves that reasoning emerged."</strong> Part of the length jump coincides with a doubling of the length cap at step 8.2K, GRPO's length normalization can inflate length on wrong answers, and an independent study found "aha" behavior already in V3-Base. RL selects and amplifies behaviors the base has; length alone is not skill.</li>
+    <li><strong>"R1 is R1-Zero made readable."</strong> The cold-start checkpoint is <em>worse</em> at reasoning (AIME 59.0 against 77.9). The four stages buy readability, language consistency and breadth (IF-Eval 46.6 to 83.3, AlpacaEval 24.7 to 87.6), while AIME ends at 79.8, close to R1-Zero's 77.9. Reasoning strength came from RL, and the rest from structure.</li>
+    <li><strong>"Distillation beats RL, so RL is unnecessary."</strong> The teacher's traces came from large-scale RL on a 671B base. The 32B comparison is one recipe, not compute-matched, and the authors themselves say going beyond the teacher needs stronger bases and larger-scale RL.</li>
+    <li><strong>"Hybrid thinking is two models, or an architectural switch."</strong> In V3.1 it is one set of weights and a template: the assistant turn starts with <code>&lt;/think&gt;</code> (non-thinking) or <code>&lt;think&gt;</code> (thinking). Earlier turns keep only the closing tag, and V3.2 later changed the retention rule for tool calls.</li>
+    <li><strong>"DSA shrinks the KV cache."</strong> Every latent (and an indexer key) must stay because any later query may select it. DSA cuts FLOPs and bytes read, and below about 2K tokens it costs more than dense attention (break-even 2,176).</li>
+    <li><strong>"The indexer is trained by the language-modeling loss."</strong> Top-k has no gradient. The indexer learns from a KL to the dense attention, on a detached input, and the main model learns only from the LM loss.</li>
+    <li><strong>"V3.2 is better than V3.1 because of sparse attention."</strong> The claim is parity (same recipe, same data). V3.2's gains over V3.1 come from scaled RL (over 10% of pre-training cost) and synthetic agent tasks, and the sparse attention paid for the long rollouts.</li>
+    <li><strong>"V4 replaced RL with distillation."</strong> The specialists are still trained by SFT and GRPO. Only the merging stage, V3.2's mixed RL, was replaced by on-policy distillation, and the report shows no ablation of that swap.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What did R1-Zero demonstrate, and what problems did it have?</summary>
+    <div class="answer">
+      <p>It showed that RL alone, with no supervised reasoning data, can turn a strong base model (V3-Base, 671B) into a long-chain-of-thought reasoner. The reward was two rules: answer accuracy (a boxed answer or test cases) and a format rule (reasoning inside think tags), summed with equal weight, optimized by GRPO with 16 samples per question for 10,400 steps. AIME 2024 pass@1 rose from 15.6% to 77.9% (86.7% with majority voting; the first paper version reported 71.0%), response length grew, and reflective words became 5 to 7 times more frequent, with "wait" spiking late in training (the "aha moment").</p>
+      <p>Problems: outputs were hard to read and mixed languages, and general abilities were weak (IF-Eval 46.6, AlpacaEval 24.7). It also needs a big base (7B and 16B models failed to improve on AIME) and a reliable verifier, and the length growth is partly a budget and normalization artifact (the cap doubled at step 8.2K, and V3-Base already shows aha behavior). Each problem maps to an R1 stage.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What limitations does DeepSeek itself report for V3.2, and how do you compare reasoning models fairly given the last one?</summary>
+    <div class="answer">
+      <p>Three in the report's §5: (1) breadth of world knowledge lags proprietary models because of fewer total training FLOPs; (2) token efficiency: it needs longer generation trajectories to match Gemini-3.0-Pro; (3) complex tasks remain inferior to frontier models. Operational issues from the evaluation sections: the 128K limit (over 20% of BrowseComp cases overflow, so context management is used), redundant self-verification on MCP tasks, and incompatibility of its thinking-retention rule with frameworks that simulate tool results as user messages.</p>
+      <p>Fair comparison must report output tokens next to accuracy, as the report's Table 3 does. Speciale reaches Codeforces 2701 versus Gemini's 2708 but with 77K against 22K tokens (3.5×); R1-0528's AIME 2025 gain from 70.0 to 87.5 came with about 12K to 23K tokens. Compare at matched token budgets or plot accuracy against tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate: what did the R1 training programme cost, and how does it compare with V3's training?</summary>
+    <div class="answer">
+      <p>Both R1 runs used \(64 \times 8 = 512\) H800 GPUs. R1-Zero took about 198 hours: \(512 \times 198 = 101{,}376 \approx 101\)K GPU-hours. R1 took about 80 hours: \(512 \times 80 = 40{,}960 \approx 41\)K. SFT data creation took 5K. Total 147K GPU-hours, which at the paper's $2 per GPU-hour is $202K + $10K + $82K = $294K. V3's own training was 2,788K GPU-hours ($5.576M), so R1's RL programme is \(147/2788 \approx 5.3\%\).</p>
+      <p>Caveats to say aloud: this is the marginal cost on top of an existing base, it excludes V3-Base and the earlier 30B experiments on A100s, and the later V3.2 report says its RL budget "exceeds 10% of the pre-training cost", roughly 266K GPU-hours if that means a V3-sized pre-training run (2,664K), about 1.8 times R1's entire programme.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is V3.1's "hybrid thinking", and how is the mode selected?</summary>
+    <div class="answer">
+      <p>One checkpoint supports both a thinking mode (long chain of thought, R1-style) and a non-thinking mode, selected by the chat template. The assistant turn begins with <code>&lt;think&gt;</code> for thinking and with a closed <code>&lt;/think&gt;</code> for non-thinking, so the model skips reasoning and answers directly. In multi-turn contexts earlier reasoning is dropped but the closing tag is kept in every turn. Tool calls were supported in non-thinking mode, with a search-agent format for thinking mode. Motivation: one deployment instead of separate chat and reasoner models (V3-0324 and R1-0528 before), with V3.1-Think reported to match R1-0528 quality faster, and much better agent scores (BrowseComp 30.0 against 8.9, SWE-bench Verified in agent mode 66.0 against 44.6). V3.2 later changed the rule so reasoning is retained across tool results.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Walk through the R1 training pipeline and justify each stage.</summary>
+    <div class="answer">
+      <p>Start from V3-Base and diagnose what R1-Zero got wrong. (1) <strong>Cold-start SFT</strong> on thousands of long-CoT examples (R1-Zero samples filtered for correctness and readability, rewritten by V3 and humans into a first-person, summarized style): fixes readability and gives RL a better initial policy. It costs reasoning strength (AIME 77.9 to 59.0) but lifts IF-Eval 46.6 to 71.7. (2) <strong>Reasoning RL</strong>, the same GRPO recipe plus a language-consistency reward (the fraction of target-language words in the CoT): wins reasoning back (AIME 74.0) and fixes language mixing at a small accuracy cost. (3) <strong>Rejection sampling and SFT</strong>: sample the RL checkpoint, keep correct answers (V3 judges non-rule-checkable ones), filter unreadable chains; about 600K reasoning plus about 200K non-reasoning samples (804,745 in total: math 395K, code 211K, general 178K, STEM 10K, logic 10K), and fine-tune V3-Base again for 2 to 3 epochs. It restores breadth (Aider 25.6 to 44.8). (4) <strong>RL for all scenarios</strong>: rules for reasoning, helpfulness and safety reward models for general prompts, 1,700 steps with preference rewards only in the last 400 (reward hacking otherwise), temperature 0.7: AlpacaEval 62.1 to 87.6.</p>
+      <p>The unifying principle: human structure where RL cannot supply it (style, breadth, preferences), RL where a verifier exists (reasoning), and short late RL for learned rewards.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why distill R1 into small models instead of running RL on them?</summary>
+    <div class="answer">
+      <p>DeepSeek's controlled comparison on Qwen2.5-32B: RL for over 10K steps gives AIME 47.0 (on par with QwQ-32B-Preview's 50.0), while SFT on the 800K R1 samples gives 72.6, with better MATH-500, GPQA and LiveCodeBench too. Reasons: (a) information per sample: distillation supervises every token, RL gives one outcome reward per multi-thousand-token episode; (b) RL needs a base that can explore (their 7B and 16B attempts failed), whereas distillation hands the student behaviors it could not discover; (c) the teacher already paid for the search, and one set of traces serves every student (the whole R1 programme was 147K GPU-hours).</p>
+      <p>Caveats: the comparison is not compute-matched and excludes the teacher's cost; the student is bounded by the teacher; it is one recipe on one model, so it does not prove RL cannot work on small models (Qwen3's small models later used on-policy distillation, which is even more efficient). The authors' own conclusion: distillation is economical, but going beyond the teacher "may still require more powerful base models and larger-scale reinforcement learning".</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did R1 use rule-based rewards for reasoning, and why did process reward models and MCTS fail?</summary>
+    <div class="answer">
+      <p>Rules (answer match, unit tests, format) are cheap, exact, and resist hacking; the paper says neural reward models, outcome or process, "are susceptible to reward hacking during large-scale reinforcement learning" and retraining them adds cost and complexity. The one place learned rewards appear is stage 4's general data, and only for the last 400 of 1,700 steps because their Figure 6 shows the reward rising while Codeforces performance falls.</p>
+      <p>PRM failed on three counts: defining a fine-grained "step" in general reasoning is ill-posed, judging intermediate correctness is hard (auto-annotation is poor, manual annotation does not scale), and a model-based PRM invites hacking and needs retraining. MCTS, AlphaGo-style, failed because token space is exponentially larger than chess (capping node expansion produced local optima) and a fine-grained value model is very hard to train, so iterative self-improvement through search did not work. The takeaway is that a single long sample plus a verifiable outcome reward was the more scalable search.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain DeepSeek Sparse Attention and how it was trained from a dense checkpoint.</summary>
+    <div class="answer">
+      <p>DSA adds a lightning indexer to MLA (in its MQA mode, so each cached latent is shared by all 128 heads): \(I_{t,s} = \sum_{j=1}^{H^I} w^I_{t,j} \operatorname{ReLU}(q^I_{t,j} \cdot k^I_s)\) with 64 heads of dimension 128, FP8. A top-\(k\) selector (\(k = 2048\)) keeps the highest-scoring earlier tokens, and core attention reads only those latents, so core cost falls from \(O(L^2)\) to \(O(Lk)\) while the indexer stays \(O(L^2)\) but is cheap.</p>
+      <p>Training, from the 128K V3.1-Terminus checkpoint with the same data: (1) dense warm-up, everything frozen except the indexer, loss \(\sum_t D_{\mathrm{KL}}(p_t \,\|\, \softmax(I_t))\), where \(p_t\) is the main attention summed over heads and L1-normalized; learning rate \(10^{-3}\), 1,000 steps of 16 sequences of 128K, 2.1B tokens. (2) Sparse training: top-2048 on, all parameters trained, the KL restricted to the selected set, learning rate \(7.3\times10^{-6}\), 15,000 steps of 480 sequences of 128K, 943.7B tokens. The indexer input is detached, so the indexer sees only the KL and the main model only the LM loss. Result: parity with V3.1-Terminus on benchmarks, Elo and long-context tests at a cost of 6.4% of V3's pre-training tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: the DSA per-layer FLOP saving at 128K and 1M, the break-even length, and the limit.</summary>
+    <div class="answer">
+      <p>Per key, absorbed core attention costs \(2 n_h [(d_c + d_r) + d_c] = 2 \cdot 128 \cdot 1088 = 278{,}528\) FLOPs and the indexer \(2 H^I d^I = 2 \cdot 64 \cdot 128 = 16{,}384\). At \(L = 131{,}072\): dense core \(278{,}528 \cdot L = 36.5\) GFLOP; sparse core \(278{,}528 \cdot 2048 = 0.570\) GFLOP; indexer \(16{,}384 \cdot L = 2.147\) GFLOP; ratio \(36.51/2.717 = 13.4\). At \(L = 2^{20}\): 292.1 against \(0.570 + 17.18 = 17.75\), ratio 16.5. The limit as \(L \to \infty\) is \(278{,}528/16{,}384 = 17\). Break-even: \(278{,}528\,k + 16{,}384\,L = 278{,}528\,L\) gives \(L^* = 278{,}528 \cdot 2048/262{,}144 = 2{,}176\) tokens: below that DSA costs more, which is why short prefills run a masked dense mode.</p>
+      <p>Interpretation: the core-only saving is \(L/k = 64\times\) at 128K, but the indexer keeps the total at 13.4×, and at 1M the indexer is 30 times the sparse core. That is the wall V4 removes by compressing 4 tokens per entry before indexing. The KV cache itself is not reduced.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What changed in DeepSeek's post-training from R1 to V3.2?</summary>
+    <div class="answer">
+      <p>Structure: R1 was a chain (cold-start SFT, reasoning RL, rejection-sampled SFT, all-scenario RL) producing a separate reasoning model. V3.2 trains <strong>specialists</strong> (math, programming, general logic, general agent, agentic coding, agentic search, plus writing and QA; each with thinking and non-thinking modes) with large-scale RL, distills them into one checkpoint by SFT on their outputs ("marginally below the specialists"), then runs <strong>one mixed RL stage</strong> over reasoning, agent and alignment to avoid the forgetting of multi-stage RL. Rewards: rule-based outcome reward plus a length penalty and language consistency for reasoning and agents; a rubric-based generative reward model for general tasks (R1 used neural reward models only briefly). Algorithm: still GRPO, but with an unbiased KL estimate, off-policy sequence masking, Keep Routing (force the sampled experts in training) and Keep Sampling Mask, and the advantage without division by the standard deviation. Scale: RL compute above 10% of pre-training cost against R1's 147K GPU-hours in total. Scope: thinking inside tool use (retain reasoning through tool results, drop it at a new user message) and 1,827 synthetic environments (about 85K prompts in total), which transfer to unseen agent benchmarks. Speciale relaxes the length penalty and adds DeepSeekMath-V2 proof data, at 1.4 to 3.5 times the tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does V4's post-training differ from V3.2's, and what are the trade-offs of on-policy distillation?</summary>
+    <div class="answer">
+      <p>The specialist stage is kept (SFT then GRPO per domain), but the mixed RL stage is replaced by multi-teacher on-policy distillation: the student samples its own trajectories and minimizes \(\sum_i w_i D_{\mathrm{KL}}(\pi_\theta \| \pi_{E_i})\), a reverse KL to the teacher of the sample's domain, over the full vocabulary, with more than ten teachers. Full-vocabulary logits are used because token-level KL estimates reused as RL advantages were high-variance and unstable; the system caches teachers' last-layer hidden states and reconstructs logits on demand. Also new: reasoning effort as three trained modes, a generative reward model whose judge is the actor itself, and reasoning retained across user turns in tool conversations.</p>
+      <p>Why OPD: dense per-token supervision on the student's own distribution (no SFT exposure bias, no sparse-reward credit assignment), and it avoids the interference of merging weights or balancing many domains in one RL run. Trade-offs: it needs every teacher (and full-vocabulary logits) available, the student is bounded by the teachers, teachers still need RL and verifiers, and the report shows no ablation against mixed RL, so the benefit is asserted rather than measured.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you must add DSA-style sparse attention to a dense 128K MLA model with a limited training budget. What is your plan, and what can go wrong?</summary>
+    <div class="answer">
+      <p><strong>Plan.</strong> (1) Keep the parent's data distribution and post-training identical, so any difference is due to sparsity (V3.2's controlled design). (2) Dense warm-up: freeze the model, train only the indexer against the summed, L1-normalized attention with a KL; a large learning rate (\(10^{-3}\)) for about 2B tokens. (3) Sparse stage: switch on top-\(k\) and train everything at a low rate near the end-of-pre-training value (\(7.3\times10^{-6}\)), the indexer only through the KL restricted to the selected set, with its input detached; budget hundreds of billions of tokens if you can (V3.2: 943.7B; GLM-5 reports parity with only 20B). (4) Keep a masked dense path for short sequences (break-even about 2K tokens).</p>
+      <p><strong>Risks.</strong> The sparse-stage KL only sees selected keys, so it cannot repair a key the indexer wrongly drops, which is what a short warm-up-only indexer suffers (page 09 cites a 7.9-point RULER loss at 128K for one such case); indexer RoPE layout must match the code (the V3.2-Exp demo code had the wrong layout until a 17 November 2025 fix); the indexer dominates cost at 1M and the cache does not shrink; in RL, non-deterministic top-k kernels cause train-inference selection mismatch (GLM-5 fixed this with a deterministic top-k), so use deterministic kernels and consider freezing the indexer; evaluate long-context retrieval on unseen tests (AA-LCR, RULER) and short-context regressions, not only headline benchmarks.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How does V4's attention differ from V3.2's, and where do the reported "27% of FLOPs and 10% of KV cache at 1M" come from?</summary>
+    <div class="answer">
+      <p>V3.2 keeps MLA with DSA: every one of 61 layers scans all \(L\) tokens with its indexer and reads 2,048 latents. V4 replaces MLA by shared-KV MQA with one 512-dimensional entry per token (partial RoPE on 64 dims, inverse rotation on outputs), compresses along the sequence, and alternates two layer types. CSA merges every 4 tokens into one entry (learned softmax weights over overlapping windows), <em>then</em> runs DSA-style selection over the compressed entries (top-1024 for Pro, 512 for Flash) with the indexer in FP4; HCA merges every 128 tokens and attends densely over the 8,192 resulting entries at 1M; a 128-token sliding window and learned sinks are added to both.</p>
+      <p>Reconstruction at \(L = 2^{20}\): V3.2 spends \(61 \times 17.75 = 1{,}083\) GFLOP on attention plus \(2 \times 37\text{B} = 74\) GFLOP on weights (1,157 total). V4-Pro's CSA layer costs 4.60 GFLOP (indexer 4.29, over \(L/4\) entries) and an HCA layer 2.18 GFLOP, so 206 GFLOP for 30 CSA plus 31 HCA layers, plus \(2 \times 49\text{B} = 98\), 304 in total: 26% (reported 27%). KV: V3.2 stores \(61 \times (656 + 132) = 48{,}068\) B per token; V4-Pro stores \(30 \times 644/4 + 31 \times 576/128 = 4{,}970\) B, 10.3% (reported 10%). The key insight is that compressing <em>before</em> indexing cuts the dominant indexer term four-fold.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How do V4 and V4.1 implement reasoning-effort control, and how would you validate it?</summary>
+    <div class="answer">
+      <p>V4: three modes (non-think, think high, think max), each with its own RL configuration: distinct length penalties and context windows (8K, 128K and 384K in evaluation), and for Max an injected system-prompt instruction to reason exhaustively. V4.1: one checkpoint with a scalar effort \(b \in \{1..100\}\) in the system prompt. For each prompt, responses are sampled at several \(b\) values, advantages are mean-centered within each \((x, b)\) subgroup (so efforts are never compared directly), and the reward gets \(r^{\text{len}} = -\min(C_{\max}, k(b)\,\ell/L_{\text{norm}})\) with \(k(b) = k_0 \exp(-(b - b_{\min})/\tau)\): each \(\tau\) of extra effort multiplies the token penalty by \(e^{-1}\). The public tiers are max = 100, high = 75, low = 50, and intermediate values interpolate.</p>
+      <p>Validation: plot accuracy against output tokens at each \(b\) on held-out sets (a smooth, monotone cost-quality frontier, with more tokens at higher \(b\) and no reversals), check that low effort does not break formats or tool use, compare at matched token budgets rather than nominal modes, and watch for length bias from asynchronous rollouts (short samples arrive first). The V4 table shows the size of the effect: HMMT 40.8 (non-think) to 94.8 (max) on Flash.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> V4.1-Flash: what do the causal encoder-decoder, CSA2 and SWA Bounded Replay each save, what do they risk, and how do you get 890 bytes per token?</summary>
+    <div class="answer">
+      <p><strong>CED</strong> (bottom half of layers is the encoder; decoder global KV is projected from layer \(L/2\)'s output) saves prefill compute: prompt tokens need only the encoder, about halving prefill (8B active in prefill, 16B in decode). Risk: decoder KV comes from one hidden state, which limits its capacity, and decoder sliding-window KV must be replayed. <strong>CSA2</strong> (four Full layers own KV and an indexer, four Reindex layers re-rank with their own indexer queries, thirty Reuse layers share KV and top-K) saves cache along the layer axis and indexing compute; with the Hierarchical Sparse Indexer (a 16,384-position candidate pool) later indexers cost a constant. Risk: shared or stale selections and the pool missing a needed key. <strong>FP4 KV</strong> halves storage against FP8, with QAT. <strong>SWA Bounded Replay</strong> replays only the last \(n_{win}\) tokens to rebuild sliding-window state, so it is not persisted (persistent cache about 1/8 of V4-Flash's), at the risk of approximate state at cache-resume boundaries, which the report itself flags.</p>
+      <p><strong>890 B</strong>: caches are owned by layers 2, 8 and 14 (encoder, \(m = 2\), so 1/2 entry per token each) and layer 20 (decoder, \(m = 1\)): \(3 \times \tfrac12 + 1 = 2.5\) entries per token. Each entry is a main KV (512 channels in FP4 = 256 B, plus 32 one-byte E4M3 scales, 288 B) and an indexer key (128 channels in FP4 = 64 B, plus an assumed 4 B of scale, 68 B), so \(2.5 \times 356 = 890\).</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>DeepSeek Sparse Attention.</strong> Implement the three pieces of DSA and its cost model. <code>lightning_index_scores</code> computes \(\sum_j w_j \operatorname{ReLU}(q_j \cdot k_s)\) with an end-aligned causal mask (negative infinity on hidden keys). <code>dsa_attention</code> selects the top-\(k\) keys per query, gathers their latents and RoPE keys, and runs MQA-mode attention over only those (with the first few queries having fewer than \(k\) usable keys). <code>indexer_kl_loss</code> builds the L1-normalized head-summed target from the dense attention and computes the KL to \(\softmax(I)\) in its dense (warm-up) and sparse (selected-set) variants, with a detached target. <code>dsa_decode_flops</code> and <code>dsa_break_even_length</code> reproduce the ratios and the 2,176-token break-even. The tests check equality with dense MQA-mode attention when \(k \ge S\), causality and independence from unselected entries, that the KL is zero when the index softmax equals the target, gradient flow only into the indexer, and the worked numbers. An interviewer would expect the first three functions in 30 to 40 minutes and the cost model in 5. <span class="ex-path">exercises/drills/dsa.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_dsa.py</code>; add <code>--solutions</code> to check the reference. See also the top-k attention drill on page 09 (<code>exercises/drills/efficient_attention.py</code>), which this one extends with MLA's latent-space attention, the indexer and its loss.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning (Nature 645, 633-638, 2025).</a> <span class="why">Why read it: R1-Zero, the four stages, the per-stage table, the cost and data tables, distillation against RL and the failed attempts. Read v2 (January 2026) and note where it differs from v1.</span></li>
+    <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models.</a> <span class="why">Why read it: DSA and its two training stages, the four RL stabilizers, agent task synthesis, Speciale with token counts, and explicit limitations. Short: 17 pages.</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence.</a> <span class="why">Why read it: CSA/HCA, mHC, Muon, the fused MoE kernel and deterministic kernels, Anticipatory Routing, on-policy distillation and effort modes.</span></li>
+    <li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf">DeepSeek-AI (2026). DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression (technical report on Hugging Face).</a> <span class="why">Why read it: the newest architecture (CED, CSA2, FP4 KV, bounded replay, Engram), the effort-scalar formula and the claim that data pipelines beat algorithmic novelty in post-training.</span></li>
+    <li><a href="https://arxiv.org/abs/2502.11089">Yuan et al. (2025). Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.</a> <span class="why">Why read it: the kernel-level argument (share selected entries across query heads) behind DSA's MQA-mode design.</span></li>
+    <li><a href="https://arxiv.org/abs/2511.22570">Shao et al. (2025). DeepSeekMath-V2: Towards Self-Verifiable Mathematical Reasoning.</a> <span class="why">Why read it: verifier, meta-verifier and self-verifying generator; the answer to "what if there is no checkable answer".</span></li>
+    <li><a href="https://arxiv.org/abs/2512.24880">Xie et al. (2026). mHC: Manifold-Constrained Hyper-Connections.</a> <span class="why">Why read it: the residual-stream change used in V4 and V4.1, with the stability argument.</span></li>
+    <li><a href="https://arxiv.org/abs/2601.07372">Cheng et al. (2026). Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models (Engram).</a> <span class="why">Why read it: the U-shaped allocation law between experts and memory, later used in V4.1-Flash.</span></li>
+    <li><a href="https://arxiv.org/abs/2607.05147">Cheng et al. (2026). DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation.</a> <span class="why">Why read it: the speculative decoding module shipped with V4 checkpoints and V4.1.</span></li>
+    <li><a href="https://api-docs.deepseek.com/updates/">DeepSeek API change log and Hugging Face model cards (R1-0528, V3.1, V3.1-Terminus, V3.2-Exp, V4-Pro-0813, V4.1-Flash).</a> <span class="why">Why read it: the only primary source for the releases without papers (dates, templates, benchmark tables, the UE8M0 caveat, the RoPE-layout bug).</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>R1-Zero:</strong> GRPO on V3-Base, reward = accuracy + format (rules), lr \(3\times10^{-6}\), KL 0.001, 16 samples, 512 responses per step, 10,400 steps. AIME'24 15.6 to 77.9 (v1: 71.0), 86.7 with voting. Problems: readability, language mixing, weak general ability.</li>
+      <li><strong>R1 stages:</strong> cold start (thousands) then reasoning RL + language-consistency reward, then RS + SFT (about 600K + 200K = 804,745; from V3-Base) then RL for all scenarios (1,700 steps, reward models in the last 400). AIME by stage: 59.0, 74.0, 78.1, 79.8.</li>
+      <li><strong>R1 cost:</strong> 512 H800s; 101K + 5K + 41K = 147K GPU-hours = $294K at $2/h = 5.3% of V3's 2,788K. Distilled Qwen-32B: AIME 72.6 against 47.0 for RL alone. PRM and MCTS failed.</li>
+      <li><strong>Timeline:</strong> R1 Jan 20, 2025; R1-0528 May 28 (12K to 23K tokens); V3.1 Aug 21 (hybrid template; 630B and 209B extension tokens; UE8M0); Terminus Sep 22; V3.2-Exp Sep 29; V3.2 and Speciale Dec 1; V4 preview Apr 24, 2026; V4-Flash-0731; V4-Pro-0813; V4.1-Flash Sep 10, 2026.</li>
+      <li><strong>DSA:</strong> \(I_{t,s} = \sum_j w_{t,j}\operatorname{ReLU}(q_{t,j}\cdot k_s)\), \(H^I = 64\), \(d^I = 128\), FP8, top-2048, in MLA's MQA mode. Train: KL to head-summed dense attention, detached; warm-up 2.1B tokens (lr \(10^{-3}\)), sparse 943.7B (lr \(7.3\times10^{-6}\)) = 6.4% of V3's tokens.</li>
+      <li><strong>DSA cost per layer:</strong> \(c_{\text{core}} = 278{,}528\), \(c_{\text{idx}} = 16{,}384\) FLOPs per key. Ratio 13.4× at 128K, 16.5× at 1M, ceiling 17×, break-even 2,176 tokens. The cache is not reduced.</li>
+      <li><strong>V3.2 post-training:</strong> specialists (six domains) distilled, then one mixed GRPO stage; rewards: rule outcome + length penalty + language consistency; rubric GRM; RL over 10% of pre-training cost. Stabilizers: unbiased KL, off-policy sequence masking, Keep Routing, Keep Sampling Mask. 1,827 environments, 85,267 tasks; thinking retained across tool results.</li>
+      <li><strong>Speciale:</strong> reduced length penalty + Math-V2 data; IMO 35/42, CMO 102/126, IOI 492/600, ICPC WF 10/12; 1.4 to 3.5× the tokens of V3.2 or Gemini-3.0-Pro. V3.2 limits: knowledge breadth, token efficiency, complex tasks.</li>
+      <li><strong>V4 (Apr 2026):</strong> Pro 1.6T/49B (61 layers, 384+1 experts, top-6), Flash 284B/13B (43 layers, 256+1); 33T/32T tokens; CSA (m = 4, top-1024/512) + HCA (m = 128) + window 128; mHC \(n = 4\); Muon; Sqrt(Softplus), hash routing in the first 3 MoE layers, no node limit; FP4 experts. At 1M: 27% FLOPs, 10% KV of V3.2 (Pro). Post-training: specialists then full-vocabulary on-policy distillation (10+ teachers); three effort modes; trails frontier by about 3 to 6 months.</li>
+      <li><strong>V4.1-Flash (Sep 2026):</strong> 552B, 8B active in prefill and 16B in decode (causal encoder-decoder), CSA2 (4 Full, 4 Reindex, 30 Reuse), FP4 KV, 890 B = 2.5 × (288 + 68) per token, SWA Bounded Replay (persistent cache 1/8), Engram 196B, DSpark, 45T tokens, sparse from scratch at 64K, effort scalar 1 to 100 (max 100, high 75, low 50).</li>
+      <li><strong>Lessons:</strong> each release answers a stated limitation; verifier quality gates RL; reasoning is bought with tokens and knowledge with parameters; post-training data and environments now dominate algorithms; nearly all post-R1 numbers are self-reported.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -371,7 +371,97 @@ def test_kl_gradients_of_the_estimators_used_as_losses(impl):
 
     torch.testing.assert_close(loss_grad(0), torch.zeros(3, dtype=torch.float64), atol=1e-12, rtol=0)   # k1: zero in expectation
     torch.testing.assert_close(loss_grad(1), kl_grad(True))     # k2: gradient of KL(pi || pi_ref)
-    torch.testing.assert_close(loss_grad(2), kl_grad(False))    # k3: gradient of the REVERSE KL(pi_ref || pi)
+    torch.testing.assert_close(loss_grad(2), kl_grad(False))    # k3: gradient of the other direction, KL(pi_ref || pi)
+
+
+def test_ppo_advantage_is_a_constant(impl):
+    lp = torch.randn(2, 3, requires_grad=True)
+    adv = torch.randn(2, 3, requires_grad=True)
+    impl.ppo_clip_loss(lp, lp.detach().clone() + 0.1, adv).backward()
+    assert adv.grad is None or torch.count_nonzero(adv.grad) == 0
+
+
+# ------------------------------------------------------------------------ padding garbage ----
+def test_gae_outputs_are_constants(impl):
+    r = torch.zeros(2, 4); r[:, -1] = 1.0
+    v = torch.rand(2, 4, requires_grad=True)
+    adv, ret = impl.gae(r, v, 1.0, 0.95)
+    assert not adv.requires_grad and not ret.requires_grad       # the critic target must not carry gradient
+
+
+def test_masks_may_be_bool(impl):
+    lp_old = torch.randn(2, 4)
+    lp_new = lp_old + 0.2 * torch.randn(2, 4)
+    adv = torch.randn(2, 4)
+    mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+    torch.testing.assert_close(impl.ppo_clip_loss(lp_new, lp_old, adv, 0.2, mask.bool()),
+                               impl.ppo_clip_loss(lp_new, lp_old, adv, 0.2, mask))
+    a, r = impl.gae(adv, lp_new, 1.0, 0.9, mask=mask.bool())
+    a2, r2 = impl.gae(adv, lp_new, 1.0, 0.9, mask=mask)
+    torch.testing.assert_close(a, a2)
+    torch.testing.assert_close(r, r2)
+    torch.testing.assert_close(impl.masked_whiten(adv, mask.bool()), impl.masked_whiten(adv, mask))
+
+
+def test_padding_may_hold_nan_or_inf(impl):
+    """0 * nan = nan: masking by multiplication is not enough when padded entries hold nan or inf."""
+    B, T = 3, 5
+    mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0], [1, 0, 0, 0, 0]])
+    pad = mask == 0
+    junk = torch.zeros(B, T)
+    junk[pad] = torch.tensor([float("nan"), float("inf"), -float("inf")]).repeat(4)[: int(pad.sum())]
+
+    def clean(x):                                                # same tensor with zeros in the padding
+        y = x.clone(); y[pad] = 0.0; return y
+
+    def dirty(x):
+        y = x.clone(); y[pad] = junk[pad]; return y
+
+    torch.manual_seed(7)
+    lp_old = torch.randn(B, T) - 2
+    lp_new = lp_old + 0.3 * torch.randn(B, T)
+    adv = torch.randn(B, T)
+    rew = torch.randn(B, T)
+    val = torch.randn(B, T)
+    base = torch.randn(B, T)
+    lv = torch.randn(B)
+    lv_dirty = lv.clone(); lv_dirty[1:] = float("nan")           # rows 1 and 2 end early: last_value is ignored
+
+    # ppo_clip_loss: same loss as with zeros, finite, and exactly zero gradient at padded positions
+    for agg in ("token", "seq"):
+        a = dirty(lp_new).requires_grad_(True)
+        loss = impl.ppo_clip_loss(a, dirty(lp_old), dirty(adv), 0.2, mask, agg=agg)
+        loss.backward()
+        b = clean(lp_new).requires_grad_(True)
+        ref = impl.ppo_clip_loss(b, clean(lp_old), clean(adv), 0.2, mask, agg=agg)
+        ref.backward()
+        assert torch.isfinite(loss) and torch.isfinite(a.grad).all()
+        torch.testing.assert_close(loss, ref)
+        assert torch.all(a.grad[pad] == 0)
+        torch.testing.assert_close(a.grad, b.grad)
+
+    # reinforce_loss
+    a = dirty(lp_new).requires_grad_(True)
+    loss = impl.reinforce_loss(a, dirty(rew), dirty(base), mask=mask)
+    loss.backward()
+    b = clean(lp_new).requires_grad_(True)
+    ref = impl.reinforce_loss(b, clean(rew), clean(base), mask=mask)
+    ref.backward()
+    assert torch.isfinite(loss) and torch.isfinite(a.grad).all() and torch.all(a.grad[pad] == 0)
+    torch.testing.assert_close(loss, ref)
+
+    # gae: identical to the zero-padded result, and zero at padding
+    adv_d, ret_d = impl.gae(dirty(rew), dirty(val), 0.99, 0.9, mask=mask, last_value=lv_dirty)
+    adv_c, ret_c = impl.gae(clean(rew), clean(val), 0.99, 0.9, mask=mask, last_value=lv)
+    assert torch.isfinite(adv_d).all() and torch.isfinite(ret_d).all()
+    torch.testing.assert_close(adv_d, adv_c)
+    torch.testing.assert_close(ret_d, ret_c)
+    assert torch.all(adv_d[pad] == 0) and torch.all(ret_d[pad] == 0)
+
+    # masked_whiten
+    w = impl.masked_whiten(dirty(adv), mask)
+    torch.testing.assert_close(w, impl.masked_whiten(clean(adv), mask))
+    assert torch.isfinite(w).all() and torch.all(w[pad] == 0)
 
 
 # ------------------------------------------------------------------------------ whitening ----

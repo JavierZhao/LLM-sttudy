@@ -34,6 +34,7 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 07 | GQA with a KV cache; MHA→GQA mean-pool conversion | `drills/gqa.py` |
 | 07 | MLA: decompressed forward and absorbed decode; KV bytes per token | `drills/mla.py` |
 | 08 | Mixture of Experts: router, MoE layer, balance losses, aux-loss-free bias, capacity mask | `drills/moe.py` |
+| 11 | Training stability primitives (RMSNorm, QK-norm attention, z-loss, soft-cap, attention entropy) and multi-token prediction | `drills/stability.py` |
 | 13 | Scaling laws: fit, optimum, inference-aware sizing | `drills/scaling.py` |
 | 14 | Optimizers: AdamW step, LR schedules (cosine/WSD/step), Newton-Schulz, Muon step | `drills/optim.py` |
 | 15 | Distributed training by simulation: ring all-reduce, tensor-parallel MLP and attention, ZeRO memory, pipeline bubble, MFU | `drills/parallel.py` |

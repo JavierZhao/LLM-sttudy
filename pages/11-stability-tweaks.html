@@ -133,7 +133,7 @@
   <h3 id="qk-history">Origin and adopters</h3>
   <p>Henry et al. (2020) proposed \(\ell_2\)-normalized queries and keys with a learnable scalar in place of \(1/\sqrt d\) for low-resource translation <a href="https://arxiv.org/abs/2010.04245">[Henry et al. 2020]</a>. The stability case came from ViT-22B: at about 8B parameters and Adam \(10^{-3}\) the loss diverged within a few thousand steps as attention logits passed 50,000. LayerNorm on \(q\) and \(k\) (a fix they credit to unpublished work of Gilmer et al.) removed it and kept LR \(10^{-3}\) usable at larger sizes <a href="https://arxiv.org/abs/2302.05442">[Dehghani et al. 2023, §2, App. B]</a>. Adopters:</p>
   <ul>
-    <li><strong>Chameleon</strong> 7B and 34B: essential; the 7B diverged after about 20% of an epoch without it <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. <strong>OLMo 2</strong>, <strong>Gemma 3</strong> ("we replace the soft-capping of Gemma 2 with QK-norm") and <strong>Qwen3</strong> (removed QKV bias, added QK-Norm "to ensure stable training") <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.1]</a>, <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>, <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>.</li>
+    <li><strong>Chameleon</strong> 7B and 34B: essential; the 7B diverged after about 20% of an epoch without it <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. <strong>OLMo 2</strong>, <strong>Gemma 3</strong> ("we replace the soft-capping of Gemma 2 with QK-norm") and <strong>Qwen3</strong> (removed QKV bias, added QK-Norm "to ensure stable training") <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.1]</a>, <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>, <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>. <strong>Gemma 4</strong> (2026) lists pre-norm and post-norm RMSNorm together with QK-norm <a href="https://arxiv.org/abs/2607.02770">[Gemma 4, §2]</a>.</li>
     <li><strong>DeepSeek-V4</strong> normalizes each query head and the single compressed KV entry just before core attention, which "avoids exploding attention logits", so it does not use QK-Clip <a href="https://arxiv.org/abs/2606.19348">[V4, §2.3.3, §2.4]</a>.</li>
   </ul>
 
@@ -169,7 +169,7 @@
       <dt>Why it works</dt><dd>\(|z| \le g^2\sqrt{d_h}\) for any weights; the quadratic weight-scale dependence is gone.</dd>
       <dt>Evidence</dt><dd>ViT-22B at 8B <a href="https://arxiv.org/abs/2302.05442">[App. B]</a>; 1.2B model at LR 0.3 <a href="https://arxiv.org/abs/2309.14322">[Wortsman, Fig. 1]</a>; Chameleon-7B diverges without it <a href="https://arxiv.org/abs/2405.09818">[Fig. 5b]</a>. OLMo 2 saw a gain only together with output-norm <a href="https://arxiv.org/abs/2501.00656">[§3.3.2]</a>.</dd>
       <dt>Cost</dt><dd>Two fused norms and \(d_h\) gains per layer; caps sharpness at \(g^2\sqrt{d_h}\); incompatible with absorbed MLA; leaves the output softmax alone.</dd>
-      <dt>Used by</dt><dd>ViT-22B, Chameleon, OLMo 2, Gemma 3, Qwen3, DeepSeek-V4.</dd>
+      <dt>Used by</dt><dd>ViT-22B, Chameleon, OLMo 2, Gemma 3 and 4, Qwen3, DeepSeek-V4.</dd>
     </dl>
   </div>
 

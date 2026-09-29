@@ -69,7 +69,7 @@
 
   <h3>Table 1. Identity and scale</h3>
   <p>Parameters are as the source advertises them, with our exact recount in parentheses where the rounded name hides a difference. Vocabulary is the number of embedding rows in the released tensor.</p>
-  <div class="table-wrap"><table class="data" style="min-width:1240px">
+  <div class="table-wrap"><table class="data" style="min-width:1420px">
 <thead><tr><th>Model</th><th>Released</th><th class="num" style="min-width:150px">Parameters (total / activated)</th><th class="num">L</th><th class="num">d</th><th class="num">Vocab (rows)</th><th style="min-width:170px">Context</th><th class="num">Train tokens</th><th style="min-width:240px">Sources</th></tr></thead>
 <tbody>
 <tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
@@ -109,7 +109,7 @@
 
   <h3>Table 2. Attention, positions, norms</h3>
   <p>"Heads" is query heads over KV heads times head dimension; for MLA it is the head count and the cached latent. When a model mixes layer types, the softmax layers are given.</p>
-  <div class="table-wrap"><table class="data" style="min-width:1100px">
+  <div class="table-wrap"><table class="data" style="min-width:1560px">
 <thead><tr><th>Model</th><th style="min-width:200px">Attention</th><th class="num">Heads: query / KV × head dim</th><th style="min-width:200px">Positions</th><th style="min-width:220px">Norm and stability</th></tr></thead>
 <tbody>
 <tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
@@ -149,7 +149,7 @@
 
   <h3>Table 3. FFN and experts</h3>
   <p>"Sparsity" is routed experts divided by routed experts activated, the definition of the Kimi K2 report (384 / 8 = 48). Shared experts are not counted in it.</p>
-  <div class="table-wrap"><table class="data" style="min-width:1060px">
+  <div class="table-wrap"><table class="data" style="min-width:1400px">
 <thead><tr><th>Model</th><th>FFN (hidden width, ratio to d)</th><th style="min-width:200px">Experts: routed / active / shared × width</th><th class="num">Sparsity</th><th style="min-width:220px">Routing and balancing</th></tr></thead>
 <tbody>
 <tr class="grp"><td colspan="5" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
@@ -189,7 +189,7 @@
 
   <h3>Table 4. Derived columns, recomputed with the drill</h3>
   <p>The activated column gives the range between the non-embedding count and the count with both vocabulary matrices. Every cell is produced by <code>exercises/solutions/config_zoo.py</code> from the config of the same row, and compared with the released checkpoint's tensor count where the file allows it. Worked arithmetic for one full row is in <a href="#config">From config.json to numbers</a>.</p>
-  <div class="table-wrap"><table class="data" style="min-width:1360px">
+  <div class="table-wrap"><table class="data" style="min-width:1700px">
 <thead><tr><th>Model</th><th class="num">Recount, total</th><th class="num">Recount, activated (range)</th><th style="min-width:230px">Recount versus released file</th><th class="num">KV bytes / token (bf16)</th><th class="num">KV GiB, 1 seq. at 128K</th><th class="num">GFLOPs / token at 8K</th><th class="num">Tokens per activated param</th><th class="num">6·N<sub>act</sub>·D (FLOPs)</th></tr></thead>
 <tbody>
 <tr class="grp"><td colspan="9" style="background:var(--bg-soft)"><strong>Dense</strong></td></tr>
@@ -668,8 +668,8 @@ gflops = flops_per_token(s, 8192) / 1e9       # 55.75: 2 * act_head + causal att
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Compare DeepSeek-V3 and Llama 3.1 405B on FLOPs per token, weight memory and KV per token. What does each tell you about serving?</summary>
     <div class="answer">
-      <p>FLOPs per token at 8K: V3 93.7 GFLOPs (activated 36.63B with the head, so 73.3 for the matmuls, plus 20.5 of attention at the decompressed MLA cost); Llama 405B 841.3 GFLOPs (\(2 \times 403.75\text{B} = 807.5\) plus 33.8). V3 does 9.0× less compute per token. Weight memory: the released V3 checkpoint is FP8 with 684.5B elements (the 671.03B recount plus the MTP module), about 685 GB, against 812 GB for 405B in bf16 (405.85B × 2), so both need a similar number of GPUs just to hold weights. KV per token: 70,272 B against 516,096 B, 7.3× less.</p>
-      <p>Serving: prefill is compute-bound, so V3 is about 9× cheaper per token. Decode is memory-bound and reads the weights of every expert that any sequence in the batch selects. At batch 1 V3 reads only its activated 37B parameters (about 37 GB in FP8) against 812 GB for the dense model, but once the batch reaches about a hundred nearly all experts are hit and V3 reads about 685 GB per step, the same order as 405B (pages <a href="08-mixture-of-experts.html">08</a>, <a href="34-back-of-envelope.html">34</a>). MoE therefore wins training cost and prefill outright, and wins decode through its smaller KV cache and, at small batch, its fewer bytes read, provided you have enough parallelism to hold and shard the experts.</p>
+      <p>FLOPs per token at 8K: V3 93.7 GFLOPs (activated 36.63B with the head, so 73.3 for the matmuls, plus 20.5 of attention at the decompressed MLA cost); Llama 405B 841.3 GFLOPs (\(2 \times 403.75\text{B} = 807.5\) plus 33.8). V3 does 9.0× less compute per token. Weight memory: the released V3 checkpoint is FP8 (684.5B elements with the MTP module, about 689 GB including its bf16 and fp32 tensors), against 812 GB for 405B in bf16 (405.85B × 2), so both need a similar number of GPUs just to hold weights. KV per token: 70,272 B against 516,096 B, 7.3× less.</p>
+      <p>Serving: prefill is compute-bound, so V3 is about 9× cheaper per token. Decode is memory-bound and reads the weights of every expert that any sequence in the batch selects. At batch 1 V3 reads only its activated 37B parameters (about 37 GB in FP8) against 812 GB for the dense model, but once the batch reaches about a hundred nearly all experts are hit and V3 reads most of that checkpoint, about 0.7 TB per step, the same order as 405B (pages <a href="08-mixture-of-experts.html">08</a>, <a href="34-back-of-envelope.html">34</a>). MoE therefore wins training cost and prefill outright, and wins decode through its smaller KV cache and, at small batch, its fewer bytes read, provided you have enough parallelism to hold and shard the experts.</p>
     </div>
   </details>
 

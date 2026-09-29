@@ -211,6 +211,19 @@
     });
   }
 
+  // ---------- exercise paths -> GitHub links ----------
+  function linkExercisePaths() {
+    if (!M.repo) return;
+    document.querySelectorAll(".ex-path").forEach(function (span) {
+      if (span.closest("a")) return;
+      var path = span.textContent.trim();
+      if (!/^exercises\/[\w\/.-]+$/.test(path)) return;
+      var a = el("a", { href: M.repo + "/blob/" + (M.branch || "main") + "/" + path, "class": "ex-path" });
+      a.textContent = path;
+      span.replaceWith(a);
+    });
+  }
+
   // ---------- index page ----------
   function buildIndex() {
     var root = document.getElementById("index-root");
@@ -295,5 +308,6 @@
   buildPager();
   renderCode();
   buildCopyButtons();
+  linkExercisePaths();
   buildIndex();
 })();

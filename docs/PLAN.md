@@ -52,7 +52,8 @@ P0 pages (know cold): 01–08, 10, 12–15, 19, 21–24, 26–28, 33–36.
    fixes errors in place and reports a changelog.
 6. **Audit (Opus):** reads the review reports, spot-checks the derivation-heavy P0 pages
    (RoPE, MLA, DPO, PPO/GRPO, scaling laws, memory math), flips the page to `written`
-   in the manifest, commits, and pushes.
+   in the manifest, commits, and pushes. The push triggers CI (QA + drill tests) and, on
+   success, deploys the finished pages to GitHub Pages (`.github/workflows/site.yml`).
 7. **Aggregate (Haiku):** question bank (36), glossary (37), and README index at the end.
 
 Batches: I (01–06) → user checkpoint → II (08–11) → III (12–18) → IV+V (19–25) →

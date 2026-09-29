@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not published yet · LLM Interview Prep</title>
+<style>
+  :root { --bg: #fbfbf9; --fg: #1c1c1f; --muted: #5c5c63; --link: #2449b0; --border: #deded8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141417; --fg: #e6e6e9; --muted: #a0a0a8; --link: #9db6ff; --border: #2e2e35; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16.5px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 12vh auto; padding: 0 16px; }
+  h1 { font-size: 1.6rem; margin: 0 0 .6rem; }
+  p { color: var(--muted); }
+  a { color: var(--link); }
+  .box { border: 1px solid var(--border); border-radius: 8px; padding: 18px 20px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="box">
+    <h1>This page is not published yet</h1>
+    <p>Pages appear on the site once they have been written and fact-checked. The link you followed points to a page that is still planned or in progress.</p>
+    <p><a id="home" href="./">Back to the course index</a></p>
+  </div>
+</main>
+<script>
+  // project sites live under /<repo>/, so link to the first path segment
+  (function () {
+    var seg = location.pathname.split("/").filter(Boolean)[0];
+    var a = document.getElementById("home");
+    if (location.hostname.endsWith("github.io") && seg) a.href = "/" + seg + "/";
+  })();
+</script>
+</body>
+</html>

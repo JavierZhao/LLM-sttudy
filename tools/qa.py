@@ -228,9 +228,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="*")
     ap.add_argument("--no-render", action="store_true")
+    ap.add_argument("--written-only", action="store_true", help="only pages marked written in the manifest (plus index)")
     ap.add_argument("-q", "--quiet", action="store_true", help="hide warnings")
     args = ap.parse_args()
-    paths = args.paths or sorted(glob.glob(os.path.join(ROOT, "pages", "[0-9][0-9]-*.html"))) + [os.path.join(ROOT, "index.html")]
+    if args.written_only:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import manifest
+        paths = manifest.written_page_paths() + [os.path.join(ROOT, "index.html")]
+    else:
+        paths = args.paths or sorted(glob.glob(os.path.join(ROOT, "pages", "[0-9][0-9]-*.html"))) + [os.path.join(ROOT, "index.html")]
     paths = [p for p in paths if os.path.basename(p) != "_template.html"]
     results = {p: static_checks(p) for p in paths}
     if not args.no_render:

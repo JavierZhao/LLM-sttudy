@@ -187,8 +187,9 @@ the concept (`attention`, `bpe`, `rope`, …, never with a page-number prefix):
   CPU in under 30 seconds total, and must use small shapes.
 - Verify: `python3 -m pytest exercises/tests/test_<name>.py --solutions -q` passes, and
   without `--solutions` it fails with `NotImplementedError`.
-- Append one row per drill to the table at the end of `exercises/README.md`:
-  `| NN | Drill title | drills/<name>.py |`.
+- Do **not** edit `exercises/README.md` (several writers run in parallel). Instead, list one
+  row per drill in your final report as `| NN | Drill title | drills/<name>.py |`, and the
+  coordinator adds them.
 - In the page's `#exercises` section, describe each drill in 1 to 2 sentences, name its
   path, and say what an interviewer would expect you to finish in 20 to 40 minutes.
 
@@ -263,8 +264,8 @@ Handy derived numbers (bf16, 2 bytes/element, per token):
 3. Write the page and the drills.
 4. Run `python3 tools/qa.py pages/NN-*.html` and fix every ERROR and every warning that
    is not about links to not-yet-written pages. Run the drill tests.
-5. **Do not edit** shared files: `assets/*`, `index.html`, `docs/STYLE_GUIDE.md`, other pages,
-   or `exercises/conftest.py`. The only shared file you may append to is the table in
-   `exercises/README.md`. Put requests for shared changes in your final report.
+5. **Do not edit** shared files: `assets/*`, `index.html`, `docs/*`, `exercises/README.md`,
+   `exercises/conftest.py`, or other pages. Put requests for shared changes in your final report.
+   Do not commit; the coordinator commits.
 6. Final report: files created, facts you could not verify, anything in the brief you
    chose to skip and why, requested shared-file changes.

@@ -53,13 +53,7 @@
 <section>
   <h2 id="lineage">Four generations in one figure</h2>
 
-  <p>Llama's public history is short: February 2023 to April 2025 for language models, four generations. Each generation attacked a different bottleneck, and the design choices follow from it.</p>
-  <ul>
-    <li><strong>Llama 1 (Feb 2023)</strong> asked which model is cheapest to <em>serve</em> for a target quality, and answered: a small model trained on far more tokens than compute-optimal.</li>
-    <li><strong>Llama 2 (Jul 2023)</strong> made that base model usable as an assistant: 2T tokens, 4K context, GQA for the large sizes, and a full open RLHF recipe.</li>
-    <li><strong>Llama 3 (2024)</strong> scaled the same block: 15T tokens, a 405B flagship on 16K GPUs, and a paper that documents the engineering. Its theme is "managing complexity".</li>
-    <li><strong>Llama 4 (Apr 2025)</strong> changed the block: mixture of experts, native multimodality, and interleaved RoPE and position-free attention layers for context length.</li>
-  </ul>
+  <p>Llama's public history is short: four generations between February 2023 and April 2025, each attacking a different bottleneck. Llama 1 asked which model is cheapest to <em>serve</em> for a target quality and answered with a small model trained on far more tokens than compute-optimal. Llama 2 made that base usable as an assistant. Llama 3 scaled the same block to 15T tokens and a 405B flagship on 16K GPUs, and documented the engineering. Llama 4 changed the block: mixture of experts, native multimodality, and interleaved RoPE and position-free layers for context length.</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 318" role="img" aria-labelledby="fig-29-1-title">
@@ -131,14 +125,16 @@
 <text x="378" y="241" class="s-small s-bold">3.2 (Sep) and 3.3 (Dec)</text>
 <text x="378" y="257" class="s-small">3.2: 1B, 3B, pruned and</text>
 <text x="378" y="272" class="s-small">distilled from 8B, 70B</text>
-<text x="378" y="287" class="s-small">3.3: 70B, new post-training</text>
+<text x="378" y="287" class="s-small">3.3: 70B instruct only</text>
 
-<rect class="s-plain s-dash" x="551" y="222" width="163" height="90" rx="6"/>
+<rect class="s-plain s-dash" x="551" y="222" width="163" height="92" rx="6"/>
 <text x="561" y="241" class="s-small s-bold">Not Llama: Muse</text>
-<text x="561" y="257" class="s-small">Spark, Apr 2026: no weights</text>
-<text x="561" y="272" class="s-small">Glimmer 30B, Aug 2026:</text>
-<text x="561" y="287" class="s-small">dense, Apache 2.0 weights</text>
-<text x="561" y="302" class="s-small s-muted">(*34B not released)</text>
+<text x="561" y="257" class="s-small">Spark (Apr 2026):</text>
+<text x="561" y="272" class="s-small">no weights released</text>
+<text x="561" y="287" class="s-small">Glimmer 30B (Aug 2026):</text>
+<text x="561" y="302" class="s-small">dense, open weights</text>
+<text x="8" y="232" class="s-small s-muted">* Llama 2 34B was trained</text>
+<text x="8" y="247" class="s-small s-muted">but not released</text>
 
 <path class="s-line s-dash" d="M266,208 L266,222"/>
 <path class="s-line s-dash" d="M449,208 L449,222"/>
@@ -147,16 +143,14 @@
     <figcaption><b>Figure 1.</b> The four generations. Every column is a different bet: tokens per parameter (Llama 1), a usable chat model (Llama 2), scale and reliability on an unchanged block (Llama 3), and sparsity plus long context (Llama 4). Dashed boxes are intermediate releases and what came after. Sources are given in each section below.</figcaption>
   </figure>
 
-  <p>The rest of the page takes the generations in order. The thread to follow is <strong>serving cost</strong>: Llama 1 chose tokens over parameters to make inference cheap, Llama 3 kept doing so for its small models, and Llama 4 attacks FLOPs per token directly with sparsity. The counter-thread is <strong>risk</strong>: Llama 3 explicitly avoided MoE and RL to keep a 405B run stable, and Llama 4 took both risks.</p>
+  <p>Two threads run through the page. The first is <strong>serving cost</strong>: Llama 1 chose tokens over parameters to make inference cheap, Llama 3 kept doing so for its small models, and Llama 4 attacks FLOPs per token directly with sparsity. The counter-thread is <strong>risk</strong>: Llama 3 avoided MoE and RL to keep a 405B run stable, and Llama 4 took both risks.</p>
 </section>
 
 <section>
   <h2 id="llama1">Llama 1 (February 2023): the overtraining bet and the standard block</h2>
 
   <h3 id="l1-bet">The bet: pay for tokens now, save on inference forever</h3>
-  <p>The scaling-law result of Hoffmann et al. (Chinchilla) tells you how to spend a training budget: roughly 20 tokens per parameter (<a href="13-scaling-laws.html">page 13</a>). Llama 1 argued that this answers the wrong question for a model that will be served millions of times. The paper says the Chinchilla objective "disregards the inference budget", that "given a target level of performance, the preferred model is not the fastest to train but the fastest at inference", and that "a smaller one trained longer will ultimately be cheaper at inference" <a href="https://arxiv.org/abs/2302.13971">[Touvron et al. 2023, §1]</a>. Their evidence was empirical: "although Hoffmann et al. (2022) recommends training a 10B model on 200B tokens, we find that the performance of a 7B model continues to improve even after 1T tokens."</p>
-
-  <p>So the four sizes were trained for 1.0T (7B, 13B) and 1.4T tokens (33B, 65B), all with a 4M-token batch and a 2,000-step warmup <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 2, §2.3]</a>. Tokens per parameter, using exact parameter counts of the released checkpoints (the drill reproduces them):</p>
+  <p>Chinchilla says to spend a training budget at roughly 20 tokens per parameter (<a href="13-scaling-laws.html">page 13</a>). Llama 1 argued that this answers the wrong question for a model served millions of times: the objective "disregards the inference budget", and "a smaller one trained longer will ultimately be cheaper at inference" <a href="https://arxiv.org/abs/2302.13971">[Touvron et al. 2023, §1]</a>. Their evidence: "although Hoffmann et al. (2022) recommends training a 10B model on 200B tokens, we find that the performance of a 7B model continues to improve even after 1T tokens." So the 7B and 13B saw 1.0T tokens and the 33B and 65B saw 1.4T, with a 4M-token batch <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 2]</a>. Using exact parameter counts (the drill reproduces them):</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Model</th><th class="num">Parameters</th><th class="num">\(d\)</th><th class="num">Heads</th><th class="num">Layers</th><th class="num">Peak LR</th><th class="num">Tokens \(D\)</th><th class="num">\(D/N\)</th></tr></thead>
@@ -167,45 +161,25 @@
       <tr><td>LLaMA-65B</td><td class="num">65,285,660,672</td><td class="num">8192</td><td class="num">64</td><td class="num">80</td><td class="num">1.5e-4</td><td class="num">1.4T</td><td class="num">21</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Sizes, \(d\), heads, layers, LR and tokens from Llama 1 Table 2 (which prints 6.7B, 13.0B, 32.5B and 65.2B). \(D/N\) is our arithmetic: for the 7B, \(1.0\times10^{12} / 6.74\times10^{9} = 148\), which is 7.4 times the Chinchilla 20. The context length is 2,048 <a href="https://arxiv.org/abs/2307.09288">[Llama 2, Tab. 1]</a>.</p>
-
-  <p>Only the 65B sits near the Chinchilla ratio. The 7B sits at 7.4 times it. That is the whole design: the small models are deliberately past their compute-optimal point.</p>
+  <p class="small muted">Table 2 of Llama 1 (which prints 6.7B, 13.0B, 32.5B and 65.2B); \(D/N\) is our arithmetic. The context length is 2,048 <a href="https://arxiv.org/abs/2307.09288">[Llama 2, Tab. 1]</a>.</p>
+  <p>Only the 65B sits near the Chinchilla ratio; the 7B, at \(1.0\text{T}/6.74\text{B} = 148\), is 7.4 times past it. That is the design: the small models are deliberately beyond their compute-optimal point.</p>
 
   <h3 id="l1-block">The block: three borrowed ideas</h3>
-  <p>Llama 1's architecture section lists three changes to the original transformer, each with its source in brackets <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.2]</a>. None was new in 2023. The contribution was the combination, trained at scale and released.</p>
-
   <div class="decision">
     <div class="decision-title">The Llama block: pre-norm RMSNorm, SwiGLU, RoPE</div>
     <dl>
-      <dt>Problem</dt><dd>The original transformer normalizes after each sublayer (post-norm), uses a ReLU FFN of width \(4d\) and adds absolute position embeddings once at the input. Deep post-norm stacks are hard to train without careful warmup, and absolute positions are tied to the training length.</dd>
-      <dt>Idea</dt><dd><strong>Pre-normalization</strong> with RMSNorm <span class="zh">均方根归一化</span> on the input of each sublayer [credited to GPT-3]; <strong>SwiGLU</strong> instead of ReLU, with hidden width \(\tfrac23\cdot 4d\) [PaLM]; <strong>rotary embeddings</strong> <span class="zh">旋转位置编码</span> at every layer instead of absolute positions [GPT-Neo].</dd>
-      <dt>Why it works</dt><dd>Pre-norm keeps an identity path through the residual stream, which is what makes depth trainable (<a href="04-transformer-block.html">page 04</a>). RMSNorm drops LayerNorm's mean subtraction and bias, so it is cheaper. The gated FFN uses three matrices, so width \(\tfrac83 d\) gives \(3 \cdot d \cdot \tfrac83 d = 8d^2\) parameters, exactly the \(2 \cdot d \cdot 4d\) of the ReLU FFN it replaces. RoPE rotates queries and keys so that attention scores depend on relative offset, at every layer (<a href="05-positional-encoding.html#rope">page 05</a>).</dd>
-      <dt>Evidence</dt><dd>The paper reports no ablation of these three choices: it cites the works they come from. The evidence is that the resulting models are strong (below) and that most open dense models since have used the same block.</dd>
-      <dt>Cost</dt><dd>Nothing measurable at this scale. Pre-norm is known to leave the deepest layers doing little (page 04). Full multi-head attention means a KV cache of 512 KiB per token for the 7B (<a href="#llama2">next section</a>).</dd>
-      <dt>Used by</dt><dd>Llama 1 to 4, and close variants in Qwen, Mistral, DeepSeek LLM and OLMo 2 (pages <a href="04-transformer-block.html">04</a> and <a href="05-positional-encoding.html">05</a> list the families).</dd>
+      <dt>Problem</dt><dd>The original transformer normalizes after each sublayer, uses a ReLU FFN of width \(4d\) and adds absolute position embeddings once at the input. Deep post-norm stacks are hard to train, and absolute positions are tied to the training length.</dd>
+      <dt>Idea</dt><dd><strong>Pre-normalization</strong> with RMSNorm <span class="zh">均方根归一化</span> [credited to GPT-3]; <strong>SwiGLU</strong> with hidden width \(\tfrac23\cdot 4d\) [PaLM]; <strong>rotary embeddings</strong> <span class="zh">旋转位置编码</span> at every layer instead of absolute positions [GPT-Neo] <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.2]</a>.</dd>
+      <dt>Why it works</dt><dd>Pre-norm keeps an identity path through the residual stream, which makes depth trainable (<a href="04-transformer-block.html">page 04</a>). RMSNorm drops the mean subtraction and bias, so it is cheaper. A gated FFN has three matrices, so width \(\tfrac83 d\) gives \(3 \cdot d \cdot \tfrac83 d = 8d^2\) parameters, the same as the \(2 \cdot d \cdot 4d\) it replaces. RoPE makes attention scores depend on relative offset at every layer (<a href="05-positional-encoding.html#rope">page 05</a>).</dd>
+      <dt>Evidence</dt><dd>None in the paper: no ablation of these choices, only citations of where each came from. The evidence is that the resulting models are strong and most open dense models since use the same block.</dd>
+      <dt>Cost</dt><dd>Nothing measurable here. Full multi-head attention costs 512 KiB of KV cache per token in the 7B (<a href="#llama2">next section</a>).</dd>
+      <dt>Used by</dt><dd>Llama 1 to 4, and close variants in Qwen, Mistral, DeepSeek LLM and OLMo 2 (pages <a href="04-transformer-block.html">04</a>, <a href="05-positional-encoding.html">05</a>).</dd>
     </dl>
   </div>
-
-  <p>Two further details are part of the recipe. Every linear layer is bias-free: a bias-free count reproduces the parameter total of each released checkpoint to the digit (for example 6,738,415,616 for the 7B), so no bias tensors exist. And the input embedding and output head are separate matrices (untied). The tokenizer is SentencePiece BPE with byte fallback for unknown UTF-8 characters, a 32K vocabulary, and every number split into single digits <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.1]</a>, <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §2.2]</a> (<a href="02-tokenization.html">page 02</a>).</p>
-
-  <h3 id="l1-data">Data: public only</h3>
-  <p>The second half of the pitch was that a competitive model needs no proprietary data. The mixture (Table 1 of the paper) is about 1.4T tokens after tokenization <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.1]</a>:</p>
-  <div class="table-wrap"><table class="data">
-    <thead><tr><th>Source</th><th class="num">Sampling proportion</th><th class="num">Epochs on 1.4T tokens</th><th class="num">Disk size</th></tr></thead>
-    <tbody>
-      <tr><td>CommonCrawl (five dumps, CCNet)</td><td class="num">67.0%</td><td class="num">1.10</td><td class="num">3.3 TB</td></tr>
-      <tr><td>C4</td><td class="num">15.0%</td><td class="num">1.06</td><td class="num">783 GB</td></tr>
-      <tr><td>GitHub (Apache, BSD, MIT)</td><td class="num">4.5%</td><td class="num">0.64</td><td class="num">328 GB</td></tr>
-      <tr><td>Wikipedia (20 languages)</td><td class="num">4.5%</td><td class="num">2.45</td><td class="num">83 GB</td></tr>
-      <tr><td>Books (Gutenberg, Books3)</td><td class="num">4.5%</td><td class="num">2.23</td><td class="num">85 GB</td></tr>
-      <tr><td>ArXiv</td><td class="num">2.5%</td><td class="num">1.06</td><td class="num">92 GB</td></tr>
-      <tr><td>Stack Exchange</td><td class="num">2.0%</td><td class="num">1.03</td><td class="num">78 GB</td></tr>
-    </tbody>
-  </table></div>
-  <p>Web text dominates, curated sources are repeated for about two epochs, and the run is almost single-epoch overall (pipelines and mixtures: <a href="12-pretraining-data.html">page 12</a>). The paper blames its MMLU gap to Chinchilla and PaLM on having only 177 GB of books and papers against up to 2 TB for them <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §3.6]</a>, an early hint that data composition mattered more than the architecture.</p>
+  <p>Two further details: every linear layer is bias-free and the embedding and output head are untied (a bias-free, untied count reproduces each released checkpoint's parameter total to the digit, for example 6,738,415,616 for the 7B). The tokenizer is a 32K SentencePiece BPE with byte fallback that splits numbers into digits <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §2.2]</a> (<a href="02-tokenization.html">page 02</a>). The data was public only: 67% CommonCrawl (CCNet), 15% C4, 4.5% each of GitHub, Wikipedia and books, 2.5% arXiv and 2% Stack Exchange, about 1.4T tokens, with Wikipedia and books at about two epochs <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 1]</a> (<a href="12-pretraining-data.html">page 12</a>). The authors blame their MMLU gap to Chinchilla on having only 177 GB of books and papers against up to 2 TB for the others, an early hint that data mattered more than architecture.</p>
 
   <h3 id="l1-gpt3">Reading the "13B beats GPT-3" claim</h3>
-  <p>The abstract says "LLaMA-13B outperforms GPT-3 (175B) on most benchmarks". Table 3 (zero-shot common-sense reasoning) lets you count what "most" means:</p>
+  <p>The abstract says "LLaMA-13B outperforms GPT-3 (175B) on most benchmarks". Table 3 (zero-shot common sense) shows what "most" means:</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Zero-shot</th><th class="num">BoolQ</th><th class="num">PIQA</th><th class="num">HellaSwag</th><th class="num">WinoGrande</th><th class="num">ARC-e</th><th class="num">ARC-c</th><th class="num">OBQA</th></tr></thead>
     <tbody>
@@ -213,77 +187,57 @@
       <tr class="hl"><td>LLaMA-13B</td><td class="num">78.1</td><td class="num">80.1</td><td class="num">79.2</td><td class="num">73.0</td><td class="num">74.8</td><td class="num">52.7</td><td class="num">56.4</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Source: Llama 1 Table 3 (SIQA omitted: GPT-3 has no number). LLaMA-13B wins five of seven and loses PIQA and OBQA by about one point. On NaturalQuestions it is ahead at 0-shot (20.1 vs 14.6) and 64-shot (31.9 vs 29.9) <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 4]</a>.</p>
-  <p>So the claim is fair but modest, and the comparison is deliberately not token-matched. GPT-3 175B saw 300B tokens, 1.7 tokens per parameter <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, Tab. 2.1]</a>. LLaMA-13B saw 1.0T, 77 per parameter. Training compute by \(6ND\) was also lower for LLaMA-13B: \(6 \times 13.0\text{B} \times 1.0\text{T} = 7.8\times10^{22}\) FLOPs against GPT-3's \(3.14\times10^{23}\) <a href="https://arxiv.org/abs/2005.14165">[GPT-3, App. D]</a>. The paper also states that LLaMA-65B beats Chinchilla-70B on every reported common-sense benchmark except BoolQ <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §3.1]</a>.</p>
+  <p>Five of seven wins, two narrow losses (SIQA omitted, GPT-3 has no number) <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 3]</a>. The claim is fair but modest, and the comparison is deliberately not token-matched: GPT-3 saw 300B tokens (1.7 per parameter) <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, Tab. 2.1]</a>, LLaMA-13B 1.0T (77 per parameter). By \(6ND\) the 13B also cost less to train: \(7.8\times10^{22}\) against GPT-3's \(3.14\times10^{23}\) FLOPs <a href="https://arxiv.org/abs/2005.14165">[GPT-3, App. D]</a>.</p>
 
-  <h3 id="l1-speed">Worked numbers: the 65B training run</h3>
-  <p>Llama 1 reports throughput rather than MFU: about 380 tokens per second per GPU on 2,048 A100-80GB GPUs, so that 1.4T tokens take about 21 days <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.4]</a>. Check it, then convert:</p>
-  <ul>
-    <li>Cluster throughput: \(380 \times 2048 = 778{,}240\) tokens/s, so \(1.4\times10^{12} / 778{,}240 = 1.80\times10^{6}\) s \(= 20.8\) days. The paper's carbon table lists 1,022,362 GPU-hours for the 65B, and \(1{,}022{,}362 / 2048 = 499\) hours \(= 20.8\) days <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 15]</a>.</li>
-    <li>Per-GPU FLOP rate by the \(6N\) rule: \(380 \times 6 \times 65.29\times10^{9} = 1.49\times10^{14}\) FLOP/s, which is 48% of the A100's 312 TFLOP/s dense bf16 peak (<a href="16-gpus-kernels.html">page 16</a>). This is our arithmetic and a floor, since \(6N\) ignores the attention term.</li>
-  </ul>
-  <p>That is a high number for 2023. The paper credits an efficient causal-attention implementation that does not store attention weights, hand-written backward passes that save the expensive activations instead of recomputing them, and overlap of communication with computation <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.4]</a> (<a href="15-distributed-training.html">page 15</a>, <a href="16-gpus-kernels.html">page 16</a>).</p>
+  <h3 id="l1-speed">Worked numbers: the 65B run</h3>
+  <p>The paper reports about 380 tokens per second per GPU on 2,048 A100-80GB GPUs, so 1.4T tokens take about 21 days <a href="https://arxiv.org/abs/2302.13971">[Llama 1, §2.4]</a>. Check: \(380 \times 2048 = 778{,}240\) tokens/s, so \(1.4\times10^{12}/778{,}240\) s \(= 20.8\) days, and the carbon table's 1,022,362 GPU-hours \(/\,2048 = 499\) h \(= 20.8\) days as well <a href="https://arxiv.org/abs/2302.13971">[Llama 1, Tab. 15]</a>. Per GPU, \(380 \times 6 \times 65.29\times10^{9} = 1.49\times10^{14}\) FLOP/s, 48% of the A100's 312 TFLOP/s bf16 peak (<a href="16-gpus-kernels.html">page 16</a>; our arithmetic, a floor since \(6N\) omits attention). The paper credits a memory-efficient causal attention kernel, hand-written backward passes that save expensive activations, and communication overlap (<a href="15-distributed-training.html">page 15</a>).</p>
 </section>
 
 <section>
   <h2 id="llama2">Llama 2 (July 2023): more tokens, longer context, GQA and the open RLHF recipe</h2>
 
   <h3 id="l2-base">The base model: almost nothing changed in the block</h3>
-  <p>The Llama 2 paper says it adopts "most of the pretraining setting and model architecture from Llama 1", with two architectural differences: doubled context and grouped-query attention <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023b, §2.2]</a>. The rest of the change is data: "a new mix of publicly available data" with more cleaning, 40% more total tokens than Llama 1's 1.4T (so 2T), and up-sampling of the most factual sources.</p>
-
-  <div class="table-wrap"><table class="data">
-    <thead><tr><th></th><th>Llama 1</th><th>Llama 2</th></tr></thead>
-    <tbody>
-      <tr><td>Sizes</td><td>7B, 13B, 33B, 65B</td><td>7B, 13B, 34B (not released), 70B</td></tr>
-      <tr><td>Training tokens</td><td class="num">1.0T (7B, 13B), 1.4T (33B, 65B)</td><td class="num">2.0T for every size</td></tr>
-      <tr><td>Context length</td><td class="num">2,048</td><td class="num">4,096</td></tr>
-      <tr><td>Attention</td><td>MHA</td><td>GQA with 8 KV heads on 34B and 70B; MHA on 7B and 13B</td></tr>
-      <tr><td>Optimizer, schedule</td><td colspan="2">AdamW, \(\beta_1 = 0.9\), \(\beta_2 = 0.95\), cosine to 10% of peak, 2,000 warmup steps, weight decay 0.1, clip 1.0, 4M-token batch. Llama 2 also states \(\epsilon = 10^{-5}\).</td></tr>
-      <tr><td>Compute (A100-80GB GPU-hours)</td><td class="num">65B: 1,022,362</td><td class="num">7B 184,320; 13B 368,640; 34B 1,038,336; 70B 1,720,320; total 3.3M</td></tr>
-    </tbody>
-  </table></div>
-  <p class="small muted">Sources: Llama 2 Tables 1 and 2, §2.2 <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023b]</a>; Llama 1 Tables 2 and 15. The 34B was trained but withheld: "we are delaying the release of the 34B model due to a lack of time to sufficiently red team."</p>
-
-  <p>The context change has its own ablation: two models trained on 150B tokens each, one at 2K and one at 4K. On SCROLLS, whose average input is 3.5K tokens, the 2K model is close to zero (NarrativeQA F1 0.21 against 17.26, Qasper 0.71 against 18.52) and the 4K model is better everywhere on long inputs; on short-context tasks the two are within noise (HellaSwag 75.1 against 74.8) <a href="https://arxiv.org/abs/2307.09288">[Llama 2, App. A.2.1, Tab. 16-17]</a>. The lesson is that a model cannot use context it was not trained on, which is why the context-extension stages of <a href="10-long-context.html">page 10</a> exist.</p>
+  <p>The paper adopts "most of the pretraining setting and model architecture from Llama 1"; the two architectural differences are doubled context (2,048 to 4,096) and GQA with 8 KV heads on the 34B and 70B only <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023b, §2.2, Tab. 1]</a>. Everything else in the optimizer is unchanged (AdamW with \(\beta = (0.9, 0.95)\), cosine to 10% of peak, 2,000 warmup steps, weight decay 0.1, clip 1.0, 4M-token batch), and Llama 2 adds \(\epsilon = 10^{-5}\). The change is data: a new public mix with more cleaning and up-sampling of factual sources, 2.0T tokens at every size (40% more than Llama 1's 1.4T), and 3.3M A100-80GB GPU-hours in total, of which 1,720,320 went to the 70B (Llama 1's 65B took 1,022,362). The 34B was trained but withheld: "we are delaying the release of the 34B model due to a lack of time to sufficiently red team."</p>
+  <p>The context change has its own ablation, two models on 150B tokens each. On SCROLLS, whose inputs average 3.5K tokens, the 2K model is near zero (NarrativeQA F1 0.21 against 17.26 for the 4K model) while short-context tasks are within noise (HellaSwag 75.1 against 74.8) <a href="https://arxiv.org/abs/2307.09288">[Llama 2, App. A.2.1, Tab. 16-17]</a>. A model cannot use context it was not trained on, which is why the staged extension of <a href="10-long-context.html">page 10</a> exists.</p>
 
   <h3 id="l2-gqa">GQA only where the cache hurts</h3>
-  <p>Only the 34B and 70B use GQA, with 8 KV heads. The paper's stated purpose is "inference scalability for our larger models" and it gives two arguments <a href="https://arxiv.org/abs/2307.09288">[Llama 2, App. A.2.1, Tab. 18]</a>. First, a 30B ablation on 150B tokens: GQA "performs comparably to the MHA baseline on most evaluation tasks and is better than the MQA variant on average", with the FFN widened by 1.3 (GQA) or 1.33 (MQA) to keep parameter counts equal. Second, the largest models are served on 8 A100s with tensor parallelism, and an MQA head cannot be split across 8 GPUs, so it would be duplicated and the cache would be no smaller than GQA's. The mechanism is the subject of <a href="07-kv-efficient-attention.html#why-8">page 07</a>. The stakes, per token with 128-dim heads in bf16:</p>
+  <p>The stated purpose is "inference scalability for our larger models". The evidence is a 30B ablation on 150B tokens, where GQA "performs comparably to the MHA baseline on most evaluation tasks and is better than the MQA variant on average" (FFN widened by 1.3 for GQA and 1.33 for MQA to hold parameters equal), plus a serving argument: the largest models run on 8 A100s with tensor parallelism, an MQA head cannot be split across 8 GPUs, so it would be duplicated and the cache would be no smaller than GQA's <a href="https://arxiv.org/abs/2307.09288">[Llama 2, App. A.2.1, Tab. 18]</a> (mechanism: <a href="07-kv-efficient-attention.html#why-8">page 07</a>). The stakes per token, with 128-dim heads in bf16:</p>
   <ul>
-    <li>Llama 2 7B (MHA): \(32 \text{ layers} \times 2 \times 32 \text{ heads} \times 128 \times 2\text{ B} = 524{,}288\) B = 512 KiB, or 2 GiB per 4K-token sequence.</li>
-    <li>Llama 2 70B with GQA-8: \(80 \times 2 \times 8 \times 128 \times 2 = 327{,}680\) B = 320 KiB, or 1.25 GiB per sequence. With plain MHA (64 KV heads) it would be \(80 \times 2 \times 64 \times 128 \times 2 = 2{,}621{,}440\) B = 2.5 MiB, 8 times more: 10 GiB per 4K sequence.</li>
+    <li>Llama 2 7B (MHA): \(32 \times 2 \times 32 \times 128 \times 2\text{ B} = 524{,}288\) B = 512 KiB, so 2 GiB per 4K-token sequence.</li>
+    <li>Llama 2 70B (GQA-8): \(80 \times 2 \times 8 \times 128 \times 2 = 327{,}680\) B = 320 KiB, 1.25 GiB per sequence. As MHA (64 KV heads) it would be 2.5 MiB per token, 8 times more (10 GiB per sequence).</li>
   </ul>
-  <p>The 7B and 13B kept MHA because their caches were small relative to the serving budget. Llama 3 then adopted GQA-8 at every size, including the 8B, once the target became long contexts and cheap serving everywhere (<a href="#llama3">below</a>).</p>
+  <p>The 7B and 13B kept MHA because their caches were small relative to the serving budget. Llama 3 adopted GQA-8 at every size, including the 8B (<a href="#llama3">below</a>).</p>
 
   <h3 id="l2-rlhf">The post-training recipe, and why each piece</h3>
-  <p>Llama 2-Chat was the first fully documented open RLHF pipeline. Each piece answers a specific problem the authors ran into; the mechanics are on pages <a href="19-sft-distillation.html">19</a>, <a href="21-preference-optimization.html">21</a> and <a href="23-rlhf.html">23</a>.</p>
+  <p>Llama 2-Chat was the first fully documented open RLHF pipeline. Each piece answers a problem the authors hit; mechanics are on pages <a href="19-sft-distillation.html">19</a>, <a href="21-preference-optimization.html">21</a> and <a href="23-rlhf.html">23</a>.</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Stage</th><th>What Llama 2 did</th><th>Why</th></tr></thead>
     <tbody>
-      <tr><td>SFT</td><td>27,540 vendor-written annotations; 2 epochs, LR \(2\times10^{-5}\), batch 64, 4,096-token sequences, loss on answer tokens only</td><td>"Quality is all you need": they set aside millions of third-party examples, and found SFT samples often competitive with human-written ones, so annotation effort moved to preferences.</td></tr>
-      <tr><td>Reward models</td><td>Two, helpfulness and safety, initialized from chat checkpoints; ranking loss with a preference-strength margin; one epoch; 1,418,091 Meta comparisons (2,919,326 with open datasets) in 14 weekly batches</td><td>Helpfulness and safety trade off, so one model is confused: "optimizing two separate models eases the reward modeling task". Fresh batches every week keep the RM on the policy's distribution.</td></tr>
-      <tr><td>Rejection sampling (RS)</td><td>Sample \(K\) answers, keep the highest-reward one, fine-tune on it. Done with the 70B only, then distilled into the smaller models</td><td>Breadth: \(K\) samples per prompt explore more than one PPO rollout. After RLHF-V3 forgot how to write rhymes, later rounds also drew on top samples from all earlier iterations.</td></tr>
-      <tr><td>PPO</td><td>From RLHF-V5, PPO on top of the RS checkpoint. LR \(10^{-6}\), batch 512, mini-batch 64, clip 0.2, KL coefficient 0.01 (7B, 13B) or 0.005 (34B, 70B), 200 to 400 iterations</td><td>Depth: the policy at step \(t\) is trained on its own latest samples. The KL penalty guards against reward hacking.</td></tr>
-      <tr><td>Ghost Attention</td><td>Attach the instruction to every user turn while sampling data, then train on that data with the instruction kept only in the first turn and loss zeroed on earlier turns</td><td>Early RLHF models forgot a system instruction ("answer as Napoleon") after a few turns.</td></tr>
+      <tr><td>SFT</td><td>27,540 vendor-written annotations, 2 epochs, LR \(2\times10^{-5}\), loss on answers only</td><td>"Quality is all you need": millions of third-party examples were set aside; SFT samples were often competitive with human-written ones, so annotation effort moved to preferences.</td></tr>
+      <tr><td>Reward models</td><td>Two (helpfulness, safety) from chat checkpoints; ranking loss with a preference-strength margin; 1,418,091 Meta comparisons in 14 weekly batches</td><td>The objectives trade off: "optimizing two separate models eases the reward modeling task". Weekly batches keep the RM on the policy's distribution.</td></tr>
+      <tr><td>Rejection sampling</td><td>Best of \(K\) samples, then fine-tune on it; 70B only, distilled into smaller models</td><td>Breadth: \(K\) samples per prompt explore more than one PPO rollout. After V3 forgot how to write rhymes, later rounds reused top samples from all earlier iterations.</td></tr>
+      <tr><td>PPO</td><td>From V5, on top of the RS checkpoint: LR \(10^{-6}\), batch 512, clip 0.2, KL coefficient 0.01 (7B, 13B) or 0.005 (34B, 70B), 200 to 400 iterations</td><td>Depth: each step trains on the latest policy's samples. The KL penalty guards against reward hacking.</td></tr>
+      <tr><td>Ghost Attention</td><td>Attach the instruction to every user turn when sampling, then train with it only in the first turn and loss zeroed on earlier turns</td><td>Early RLHF models forgot a system instruction ("act as Napoleon") after a few turns.</td></tr>
     </tbody>
   </table></div>
-  <p>Two cost figures from the paper matter later. A PPO iteration on the 70B took about 330 seconds, and FSDP caused a roughly 20 times slowdown during generation, even with a large batch and a KV cache, until the weights were consolidated onto each node before generating <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §3.2.3]</a>. The paper's own schedule is telling: "Until RLHF (V4), we used only Rejection Sampling fine-tuning, and after that, we combined the two sequentially". RS did most of the work, PPO came last. That is the seed of Llama 3's decision to drop PPO.</p>
+  <p>Two costs matter later. A PPO iteration on the 70B took about 330 seconds, and FSDP caused a roughly 20 times slowdown during generation, even with a KV cache, until weights were consolidated onto each node before generating <a href="https://arxiv.org/abs/2307.09288">[Llama 2, §3.2.3]</a>. And the schedule itself: "Until RLHF (V4), we used only Rejection Sampling fine-tuning, and after that, we combined the two sequentially". RS did most of the work and PPO came last, the seed of Llama 3's decision to drop PPO.</p>
 
   <h3 id="l2-code">Code Llama and the RoPE base</h3>
-  <p>One Llama 2 offshoot changed the recipe of everything after it. Code Llama (August 2023) continued Llama 2 on code, then added a long-context fine-tuning stage on 16,384-token sequences (4 times Llama 2's 4,096) in which "we increase the base period \(\theta\) from 10,000 to 1,000,000" <a href="https://arxiv.org/abs/2308.12950">[Rozière et al. 2023, §2.4]</a>. The fine-tuning used LR \(2\times10^{-5}\) and 10,000 gradient steps by default with a 2M-token batch for the 7B and 13B, and the models stayed stable up to 100,000 tokens. Their ablation on an earlier 7B: fine-tuning on 16K sequences without changing the base failed to retrieve far-away keys already at 8,000 tokens, and linear position interpolation (frequency scaling 1/4) failed to extrapolate <a href="https://arxiv.org/abs/2308.12950">[Code Llama, App. G.4, Tab. 18]</a>. The paper notes that a Reddit user had proposed raising the base concurrently, and that the change is cheap: it needs no architecture change. The same lever reappears in Llama 3, which sets a base of 500,000 in the architecture itself and cites Xiong et al. for it <a href="https://arxiv.org/abs/2309.16039">[Xiong et al. 2023]</a> (theory and scaling recipes: <a href="05-positional-encoding.html">page 05</a>, <a href="10-long-context.html">page 10</a>).</p>
+  <p>Code Llama (August 2023) continued Llama 2 on code, then ran a long-context stage on 16,384-token sequences in which "we increase the base period \(\theta\) from 10,000 to 1,000,000" (LR \(2\times10^{-5}\), 10,000 steps, stable to 100,000 tokens) <a href="https://arxiv.org/abs/2308.12950">[Rozière et al. 2023, §2.4]</a>. Their ablation on an earlier 7B: fine-tuning on 16K sequences without changing the base already failed to retrieve far keys at 8,000 tokens, and linear position interpolation failed to extrapolate <a href="https://arxiv.org/abs/2308.12950">[Code Llama, App. G.4]</a>. The lever needs no architecture change, and it reappears in Llama 3, which sets a base of 500,000 and cites Xiong et al. <a href="https://arxiv.org/abs/2309.16039">[Xiong et al. 2023]</a> (theory: <a href="05-positional-encoding.html">page 05</a>, <a href="10-long-context.html">page 10</a>).</p>
 </section>
 
 <section>
   <h2 id="llama3">Llama 3 and 3.1 (2024): the same block, ten times the data, 16K GPUs</h2>
 
-  <p>Llama 3 shipped in two steps: 8B and 70B with 8K context in April 2024, then the 3.1 family of 8B, 70B and 405B with 128K context in July, together with the paper "The Llama 3 Herd of Models" <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024]</a>. The paper organizes its choices around "three key levers": data, scale, and managing complexity. The third is the one that explains the design: "we opt for a standard dense Transformer model architecture with minor adaptations, rather than for a mixture-of-experts model to maximize training stability", and "a relatively simple post-training procedure based on supervised finetuning, rejection sampling, and direct preference optimization as opposed to more complex reinforcement learning algorithms that tend to be less stable and harder to scale" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>. Llama 3 is the "reduce the risk" generation.</p>
+  <p>Llama 3 shipped in two steps: 8B and 70B with 8K context in April 2024, then 3.1 (8B, 70B, 405B, 128K context) in July with the paper "The Llama 3 Herd of Models" <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024]</a>. It names "three key levers": data, scale, and managing complexity. The third explains the design: a dense transformer "rather than a mixture-of-experts model to maximize training stability", and "a relatively simple post-training procedure" of SFT, rejection sampling and DPO "as opposed to more complex reinforcement learning algorithms that tend to be less stable and harder to scale" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>. Llama 3 is the "reduce the risk" generation.</p>
 
   <h3 id="l3-arch">Architecture: four small changes to Llama 2</h3>
-  <p>The paper says the architecture "does not deviate significantly from Llama and Llama 2", and that the performance gains "are primarily driven by improvements in data quality and diversity as well as by increased training scale" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. The four modifications and why:</p>
+  <p>The architecture "does not deviate significantly from Llama and Llama 2"; the gains "are primarily driven by improvements in data quality and diversity as well as by increased training scale" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. The four changes:</p>
   <ol>
-    <li><strong>GQA with 8 KV heads at every size</strong>, "to improve inference speed and to reduce the size of key-value caches during decoding". For the 8B this cuts the cache from 512 KiB per token (Llama 2 7B, MHA) to 128 KiB, a factor 4 (<a href="07-kv-efficient-attention.html">page 07</a>). It also makes context-parallel all-gathers cheap, because K and V are small (below).</li>
-    <li><strong>A document mask</strong> that stops attention across document boundaries within a packed sequence. It had limited impact in standard pre-training but is "important in continued pre-training on very long sequences", where a 128K-token sequence packs many unrelated documents.</li>
+    <li><strong>GQA with 8 KV heads at every size</strong>, "to improve inference speed and to reduce the size of key-value caches during decoding". For the 8B that is 128 KiB per token against 512 KiB for a Llama 2 7B-shaped MHA (<a href="07-kv-efficient-attention.html">page 07</a>), and it makes context-parallel all-gathers of K and V cheap.</li>
+    <li><strong>A document mask</strong> stopping attention across document boundaries in a packed sequence: limited impact in standard pre-training, but "important in continued pre-training on very long sequences", where a 128K sequence packs many unrelated documents.</li>
     <li><strong>A 128K-token vocabulary</strong> (decision card below).</li>
-    <li><strong>RoPE base 500,000</strong>, up from 10,000, "to better support longer contexts"; Xiong et al. showed it effective up to 32,768 (<a href="05-positional-encoding.html">page 05</a>, <a href="10-long-context.html">page 10</a>).</li>
+    <li><strong>RoPE base 500,000</strong> (from 10,000) "to better support longer contexts"; Xiong et al. showed it effective to 32,768 (<a href="05-positional-encoding.html">page 05</a>, <a href="10-long-context.html">page 10</a>).</li>
   </ol>
 
   <div class="table-wrap"><table class="data">
@@ -292,18 +246,17 @@
       <tr><td>Layers \(L\)</td><td class="num">32</td><td class="num">80</td><td class="num">126</td></tr>
       <tr><td>Model dimension \(d\)</td><td class="num">4,096</td><td class="num">8,192</td><td class="num">16,384</td></tr>
       <tr><td>FFN dimension \(\dff\)</td><td class="num">14,336</td><td class="num">28,672</td><td class="num">53,248</td></tr>
-      <tr><td>Attention heads \(n_h\) (\(d_h = 128\))</td><td class="num">32</td><td class="num">64</td><td class="num">128</td></tr>
-      <tr><td>KV heads \(n_{kv}\)</td><td class="num">8</td><td class="num">8</td><td class="num">8</td></tr>
+      <tr><td>Attention heads \(n_h\) (\(d_h = 128\)); KV heads</td><td class="num">32; 8</td><td class="num">64; 8</td><td class="num">128; 8</td></tr>
       <tr><td>Peak learning rate</td><td class="num">3e-4</td><td class="num">1.5e-4</td><td class="num">8e-5</td></tr>
       <tr><td>\(\dff / d\)</td><td class="num">3.5</td><td class="num">3.5</td><td class="num">3.25</td></tr>
       <tr><td>FFN rule: <code>multiple_of</code>, multiplier</td><td class="num">1024, 1.3</td><td class="num">4096, 1.3</td><td class="num">4096, 1.2</td></tr>
       <tr class="hl"><td>Exact parameters</td><td class="num">8,030,261,248</td><td class="num">70,553,706,496</td><td class="num">405,853,388,800</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Common to all: SwiGLU, vocabulary 128,000 in the paper (128,256 embedding rows in the checkpoints, see <a href="04-transformer-block.html">page 04</a>), RoPE \(\theta = 500{,}000\), 8 KV heads. Rows 1 to 6 are Table 3 of the paper <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 3]</a>. The FFN rule parameters are Meta's, from the <code>llama-models</code> repository, and reproduce the paper's \(\dff\) exactly (next). The parameter totals are the tensor sizes of the released checkpoints, reproduced by <code>llama_params</code> in the drill.</p>
+  <p class="small muted">Common: SwiGLU, RoPE \(\theta = 500{,}000\), vocabulary 128,000 in the paper (128,256 embedding rows in the checkpoints, <a href="04-transformer-block.html">page 04</a>). Rows 1 to 5 are Table 3 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 3]</a>. The FFN rule parameters are Meta's, from the <code>llama-models</code> repository, and reproduce the paper's \(\dff\) exactly. Totals are the released checkpoints' tensor sizes, reproduced by the drill.</p>
 
   <h3 id="l3-ffn">The FFN width rule, and where the extra parameters went</h3>
-  <p>Llama 1 used \(\tfrac83 d\). Llama 3 does not: \(\dff/d\) is 3.5 for the 8B and 70B. The width comes from the rule in Meta's reference code, which the drill asks you to write (<a href="04-transformer-block.html">page 04</a> derives it):</p>
+  <p>Llama 1 used \(\tfrac83 d\); Llama 3's \(\dff/d\) is 3.5. The width comes from Meta's reference code, which the drill asks you to write (<a href="04-transformer-block.html">page 04</a> derives it):</p>
 <pre><code class="language-python">def ffn_hidden_dim(d, multiple_of, ffn_dim_multiplier=None):   # llama/model.py, FeedForward
     h = int(2 * (4 * d) / 3)                       # 2/3 of 4d, truncated
     if ffn_dim_multiplier is not None:
@@ -314,155 +267,137 @@
 # 70B:  32768 -> 21845 -> int(1.3 * 21845) = 28398 -> 7 * 4096  = 28672
 # 405B: 65536 -> 43690 -> int(1.2 * 43690) = 52428 -> 13 * 4096 = 53248
 </code></pre>
-  <p>The multiplier is not explained in the paper. Its effect is visible when you decompose the change from Llama 2 7B (6,738,415,616 parameters) to Llama-3-8B (8,030,261,248), which share \(L = 32\) and \(d = 4096\):</p>
+  <p>The paper does not explain the multiplier, but the accounting from Llama 2 7B (6,738,415,616 parameters, same \(L = 32\) and \(d = 4096\)) to Llama-3-8B shows the trade:</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Change</th><th>Arithmetic</th><th class="num">Parameters</th></tr></thead>
     <tbody>
       <tr><td>GQA (32 to 8 KV heads)</td><td>\(-32 \cdot 2 \cdot 4096 \cdot (32-8) \cdot 128\)</td><td class="num">\(-805{,}306{,}368\)</td></tr>
       <tr><td>Wider FFN (11,008 to 14,336)</td><td>\(+32 \cdot 3 \cdot 4096 \cdot (14336-11008)\)</td><td class="num">\(+1{,}308{,}622{,}848\)</td></tr>
-      <tr><td>Larger vocabulary (32,000 to 128,256, untied)</td><td>\(+2 \cdot 4096 \cdot (128256-32000)\)</td><td class="num">\(+788{,}529{,}152\)</td></tr>
+      <tr><td>Vocabulary (32,000 to 128,256, untied)</td><td>\(+2 \cdot 4096 \cdot (128256-32000)\)</td><td class="num">\(+788{,}529{,}152\)</td></tr>
       <tr class="hl"><td>Net</td><td></td><td class="num">\(+1{,}291{,}845{,}632\)</td></tr>
     </tbody>
   </table></div>
-  <p>The sum reproduces 8,030,261,248 exactly. The pattern is a familiar trade: GQA frees attention parameters, and the FFN, which holds about 70% of the model, absorbs them. Llama 2 did the same in its GQA ablation, widening the FFN by 1.3 to keep parameters equal. The paper gives no reason for the round <code>multiple_of</code> values; the usual explanation is alignment with tensor-core tile sizes and the 8-way tensor-parallel split (each GPU holds \(14336/8 = 1792\) columns).</p>
+  <p>The sum reproduces 8,030,261,248 exactly. GQA frees attention parameters and the FFN, about 70% of the model, absorbs them; Llama 2's GQA ablation did the same with its 1.3 factor. The round <code>multiple_of</code> values plausibly align with tensor-core tiles and the 8-way tensor-parallel split (\(14336/8 = 1792\) columns per GPU); the paper says nothing about either.</p>
 
   <div class="decision">
     <div class="decision-title">A 128K-token vocabulary</div>
     <dl>
-      <dt>Problem</dt><dd>Llama 2's 32K SentencePiece vocabulary encodes English at 3.17 characters per token and other languages worse. Every token costs the same FLOPs and KV-cache bytes, so a poor tokenizer wastes compute and context.</dd>
-      <dt>Idea</dt><dd>A vocabulary of 128K tokens: 100K from the tiktoken BPE tokenizer plus 28K added for non-English languages <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>.</dd>
-      <dt>Why it works</dt><dd>English compression goes from 3.17 to 3.94 characters per token. The same text is \(3.17/3.94 = 80.5\%\) as many tokens, or equivalently the model "reads" 24% more text for the same training FLOPs and holds 24% more text in the same context window. The 28K added tokens improved both compression and downstream performance "with no impact on English tokenization".</dd>
-      <dt>Evidence</dt><dd>The compression numbers above. The paper reports no isolated ablation of the vocabulary's effect on quality.</dd>
-      <dt>Cost</dt><dd>Embedding and output head grow: \(2 \times 128{,}256 \times 4096 = 1{,}050{,}673{,}152\) parameters in the 8B, 13.1% of the model, against 3.9% for Llama 2 7B. Rare tokens see fewer updates, and the output softmax and logits tensor are 4 times wider.</dd>
-      <dt>Used by</dt><dd>Llama 3 and later Llama models; several other families use even larger vocabularies for the same reason. Trade-offs: <a href="02-tokenization.html">page 02</a>.</dd>
+      <dt>Problem</dt><dd>Llama 2's 32K vocabulary encodes English at 3.17 characters per token and other languages worse. Every token costs the same FLOPs and KV-cache bytes, so a poor tokenizer wastes compute and context.</dd>
+      <dt>Idea</dt><dd>100K tokens from the tiktoken BPE tokenizer plus 28K for non-English languages <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>.</dd>
+      <dt>Why it works</dt><dd>English compression rises from 3.17 to 3.94 characters per token, so the same text is \(3.17/3.94 = 80.5\%\) as many tokens: 24% more text per training FLOP and per context window. The 28K added tokens improved compression and downstream performance "with no impact on English tokenization".</dd>
+      <dt>Evidence</dt><dd>The compression numbers; no isolated quality ablation is reported.</dd>
+      <dt>Cost</dt><dd>Embedding and head are \(2 \times 128{,}256 \times 4096 = 1{,}050{,}673{,}152\) parameters in the 8B, 13.1% of the model (3.9% for Llama 2 7B); rare tokens see fewer updates; the logits tensor is 4 times wider.</dd>
+      <dt>Used by</dt><dd>Llama 3 onward; other families use even larger vocabularies for the same reason (<a href="02-tokenization.html">page 02</a>).</dd>
     </dl>
   </div>
 
   <h3 id="l3-numbers">Worked numbers: 405B parameters, then \(6ND\) against 3.8e25</h3>
-  <p>The 405B config: \(d = 16{,}384\), \(L = 126\), \(n_h = 128\), \(n_{kv} = 8\), \(d_h = 128\), \(\dff = 53{,}248\), \(V = 128{,}256\), untied embeddings, no biases.</p>
+  <p>The 405B config: \(d = 16{,}384\), \(L = 126\), \(n_h = 128\), \(n_{kv} = 8\), \(d_h = 128\), \(\dff = 53{,}248\), \(V = 128{,}256\), untied, no biases.</p>
   <div class="table-wrap"><table class="data">
-    <thead><tr><th>Item</th><th>Shape or formula</th><th class="num">Parameters</th></tr></thead>
+    <thead><tr><th>Item</th><th>Formula</th><th class="num">Parameters</th></tr></thead>
     <tbody>
-      <tr><td>Q and O projections</td><td>\(2 \times 16384 \times 16384\)</td><td class="num">536,870,912</td></tr>
-      <tr><td>K and V projections (GQA-8)</td><td>\(2 \times 16384 \times (8 \cdot 128)\)</td><td class="num">33,554,432</td></tr>
-      <tr><td>SwiGLU FFN (gate, up, down)</td><td>\(3 \times 16384 \times 53248\)</td><td class="num">2,617,245,696</td></tr>
+      <tr><td>Q and O projections</td><td>\(2 \times 16384^2\)</td><td class="num">536,870,912</td></tr>
+      <tr><td>K and V projections (GQA-8)</td><td>\(2 \times 16384 \times 1024\)</td><td class="num">33,554,432</td></tr>
+      <tr><td>SwiGLU FFN</td><td>\(3 \times 16384 \times 53248\)</td><td class="num">2,617,245,696</td></tr>
       <tr><td>Two RMSNorm vectors</td><td>\(2 \times 16384\)</td><td class="num">32,768</td></tr>
-      <tr><td><strong>One layer</strong></td><td></td><td class="num">3,187,703,808</td></tr>
-      <tr><td>126 layers</td><td>\(126 \times 3{,}187{,}703{,}808\)</td><td class="num">401,650,679,808</td></tr>
-      <tr><td>Input embedding and output head</td><td>\(2 \times 128256 \times 16384\)</td><td class="num">4,202,692,608</td></tr>
-      <tr><td>Final RMSNorm</td><td>\(16384\)</td><td class="num">16,384</td></tr>
+      <tr><td><strong>One layer</strong>, times 126</td><td>\(3{,}187{,}703{,}808 \times 126\)</td><td class="num">401,650,679,808</td></tr>
+      <tr><td>Embedding and output head, final norm</td><td>\(2 \times 128256 \times 16384 + 16384\)</td><td class="num">4,202,708,992</td></tr>
       <tr class="hl"><td><strong>Total</strong></td><td></td><td class="num">405,853,388,800</td></tr>
     </tbody>
   </table></div>
-  <p>The released checkpoint's tensors sum to 405,853,388,800 as well, so the accounting is exact. Now the compute. With \(N = 405.85\text{B}\) and \(D = 15.6\text{T}\) tokens <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>:</p>
+  <p>The released checkpoint's tensors sum to the same number. With \(N = 405.85\text{B}\) and \(D = 15.6\text{T}\) tokens <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>:</p>
   <div class="eq-box">
   \[ 6ND = 6 \times 4.0585\times10^{11} \times 1.56\times10^{13} = 3.80\times10^{25} \ \text{FLOPs} \]
-  <div class="eq-label">The paper reports 3.8e25: its FLOP count is the 6ND convention (page 13)</div>
+  <div class="eq-label">The paper reports 3.8e25, so its FLOP count is the 6ND convention (page 13)</div>
   </div>
-  <p>Two consistency checks link this to the hardware story below. The model card lists 30.84M H100 GPU-hours for the 405B <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md">[Llama 3.1 model card]</a>. Then \(3.80\times10^{25} / (30.84\times10^{6} \times 3600\ \text{s}) = 3.42\times10^{14}\) FLOP/s per GPU, 34.6% of the 989 TFLOP/s dense bf16 peak (<a href="04-transformer-block.html">page 04</a>). The paper's MFU is 38 to 43% while training and its effective training time is above 90%, and \(0.41 \times 0.9 \approx 37\%\), the same ballpark: the GPU-hours count everything, including restarts, and \(6ND\) omits attention. Second, the paper's own scaling-law extrapolation was 402B parameters on 16.55T tokens, whose \(6ND\) is \(3.99\times10^{25}\), 5% above 3.8e25 (page 13 discusses this).</p>
+  <p>Cross-check against hardware: the model card lists 30.84M H100 GPU-hours for the 405B <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md">[Llama 3.1 model card]</a>, so the average is \(3.80\times10^{25} / (30.84\times10^{6} \times 3600) = 342\) TFLOP/s per GPU, 34.6% of the 989 TFLOP/s dense bf16 peak (<a href="04-transformer-block.html">page 04</a>). The paper's MFU while training is 38 to 43% with above 90% effective time, and \(0.41 \times 0.9 \approx 37\%\) is the same ballpark (GPU-hours include restarts, and \(6ND\) omits attention). The paper's own scaling fit suggested 402B on 16.55T tokens, whose \(6ND\) is \(3.99\times10^{25}\), 5% higher (page 13).</p>
 </section>
 
 <section>
   <h2 id="llama3-scale">Llama 3 in practice: scaling laws, 16K GPUs, 128K context and post-training</h2>
 
   <h3 id="l3-scale">Scaling laws, and small models trained far past optimal</h3>
-  <p>The flagship's size came from a scaling-law fit (method and caveats: <a href="13-scaling-laws.html">page 13</a>). Llama 3 trained models from 40M to 16B parameters at compute budgets from \(6\times10^{18}\) to \(10^{22}\) FLOPs, fitted a parabola to each IsoFLOP curve, and fitted a power law \(N^\star(C) = A\,C^\alpha\) with \((\alpha, A) = (0.53, 0.29)\) through the minima. Extrapolated to \(3.8\times10^{25}\) FLOPs it suggested 402B parameters on 16.55T tokens. Because the curves "become flatter around the minimum as the compute budget increases", the team chose 405B <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2.1]</a>. The second use of the same runs was forecasting: a linear fit of downstream negative log-likelihood against FLOPs (models up to \(10^{22}\)), then a sigmoid from log-likelihood to accuracy, using both the scaling-law models and the older Llama 2 models to cover the accuracy range. On ARC Challenge this extrapolated four orders of magnitude and only slightly underestimated the final 405B result. The same small-model runs chose the data mix (below).</p>
-
-  <p>The flagship sits near the Chinchilla ratio: \(15.6\text{T} / 405.85\text{B} = 38\) tokens per parameter. The smaller models do not. The paper says it trains "smaller models for much longer than is compute-optimal", that these "perform better than compute-optimal models at the same inference budget", and that the flagship then improves them "during post-training" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>. The launch post adds the observation: the Chinchilla-optimal compute for an 8B model corresponds to about 200B tokens, yet "both our 8B and 70B parameter models continued to improve log-linearly after we trained them on up to 15T tokens", and larger models "can match the performance of these smaller models with less training compute, but smaller models are generally preferred because they are much more efficient during inference" <a href="https://ai.meta.com/blog/meta-llama-3/">[Meta 2024]</a>. That is Llama 1's argument, pushed 12 times further.</p>
+  <p>The flagship's size came from a scaling-law fit (method and caveats: <a href="13-scaling-laws.html">page 13</a>): models of 40M to 16B parameters at budgets from \(6\times10^{18}\) to \(10^{22}\) FLOPs, a parabola per IsoFLOP curve, and a power law \(N^\star(C) = A\,C^\alpha\) with \((\alpha, A) = (0.53, 0.29)\). Extrapolated to \(3.8\times10^{25}\) FLOPs it suggested 402B parameters on 16.55T tokens; the curves "become flatter around the minimum as the compute budget increases", so they chose 405B <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2.1]</a>. The same runs forecast benchmarks in two steps (negative log-likelihood against FLOPs, then a sigmoid to accuracy using Llama 2 models to cover the range) and chose the data mix.</p>
+  <p>The flagship sits near Chinchilla: \(15.6\text{T}/405.85\text{B} = 38\) tokens per parameter. The small models do not. The paper trains "smaller models for much longer than is compute-optimal", which "perform better than compute-optimal models at the same inference budget", and uses the flagship to improve them "during post-training" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>. The launch post adds that Chinchilla-optimal for an 8B model is about 200B tokens, yet "both our 8B and 70B parameter models continued to improve log-linearly after we trained them on up to 15T tokens" <a href="https://ai.meta.com/blog/meta-llama-3/">[Meta 2024]</a>. That is Llama 1's argument pushed 12 times further.</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 392" role="img" aria-labelledby="fig-29-2-title">
 <title id="fig-29-2-title">Training tokens per parameter for Llama 1, 2, 3 and 4 models on a log axis, with the Chinchilla ratio of 20 marked</title>
 <line class="s-line s-dash" x1="150.0" y1="44" x2="150.0" y2="336" style="opacity:.45"/>
-<line class="s-line s-dash" x1="357.5" y1="44" x2="357.5" y2="336" style="opacity:.45"/>
-<line class="s-line s-dash" x1="565.0" y1="44" x2="565.0" y2="336" style="opacity:.45"/>
-<line class="s-line-c s-dash" x1="212.5" y1="36" x2="212.5" y2="336"/>
-<text x="218.5" y="30" class="s-small s-tc s-bold">20 = Chinchilla-optimal</text>
+<line class="s-line s-dash" x1="315.0" y1="44" x2="315.0" y2="336" style="opacity:.45"/>
+<line class="s-line s-dash" x1="480.0" y1="44" x2="480.0" y2="336" style="opacity:.45"/>
+<line class="s-line-c s-dash" x1="199.7" y1="36" x2="199.7" y2="336"/>
+<text x="205.7" y="30" class="s-small s-tc s-bold">20 = Chinchilla-optimal</text>
 <text x="140" y="58" text-anchor="end" class="s-small">Llama 1 7B</text>
-<line class="s-line" x1="212.5" y1="54" x2="393.1" y2="54"/>
-<circle class="s-fill-a" cx="393.1" cy="54" r="6"/>
-<text x="404.1" y="58" class="s-small">148</text>
+<line class="s-line" x1="199.7" y1="54" x2="343.3" y2="54"/>
+<circle class="s-fill-a" cx="343.3" cy="54" r="6"/>
+<text x="354.3" y="58" class="s-small">148</text>
 <text x="140" y="82" text-anchor="end" class="s-small">Llama 1 13B</text>
-<line class="s-line" x1="212.5" y1="78" x2="333.7" y2="78"/>
-<circle class="s-fill-a" cx="333.7" cy="78" r="6"/>
-<text x="344.7" y="82" class="s-small">77</text>
+<line class="s-line" x1="199.7" y1="78" x2="296.1" y2="78"/>
+<circle class="s-fill-a" cx="296.1" cy="78" r="6"/>
+<text x="307.1" y="82" class="s-small">77</text>
 <text x="140" y="106" text-anchor="end" class="s-small">Llama 1 33B</text>
-<line class="s-line" x1="212.5" y1="102" x2="281.4" y2="102"/>
-<circle class="s-fill-a" cx="281.4" cy="102" r="6"/>
-<text x="292.4" y="106" class="s-small">43</text>
+<line class="s-line" x1="199.7" y1="102" x2="254.5" y2="102"/>
+<circle class="s-fill-a" cx="254.5" cy="102" r="6"/>
+<text x="265.5" y="106" class="s-small">43</text>
 <text x="140" y="130" text-anchor="end" class="s-small">Llama 1 65B</text>
-<line class="s-line" x1="212.5" y1="126" x2="218.6" y2="126"/>
-<circle class="s-fill-a" cx="218.6" cy="126" r="6"/>
-<text x="229.6" y="130" class="s-small">21</text>
+<line class="s-line" x1="199.7" y1="126" x2="204.5" y2="126"/>
+<circle class="s-fill-a" cx="204.5" cy="126" r="6"/>
+<text x="215.5" y="130" class="s-small">21</text>
 <text x="140" y="154" text-anchor="end" class="s-small">Llama 2 7B</text>
-<line class="s-line" x1="212.5" y1="150" x2="455.5" y2="150"/>
-<circle class="s-fill-b" cx="455.5" cy="150" r="6"/>
-<text x="466.5" y="154" class="s-small">297</text>
+<line class="s-line" x1="199.7" y1="150" x2="393.0" y2="150"/>
+<circle class="s-fill-b" cx="393.0" cy="150" r="6"/>
+<text x="404.0" y="154" class="s-small">297</text>
 <text x="140" y="178" text-anchor="end" class="s-small">Llama 2 13B</text>
-<line class="s-line" x1="212.5" y1="174" x2="396.2" y2="174"/>
-<circle class="s-fill-b" cx="396.2" cy="174" r="6"/>
-<text x="407.2" y="178" class="s-small">154</text>
+<line class="s-line" x1="199.7" y1="174" x2="345.8" y2="174"/>
+<circle class="s-fill-b" cx="345.8" cy="174" r="6"/>
+<text x="356.8" y="178" class="s-small">154</text>
 <text x="140" y="202" text-anchor="end" class="s-small">Llama 2 70B</text>
-<line class="s-line" x1="212.5" y1="198" x2="245.9" y2="198"/>
-<circle class="s-fill-b" cx="245.9" cy="198" r="6"/>
-<text x="256.9" y="202" class="s-small">29</text>
+<line class="s-line" x1="199.7" y1="198" x2="226.3" y2="198"/>
+<circle class="s-fill-b" cx="226.3" cy="198" r="6"/>
+<text x="237.3" y="202" class="s-small">29</text>
 <text x="140" y="226" text-anchor="end" class="s-small">Llama 3 8B</text>
-<line class="s-line" x1="212.5" y1="222" x2="621.3" y2="222"/>
-<circle class="s-fill-c" cx="621.3" cy="222" r="6"/>
-<text x="632.3" y="226" class="s-small">1,868</text>
+<line class="s-line" x1="199.7" y1="222" x2="524.8" y2="222"/>
+<circle class="s-fill-c" cx="524.8" cy="222" r="6"/>
+<text x="535.8" y="226" class="s-small">1,868</text>
 <text x="140" y="250" text-anchor="end" class="s-small">Llama 3 70B</text>
-<line class="s-line" x1="212.5" y1="246" x2="425.5" y2="246"/>
-<circle class="s-fill-c" cx="425.5" cy="246" r="6"/>
-<text x="436.5" y="250" class="s-small">213</text>
+<line class="s-line" x1="199.7" y1="246" x2="369.0" y2="246"/>
+<circle class="s-fill-c" cx="369.0" cy="246" r="6"/>
+<text x="380.0" y="250" class="s-small">213</text>
 <text x="140" y="274" text-anchor="end" class="s-small">Llama 3 405B</text>
-<line class="s-line" x1="212.5" y1="270" x2="271.2" y2="270"/>
-<circle class="s-fill-c" cx="271.2" cy="270" r="6"/>
-<text x="282.2" y="274" class="s-small">38</text>
+<line class="s-line" x1="199.7" y1="270" x2="246.4" y2="270"/>
+<circle class="s-fill-c" cx="246.4" cy="270" r="6"/>
+<text x="257.4" y="274" class="s-small">38</text>
 <text x="140" y="298" text-anchor="end" class="s-small">Llama 4 Scout</text>
-<line class="s-line" x1="212.5" y1="294" x2="641.2" y2="294"/>
-<circle class="s-d" cx="641.2" cy="294" r="6"/>
-<text x="652.2" y="298" class="s-small">2,330 per active param</text>
+<line class="s-line" x1="199.7" y1="294" x2="540.6" y2="294"/>
+<circle class="s-d" cx="540.6" cy="294" r="6"/>
+<text x="551.6" y="298" class="s-small">2,330 per active param</text>
 <text x="140" y="322" text-anchor="end" class="s-small">Llama 4 Maverick</text>
-<line class="s-line" x1="212.5" y1="318" x2="587.3" y2="318"/>
-<circle class="s-d" cx="587.3" cy="318" r="6"/>
-<text x="598.3" y="322" class="s-small">1,281 per active param</text>
-<line class="s-line" x1="150" y1="336" x2="690" y2="336"/>
+<line class="s-line" x1="199.7" y1="318" x2="497.7" y2="318"/>
+<circle class="s-d" cx="497.7" cy="318" r="6"/>
+<text x="508.7" y="322" class="s-small">1,281 per active param</text>
+<line class="s-line" x1="150" y1="336" x2="579.3" y2="336"/>
 <line class="s-line" x1="150.0" y1="336" x2="150.0" y2="341"/>
 <text x="150.0" y="355" text-anchor="middle" class="s-small s-muted">10</text>
-<line class="s-line" x1="212.5" y1="336" x2="212.5" y2="341"/>
-<text x="212.5" y="355" text-anchor="middle" class="s-small s-muted">20</text>
-<line class="s-line" x1="357.5" y1="336" x2="357.5" y2="341"/>
-<text x="357.5" y="355" text-anchor="middle" class="s-small s-muted">100</text>
-<line class="s-line" x1="565.0" y1="336" x2="565.0" y2="341"/>
-<text x="565.0" y="355" text-anchor="middle" class="s-small s-muted">1,000</text>
-<text x="420" y="376" text-anchor="middle" class="s-small">training tokens per parameter (log scale)</text>
+<line class="s-line" x1="199.7" y1="336" x2="199.7" y2="341"/>
+<text x="199.7" y="355" text-anchor="middle" class="s-small s-muted">20</text>
+<line class="s-line" x1="315.0" y1="336" x2="315.0" y2="341"/>
+<text x="315.0" y="355" text-anchor="middle" class="s-small s-muted">100</text>
+<line class="s-line" x1="480.0" y1="336" x2="480.0" y2="341"/>
+<text x="480.0" y="355" text-anchor="middle" class="s-small s-muted">1,000</text>
+<text x="364.7" y="376" text-anchor="middle" class="s-small">training tokens per parameter (log scale)</text>
 </svg>
-    <figcaption><b>Figure 2.</b> Training tokens per parameter, log scale. Each lollipop starts at the Chinchilla ratio of 20 and ends at the model's value. Sizes use exact parameter counts and the reported token counts (1.0T or 1.4T for Llama 1, 2.0T for Llama 2, about 15T for Llama 3 8B and 70B and 15.6T for the 405B). The Llama 4 points (hollow) divide the model card's approximate 40T and 22T tokens by 17.17B and 17.18B <em>active</em> parameters, which is the only meaningful denominator for an MoE (<a href="13-scaling-laws.html">page 13</a>). Every generation trains its small models further past 20 than the last; the largest model of each of the first three generations (65B, 70B, 405B) stays within 1.1 to 1.9 times of it.</figcaption>
+    <figcaption><b>Figure 2.</b> Training tokens per parameter, log scale; each lollipop starts at the Chinchilla ratio of 20. Sizes use exact parameter counts and reported tokens (1.0T or 1.4T for Llama 1, 2.0T for Llama 2, about 15T for Llama 3 8B and 70B, 15.6T for the 405B). The hollow Llama 4 points divide the model cards' approximate 40T and 22T tokens by 17.17B and 17.18B <em>active</em> parameters, the only meaningful denominator for an MoE (<a href="13-scaling-laws.html">page 13</a>). The smallest model of each family goes further past 20 each generation; the largest model of the first three (65B, 70B, 405B) stays within 1.1 to 1.9 times of it.</figcaption>
   </figure>
 
-  <p>The three numbers the brief asks about, with the arithmetic: Llama 1 7B, \(1.0\text{T}/6.74\text{B} = 148\). Llama 2 70B, \(2.0\text{T}/68.98\text{B} = 29\). Llama-3-8B, \(15\text{T}/8.03\text{B} = 1{,}868\), which is 93 times Chinchilla's 20. The ratio for the smallest model of each family went 148, 297 (Llama 2 7B), 1,868: the target moved from "beat GPT-3 at 13B" to "the best model you can run yourself". When does this pay? Training an over-trained small model costs more compute than a compute-optimal model of the same quality, and saves inference FLOPs on every request; the break-even request volume is worked out on <a href="13-scaling-laws.html">page 13</a>. It stops paying when data runs out (repeated epochs give diminishing returns) or when the deployment is low-volume.</p>
+  <p>The three required numbers: Llama 1 7B, \(1.0\text{T}/6.74\text{B} = 148\); Llama 2 70B, \(2.0\text{T}/68.98\text{B} = 29\); Llama-3-8B, \(15\text{T}/8.03\text{B} = 1{,}868\), 93 times Chinchilla's 20. The target moved from "beat GPT-3 at 13B" to "the best model you can run yourself". Over-training costs more training compute than a compute-optimal model of equal quality and saves inference FLOPs on every request; the break-even volume is worked out in the design question below and on <a href="13-scaling-laws.html">page 13</a>. It stops paying when data runs out or the deployment is low-volume.</p>
 
   <h3 id="l3-data">Data and the training recipe</h3>
-  <p>The corpus is "about 15T multilingual tokens", against "1.8T tokens for Llama 2" in the Llama 3 paper's comparison (the Llama 2 paper itself says 2T, so quote the source you cite). The launch post adds that the dataset is seven times larger than Llama 2's, with four times more code, and over 5% non-English data covering more than 30 languages. Meta reports no source-level breakdown like Llama 1's. What the paper does give:</p>
-  <ul>
-    <li><strong>The final mix</strong> is roughly 50% general knowledge, 25% mathematical and reasoning, 17% code and 8% multilingual tokens, chosen with a knowledge classifier (to downsample over-represented topics such as arts and entertainment) and with scaling-law experiments: train several small models on a candidate mix, predict a large model's benchmark results on it, and repeat <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1.2]</a>.</li>
-    <li><strong>The mix changed during training</strong>: more non-English data, upsampled math, more recent web data late in training, and downsampling of subsets later found to be low quality <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.1]</a>.</li>
-    <li><strong>Annealing</strong>: over the final 40M tokens the learning rate goes linearly to 0 at 128K context, the mix upsamples very high-quality code and math, and the checkpoints are averaged (Polyak averaging). On Llama 3 8B this lifted GSM8K and MATH validation scores by 24.0% and 6.4%, but for the 405B the gains were "negligible" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1.3]</a>. Note that the 8B experiment used the GSM8K and MATH training sets, so it partly measures format learning (<a href="12-pretraining-data.html">page 12</a>).</li>
-  </ul>
-
-  <p>The 405B optimizer recipe is AdamW with peak learning rate \(8\times10^{-5}\), 8,000 warmup steps, and cosine decay to \(8\times10^{-7}\) (1% of peak) over 1,200,000 steps. The batch grows in three stages, "a lower batch size early in training to improve training stability", and the run had "few loss spikes" and "did not require interventions to correct for model training divergence" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.1]</a> (<a href="14-optimization.html">page 14</a>):</p>
-  <div class="table-wrap"><table class="data">
-    <thead><tr><th>Stage</th><th class="num">Sequence length</th><th class="num">Batch (tokens)</th><th class="num">Starts after</th><th class="num">Steps in stage (our arithmetic)</th></tr></thead>
-    <tbody>
-      <tr><td>1</td><td class="num">4,096</td><td class="num">4M</td><td class="num">0</td><td class="num">\(0.252\text{T}/4\text{M} = 63{,}000\)</td></tr>
-      <tr><td>2</td><td class="num">8,192</td><td class="num">8M</td><td class="num">252M tokens</td><td class="num">\((2.87-0.252)\text{T}/8\text{M} = 327{,}250\)</td></tr>
-      <tr><td>3</td><td class="num">8,192</td><td class="num">16M</td><td class="num">2.87T tokens</td><td class="num">\((15.6-2.87)\text{T}/16\text{M} = 795{,}625\)</td></tr>
-    </tbody>
-  </table></div>
-  <p class="small muted">The stages sum to about 1.19M steps for 15.6T tokens, consistent with the 1.2M-step cosine horizon (a check we did, not a figure from the paper).</p>
+  <p>The corpus is "about 15T multilingual tokens", against "1.8T tokens for Llama 2" in the Llama 3 paper (the Llama 2 paper says 2T, so quote the source you cite). The launch post adds seven times Llama 2's data, four times more code and over 5% non-English data. The paper gives the final mix: roughly 50% general knowledge, 25% math and reasoning, 17% code, 8% multilingual, chosen with a topic classifier and scaling-law runs (train small models on a candidate mix, predict the large model's results, repeat) and adjusted during training (more non-English and math, more recent web, less low-quality data) <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1, §3.4.1]</a>. Over the last 40M tokens the learning rate anneals linearly to 0 at 128K context on a mix that upsamples high-quality code and math, and checkpoints are averaged; on the 8B this lifted GSM8K and MATH by 24.0% and 6.4% but for the 405B the gains were "negligible", and the experiment used those benchmarks' training sets, so it partly measures format learning (<a href="12-pretraining-data.html">page 12</a>).</p>
+  <p>The 405B recipe is AdamW at peak LR \(8\times10^{-5}\), 8,000 warmup steps, cosine to \(8\times10^{-7}\) over 1.2M steps (<a href="14-optimization.html">page 14</a>), with a batch of 4M tokens at length 4,096, doubled to 8M at length 8,192 after 252M tokens, and to 16M after 2.87T tokens: "a lower batch size early in training to improve training stability", with "few loss spikes" and no interventions needed. Those stages sum to \(63{,}000 + 327{,}250 + 795{,}625 \approx 1.19\)M steps for 15.6T tokens, consistent with the 1.2M-step horizon (our check).</p>
 
   <h3 id="l3-infra">Infrastructure: 4D parallelism and the failure arithmetic</h3>
-  <p>Llama 3 405B trained on up to 16K H100 GPUs (80 GB HBM3, 700 W each) in Meta's Grand Teton servers, eight GPUs per server on NVLink, over RoCE at 400 Gbps between GPUs, out of a 24K-GPU cluster whose top network layer is oversubscribed 1:7 (so the job scheduler and the parallelism layout are topology-aware) <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.1]</a>. The model is sharded with four kinds of parallelism, ordered \([\text{TP}, \text{CP}, \text{PP}, \text{DP}]\) from the most to the least bandwidth-hungry (mechanics and memory: <a href="15-distributed-training.html">page 15</a>):</p>
+  <p>The 405B trained on up to 16K H100s (700 W, 80 GB) in eight-GPU NVLink servers over RoCE at 400 Gbps, in a 24K-GPU cluster whose top network layer is oversubscribed 1:7, so layout and scheduler are topology-aware <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.1]</a>. Four kinds of parallelism, ordered \([\text{TP}, \text{CP}, \text{PP}, \text{DP}]\) from most to least bandwidth-hungry (mechanics: <a href="15-distributed-training.html">page 15</a>):</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th class="num">GPUs</th><th class="num">TP</th><th class="num">CP</th><th class="num">PP</th><th class="num">DP</th><th class="num">Seq. length</th><th class="num">Batch per DP</th><th class="num">Tokens per batch</th><th class="num">TFLOP/s per GPU</th><th class="num">BF16 MFU</th></tr></thead>
     <tbody>
@@ -471,74 +406,55 @@
       <tr><td class="num">16,384</td><td class="num">8</td><td class="num">16</td><td class="num">16</td><td class="num">8</td><td class="num">131,072</td><td class="num">16</td><td class="num">16M</td><td class="num">380</td><td class="num">38%</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Source: Llama 3 Table 4 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>. Check: GPUs = TP × CP × PP × DP (\(8 \cdot 1 \cdot 16 \cdot 64 = 8192\)), tokens per batch = sequence length × batch per DP × DP (\(8192 \cdot 32 \cdot 64 = 16.8\text{M}\), the same in every row), and MFU = TFLOP/s ÷ 989 (430/989 = 43.5%).</p>
+  <p class="small muted">Llama 3 Table 4 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>. Check: GPUs = TP \(\cdot\) CP \(\cdot\) PP \(\cdot\) DP (\(8 \cdot 1 \cdot 16 \cdot 64 = 8192\)); tokens per batch = sequence length \(\cdot\) batch per DP \(\cdot\) DP (\(8192 \cdot 32 \cdot 64 = 16.8\text{M}\) in every row); MFU = TFLOP/s \(/\, 989\).</p>
   <ul>
-    <li><strong>Why TP=8 innermost:</strong> tensor parallelism needs the most bandwidth and lowest latency, so it stays inside one NVLink server. DP (implemented as FSDP) is outermost because it can prefetch weights and overlap gradient reduction over a slow network. Llama 3's FSDP shards optimizer states and gradients but does not reshard the weights after the forward pass, trading memory for one fewer all-gather in backward.</li>
-    <li><strong>Pipeline changes:</strong> the number of consecutive micro-batches \(N\) is tunable (standard schedules force the batch per DP group to be divisible by the number of stages, which fought the batch-size ramp); the first and last stages hold one fewer transformer layer each, to balance the embedding and the loss; and with tensors freed eagerly, 8K-token training needs no activation checkpointing. The bubble ratio is \((\text{PP}-1)/(V \cdot M)\) for \(V\) interleaved stages per rank and \(M\) micro-batches.</li>
-    <li><strong>Context parallelism</strong> for the 128K stage is all-gather based, not ring-based: gather K and V, then attend with the local Q chunk. The exposed all-gather is cheap because GQA makes K and V small (8 KV heads), attention costs \(O(S^2)\) against \(O(S)\) for the gather, and any mask, such as the document mask, is trivial to apply.</li>
-    <li><strong>Numerics:</strong> FP32 gradient accumulation across micro-batches and FP32 reduce-scatter across data-parallel ranks, added after comparing losses across parallelism setups.</li>
-    <li><strong>Why MFU fell from 43% to 41%:</strong> the paper attributes it to the lower batch per DP group (32 to 16 sequences) needed to keep 16M tokens per batch when the data-parallel size doubles.</li>
+    <li><strong>Layout:</strong> TP=8 stays inside one NVLink server; DP (FSDP) is outermost because it can prefetch weights and overlap gradient reduction over a slow network. MFU fell from 43% to 41% because doubling DP at a fixed 16M-token batch halves the batch per DP group, as the paper explains.</li>
+    <li><strong>Pipeline:</strong> the number of consecutive micro-batches is tunable (standard schedules tie the batch to the stage count, which fought the batch-size ramp), the first and last stages hold one fewer layer to balance embedding and loss, and 8K training then needs no activation checkpointing.</li>
+    <li><strong>Context parallelism</strong> for the 128K stage uses an all-gather of K and V, not a ring: the gather is cheap because GQA makes K and V small, attention costs \(O(S^2)\) against \(O(S)\) for the gather, and any mask (such as the document mask) is trivial to apply. Gradients are accumulated and reduce-scattered in FP32.</li>
   </ul>
 
-  <p>Now the numbers that give the reliability lesson. During a 54-day snapshot of pre-training the run had <strong>466 job interruptions</strong>: 47 planned (firmware upgrades, configuration or dataset updates) and <strong>419 unexpected</strong>. About 78% of the unexpected ones were attributed to confirmed or suspected hardware issues, GPU problems alone were 58.7%, and manual intervention was needed only three times. Effective training time stayed above 90% <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.4, Tab. 5]</a>. The arithmetic an interviewer wants:</p>
+  <p>Now the reliability lesson. In a 54-day snapshot of pre-training there were <strong>466 job interruptions</strong>: 47 planned and <strong>419 unexpected</strong>. About 78% of the unexpected ones were confirmed or suspected hardware, GPU issues alone were 58.7%, only three needed manual intervention, and effective training time stayed above 90% <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.4, Tab. 5]</a>. The arithmetic an interviewer wants:</p>
   <ul>
-    <li><strong>Rate:</strong> \(419 / 54 = 7.8\) unexpected interruptions per day, one every \(54 \cdot 24 / 419 = 3.1\) hours (one every 2.8 hours counting planned ones).</li>
-    <li><strong>Per-GPU reliability is high but the cluster is not:</strong> \(419 / (54 \cdot 24 \cdot 16{,}384) = 1.97\times10^{-5}\) per GPU-hour, a mean time between failures of about 50,700 GPU-hours, or 5.8 years per GPU. Failure rate scales linearly with the number of GPUs in a synchronous job (a single failure restarts the whole job), so at the same per-GPU rate and independent failures, 100K GPUs would see an interruption every 30 minutes. That is an extrapolation, not a measurement.</li>
-    <li><strong>What "above 90%" implies:</strong> at most 10% of \(54 \cdot 1440 = 77{,}760\) minutes, about 7,776 minutes, was lost across 466 interruptions, so the average interruption cost under \(7776/466 \approx 17\) minutes end to end (detection, restart, rollback to the last checkpoint). This is why the paper stresses fast diagnosis, cheap checkpoints and automation over preventing failures.</li>
+    <li><strong>Rate:</strong> \(419/54 = 7.8\) unexpected interruptions a day, one every \(54 \cdot 24/419 = 3.1\) hours.</li>
+    <li><strong>Per GPU reliable, cluster not:</strong> \(419/(54 \cdot 24 \cdot 16{,}384) = 1.97\times10^{-5}\) per GPU-hour, an MTBF of about 50,700 GPU-hours (5.8 years). In synchronous training one failure restarts the whole job, so the job's failure rate scales with the GPU count: at the same per-GPU rate and independent failures, 100K GPUs would see one every 30 minutes (an extrapolation).</li>
+    <li><strong>What "above 90%" implies:</strong> at most 10% of \(54 \cdot 1440 = 77{,}760\) minutes was lost across 466 interruptions, so the average interruption cost under \(7776/466 \approx 17\) minutes end to end (detection, restart, rollback). Hence the emphasis on fast diagnosis (PyTorch's NCCL flight recorder, straggler tools), cheap checkpoints and automation over prevention. The paper also notes a 1 to 2% diurnal throughput swing from temperature and power swings of "tens of megawatts" when all GPUs synchronize. (The launch post quoted above 95% effective time and about three times Llama 2's efficiency, for the earlier models.)</li>
   </ul>
-  <p>The paper says "the complexity and potential failure scenarios of 16K GPU training surpass those of much larger CPU clusters that we have operated", and lists the tools that made it tractable: reduced job startup and checkpoint time, PyTorch's NCCL flight recorder (a ring buffer of collective metadata and stack traces dumped on a timeout) for hang diagnosis, straggler detection (one slow GPU slows thousands), and a diurnal 1 to 2% throughput swing from mid-day temperature effects on GPU clocks. Simultaneous power changes across tens of thousands of GPUs, for example at a checkpoint or restart, swing data-center load by "tens of megawatts". Also, the launch post reported effective training time above 95% and about three times Llama 2's training efficiency <a href="https://ai.meta.com/blog/meta-llama-3/">[Meta 2024]</a>; the paper's figure for the 405B run is above 90%.</p>
 
   <aside class="callout warn">
     <div class="callout-title">Pitfall: Table 5 does not add up</div>
-    <p>The root-cause table lists "Faulty GPU" as 148 interruptions, 30.1%. But \(148/419 = 35.3\%\), while \(126/419 = 30.1\%\), and the text's 58.7% for all GPU causes matches 126 (\(126 + 72 + 19 + 17 + 6 + 6 = 246 = 58.7\%\) of 419), not 148 (which would give 64%). The counts as printed do sum to 419, so one of the printed numbers in that row is a typo, and we cannot tell which. Quote the percentages from the text, say "roughly 60%", and never present a table cell as ground truth without a sanity check. The same paper says the vocabulary is 128,000 in Table 3 while the checkpoints have 128,256 rows.</p>
+    <p>The table lists "Faulty GPU" as 148 interruptions, 30.1%. But \(148/419 = 35.3\%\), while \(126/419 = 30.1\%\), and the text's 58.7% for all GPU causes matches 126 (\(126 + 72 + 19 + 17 + 6 + 6 = 246 = 58.7\%\) of 419), not 148 (64%). The printed counts do sum to 419, so one number in that row is a typo and we cannot tell which. Quote the percentages, say "roughly 60%", and sanity-check any table cell before quoting it.</p>
   </aside>
 
   <aside class="callout bridge">
     <div class="callout-title">From your jet tagger</div>
-    <p>A tagger trains for hours on a handful of GPUs, so a crash is an anecdote and you restart from the last epoch. A synchronous run on 16K GPUs for months turns failure into a rate: with one interruption every three hours, the checkpoint interval, restart time and job scheduler are as much a part of the model recipe as the learning rate. The reading habit that transfers is the same one you use for detector performance: ask for the rate and the recovery time, not for the anecdote.</p>
+    <p>A tagger trains for hours on a few GPUs, so a crash is an anecdote and you restart from the last epoch. A synchronous run on 16K GPUs for months turns failure into a rate: with one interruption every three hours, checkpoint interval, restart time and scheduler are part of the recipe like the learning rate. The habit that transfers: ask for the rate and the recovery time, not the anecdote.</p>
   </aside>
 
-
   <h3 id="l3-long">Long context: six stages at the very end</h3>
-  <p>Llama 3 pretrains at 8K and extends to 128K only "in the final stages of pre-training", not earlier "because the compute in self-attention layers grows quadratically in the sequence length". The context grows in six stages, from 8K to 128K, on about 800B tokens (5% of the 15.6T), and each stage runs "until the model has successfully adapted to the increased context length", judged by two tests: short-context evaluations recovered completely, and "needle in a haystack" solved perfectly up to that length <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.2]</a>. Four ingredients are visible in the released material: the 500,000 base in the architecture, the document mask, 16-way context parallelism in the training layout above, and the Llama 3.1 frequency rescaling. The checkpoints' <code>rope_scaling</code> entry has factor 8, low-frequency factor 1, high-frequency factor 4 and original length 8,192 (<a href="10-long-context.html">page 10</a> derives the rule and notes that Meta does not document whether training used the rescaled frequencies).</p>
-  <p>"Supports 128K" and "uses 128K" differ. On NoLiMa, which removes literal matches between question and needle, the effective length (score above 85% of the model's short-context base) is 2K tokens for Llama 3.1 405B and 70B and 1K for the 8B, against a claimed 128K <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al. 2025, Tab. 3]</a>. The paper's own long-context evaluations (needle retrieval, QuALITY, InfiniteBench) are easier, and <a href="10-long-context.html">page 10</a> covers why.</p>
+  <p>Llama 3 pretrains at 8K and extends to 128K only "in the final stages of pre-training", because "the compute in self-attention layers grows quadratically in the sequence length". The context grows in six stages on about 800B tokens (5% of 15.6T), each "until the model has successfully adapted", judged by full recovery of short-context evaluations and perfect needle-in-a-haystack at that length <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.2]</a>. The released material shows four ingredients: the 500,000 base, the document mask, 16-way context parallelism, and the 3.1 <code>rope_scaling</code> entry (factor 8, low-frequency factor 1, high-frequency factor 4, original length 8,192; <a href="10-long-context.html">page 10</a> derives the rule and notes that Meta does not document whether training used the rescaled frequencies). "Supports 128K" is not "uses 128K": on NoLiMa the effective length is 2K for Llama 3.1 405B and 70B and 1K for the 8B <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al. 2025, Tab. 3]</a>.</p>
 
   <h3 id="l3-post">Post-training: rejection sampling, SFT and DPO, six rounds</h3>
-  <p>The pipeline, per round, is <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4]</a>:</p>
-  <ol>
-    <li><strong>Preference data.</strong> Annotators compare two responses from two different recent models and rate the margin on four levels (significantly better, better, slightly better, marginally better), then edit the winner, giving edited \(\succ\) chosen \(\succ\) rejected. Only "significantly better" and "better" pairs are used.</li>
-    <li><strong>Reward model.</strong> One RM on the pretrained checkpoint, trained on all preference data so far. Compared with Llama 2 the margin term is removed "as we observe diminishing improvements after data scaling", and there is one RM instead of two.</li>
-    <li><strong>Rejection sampling.</strong> For each prompt, sample \(K\) (typically 10 to 30) answers from the latest policy, keep the RM's favorite. PagedAttention and prompt-KV sharing gave over 2 times throughput.</li>
-    <li><strong>SFT</strong> on the rejection-sampled data plus synthetic and human data, LR \(10^{-5}\), 8.5K to 9K steps, loss on target tokens only.</li>
-    <li><strong>DPO</strong> on the most recent preference batches, LR \(10^{-5}\), \(\beta = 0.1\), with two changes: mask the header and termination tokens out of the loss (they appear in both chosen and rejected responses and cause "tail repetition or abruptly generating termination tokens"), and add an NLL term with coefficient 0.2 on the chosen sequence to keep its likelihood from falling.</li>
-    <li><strong>Model averaging</strong> across runs with different data or hyperparameters at each of RM, SFT and DPO. Repeat six times.</li>
-  </ol>
+  <p>Each of six rounds <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4]</a>: (1) collect preference pairs from two recent models, rated on four levels, with an edit step (edited \(\succ\) chosen \(\succ\) rejected), keeping only "significantly better" and "better"; (2) train one reward model on all data so far, with no margin term ("diminishing improvements after data scaling"); (3) rejection-sample \(K\) = 10 to 30 answers per prompt and keep the RM's favorite; (4) SFT on that plus synthetic and human data (LR \(10^{-5}\), 8.5K to 9K steps); (5) DPO on the most recent preference batches (LR \(10^{-5}\), \(\beta = 0.1\)), with header and termination tokens masked out of the loss (they otherwise cause "tail repetition or abruptly generating termination tokens") and an NLL term of coefficient 0.2 on the chosen answer; (6) average models across runs.</p>
 
   <div class="decision">
     <div class="decision-title">DPO instead of PPO in Llama 3</div>
     <dl>
-      <dt>Problem</dt><dd>Llama 2's RS+PPO pipeline worked at 70B, but PPO puts generation inside the training loop and needs an actor, critic, reference and reward model (<a href="23-rlhf.html">page 23</a>). Llama 2 measured 330 seconds per 70B iteration and a roughly 20 times generation slowdown under FSDP. At 405B, with a synchronous 16K-GPU job, that is a large and fragile system.</dd>
-      <dt>Idea</dt><dd>Move the reward maximization into rejection sampling plus SFT (offline best-of-\(K\)), and do preference learning with DPO, a supervised loss on stored pairs, on data from the previous round's best models.</dd>
-      <dt>Why it works</dt><dd>Each round's DPO pairs come from a policy close to the one being trained, so the offline loss is nearly on-policy. DPO needs forward passes only, with a frozen reference whose log-probabilities can be cached, and no critic (<a href="21-preference-optimization.html">page 21</a>). Six rounds restore some of the iteration that online RL provides.</dd>
-      <dt>Evidence</dt><dd>One sentence, no numbers: they "explored on-policy algorithms such as PPO, but found that DPO required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.4]</a>. External evidence is mixed: Tulu 3 found PPO comparable and much slower, while Xu et al. found PPO ahead of DPO on code (page 21).</dd>
-      <dt>Cost</dt><dd>Offline pairs limit exploration, and DPO's known failure modes had to be patched (the formatting-token mask and NLL term). It is weaker where the reward is verifiable and exploration matters: reasoning, code, math.</dd>
+      <dt>Problem</dt><dd>Llama 2's RS+PPO worked at 70B, but PPO puts generation inside the training loop and needs an actor, critic, reference and reward model (<a href="23-rlhf.html">page 23</a>); Llama 2 measured 330 s per 70B iteration and a roughly 20 times generation slowdown under FSDP. At 405B on a synchronous 16K-GPU job that is a large, fragile system.</dd>
+      <dt>Idea</dt><dd>Do reward maximization offline (best-of-\(K\) plus SFT) and preference learning with DPO, a supervised loss on stored pairs, using data from the previous round's best models.</dd>
+      <dt>Why it works</dt><dd>Each round's pairs come from a policy close to the one being trained, so the offline loss is nearly on-policy. DPO needs forward passes only, with a frozen reference whose log-probabilities can be cached, and no critic (<a href="21-preference-optimization.html">page 21</a>). Six rounds restore some of online RL's iteration.</dd>
+      <dt>Evidence</dt><dd>One sentence, no numbers: they "explored on-policy algorithms such as PPO, but found that DPO required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.4]</a>. External evidence is mixed: Tulu 3 found PPO comparable and slower, Xu et al. found PPO ahead on code (page 21).</dd>
+      <dt>Cost</dt><dd>Offline pairs limit exploration, DPO's failure modes needed patches (token mask, NLL term), and it is weaker where rewards are verifiable: reasoning, code, math.</dd>
       <dt>Used by</dt><dd>Llama 3.x, Zephyr-style open recipes, Tulu 3. Llama 4 keeps only a "lightweight" DPO at the end (<a href="#llama4">below</a>).</dd>
     </dl>
   </div>
-
-  <p>Two caveats matter for an interview. First, the choice is a compute and stability argument backed by one sentence, not an ablation table. Second, Meta's own accounts differ: the April 2024 launch post for the 8B and 70B says post-training is "a combination of supervised fine-tuning (SFT), rejection sampling, proximal policy optimization (PPO), and direct preference optimization (DPO)" <a href="https://ai.meta.com/blog/meta-llama-3/">[Meta 2024]</a>, while the July paper describes SFT, RS and DPO only. We cannot say whether the April models used PPO.</p>
-
-  <h3 id="l3-family">The rest of the Llama 3 family</h3>
-  <ul>
-    <li><strong>Llama 3.2</strong> (September 2024) added 11B and 90B vision models and the 1B and 3B text models, made by single-shot structured pruning of Llama 3.1 8B, then pretraining with the logits of the 3.1 8B and 70B models as token-level distillation targets, then the same SFT, RS and DPO rounds, with 128K context <a href="https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/">[Meta 2024b]</a>. Both tie the embedding and output head: 1,235,814,400 and 3,212,749,824 parameters, which the drill checks (distillation: <a href="19-sft-distillation.html">page 19</a>).</li>
-    <li><strong>Llama 3.3</strong> (6 December 2024) is a 70B instruct model only. Its model card lists 7.0M GPU-hours, the same as Llama 3.1 70B, and over 25M synthetic fine-tuning examples <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_3/MODEL_CARD.md">[Llama 3.3 model card]</a>, which suggests that the improvement came from post-training (our inference).</li>
-  </ul>
+  <p>Two caveats: the choice rests on one sentence, not an ablation table; and Meta's accounts differ. The April 2024 post for the 8B and 70B lists "supervised fine-tuning (SFT), rejection sampling, proximal policy optimization (PPO), and direct preference optimization (DPO)" <a href="https://ai.meta.com/blog/meta-llama-3/">[Meta 2024]</a>, while the July paper describes SFT, RS and DPO only. We cannot say whether the April models used PPO.</p>
+  <p>The family continued. <strong>Llama 3.2</strong> (September 2024) made the 1B and 3B by single-shot structured pruning of Llama 3.1 8B, then pretraining with the 8B and 70B models' logits as token-level distillation targets, then SFT, RS and DPO rounds <a href="https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/">[Meta 2024b]</a>; both tie embedding and head (1,235,814,400 and 3,212,749,824 parameters, checked in the drill; <a href="19-sft-distillation.html">page 19</a>). <strong>Llama 3.3</strong> (6 December 2024) is a 70B instruct model whose card lists the same 7.0M GPU-hours as 3.1 70B and over 25M synthetic fine-tuning examples <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_3/MODEL_CARD.md">[Llama 3.3 model card]</a>, which suggests the gain came from post-training (our inference).</p>
 </section>
 
 <section>
   <h2 id="llama4">Llama 4 (April 2025): mixture of experts, early fusion and iRoPE</h2>
 
-  <p>Llama 4 is the first Llama built on a mixture of experts, and the first natively multimodal one. Meta released two models on 5 April 2025, Scout and Maverick, and previewed a third, Behemoth, as a teacher. <strong>Sources and their limits:</strong> the mechanism-level facts below come from Meta's launch post <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>, the model cards on GitHub and Hugging Face <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md">[Llama 4 model card]</a>, and the released configs and code. Meta's repositories are gated, so we read the <code>config.json</code> files from public <code>unsloth</code> mirrors and the tensor totals from the metadata of Meta's own repositories. <span class="unverified" title="We found only the launch post, model cards and released weights and code; we cannot prove that no report exists.">To our knowledge Meta has published no Llama 4 technical report</span>, so anything below that is not in the post is a reading of the configs, and we say so.</p>
+  <p>Llama 4 is the first Llama built on a mixture of experts and the first natively multimodal one. Meta released Scout and Maverick on 5 April 2025 and previewed Behemoth as a teacher. <strong>Sources and limits:</strong> the mechanism-level facts come from Meta's launch post <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>, the model cards <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md">[Llama 4 model card]</a>, and the released configs and code. Meta's repositories are gated, so we read <code>config.json</code> from public <code>unsloth</code> mirrors and tensor totals from the metadata of Meta's own repositories. <span class="unverified" title="We found only the launch post, model cards and released weights and code; we cannot prove that no report exists.">To our knowledge Meta has published no Llama 4 technical report</span>, so anything not in the post is our reading of the configs, and we say so.</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th></th><th class="num">Scout</th><th class="num">Maverick</th><th class="num">Behemoth</th></tr></thead>
@@ -547,31 +463,29 @@
       <tr><td>Text backbone total (our count from the config)</td><td class="num">107.77B</td><td class="num">400.71B</td><td class="num">n/a</td></tr>
       <tr><td>Routed experts (plus one shared)</td><td class="num">16</td><td class="num">128</td><td class="num">16</td></tr>
       <tr><td>Layers with MoE (config)</td><td class="num">48 of 48</td><td class="num">24 of 48, alternating</td><td class="num">n/a</td></tr>
-      <tr><td>Context length (model card)</td><td class="num">10M</td><td class="num">1M</td><td class="num">n/a</td></tr>
-      <tr><td>Pretraining tokens (model card)</td><td class="num">~40T</td><td class="num">~22T</td><td class="num">n/a</td></tr>
-      <tr><td>H100-80GB GPU-hours (model card)</td><td class="num">5.0M</td><td class="num">2.38M</td><td class="num">n/a</td></tr>
+      <tr><td>Context (model card)</td><td class="num">10M</td><td class="num">1M</td><td class="num">n/a</td></tr>
+      <tr><td>Pretraining tokens; GPU-hours (model cards)</td><td class="num">~40T; 5.0M</td><td class="num">~22T; 2.38M</td><td class="num">n/a</td></tr>
       <tr><td>Status</td><td class="num">released</td><td class="num">released</td><td class="num">teacher, <span class="unverified" title="No Behemoth checkpoint appears on Meta's Hugging Face organization as of September 2026, and press reports describe delays; we found no Meta announcement either way.">not released</span></td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">The post says the pretraining mixture was "more than 30 trillion tokens, which is more than double the Llama 3 pre-training mixture", while the model cards give about 40T for Scout and 22T for Maverick. We cannot reconcile the two from public information. Common backbone (config): \(d = 5120\), 48 layers, 40 query heads and 8 KV heads of dimension 128, routed and shared expert width 8,192, dense FFN width 16,384, vocabulary 202,048, RoPE \(\theta = 500{,}000\), top-1 routing.</p>
+  <p class="small muted">The post says the mixture was "more than 30 trillion tokens, which is more than double the Llama 3 pre-training mixture"; the cards say about 40T (Scout) and 22T (Maverick), which we cannot reconcile. Common backbone (config): \(d = 5120\), 48 layers, 40 query and 8 KV heads of dimension 128, expert and shared-expert width 8,192, dense FFN width 16,384, vocabulary 202,048, RoPE \(\theta = 500{,}000\), top-1 routing.</p>
 
   <h3 id="l4-moe">Mixture of experts: what is active, and why</h3>
   <div class="decision">
     <div class="decision-title">Llama 4's MoE: one routed expert plus a shared expert</div>
     <dl>
-      <dt>Problem</dt><dd>Serving cost per token scales with the active parameters. Llama 3 405B spends about 0.8 TFLOPs per token, and quality per dollar of inference was the axis on which Llama 1 had competed from the start.</dd>
-      <dt>Idea</dt><dd>MoE layers with 128 routed experts (Maverick) or 16 (Scout) and one shared expert, each token going to the shared expert and to one routed expert. Maverick alternates dense and MoE layers (stated in the post <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>); Scout's config makes every layer MoE. Mechanics: <a href="08-mixture-of-experts.html">page 08</a>.</dd>
-      <dt>Why it works</dt><dd>Meta's stated reason: "MoE architectures are more compute efficient for training and inference and, given a fixed training FLOPs budget, delivers higher quality compared to a dense model", and the alternation is "for inference efficiency". A useful fact from the config: a routed expert and the shared expert are each 8,192 wide, so a token in an MoE layer uses \(2 \times 8192 = 16{,}384\), the same as the dense layers. Active compute per layer is therefore uniform, which is why both models have 17B active parameters whatever their expert count.</dd>
-      <dt>Evidence</dt><dd>Vendor benchmarks only: Meta says Maverick achieves "comparable results to the new DeepSeek v3 on reasoning and coding" at "less than half the active parameters" (17B against 37B). The post reports no MoE-versus-dense ablation.</dd>
-      <dt>Cost</dt><dd>All parameters must be stored: 400B parameters are 401 GB in FP8, which is why the post says Maverick "can be run on a single NVIDIA H100 DGX host" (8 × 80 GB = 640 GB), while a bf16 Llama 3 405B is 812 GB. Expert-parallel communication, load balancing and harder fine-tuning follow (page 08).</dd>
-      <dt>Used by</dt><dd>Llama 4; the same shared-plus-routed design as DeepSeek-V2/V3 and Kimi K2 (<a href="26-deepseek-1-foundations.html">page 26</a>, <a href="08-mixture-of-experts.html">page 08</a>).</dd>
+      <dt>Problem</dt><dd>Serving cost per token scales with active parameters; Llama 3 405B spends about 0.8 TFLOPs per token, and cost per token was Llama's axis from Llama 1.</dd>
+      <dt>Idea</dt><dd>MoE layers with 128 routed experts (Maverick) or 16 (Scout) plus one shared expert; each token goes to the shared expert and one routed expert. Maverick alternates dense and MoE layers (stated in the post); Scout's config makes every layer MoE (<a href="08-mixture-of-experts.html">page 08</a>).</dd>
+      <dt>Why it works</dt><dd>Meta: "MoE architectures are more compute efficient for training and inference and, given a fixed training FLOPs budget, delivers higher quality compared to a dense model", with the alternation "for inference efficiency". From the config: the routed and shared experts are each 8,192 wide, so an MoE token uses \(2 \times 8192 = 16{,}384\), the dense layers' width. Active compute per layer is uniform, which is why both models have 17B active parameters whatever the expert count.</dd>
+      <dt>Evidence</dt><dd>Vendor benchmarks only, for example "comparable results to the new DeepSeek v3 on reasoning and coding" at "less than half the active parameters" (17B against 37B). No MoE-versus-dense ablation.</dd>
+      <dt>Cost</dt><dd>All parameters must be stored: 401 GB in FP8, hence Maverick "can be run on a single NVIDIA H100 DGX host" (8 × 80 GB = 640 GB), against 812 GB for a bf16 405B. Expert-parallel communication and load balancing follow (page 08).</dd>
+      <dt>Used by</dt><dd>Llama 4; the shared-plus-routed design comes from DeepSeekMoE and is shared with DeepSeek-V3 and Kimi K2 (<a href="26-deepseek-1-foundations.html">page 26</a>).</dd>
     </dl>
   </div>
-
-  <p><strong>Why might Meta have moved to MoE?</strong> The post gives one reason, the compute-efficiency claim above. The rest is our reading. (1) Cost per token is the thread from Llama 1: active parameters set FLOPs, and Maverick's are about 25 times fewer per token than the 405B (\(2 \times 16.15\text{B}\) against \(2 \times 403.75\text{B}\) matmul parameters, embeddings excluded). (2) At equal training FLOPs, MoE scaling studies favor sparse models (<a href="13-scaling-laws.html">page 13</a>). (3) Llama 3's argument against MoE was training stability at 405B; by 2025 sparse runs at hundreds of billions of parameters were established elsewhere (DeepSeek-V3 has 671B total and 37B active, <a href="08-mixture-of-experts.html">page 08</a>), so the risk had shrunk and the competitive comparison had become active parameters. (4) The single-host targets (Scout on one H100 in Int4, Maverick on one 8-GPU host) are sizes chosen for serving.</p>
+  <p><strong>Why might Meta have moved to MoE?</strong> The post gives the compute-efficiency claim; the rest is our reading. (1) Cost per token is the thread from Llama 1: Maverick has about 25 times fewer matmul parameters per token than the 405B (\(2 \times 16.15\text{B}\) against \(2 \times 403.75\text{B}\), embeddings excluded). (2) At equal training FLOPs, MoE scaling studies favor sparse models (<a href="13-scaling-laws.html">page 13</a>). (3) Llama 3's objection was stability at 405B, and by 2025 sparse runs at hundreds of billions of parameters were established elsewhere (DeepSeek-V3: 671B total, 37B active, <a href="08-mixture-of-experts.html">page 08</a>), so the risk had shrunk and the benchmark comparison had become active parameters. (4) The one-GPU (Scout, Int4) and one-host (Maverick) targets are serving sizes.</p>
 
   <h3 id="l4-numbers">Worked numbers: reconcile 17B active and 400B total</h3>
-  <p>Build Maverick from the config. Attention per layer: \(2 \cdot 5120 \cdot 5120 + 2 \cdot 5120 \cdot 1024 = 62{,}914{,}560\). One SwiGLU expert: \(3 \cdot 5120 \cdot 8192 = 125{,}829{,}120\). A dense layer's FFN: \(3 \cdot 5120 \cdot 16384 = 251{,}658{,}240\). Layers 1, 3, ..., 47 are MoE, so 24 layers of each kind:</p>
+  <p>Attention per layer: \(2 \cdot 5120^2 + 2 \cdot 5120 \cdot 1024 = 62{,}914{,}560\). One SwiGLU expert: \(3 \cdot 5120 \cdot 8192 = 125{,}829{,}120\). A dense FFN: \(3 \cdot 5120 \cdot 16384 = 251{,}658{,}240\). Layers 1, 3, ..., 47 are MoE, so 24 layers of each kind:</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Component (Maverick)</th><th class="num">Total parameters</th><th class="num">Active per token</th></tr></thead>
     <tbody>
@@ -579,26 +493,24 @@
       <tr><td>Dense FFN, 24 layers</td><td class="num">6,039,797,760</td><td class="num">6,039,797,760</td></tr>
       <tr><td>Routed experts: \(24 \times 128\) stored, \(24 \times 1\) used</td><td class="num">386,547,056,640</td><td class="num">3,019,898,880</td></tr>
       <tr><td>Shared expert, 24 layers</td><td class="num">3,019,898,880</td><td class="num">3,019,898,880</td></tr>
-      <tr><td>Routers \(24 \times 5120 \times 128\)</td><td class="num">15,728,640</td><td class="num">15,728,640</td></tr>
-      <tr><td>RMSNorms \((2 \cdot 48 + 1) \cdot 5120\)</td><td class="num">496,640</td><td class="num">496,640</td></tr>
+      <tr><td>Routers, norms</td><td class="num">15,728,640 + 496,640</td><td class="num">15,728,640 + 496,640</td></tr>
       <tr><td>Embedding and output head \(2 \cdot 202048 \cdot 5120\)</td><td class="num">2,068,971,520</td><td class="num">2,068,971,520</td></tr>
       <tr class="hl"><td><strong>Total</strong></td><td class="num">400,711,848,960</td><td class="num">17,184,691,200</td></tr>
     </tbody>
   </table></div>
-  <p>So "400B" and "17B" both check out, with two footnotes. The "17B active" includes 2.07B of embedding and head parameters; without them the transformer body uses 15.1B. And the same accounting for Scout gives 107,769,861,120 total and 17,172,894,720 active. Meta's checkpoints hold 401,583,781,376 (Maverick) and 108,641,793,536 (Scout) parameters, and both exceed our text-only counts by exactly 871,932,416, which we infer is the vision encoder and projector (identical for both models). That equality is the evidence that the accounting is exact. The drill's <code>llama4_params</code> reproduces all of this.</p>
+  <p>Both headline numbers check out, with a footnote: "17B active" includes 2.07B of embedding and head parameters (the transformer body uses 15.1B). Scout gives 107,769,861,120 total and 17,172,894,720 active. Meta's checkpoints hold 401,583,781,376 (Maverick) and 108,641,793,536 (Scout) parameters, each exactly 871,932,416 above our count, which we infer is the vision encoder and projector; the identical gap is the evidence the accounting is exact (the drill's <code>llama4_params</code> reproduces it).</p>
 
   <h3 id="l4-irope">iRoPE: interleaved RoPE and position-free layers</h3>
-  <p>Meta's post describes the idea in three sentences: "A key innovation in the Llama 4 architecture is the use of interleaved attention layers without positional embeddings. Additionally, we employ inference time temperature scaling of attention to enhance length generalization. We call this the iRoPE architecture, where 'i' stands for 'interleaved' attention layers, highlighting the long-term goal of supporting 'infinite' context length, and 'RoPE' refers to the rotary position embeddings employed in most layers." <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>. The mechanism is in the released config and the Hugging Face implementation:</p>
+  <p>Meta describes the idea in three sentences: "A key innovation in the Llama 4 architecture is the use of interleaved attention layers without positional embeddings. Additionally, we employ inference time temperature scaling of attention to enhance length generalization. We call this the iRoPE architecture, where 'i' stands for 'interleaved' attention layers, highlighting the long-term goal of supporting 'infinite' context length, and 'RoPE' refers to the rotary position embeddings employed in most layers." <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>. The mechanism is in the released config and the Hugging Face implementation:</p>
   <ol>
-    <li><strong>Layer pattern.</strong> In every group of four layers, three use RoPE (\(\theta = 500{,}000\)) and attend only within fixed chunks of 8,192 tokens (<code>attention_chunk_size</code>), and the fourth has no positional encoding at all (NoPE) and attends over the whole context. That is 12 global layers out of 48 in both models.</li>
-    <li><strong>Temperature scaling, on the NoPE layers only.</strong> The query at position \(p\) is multiplied by \(s(p) = 1 + 0.1 \ln\!\big(\lfloor (p+1)/8192 \rfloor + 1\big)\) (config values <code>attn_scale</code> 0.1 and <code>floor_scale</code> 8192). It is exactly 1 below 8,191 and grows only logarithmically: 1.28 at 131,072, 1.49 at 1M, 1.72 at 10.5M. Multiplying \(q\) by \(s\) multiplies all logits by \(s\), a sharper softmax that counters the dilution of attention over more keys. The Hugging Face code cites the Scalable-Softmax paper for it <a href="https://arxiv.org/abs/2501.19399">[Nakanishi 2025]</a>.</li>
-    <li><strong>QK-norm on the RoPE layers of Scout</strong> (a parameter-free L2 normalization; the Scout config sets it, the Maverick config does not).</li>
+    <li><strong>Layer pattern.</strong> In every group of four layers, three use RoPE and attend only within fixed 8,192-token chunks (<code>attention_chunk_size</code>); the fourth has no positional encoding (NoPE) and attends over the whole context. That is 12 global layers of 48 in both models.</li>
+    <li><strong>Temperature scaling, on the NoPE layers only.</strong> The query at position \(p\) is multiplied by \(s(p) = 1 + 0.1 \ln\!\big(\lfloor (p+1)/8192 \rfloor + 1\big)\) (<code>attn_scale</code> 0.1, <code>floor_scale</code> 8192): exactly 1 below 8,191, then 1.28 at 131,072, 1.49 at 1M, 1.72 at 10.5M. Scaling \(q\) scales all logits, a sharper softmax that counters dilution over more keys. The Hugging Face code cites Scalable-Softmax for it <a href="https://arxiv.org/abs/2501.19399">[Nakanishi 2025]</a>. (Scout also applies a parameter-free L2 QK-norm on its RoPE layers; Maverick's config does not.)</li>
   </ol>
 
   <figure class="fig">
-<svg viewBox="0 0 720 470" role="img" aria-labelledby="fig-29-3-title">
+<svg viewBox="0 0 720 492" role="img" aria-labelledby="fig-29-3-title">
 <title id="fig-29-3-title">Layer pattern of Llama 4 Scout and Maverick: three RoPE layers with chunked local attention then one NoPE layer with global attention, and the FFN type of each layer for both models</title>
-<text x="60" y="20" class="s-small s-bold">Attention (40 query heads, 8 KV heads in every layer)</text>
+<text x="34" y="20" class="s-small s-bold">Attention</text>
 <text x="362" y="20" class="s-small s-bold">FFN in Maverick</text>
 <text x="534" y="20" class="s-small s-bold">FFN in Scout</text>
 <text x="8" y="64" class="s-small s-muted">L0</text>
@@ -634,75 +546,76 @@
 <text x="8" y="196" class="s-small s-muted">L3</text>
 <rect class="s-c" x="34" y="172" width="316" height="38" rx="6"/>
 <text x="44" y="188" class="s-small s-bold">NoPE, global attention</text>
-<text x="44" y="203" class="s-small">no rotation; queries scaled by s(p); KV kept for all T tokens</text>
+<text x="44" y="203" class="s-small">queries scaled by s(p); KV kept for all T tokens</text>
 <rect class="s-d" x="362" y="172" width="160" height="38" rx="6"/>
 <text x="372" y="188" class="s-small s-bold">MoE</text>
 <text x="372" y="203" class="s-small">shared + 1 of 128 routed</text>
 <rect class="s-d" x="534" y="172" width="178" height="38" rx="6"/>
 <text x="544" y="188" class="s-small s-bold">MoE</text>
 <text x="544" y="203" class="s-small">shared + 1 of 16 routed</text>
-<text x="8" y="254" class="s-small s-muted">L4</text>
-<rect class="s-a" x="34" y="230" width="316" height="38" rx="6"/>
-<text x="44" y="246" class="s-small s-bold">RoPE, local (chunked) attention</text>
-<text x="44" y="261" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
-<rect class="s-plain" x="362" y="230" width="160" height="38" rx="6"/>
-<text x="372" y="246" class="s-small s-bold">Dense FFN</text>
-<text x="372" y="261" class="s-small">width 16,384</text>
-<rect class="s-d" x="534" y="230" width="178" height="38" rx="6"/>
-<text x="544" y="246" class="s-small s-bold">MoE</text>
-<text x="544" y="261" class="s-small">shared + 1 of 16 routed</text>
-<text x="8" y="298" class="s-small s-muted">L5</text>
-<rect class="s-a" x="34" y="274" width="316" height="38" rx="6"/>
-<text x="44" y="290" class="s-small s-bold">RoPE, local (chunked) attention</text>
-<text x="44" y="305" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
-<rect class="s-d" x="362" y="274" width="160" height="38" rx="6"/>
-<text x="372" y="290" class="s-small s-bold">MoE</text>
-<text x="372" y="305" class="s-small">shared + 1 of 128 routed</text>
-<rect class="s-d" x="534" y="274" width="178" height="38" rx="6"/>
-<text x="544" y="290" class="s-small s-bold">MoE</text>
-<text x="544" y="305" class="s-small">shared + 1 of 16 routed</text>
-<text x="8" y="342" class="s-small s-muted">L6</text>
-<rect class="s-a" x="34" y="318" width="316" height="38" rx="6"/>
-<text x="44" y="334" class="s-small s-bold">RoPE, local (chunked) attention</text>
-<text x="44" y="349" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
-<rect class="s-plain" x="362" y="318" width="160" height="38" rx="6"/>
-<text x="372" y="334" class="s-small s-bold">Dense FFN</text>
-<text x="372" y="349" class="s-small">width 16,384</text>
-<rect class="s-d" x="534" y="318" width="178" height="38" rx="6"/>
-<text x="544" y="334" class="s-small s-bold">MoE</text>
-<text x="544" y="349" class="s-small">shared + 1 of 16 routed</text>
-<text x="8" y="386" class="s-small s-muted">L7</text>
-<rect class="s-c" x="34" y="362" width="316" height="38" rx="6"/>
-<text x="44" y="378" class="s-small s-bold">NoPE, global attention</text>
-<text x="44" y="393" class="s-small">no rotation; queries scaled by s(p); KV kept for all T tokens</text>
-<rect class="s-d" x="362" y="362" width="160" height="38" rx="6"/>
-<text x="372" y="378" class="s-small s-bold">MoE</text>
-<text x="372" y="393" class="s-small">shared + 1 of 128 routed</text>
-<rect class="s-d" x="534" y="362" width="178" height="38" rx="6"/>
-<text x="544" y="378" class="s-small s-bold">MoE</text>
-<text x="544" y="393" class="s-small">shared + 1 of 16 routed</text>
-<line class="s-line s-dash" x1="8" y1="217" x2="712" y2="217"/>
-<text x="712" y="213" text-anchor="end" class="s-small s-muted">same 4-layer pattern repeats: 12 groups, 48 layers in total</text>
-<text x="8" y="422" class="s-small">s(p) = 1 + 0.1 ln(floor((p+1)/8192) + 1) at position p: 1.00 below 8,191, 1.28 at 131,072, 1.49 at 1M, 1.72 at 10.5M.</text>
-<text x="8" y="439" class="s-small">Routed and shared experts are SwiGLU FFNs of width 8,192, so a token in an MoE layer uses 2 × 8,192 = 16,384, the dense width.</text>
-<text x="8" y="456" class="s-small">KV cache at T = 10,485,760: 12 global layers × 4,096 B × T = 480 GiB, plus 36 local layers × 4,096 B × 8,192 = 1.1 GiB.</text>
+<text x="8" y="260" class="s-small s-muted">L4</text>
+<rect class="s-a" x="34" y="236" width="316" height="38" rx="6"/>
+<text x="44" y="252" class="s-small s-bold">RoPE, local (chunked) attention</text>
+<text x="44" y="267" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
+<rect class="s-plain" x="362" y="236" width="160" height="38" rx="6"/>
+<text x="372" y="252" class="s-small s-bold">Dense FFN</text>
+<text x="372" y="267" class="s-small">width 16,384</text>
+<rect class="s-d" x="534" y="236" width="178" height="38" rx="6"/>
+<text x="544" y="252" class="s-small s-bold">MoE</text>
+<text x="544" y="267" class="s-small">shared + 1 of 16 routed</text>
+<text x="8" y="304" class="s-small s-muted">L5</text>
+<rect class="s-a" x="34" y="280" width="316" height="38" rx="6"/>
+<text x="44" y="296" class="s-small s-bold">RoPE, local (chunked) attention</text>
+<text x="44" y="311" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
+<rect class="s-d" x="362" y="280" width="160" height="38" rx="6"/>
+<text x="372" y="296" class="s-small s-bold">MoE</text>
+<text x="372" y="311" class="s-small">shared + 1 of 128 routed</text>
+<rect class="s-d" x="534" y="280" width="178" height="38" rx="6"/>
+<text x="544" y="296" class="s-small s-bold">MoE</text>
+<text x="544" y="311" class="s-small">shared + 1 of 16 routed</text>
+<text x="8" y="348" class="s-small s-muted">L6</text>
+<rect class="s-a" x="34" y="324" width="316" height="38" rx="6"/>
+<text x="44" y="340" class="s-small s-bold">RoPE, local (chunked) attention</text>
+<text x="44" y="355" class="s-small">chunks of 8,192 tokens; KV kept: at most 8,192 tokens</text>
+<rect class="s-plain" x="362" y="324" width="160" height="38" rx="6"/>
+<text x="372" y="340" class="s-small s-bold">Dense FFN</text>
+<text x="372" y="355" class="s-small">width 16,384</text>
+<rect class="s-d" x="534" y="324" width="178" height="38" rx="6"/>
+<text x="544" y="340" class="s-small s-bold">MoE</text>
+<text x="544" y="355" class="s-small">shared + 1 of 16 routed</text>
+<text x="8" y="392" class="s-small s-muted">L7</text>
+<rect class="s-c" x="34" y="368" width="316" height="38" rx="6"/>
+<text x="44" y="384" class="s-small s-bold">NoPE, global attention</text>
+<text x="44" y="399" class="s-small">queries scaled by s(p); KV kept for all T tokens</text>
+<rect class="s-d" x="362" y="368" width="160" height="38" rx="6"/>
+<text x="372" y="384" class="s-small s-bold">MoE</text>
+<text x="372" y="399" class="s-small">shared + 1 of 128 routed</text>
+<rect class="s-d" x="534" y="368" width="178" height="38" rx="6"/>
+<text x="544" y="384" class="s-small s-bold">MoE</text>
+<text x="544" y="399" class="s-small">shared + 1 of 16 routed</text>
+<line class="s-line s-dash" x1="8" y1="223" x2="712" y2="223"/>
+<text x="360" y="218" text-anchor="middle" class="s-small s-muted">same four-layer pattern repeats: 12 groups, 48 layers in total</text>
+<text x="8" y="428" class="s-small">40 query heads and 8 KV heads in every layer.</text>
+<text x="8" y="445" class="s-small">s(p) = 1 + 0.1 ln(floor((p+1)/8192) + 1): 1.00 below 8,191, 1.28 at 131,072, 1.49 at 1M, 1.72 at 10.5M.</text>
+<text x="8" y="462" class="s-small">Routed and shared experts are 8,192 wide, so an MoE token uses 2 × 8,192 = 16,384, the dense width.</text>
+<text x="8" y="479" class="s-small">KV cache at T = 10,485,760: 12 global layers × 4,096 B × T = 480 GiB, plus 36 local layers × 4,096 B × 8,192 = 1.1 GiB.</text>
 </svg>
-    <figcaption><b>Figure 3.</b> Two of the twelve identical four-layer groups. Blue layers use RoPE and see one 8,192-token chunk. Green layers have no positional encoding, see everything, and get temperature-scaled queries. In Maverick every global layer is also an MoE layer (odd layer indices); in Scout every layer is MoE. Layer pattern, chunk size and scaling constants come from the released configs and code, not from a Meta paper.</figcaption>
+    <figcaption><b>Figure 3.</b> Two of the twelve identical four-layer groups. Blue layers use RoPE and see one 8,192-token chunk. Green layers have no positional encoding, see everything, and get temperature-scaled queries. In Maverick every global layer is also an MoE layer (odd indices); in Scout every layer is MoE. Pattern, chunk size and constants come from the released configs and code, not from a Meta paper.</figcaption>
   </figure>
 
   <div class="decision">
     <div class="decision-title">iRoPE</div>
     <dl>
-      <dt>Problem</dt><dd>Three linked ones. RoPE generalizes poorly to relative distances never seen in training, and patching it with position interpolation or YaRN is a heuristic (<a href="10-long-context.html">page 10</a>). Softmax attention over a growing context dilutes: with more keys, weights flatten. And a KV cache that grows linearly in every layer makes very long contexts unaffordable.</dd>
-      <dt>Idea</dt><dd>Split the depth. Most layers see a bounded window with RoPE, so their positions stay in the trained range at any total length. A minority of layers see everything and carry no positional code, with a length-dependent temperature.</dd>
-      <dt>Why it works</dt><dd>The local RoPE layers never meet an out-of-range relative distance (at most 8,191), so there is nothing to extrapolate. The global layers have no rotation phases to extrapolate either, and a causal decoder can infer order from the mask itself (NoPE: <a href="05-positional-encoding.html">page 05</a>). The logarithmic temperature offsets the growth of attention entropy with length. And only 12 of 48 layers grow a cache with \(T\).</dd>
-      <dt>Evidence</dt><dd>Meta reports needle-in-a-haystack retrieval and cumulative negative log-likelihood over 10M tokens of code for Scout, which was "pre-trained and post-trained with a 256K context length", so 10M is 40 times the trained length. No ablation is published.</dd>
-      <dt>Cost</dt><dd>Information must cross chunk boundaries through the 12 global layers alone. NoPE layers do not encode order explicitly, which may hurt tasks that need precise positions. And a long window is not a long effective context, as the tests below show.</dd>
-      <dt>Used by</dt><dd>Llama 4. The same shape (RoPE on local layers, none on global layers) appears in the dense Muse Glimmer 30B (<a href="#l4-after">below</a>), and hybrids like it are the subject of <a href="09-beyond-full-attention.html">page 09</a>.</dd>
+      <dt>Problem</dt><dd>RoPE generalizes poorly to relative distances never seen in training, and patching it (interpolation, YaRN) is a heuristic (<a href="10-long-context.html">page 10</a>). Softmax attention dilutes as keys multiply. And a KV cache growing linearly in every layer makes very long contexts unaffordable.</dd>
+      <dt>Idea</dt><dd>Split the depth: most layers see a bounded window with RoPE, so their positions stay in the trained range at any total length; a minority see everything with no positional code and a length-dependent temperature.</dd>
+      <dt>Why it works</dt><dd>Local layers never meet a relative distance above 8,191, so there is nothing to extrapolate; global layers have no rotation phases to extrapolate either, and a causal decoder can infer order from the mask itself (NoPE, <a href="05-positional-encoding.html">page 05</a>). The logarithmic temperature offsets the growth of attention entropy. Only 12 of 48 layers grow a cache with \(T\).</dd>
+      <dt>Evidence</dt><dd>Needle retrieval and cumulative NLL over 10M tokens of code for Scout, "pre-trained and post-trained with a 256K context length" (so 10M is 40 times the trained length). No ablation.</dd>
+      <dt>Cost</dt><dd>Information must cross chunk boundaries through the 12 global layers alone; NoPE layers give no explicit order; and a long window is not a long effective context (below).</dd>
+      <dt>Used by</dt><dd>Llama 4. The same shape (RoPE on local layers, none on global) appears in the dense Muse Glimmer 30B (<a href="#l4-after">below</a>); hybrids are the subject of <a href="09-beyond-full-attention.html">page 09</a>.</dd>
     </dl>
   </div>
 
-  <p><strong>Worked numbers: the KV cache at 10M tokens.</strong> Every layer stores \(2 \cdot 8 \cdot 128 \cdot 2 = 4096\) bytes per token in bf16. All 48 layers global would cost \(48 \times 4096 = 192\) KiB per token. With iRoPE only the 12 global layers grow with \(T\) (48 KiB per token), while the 36 local layers hold at most 8,192 tokens, a constant \(36 \times 4096 \times 8192 = 1.125\) GiB:</p>
+  <p><strong>Worked numbers: the KV cache.</strong> Each layer stores \(2 \cdot 8 \cdot 128 \cdot 2 = 4096\) bytes per token in bf16. All 48 layers global would be 192 KiB per token. With iRoPE only the 12 global layers grow with \(T\) (48 KiB per token); the 36 local layers hold at most 8,192 tokens, a constant \(36 \times 4096 \times 8192 = 1.125\) GiB:</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Context \(T\)</th><th class="num">Scout, all layers global</th><th class="num">Scout with iRoPE</th></tr></thead>
     <tbody>
@@ -711,13 +624,12 @@
       <tr class="hl"><td>10,485,760 (10M)</td><td class="num">1,920 GiB</td><td class="num">481.1 GiB</td></tr>
     </tbody>
   </table></div>
-  <p>For scale, Llama 3.1 405B at 128K needs 63 GiB (\(126 \times 4096\) B per token), and the 8B needs 16 GiB. So iRoPE cuts Scout's long-context cache by close to 4 times, but "fits on a single H100" refers to the Int4 weights only (about 54 GB of the 80 GB): a 10M-token sequence would need 481 GiB of KV cache in bf16, more than six H100s' worth of memory, before batching (cache quantization and paging: <a href="17-inference-serving.html">page 17</a>).</p>
-
-  <p><strong>Claimed versus effective length.</strong> The 10M figure is a claim about what the architecture accepts and what perplexity and needle retrieval show. Independent measurement is less generous. On NoLiMa (needle questions without literal overlap), Llama 4 Scout has a base score of 81.7, an effective length of 1K tokens, and 21.6 at 32K; Maverick has a base of 90.1, an effective length of 2K and 24.5 at 32K <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al. 2025, Tab. 10]</a>. These are 32K-token evaluations of models claimed at 10M and 1M, and the pattern matches the other long-context models tested (<a href="10-long-context.html">page 10</a>).</p>
+  <p>For scale, Llama 3.1 405B at 128K needs 63 GiB. iRoPE cuts Scout's cache almost 4 times, but "fits on a single H100" is about the Int4 weights (roughly 54 GB); one 10M-token sequence needs 481 GiB of bf16 KV cache, more than six H100s' memory, before batching (<a href="17-inference-serving.html">page 17</a>).</p>
+  <p><strong>Claimed versus effective length.</strong> The 10M figure is what the architecture accepts and what perplexity and needle retrieval show. On NoLiMa (needles without literal overlap) Scout has a base score of 81.7, an effective length of 1K and 21.6 at 32K; Maverick has 90.1, 2K and 24.5 at 32K <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al. 2025, Tab. 10]</a>. These are 32K evaluations of models claimed at 10M and 1M, in line with the other models tested (<a href="10-long-context.html">page 10</a>).</p>
 
   <aside class="callout bridge">
     <div class="callout-title">From your jet tagger</div>
-    <p>Your tagger had no positional encoding because a jet is a set: permutation invariance was the design goal. A causal language model is the opposite case, and yet the "position-free" (NoPE) layers in Llama 4 work anyway: the causal mask alone breaks the symmetry: each token sees a different number of predecessors, and attention can recover position from that. The layers are not invariant to order, they simply are not told the order explicitly. The 3-to-1 interleaving is a bet that a few such layers can do long-range retrieval while the RoPE layers handle local order.</p>
+    <p>Your tagger had no positional encoding because a jet is a set: permutation invariance was the goal. A causal language model is the opposite case, yet Llama 4's position-free layers work: the causal mask alone breaks the symmetry, since each token sees a different number of predecessors, and attention can recover position from that. The layers are not order-invariant, they are just not told the order. The 3-to-1 interleaving bets that a few such layers can do long-range retrieval while the RoPE layers handle local order.</p>
   </aside>
 </section>
 
@@ -725,32 +637,31 @@
   <h2 id="llama4-more">Llama 4: training recipe, reception, and what came after</h2>
 
   <h3 id="l4-train">Training: early fusion, MetaP, FP8, distillation, online RL</h3>
-  <p>Everything in this list is a claim in Meta's launch post <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>; the post gives few numbers and no ablations.</p>
+  <p>These are claims in Meta's launch post <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta 2025]</a>, which gives few numbers and no ablations.</p>
   <ul>
-    <li><strong>Early fusion</strong> <span class="zh">早期融合</span>: text and vision tokens go into one backbone from the start, so the model is pre-trained jointly on unlabeled text, image and video data (up to 48 images in pre-training, tested to eight in post-training). The vision encoder is based on MetaCLIP but "trained separately in conjunction with a frozen Llama model". The alternative, used for Llama 3's vision models, is to attach an adapter to a finished text model <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §7]</a>.</li>
-    <li><strong>MetaP</strong>: a technique "that allows us to reliably set critical model hyper-parameters such as per-layer learning rates and initialization scales", with hyperparameters that "transfer well across different values of batch size, model width, depth, and training tokens". Nothing else is disclosed. The goal is the same as \(\mu\)P (<a href="14-optimization.html">page 14</a>): tune small, transfer to large.</li>
-    <li><strong>FP8 and scale</strong>: pre-training Behemoth "using FP8 and 32K GPUs, we achieved 390 TFLOPs/GPU". The post does not say which peak that is measured against: it is 39% of the H100's dense bf16 peak (989) or 20% of the dense FP8 peak (1,979; <a href="04-transformer-block.html">page 04</a>), so do not read it as an MFU without asking.</li>
-    <li><strong>Data</strong>: 200 languages (over 100 with more than 1B tokens each), 10 times more multilingual tokens than Llama 3, and a mid-training stage with "long context extension using specialized datasets". Per token counted by the model cards, Scout saw about \(40\text{T}/17.17\text{B} = 2{,}330\) tokens per active parameter and Maverick \(22\text{T}/17.18\text{B} = 1{,}280\) (Figure 2).</li>
-    <li><strong>Codistillation from Behemoth</strong>: Maverick was codistilled from the 288B-active teacher during pre-training with "a novel distillation loss function that dynamically weights the soft and hard targets through training". Doing it during pre-training "amortizes the computational cost of resource-intensive forward passes" over most of the student's data, and extra forward passes were run for the new data (distillation basics: <a href="19-sft-distillation.html">page 19</a>).</li>
-    <li><strong>Post-training reversed Llama 3's recipe</strong>: lightweight SFT, then online reinforcement learning, then lightweight DPO. The stated reason: "SFT and DPO can over-constrain the model, restricting exploration during the online RL stage and leading to suboptimal accuracy, particularly in reasoning, coding, and math domains". They dropped more than 50% of the SFT data (tagged easy by Llama judges) for Maverick and 95% for Behemoth, and ran continuous online RL that alternated training with filtering to keep only medium-to-hard prompts. For Behemoth they built a fully asynchronous RL framework that allocates models to separate GPUs, reporting about 10 times better training efficiency than previous generations (<a href="24-rlvr-reasoning.html">page 24</a>, <a href="25-rl-systems-agentic.html">page 25</a>).</li>
+    <li><strong>Early fusion</strong> <span class="zh">早期融合</span>: text and vision tokens enter one backbone from the start, jointly pre-trained on text, image and video. The vision encoder is MetaCLIP-based, "trained separately in conjunction with a frozen Llama model". Llama 3's vision models instead attached adapters to a finished text model <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §7]</a>.</li>
+    <li><strong>MetaP</strong> sets "per-layer learning rates and initialization scales", with hyperparameters that "transfer well across different values of batch size, model width, depth, and training tokens". Nothing else is disclosed; the goal matches \(\mu\)P (<a href="14-optimization.html">page 14</a>).</li>
+    <li><strong>FP8:</strong> Behemoth pre-training "using FP8 and 32K GPUs" reached 390 TFLOPs/GPU. The post does not name the peak: it is 39% of dense bf16 (989) or 20% of dense FP8 (1,979; <a href="04-transformer-block.html">page 04</a>), so do not read it as an MFU without asking.</li>
+    <li><strong>Data:</strong> 200 languages and 10 times Llama 3's multilingual tokens, then mid-training with "long context extension using specialized datasets". By the model cards, Scout saw about \(40\text{T}/17.17\text{B} = 2{,}330\) tokens per active parameter and Maverick \(22\text{T}/17.18\text{B} = 1{,}280\) (Figure 2).</li>
+    <li><strong>Codistillation:</strong> Maverick was codistilled from the 288B-active Behemoth with "a novel distillation loss function that dynamically weights the soft and hard targets through training"; doing it during pre-training "amortizes the computational cost of resource-intensive forward passes" (<a href="19-sft-distillation.html">page 19</a>).</li>
+    <li><strong>Post-training reversed Llama 3:</strong> lightweight SFT, then online RL, then lightweight DPO, because "SFT and DPO can over-constrain the model, restricting exploration during the online RL stage and leading to suboptimal accuracy, particularly in reasoning, coding, and math domains". They dropped over 50% of SFT data tagged easy (95% for Behemoth) and ran continuous online RL that kept only medium-to-hard prompts, on a fully asynchronous framework reported as about 10 times more efficient than previous generations (<a href="24-rlvr-reasoning.html">page 24</a>, <a href="25-rl-systems-agentic.html">page 25</a>).</li>
   </ul>
-  <p>Read against Llama 3: a year earlier the paper preferred DPO because RL was "less stable and harder to scale"; by April 2025 Meta's own finding was that the offline stages capped reasoning gains. The direction of change, toward online RL on hard verifiable prompts, is the field's, not only Meta's.</p>
+  <p>A year earlier RL was "less stable and harder to scale"; by April 2025 Meta's own finding was that the offline stages capped reasoning gains. The turn toward online RL on hard, verifiable prompts is the field's, not only Meta's.</p>
 
   <h3 id="l4-reception">Reception: what happened, from primary sources</h3>
-  <p>Llama 4 launched on a Saturday and the reception was mixed. What can be stated from Meta's and LMArena's own words, without adding interpretation:</p>
+  <p>Llama 4 launched on a Saturday and the reception was mixed. Stated in Meta's and LMArena's own words:</p>
   <ul>
-    <li><strong>The launch post</strong> said Maverick "offers a best-in-class performance to cost ratio with an experimental chat version scoring ELO of 1417 on LMArena", and that it beats GPT-4o and Gemini 2.0 Flash on a broad set of benchmarks.</li>
-    <li><strong>LMArena, 8 April 2025</strong>: "Meta's interpretation of our policy did not match what we expect from model providers. Meta should have made it clearer that 'Llama-4-Maverick-03-26-Experimental' was a customized model to optimize for human preference. As a result of that we are updating our leaderboard policies to reinforce our commitment to fair, reproducible evaluations so this confusion doesn't occur in the future." They also released 2,000+ head-to-head battle results and added the Hugging Face release version to the arena <a href="https://simonwillison.net/2025/Apr/8/lmaren/">[quoted by Willison]</a>.</li>
-    <li><strong>Meta's response</strong>, as reported by The Register <a href="https://www.theregister.com/2025/04/08/meta_llama4_cheating/">[Register, 8 Apr 2025]</a>: a spokesperson said "Llama-4-Maverick-03-26-Experimental is a chat optimized version we experimented with that also performs well on LMArena". Ahmad Al-Dahle, whom The Register identifies as Meta's GenAI head, acknowledged "some reports of mixed quality across different services" and said "we expect it'll take several days for all the public implementations to get dialed in", and denied training on test sets: "that's simply not true and we would never do that."</li>
-    <li><strong>Independent long-context tests</strong> (above) put the effective length of Scout and Maverick far below the claimed 10M and 1M.</li>
-    <li><strong>Behemoth</strong> remained a preview; see the status row in the table.</li>
+    <li>The post said Maverick "offers a best-in-class performance to cost ratio with an experimental chat version scoring ELO of 1417 on LMArena".</li>
+    <li>LMArena, 8 April 2025: "Meta's interpretation of our policy did not match what we expect from model providers. Meta should have made it clearer that 'Llama-4-Maverick-03-26-Experimental' was a customized model to optimize for human preference. As a result of that we are updating our leaderboard policies to reinforce our commitment to fair, reproducible evaluations so this confusion doesn't occur in the future." They released 2,000+ battle results and added the Hugging Face version to the arena <a href="https://simonwillison.net/2025/Apr/8/lmaren/">[quoted by Willison]</a>.</li>
+    <li>Meta, as reported by The Register <a href="https://www.theregister.com/2025/04/08/meta_llama4_cheating/">[Register 2025]</a>: a spokesperson called it "a chat optimized version we experimented with that also performs well on LMArena"; Ahmad Al-Dahle (identified there as Meta's GenAI head) acknowledged "some reports of mixed quality across different services", said "we expect it'll take several days for all the public implementations to get dialed in", and denied training on test sets: "that's simply not true and we would never do that."</li>
+    <li>Independent tests put the effective context of Scout and Maverick far below the claims (above).</li>
   </ul>
-  <p>The durable lessons are about evaluation practice rather than about who was right. Report the artifact you release, and label tuned variants prominently. A preference arena measures style and format as well as capability, so a variant optimized for it can outrank the model people can download. Inference stacks differ (chunked attention, MoE kernels and quantization were all new), so early third-party numbers can reflect implementation bugs rather than the weights. And a context-length claim needs an evaluation that does not reward literal matching (<a href="18-evaluation.html">page 18</a>, <a href="10-long-context.html">page 10</a>).</p>
+  <p>The lessons concern evaluation practice, not who was right. Report the artifact you release and label tuned variants. A preference arena measures style as well as capability, so a variant tuned for it can outrank the model people download. New architectures (chunked attention, MoE kernels, quantization) were served inconsistently at first, so early third-party numbers can reflect implementation bugs. And a context claim needs an evaluation that does not reward literal matching (<a href="18-evaluation.html">page 18</a>, <a href="10-long-context.html">page 10</a>).</p>
 
   <h3 id="l4-after">After Llama 4, as of September 2026</h3>
   <aside class="callout note">
     <div class="callout-title">Note: the Llama line, and what replaced it</div>
-    <p>We checked Meta's Hugging Face organization and Meta's developer pages in September 2026. The last Llama-branded language models are the Llama 4 releases of April 2025 (Llama Guard 4 and Prompt Guard 2 followed the same month); we found no Llama 5 and no Llama 4.x release. Meta's new model family is <strong>Muse</strong>, from Meta Superintelligence Labs. <strong>Muse Spark</strong> (8 April 2026) is "a natively multimodal reasoning model", available through Meta AI and a private API preview; we found no weights for it. Meta reports that "we can reach the same capabilities with over an order of magnitude less compute than our previous model, Llama 4 Maverick", based on a scaling law fitted to small models <a href="https://ai.meta.com/blog/introducing-muse-spark-msl/">[Meta 2026]</a>. <strong>Muse Glimmer 30B</strong> (August 2026, Apache 2.0, on Hugging Face) is a dense model distilled from Muse Spark: 52 layers, width 6,656, 32 query and 2 KV heads, vocabulary 202,048, a repeating pattern of three sliding-window layers (window 2,048) and one global layer with RoPE (\(\theta = 500{,}000\)) on the local layers only, and 131K context <a href="https://huggingface.co/meta-models/Muse-Glimmer-30B">[Muse Glimmer model card]</a>. That local-with-position, global-without pattern is iRoPE's layout again, in a dense model.</p>
+    <p>We checked Meta's Hugging Face organization and developer pages in September 2026. The last Llama-branded language models are the April 2025 Llama 4 releases; we found no Llama 5 and no Llama 4.x. Meta's new family is <strong>Muse</strong>, from Meta Superintelligence Labs. <strong>Muse Spark</strong> (8 April 2026) is "a natively multimodal reasoning model" offered through Meta AI and a private API preview (we found no weights); Meta says it reaches "the same capabilities with over an order of magnitude less compute than our previous model, Llama 4 Maverick", from a scaling law fitted to small models <a href="https://ai.meta.com/blog/introducing-muse-spark-msl/">[Meta 2026]</a>. <strong>Muse Glimmer 30B</strong> (August 2026, Apache 2.0, on Hugging Face) is a dense model distilled from Muse Spark: 52 layers, width 6,656, 32 query and 2 KV heads, vocabulary 202,048, three sliding-window layers (2,048) for each global layer with RoPE (\(\theta = 500{,}000\)) on the local layers only, 131K context <a href="https://huggingface.co/meta-models/Muse-Glimmer-30B">[Muse Glimmer card]</a>. That local-with-position, global-without layout is iRoPE's again, in a dense model.</p>
   </aside>
 </section>
 
@@ -763,31 +674,25 @@
     <thead><tr><th></th><th>Llama 1 (Feb 2023)</th><th>Llama 2 (Jul 2023)</th><th>Llama 3 / 3.1 (2024)</th><th>Llama 4 (Apr 2025)</th></tr></thead>
     <tbody>
       <tr><td>Normalization</td><td colspan="3">pre-norm RMSNorm (unchanged)</td><td>same; Scout adds parameter-free QK-norm on RoPE layers</td></tr>
-      <tr><td>FFN</td><td>SwiGLU, \(\tfrac23\cdot4d\) rounded up to a multiple of 256</td><td>same; 70B with multiplier 1.3, multiple of 4096</td><td>SwiGLU; multiplier 1.3 or 1.2, multiples of 1024 or 4096 (\(\dff/d\) = 3.5, 3.5, 3.25)</td><td>MoE: shared + routed SwiGLU experts of width 8,192; dense layers 16,384</td></tr>
-      <tr><td>Positions</td><td>RoPE, base 10,000</td><td>RoPE, base 10,000</td><td>RoPE, base 500,000; 3.1 adds the llama3 rescaling (factor 8)</td><td>RoPE on 3 of 4 layers (8,192-token chunks), NoPE on the 4th, temperature scaling</td></tr>
-      <tr><td>Attention</td><td>MHA</td><td>GQA-8 on 34B and 70B, MHA on 7B and 13B</td><td>GQA-8 at every size; document mask</td><td>GQA-8 (40 query heads)</td></tr>
-      <tr><td>Vocabulary</td><td class="num">32,000</td><td class="num">32,000</td><td class="num">128,000 in the paper (128,256 rows)</td><td class="num">202,048 rows (config)</td></tr>
-      <tr><td>Context: trained, then claimed</td><td class="num">2K</td><td class="num">4K</td><td class="num">8K, then 128K in six stages</td><td class="num">256K trained (Scout); 10M and 1M claimed</td></tr>
-      <tr><td>Embeddings, biases</td><td colspan="3">untied at every size, no biases anywhere (Llama 3.2 1B and 3B tie embeddings)</td><td>untied, no biases (config)</td></tr>
-      <tr><td>Training tokens</td><td class="num">1.0T to 1.4T</td><td class="num">2.0T</td><td class="num">~15T (15.6T for the 405B)</td><td class="num">"more than 30T" mixture; ~22T to ~40T per model card</td></tr>
+      <tr><td>FFN</td><td>SwiGLU, \(\tfrac23\cdot4d\), multiple of 256</td><td>same; 70B: multiplier 1.3, multiple of 4096</td><td>SwiGLU; multiplier 1.3 or 1.2 (\(\dff/d\) = 3.5, 3.5, 3.25)</td><td>MoE: shared + routed experts of width 8,192; dense layers 16,384</td></tr>
+      <tr><td>Positions</td><td>RoPE, base 10,000</td><td>RoPE, base 10,000</td><td>RoPE, base 500,000; 3.1 adds llama3 rescaling (factor 8)</td><td>RoPE on 3 of 4 layers (8,192-token chunks); NoPE plus temperature on the 4th</td></tr>
+      <tr><td>Attention</td><td>MHA</td><td>GQA-8 on 34B, 70B; MHA on 7B, 13B</td><td>GQA-8 at every size; document mask</td><td>GQA-8 (40 query heads)</td></tr>
+      <tr><td>Vocabulary</td><td class="num">32,000</td><td class="num">32,000</td><td class="num">128,000 (128,256 rows)</td><td class="num">202,048 rows (config)</td></tr>
+      <tr><td>Context: trained, then claimed</td><td class="num">2K</td><td class="num">4K</td><td class="num">8K, then 128K in six stages</td><td class="num">256K (Scout); 10M, 1M claimed</td></tr>
+      <tr><td>Embeddings, biases</td><td colspan="3">untied, no biases (Llama 3.2 1B and 3B tie embeddings)</td><td>untied, no biases (config)</td></tr>
+      <tr><td>Tokens</td><td class="num">1.0T to 1.4T</td><td class="num">2.0T</td><td class="num">~15T (15.6T for 405B)</td><td class="num">mixture over 30T; ~22T to ~40T per card</td></tr>
       <tr><td>Training FLOPs, \(6ND\) (ours; active \(N\) for MoE)</td><td class="num">65B: \(5.5\times10^{23}\)</td><td class="num">70B: \(8.3\times10^{23}\)</td><td class="num">405B: \(3.8\times10^{25}\)</td><td class="num">Maverick \(\approx 2.3\times10^{24}\), Scout \(\approx 4.1\times10^{24}\)</td></tr>
-      <tr><td>Optimizer</td><td colspan="2">AdamW (0.9, 0.95), weight decay 0.1, clip 1.0, cosine to 10%, warmup 2,000, batch 4M tokens</td><td>AdamW, cosine to 1% of peak, batch ramp 4M to 16M tokens; \(\beta\), \(\epsilon\), decay not published (page 14)</td><td>not disclosed (MetaP)</td></tr>
-      <tr><td>Hardware</td><td>2,048 A100 (65B run)</td><td>A100s on two clusters (InfiniBand and RoCE)</td><td>up to 16,384 H100, 4D parallelism, 38 to 43% MFU</td><td>FP8; 32K GPUs for Behemoth</td></tr>
-      <tr><td>Post-training</td><td>not in the paper</td><td>SFT, two RMs, rejection sampling then PPO, Ghost Attention</td><td>SFT, RM, rejection sampling, DPO, six rounds</td><td>lightweight SFT, online RL, lightweight DPO</td></tr>
+      <tr><td>Optimizer</td><td colspan="2">AdamW (0.9, 0.95), decay 0.1, clip 1.0, cosine to 10%, warmup 2,000, 4M-token batch</td><td>AdamW, cosine to 1% of peak, batch 4M to 16M tokens; \(\beta\), \(\epsilon\), decay unpublished (page 14)</td><td>not disclosed (MetaP)</td></tr>
+      <tr><td>Hardware</td><td>2,048 A100 (65B)</td><td>A100 clusters</td><td>up to 16,384 H100, 4D parallelism, 38 to 43% MFU</td><td>FP8; 32K GPUs (Behemoth)</td></tr>
+      <tr><td>Post-training</td><td>not in the paper</td><td>SFT, two RMs, RS then PPO, Ghost Attention</td><td>SFT, RM, RS, DPO, six rounds</td><td>lightweight SFT, online RL, lightweight DPO</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Sources are in the sections above. Llama 1 and 2 base 10,000 is the value Code Llama raises to 1,000,000 <a href="https://arxiv.org/abs/2308.12950">[Code Llama, §2.4]</a>. FLOPs use exact parameter counts and the reported tokens (Llama 4: 40T and 22T from the model cards, 17.17B and 17.18B active parameters).</p>
+  <p class="small muted">Sources are in the sections above. Base 10,000 for Llama 1 and 2 is the value Code Llama raises to 1,000,000 <a href="https://arxiv.org/abs/2308.12950">[Code Llama, §2.4]</a>. \(6ND\) uses exact parameter counts and the reported tokens (Llama 4: 40T and 22T from the cards, 17.17B and 17.18B active).</p>
 
   <h3 id="adopted">Which choices other labs adopted</h3>
-  <ul>
-    <li><strong>The block.</strong> Pre-norm RMSNorm, gated FFN, RoPE and no biases became the default of open dense models, with variants (Qwen, Mistral, DeepSeek LLM, OLMo 2; pages <a href="04-transformer-block.html">04</a>, <a href="05-positional-encoding.html">05</a>, and DeepSeek LLM's "LLaMA-shaped" 67B on <a href="26-deepseek-1-foundations.html">page 26</a>).</li>
-    <li><strong>GQA with 8 KV heads</strong> is the default for dense models since 2023 (<a href="07-kv-efficient-attention.html">page 07</a>).</li>
-    <li><strong>Staged, late long-context training</strong> with a raised RoPE base, then frequency rescaling, is the common recipe (<a href="10-long-context.html">page 10</a>).</li>
-    <li><strong>Post-training in stages</strong>: reward-model-filtered SFT followed by DPO became a standard open recipe (Llama 3, Tulu 3; <a href="21-preference-optimization.html">page 21</a>); the field has since moved toward online RL, as Llama 4 did (<a href="24-rlvr-reasoning.html">page 24</a>).</li>
-    <li><strong>Shared plus routed experts</strong> in a sparse model: Llama 4 took this design from the DeepSeekMoE line (<a href="08-mixture-of-experts.html">page 08</a>, <a href="26-deepseek-1-foundations.html">page 26</a>), not the other way round.</li>
-  </ul>
-  <p><strong>Which they did not.</strong> A 405B dense flagship found few followers: the large open models that followed are sparse (DeepSeek-V3 with 671B total and 37B active, Kimi K2 with 1.04T and 32.6B, Qwen3-235B-A22B; page 08). GQA stayed the default answer to the KV cache in dense models, while DeepSeek's MLA reached a smaller cache (page 07).</p>
-  <p><strong>What Llama contributed.</strong> Almost every ingredient was borrowed: pre-norm from GPT-3, SwiGLU from PaLM, RoPE from Su et al. via GPT-Neo, GQA from Ainslie et al., the RoPE-base change from Code Llama and Xiong et al., sparse experts from the GShard, Mixtral and DeepSeek line. What Llama added was <em>integration at scale, released openly, and documented</em>: the tokens-per-parameter bet (Llama 1), the first open end-to-end RLHF account (Llama 2), and the most complete public account of a frontier training run, with failure statistics (Llama 3). For interviews that is the frame: for each design choice, name where it came from, what problem it solved, and what evidence Meta gave for it. On the architecture, the answer is usually "borrowed, with no ablation"; on the systems and data, "measured, at scale".</p>
+  <p><strong>Widely.</strong> The block (pre-RMSNorm, gated FFN, RoPE, no biases) became the default of open dense models, with variants in Qwen, Mistral, DeepSeek LLM and OLMo 2 (pages <a href="04-transformer-block.html">04</a>, <a href="05-positional-encoding.html">05</a>; DeepSeek LLM's 67B was "LLaMA-shaped", <a href="26-deepseek-1-foundations.html">page 26</a>). GQA-8 is the default for dense models since 2023 (<a href="07-kv-efficient-attention.html">page 07</a>). Late, staged long-context training with a raised RoPE base and frequency rescaling is the common recipe (<a href="10-long-context.html">page 10</a>). Reward-model-filtered SFT followed by DPO became a standard open recipe (Llama 3, Tulu 3; <a href="21-preference-optimization.html">page 21</a>), and the field then moved toward online RL, as Llama 4 did (<a href="24-rlvr-reasoning.html">page 24</a>). Llama 4 took shared-plus-routed experts from the DeepSeekMoE line (<a href="08-mixture-of-experts.html">page 08</a>).</p>
+  <p><strong>Not.</strong> A 405B dense flagship found few followers: the large open models that followed are sparse (DeepSeek-V3 with 671B total and 37B active, Kimi K2 with 1.04T and 32.6B, Qwen3-235B-A22B; page 08). GQA stayed the default KV-cache answer for dense models while DeepSeek's MLA reached a smaller cache (page 07).</p>
+  <p><strong>What Llama contributed.</strong> Almost every ingredient was borrowed: pre-norm from GPT-3, SwiGLU from PaLM, RoPE from Su et al. via GPT-Neo, GQA from Ainslie et al., the RoPE-base change from Code Llama and Xiong et al., sparse experts from the GShard, Mixtral and DeepSeek line. Llama added <em>integration at scale, released openly and documented</em>: the tokens-per-parameter bet (Llama 1), the first open end-to-end RLHF account (Llama 2), and the most complete public account of a frontier run, with failure statistics (Llama 3). The interview frame: for each design choice, name where it came from, the problem it solved, and the evidence Meta gave. On architecture the answer is usually "borrowed, with no ablation"; on systems and data, "measured, at scale".</p>
 </section>
 
 <section id="pitfalls">

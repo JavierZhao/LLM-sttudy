@@ -48,12 +48,14 @@ class _SizeSpy(TorchFunctionMode):
     def __init__(self):
         super().__init__()
         self.max_numel = 0
+        self.total_numel = 0                         # rough measure of the work done
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         out = func(*args, **(kwargs or {}))
         for o in (out if isinstance(out, (tuple, list)) else (out,)):
             if isinstance(o, torch.Tensor):
                 self.max_numel = max(self.max_numel, o.numel())
+                self.total_numel += o.numel()
         return out
 
 
@@ -165,6 +167,17 @@ def test_forward_never_materializes_the_full_score_matrix(impl):
     assert B * H * T * T > limit                     # sanity: T x T would have violated this
 
 
+def test_forward_causal_skips_fully_masked_tiles(impl):
+    # With a causal mask about half of the (query tile, key tile) pairs lie above the diagonal. Visiting them and
+    # masking afterwards is correct but does roughly twice the work; the spec says to skip them.
+    q, k, v = _qkv(1, 1, 128, 128, 4)
+    with _SizeSpy() as dense:
+        impl.flash_attention_forward(q, k, v, 8, 8, False)
+    with _SizeSpy() as causal:
+        impl.flash_attention_forward(q, k, v, 8, 8, True)
+    assert causal.total_numel < 0.85 * dense.total_numel, "causal=True must skip key tiles above the diagonal"
+
+
 # ---------------------------------------------------------------- backward
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("bq,bk", [(5, 7), (16, 16)])
@@ -235,3 +248,16 @@ def test_combine_handles_chunks_with_very_different_scores(impl):
     parts = [impl.flash_attention_forward(q, k[:, :, a:b], v[:, :, a:b]) for a, b in ((0, 8), (8, 16))]
     out, _ = impl.combine_partial_attention([p[0] for p in parts], [p[1] for p in parts])
     torch.testing.assert_close(out.double(), _dense(q, k, v, False)[0], rtol=1e-4, atol=1e-5)
+
+
+def test_combine_is_stable_for_large_logsumexp(impl):
+    # lse values in the hundreds (large logits): exp(lse) overflows float32, so log(sum(exp(lse))) would be inf
+    outs = [torch.randn(2, 3, 5, 4) for _ in range(3)]
+    lses = [200.0 + 10 * torch.randn(2, 3, 5) for _ in range(3)]
+    out, lse = impl.combine_partial_attention(outs, lses)
+    stacked = torch.stack(lses).double()
+    ref_lse = torch.logsumexp(stacked, 0)
+    ref_out = (torch.stack(outs).double() * torch.exp(stacked - ref_lse)[..., None]).sum(0)
+    assert torch.isfinite(out).all() and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse.double(), ref_lse, rtol=1e-5, atol=1e-4)
+    torch.testing.assert_close(out.double(), ref_out, rtol=1e-4, atol=1e-5)

@@ -472,7 +472,7 @@
       <dt>Problem</dt><dd>Decode reads all weights per step (bandwidth-bound) and big models need many GPUs just to hold them; prefill and large batches are compute-bound.</dd>
       <dt>Idea</dt><dd>W4A16 cuts weight bytes 3.9× and keeps math in 16 bits. W8A8 cuts bytes 2× and runs both operands on the fast 8-bit tensor-core path.</dd>
       <dt>Why it works</dt><dd>Weights are smooth and calibratable, so 4 bits with group scales suffices. Activations have outliers, so 8-bit activations need a range fix (SmoothQuant) or a floating-point format with more dynamic range (FP8).</dd>
-      <dt>Evidence</dt><dd>OPT-175B 4-bit perplexity 8.37 vs 8.34, 3.25× decode speedup at batch 1 <a href="https://arxiv.org/abs/2210.17323">[GPTQ]</a>; lossless W8A8 up to 530B, up to 1.56× faster <a href="https://arxiv.org/abs/2211.10438">[SmoothQuant]</a>; W4A16 speedup 2.93× at batch 1 fading to 1.20× at 128 <a href="https://arxiv.org/abs/2408.11743">[Marlin]</a>.</dd>
+      <dt>Evidence</dt><dd>OPT-175B 4-bit perplexity 8.37 vs 8.34; the 3-bit model on one A100 is 3.25× faster per token at batch 1 than fp16 on five <a href="https://arxiv.org/abs/2210.17323">[GPTQ]</a>; lossless W8A8 up to 530B, up to 1.56× faster <a href="https://arxiv.org/abs/2211.10438">[SmoothQuant]</a>; W4A16 speedup 2.93× at batch 1 fading to 1.20× at 128 <a href="https://arxiv.org/abs/2408.11743">[Marlin]</a>.</dd>
       <dt>Cost</dt><dd>W4A16 gives no prefill speedup and fades beyond \(m \approx 76\) tokens per step on an H100; group scales add bits; calibration can overfit. W8A8 needs INT8 or FP8 kernels end to end and a tuned \(\alpha\); both need quality evaluation on the target workload (long context and reasoning are most sensitive).</dd>
       <dt>Used by</dt><dd>AWQ lists adoption in Hugging Face Transformers, NVIDIA TensorRT-LLM and vLLM among others <a href="https://arxiv.org/abs/2306.00978">[Lin et al. 2024, §1]</a>. FP8 is used by DeepSeek-V3, whose released weights are FP8 only and whose serving uses FP8 for matmuls and dispatch <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3">[model card]</a>, and by Llama 3 405B (below).</dd>
     </dl>
@@ -490,7 +490,7 @@
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Method</th><th>Quantizes</th><th>Core idea</th><th>Verified result</th><th>Watch out for</th></tr></thead>
     <tbody>
-      <tr><td>GPTQ</td><td>W3 or W4</td><td>Hessian-based error compensation, one column at a time</td><td>OPT-175B 4-bit ppl 8.37 vs 8.34; ~4 GPU-hours; 3.25× decode at batch 1</td><td>Calibration overfit; no compute saving</td></tr>
+      <tr><td>GPTQ</td><td>W3 or W4</td><td>Hessian-based error compensation, one column at a time</td><td>OPT-175B 4-bit ppl 8.37 vs 8.34; ~4 GPU-hours; 3-bit on 1 A100 is 3.25× faster per token than fp16 on 5</td><td>Calibration overfit; no compute saving</td></tr>
       <tr><td>AWQ</td><td>W4 (W3)</td><td>Scale salient channels by \(s_X^\alpha\)</td><td>OPT-6.7B INT3-g128: ppl 23.54 to 11.39; 3.2 to 3.3× vs fp16 at batch 1</td><td>Weight-only; fades with batch</td></tr>
       <tr><td>LLM.int8()</td><td>W8A8</td><td>fp16 for outlier dimensions, INT8 for the rest</td><td>No loss to 175B; 1.96× less memory (BLOOM-176B)</td><td>Often slower than fp16</td></tr>
       <tr><td>SmoothQuant</td><td>W8A8</td><td>Divide activation channels by \(s\), multiply weights</td><td>Lossless to 530B; up to 1.56× faster, ~2× less memory</td><td>Per-model \(\alpha\); INT8 kernels</td></tr>

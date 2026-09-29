@@ -25,7 +25,8 @@ def merge_softmax_stats(m_a: Tensor, l_a: Tensor, m_b: Tensor, l_b: Tensor) -> t
             An empty or fully masked set is represented by m = -inf and l = 0.
     Returns:
         (m, l) for the union of the two sets: the same statistics you would get from all scores at once.
-        The result must be finite (no NaN) when one or both inputs are empty.
+        With one empty input the result equals the other input. With two empty inputs l is exactly 0
+        (not NaN) and m stays -inf.
     """
     raise NotImplementedError
 
@@ -115,7 +116,9 @@ def combine_partial_attention(outs: Sequence[Tensor], lses: Sequence[Tensor]) ->
             chunk s only, softmax-normalized within that chunk.
         lses: list of S tensors (..., T); lses[s] is the logsumexp of the scores over chunk s.
     Returns:
-        (out, lse) exactly equal to attention over the union of the chunks.
+        (out, lse) exactly equal to attention over the union of the chunks, shapes (..., T, d) and
+        (..., T). Must stay finite when the lse values are large (hundreds), so do not exponentiate them
+        without subtracting a maximum.
     """
     raise NotImplementedError
 

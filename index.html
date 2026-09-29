@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Interview Prep</title>
+<link rel="stylesheet" href="assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-page="index" data-root=".">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header index-hero">
+  <div class="crumbs">Start here</div>
+  <h1>LLM Interview Prep</h1>
+  <p class="lede">A ground-up course on how frontier language models are built: architecture, pretraining, finetuning and reinforcement learning. It is written for interviews at frontier labs and assumes solid ML fundamentals but no prior LLM experience.</p>
+</header>
+
+<section>
+  <h2 id="how-to-use">How to use this course</h2>
+  <ul>
+    <li><strong>Go in order.</strong> Each page builds on the previous ones, and the prerequisites are listed in its header. Parts I and II are the base everything else rests on.</li>
+    <li><strong>P0 pages must be known cold.</strong> P1 pages matter but come up less often. P2 pages are reference material. The <em>P0 only</em> filter below is the shortest serious path, about 20 hours.</li>
+    <li><strong>Answer each interview question aloud before you open the answer.</strong> Reading an answer and producing it under pressure are different skills.</li>
+    <li><strong>Do the drills by hand.</strong> Every page has runnable exercises in <code>exercises/</code> with tests. Coding rounds routinely ask for attention, RoPE, KV-cache decoding, sampling, or a DPO/GRPO loss from scratch.</li>
+    <li><strong>DeepSeek is the running example.</strong> MLA, DeepSeekMoE and GRPO are taught where their concepts first appear, and pages 26 to 28 put the whole lineage together.</li>
+  </ul>
+  <aside class="callout warn">
+    <div class="callout-title">On accuracy</div>
+    <p>These pages were drafted with AI help and fact-checked against the primary papers, but errors are still possible. Claims that could not be verified are marked <span class="unverified">like this</span>. For the derivations you are most likely to be grilled on (RoPE, MLA, DPO, PPO/GRPO, scaling laws, memory math), treat the linked papers as the ground truth.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="page-anatomy">What every page contains</h2>
+  <ol>
+    <li><strong>What interviewers probe:</strong> the angles you will be tested on.</li>
+    <li><strong>The body:</strong> intuition, then math, then minimal PyTorch, then a diagram, then worked numbers on two reference models (Llama-3-8B and DeepSeek-V3).</li>
+    <li><strong>Design decision cards:</strong> problem, idea, why it works, evidence, cost, who uses it.</li>
+    <li><strong>Common misconceptions.</strong></li>
+    <li><strong>Interview questions</strong> in three tiers (warm-up, core, deep-dive), with answers collapsed.</li>
+    <li><strong>Hands-on drills, primary sources, and a one-screen cheat sheet.</strong></li>
+  </ol>
+</section>
+
+<section>
+  <h2 id="curriculum">Curriculum</h2>
+  <div class="index-filters">
+    <button class="icon-btn" type="button" data-filter="all">All pages</button>
+    <button class="icon-btn" type="button" data-filter="p0">P0 only</button>
+    <button class="icon-btn" type="button" data-filter="todo">Not done yet</button>
+  </div>
+  <div id="index-root"></div>
+</section>
+
+<section>
+  <h2 id="exercises">Running the exercises</h2>
+<pre><code class="language-bash">pip install -r exercises/requirements.txt   # torch (CPU is fine), numpy, pytest
+pytest exercises/tests/test_attention.py     # run the tests against YOUR code in exercises/drills/
+pytest exercises --solutions                 # check the reference solutions instead
+</code></pre>
+</section>
+
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="assets/vendor/katex/katex.min.js"></script>
+<script src="assets/vendor/katex/auto-render.min.js"></script>
+<script src="assets/vendor/hljs/highlight.min.js"></script>
+<script src="assets/manifest.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

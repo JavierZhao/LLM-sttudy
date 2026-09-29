@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NN · Page title · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="NN" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part X · Part title · Page NN</div>
+  <h1>Page title</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~NN min</span>
+    <span>Prereqs: <a href="03-attention.html">03 Attention</a></span>
+  </div>
+  <p class="lede">One or two sentences: what this page teaches and why it matters.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li>...</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>...</li>
+  </ul>
+</section>
+
+<!-- ===== BODY: 4 to 8 h2 sections. intuition → math → code → diagram → worked numbers ===== -->
+<section>
+  <h2 id="first-topic">First topic</h2>
+  <p>Inline math \( QK^\top / \sqrt{d_h} \) and display math:</p>
+  \[ \operatorname{Attn}(Q,K,V) = \softmax\!\left(\frac{QK^\top}{\sqrt{d_h}}\right) V \]
+
+  <div class="decision">
+    <div class="decision-title">Name of the design choice</div>
+    <dl>
+      <dt>Problem</dt><dd>...</dd>
+      <dt>Idea</dt><dd>...</dd>
+      <dt>Why it works</dt><dd>...</dd>
+      <dt>Evidence</dt><dd>... <a href="https://arxiv.org/abs/XXXX.XXXXX">[Paper, §N]</a></dd>
+      <dt>Cost</dt><dd>...</dd>
+      <dt>Used by</dt><dd>...</dd>
+    </dl>
+  </div>
+
+  <figure class="fig">
+    <svg viewBox="0 0 720 200" role="img" aria-labelledby="fig-NN-1-title">
+      <title id="fig-NN-1-title">Short description of the diagram</title>
+      <rect class="s-a" x="20" y="20" width="160" height="50" rx="6"/>
+      <text x="100" y="50" text-anchor="middle">Label</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> What to notice.</figcaption>
+  </figure>
+
+<pre><code class="language-python">import torch
+x = torch.randn(2, 8, 64)   # (B, T, d)
+</code></pre>
+
+  <aside class="callout key"><div class="callout-title">Key idea</div><p>...</p></aside>
+  <aside class="callout warn"><div class="callout-title">Pitfall</div><p>...</p></aside>
+  <aside class="callout bridge"><div class="callout-title">From your jet tagger</div><p>...</p></aside>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>Misconception.</strong> Correction.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Question text?</summary>
+    <div class="answer"><p>Answer.</p></div>
+  </details>
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Question text?</summary>
+    <div class="answer"><p>Answer.</p></div>
+  </details>
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Question text?</summary>
+    <div class="answer"><p>Answer.</p></div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Drill name.</strong> What to implement. <span class="ex-path">exercises/drills/name.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_name.py</code>; add <code>--solutions</code> to check the reference.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/XXXX.XXXXX">Author et al. (Year). Title.</a> <span class="why">Why read it: ...</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>...</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

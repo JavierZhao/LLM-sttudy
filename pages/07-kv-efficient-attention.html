@@ -575,7 +575,7 @@ def gqa_attention(q, k, v):
     </dl>
   </div>
 
-  <h3 id="after-mla">What came next: DeepSeek-V3.2 and V4</h3>
+  <h3 id="after-mla">What came next: DeepSeek-V3.2, V4 and V4.1</h3>
   <p>MLA shrank the cache along the <em>feature</em> axis: 576 numbers per token per layer instead of 40,960. DeepSeek's next two steps attack the <em>sequence</em> axis.</p>
   <ul>
     <li><strong>DeepSeek-V3.2</strong> (December 2025) keeps MLA unchanged and adds DeepSeek Sparse Attention on top of its MQA mode. A small "lightning indexer" scores every previous token, and each query attends to only the top 2,048 cached latents <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.1]</a>. The cache itself is the same size. What shrinks is the bytes read and the attention FLOPs per step.</li>
@@ -586,10 +586,11 @@ def gqa_attention(q, k, v):
         <li><strong>It lowers precision.</strong> KV entries are stored in FP8 except the RoPE dimensions (BF16), and the indexer runs in FP4.</li>
       </ol>
       DeepSeek reports that at 1M tokens V4-Pro needs 27% of V3.2's single-token inference FLOPs and 10% of its KV cache, and about 2% of the cache of a BF16 GQA-8 baseline with 128-dim heads <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Abstract, §2.3.4]</a>.</li>
+    <li><strong>DeepSeek-V4.1-Flash</strong> (September 2026; 552B backbone parameters, 8B activated per token in prefill and 16B in decode) attacks the <em>layer</em> axis. Its Compressed Sparse Attention 2 lets one layer produce the global KV entries and indexer keys and has the following layers of its group reuse them (and optionally its top-k indices), and it stores the global cache in FP4. The global cache falls to 890 bytes per token, about a quarter of V4-Flash's <a href="https://arxiv.org/abs/2609.19969">[DeepSeek-V4.1-Flash, Abstract, §1]</a>. Against V3's MLA cache of 70,272 bytes per token that is 79 times smaller, and against DeepSeek LLM 67B's GQA cache (\(2 \times 8 \times 128 \times 95 \times 2 = 389{,}120\) bytes) it is the 437-fold reduction the paper reports.</li>
   </ul>
   <aside class="callout key">
     <div class="callout-title">The pattern to remember</div>
-    <p>KV bytes = layers × tokens × features per token × bytes per feature, and each generation attacked a different factor. MQA and GQA cut the number of distinct K/V heads (features). MLA compressed every token's K/V into one shared latent (features). DSA reads only a subset of tokens per step (bandwidth, not capacity). CSA/HCA merge the tokens themselves (tokens), and FP8/FP4 storage cuts the last factor.</p>
+    <p>KV bytes = layers × tokens × features per token × bytes per feature, and each generation attacked a different factor. MQA and GQA cut the number of distinct K/V heads (features). MLA compressed every token's K/V into one shared latent (features). DSA reads only a subset of tokens per step (bandwidth, not capacity). CSA/HCA merge the tokens themselves (tokens), V4.1's cross-layer reuse stores global KV for only some layers (layers), and FP8/FP4 storage cuts the last factor.</p>
   </aside>
 </section>
 

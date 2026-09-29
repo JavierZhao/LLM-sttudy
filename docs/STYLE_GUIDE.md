@@ -164,7 +164,7 @@ This is interview prep: a confidently wrong fact is worse than no fact.
   EAGLE-3, Gemma 4 multi-token-prediction drafters (Google blog, 2026), **DeepSeek-V4**
   (arXiv 2606.19348, April 2026 preview: V4-Pro 1.6T/49B and V4-Flash 284B/13B, 1M context,
   CSA/HCA compressed attention replacing MLA, mHC residuals, Muon, FP4 QAT experts, on-policy
-  distillation instead of mixed RL), mHC (Xie et al. 2026). Other models referenced in 2026
+  distillation instead of mixed RL), mHC (Xie et al. 2026). **DeepSeek-V4.1-Flash** (arXiv 2609.19969, 17 Sep 2026: 552B backbone + 196B Engram, 8B/16B activated in prefill/decode, causal encoder-decoder, CSA2 cross-layer KV reuse with FP4 KV at 890 B/token global, 45T multimodal tokens) and DSec, DeepSeek's agentic-RL sandbox platform (arXiv 2609.22978). Closed models named in the V4.1 report's comparison table: Opus-5, GPT-5.6 Sol; open: Kimi K3, GLM-5.3. Other models referenced in 2026
   reports: GPT-5.4, Gemini 3.1 Pro, Claude Opus 4.6, Kimi K2.6, GLM-5.1. Search for others.
 - Today is late September 2026. For fast-moving topics (latest model releases, newest RL
   variants), search for developments after your training data and say "as of <month

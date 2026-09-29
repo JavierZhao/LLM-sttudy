@@ -59,11 +59,11 @@
   <p>The benchmark is a finite sample of questions \(q\) from a distribution \(\mathcal{Q}\). The <strong>prompt</strong> (template, shots, chat format), the <strong>decoding rule</strong> (greedy, temperature, token budget) and the <strong>scorer</strong> \(s\) (exact match, unit tests, likelihood rank, a judge) each move the number, and the finite sample adds sampling error. Five failure sources follow. Learn one measured number for each.</p>
 
   <ol>
-    <li><strong>Open-ended outputs.</strong> There is no single reference string, so you need a verifier, a fixed candidate set or a judge. String overlap is a poor stand-in: Chen et al. found that BLEU improvements "may not indicate improved rates of functional correctness" <a href="https://arxiv.org/abs/2107.03374">[Chen et al. 2021, §3.3]</a>.</li>
+    <li><strong>Open-ended outputs.</strong> There is no single reference string, so you need a verifier, a fixed candidate set or a judge. String overlap is a poor stand-in: Chen et al. found that BLEU improvements "may not indicate improved rates of functional correctness in practice" <a href="https://arxiv.org/abs/2107.03374">[Chen et al. 2021, Fig. 8]</a>.</li>
     <li><strong>Prompt and format sensitivity.</strong> Formatting choices alone moved LLaMA-2-13B accuracy by up to 76 points, and the effect persisted with larger models, more shots and instruction tuning <a href="https://arxiv.org/abs/2310.11324">[Sclar et al. 2023]</a>. Across 24 prompt styles, MMLU scores typically varied by 4 to 5 points (up to 10.98), against about 2 (up to 3.74) on MMLU-Pro <a href="https://arxiv.org/abs/2406.01574">[MMLU-Pro, §6.3]</a>. "ARC-Challenge" for Llama-3-8B appears as 60.2 (cloze, Hugging Face leaderboard) and 78.6 (multiple choice, Meta's model card): 18 points from formulation alone <a href="https://arxiv.org/abs/2406.08446">[OLMES, Tab. 1]</a>.</li>
     <li><strong>Contamination</strong> <span class="zh">数据污染</span>. Test items, or close variants, in the training data turn a capability measurement into a memory measurement. On GSM1k, 1,205 freshly written problems matched to GSM8K, accuracy dropped by up to 8 points for some model families <a href="https://arxiv.org/abs/2405.00332">[Zhang et al. 2024]</a>. A Llama-2-13B fine-tuned on <em>rephrased</em> MMLU test questions went from 54.8 to 85.9 while 10-gram decontamination flagged nothing <a href="https://arxiv.org/abs/2311.04850">[Yang et al. 2023, Tab. 2]</a>. The data-side view is on <a href="12-pretraining-data.html#contamination">page 12</a>.</li>
     <li><strong>Saturation</strong> <span class="zh">饱和</span>. GPT-4 scored 86.4% on MMLU in March 2023, and frontier models released in early to mid 2024 all sat at 86 to 87% <a href="https://arxiv.org/abs/2406.01574">[MMLU-Pro, §1]</a>. The ceiling is below 100%: an audit estimates that 6.49% of MMLU questions contain errors, and 57% of the Virology subset <a href="https://arxiv.org/abs/2406.04127">[Gema et al. 2024]</a>. At the top, score differences measure label noise as much as skill.</li>
-    <li><strong>Sampling noise.</strong> A 500-question benchmark gives a 95% interval of about \(\pm 4\) points around 70% (worked below). AIME has 30 problems, so one problem moves pass@1 by 3.3 points <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert et al. 2025, §1]</a>. Add training-seed noise and hardware noise on top.</li>
+    <li><strong>Sampling noise.</strong> A 500-question benchmark gives a 95% interval of about \(\pm 4\) points around 70% (worked below). AIME has 30 problems, so one problem moves pass@1 by 3.3 points <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert et al. 2025]</a>. Add training-seed noise and hardware noise on top.</li>
   </ol>
 
   <aside class="callout key">
@@ -83,126 +83,127 @@
   <p>Benchmarks group by what they measure and, more usefully for interviews, by how they fail. Figure 1 places the ones you will meet by domain and by the best score reported in a 2026 frontier comparison. Table 1 gives one line each. A benchmark is <em>saturated</em> when the top models are within noise of each other, so it no longer ranks them, and the field moves to a harder one.</p>
 
   <figure class="fig">
-    <svg viewBox="0 0 720 485" role="img" aria-labelledby="fig-18-1-title">
+    <svg viewBox="0 0 720 497" role="img" aria-labelledby="fig-18-1-title">
     <title id="fig-18-1-title">Benchmark map: capability domains as columns, best reported score band as rows, with the best reported score on each chip</title>
-    <text x="162.5" y="20" text-anchor="middle" class="s-bold s-small">Knowledge</text>
-    <text x="162.5" y="34" text-anchor="middle" class="s-bold s-small">&amp; science</text>
-    <text x="263.5" y="20" text-anchor="middle" class="s-bold s-small">Math</text>
-    <text x="364.5" y="20" text-anchor="middle" class="s-bold s-small">Code</text>
-    <text x="465.5" y="20" text-anchor="middle" class="s-bold s-small">Instruction</text>
-    <text x="465.5" y="34" text-anchor="middle" class="s-bold s-small">&amp; preference</text>
-    <text x="566.5" y="20" text-anchor="middle" class="s-bold s-small">Agentic</text>
-    <text x="566.5" y="34" text-anchor="middle" class="s-bold s-small">tool use</text>
-    <text x="667.5" y="20" text-anchor="middle" class="s-bold s-small">Long context</text>
-    <text x="667.5" y="34" text-anchor="middle" class="s-bold s-small">&amp; abstraction</text>
+    <text x="144.3" y="20" text-anchor="middle" class="s-bold s-small">Knowledge</text>
+    <text x="144.3" y="34" text-anchor="middle" class="s-bold s-small">&amp; science</text>
+    <text x="248.89999999999998" y="20" text-anchor="middle" class="s-bold s-small">Math</text>
+    <text x="353.5" y="20" text-anchor="middle" class="s-bold s-small">Code</text>
+    <text x="458.09999999999997" y="20" text-anchor="middle" class="s-bold s-small">Instruction</text>
+    <text x="458.09999999999997" y="34" text-anchor="middle" class="s-bold s-small">&amp; preference</text>
+    <text x="562.6999999999999" y="20" text-anchor="middle" class="s-bold s-small">Agentic</text>
+    <text x="562.6999999999999" y="34" text-anchor="middle" class="s-bold s-small">tool use</text>
+    <text x="667.3" y="20" text-anchor="middle" class="s-bold s-small">Long context</text>
+    <text x="667.3" y="34" text-anchor="middle" class="s-bold s-small">&amp; abstraction</text>
     <rect class="s-box" x="0" y="52" width="720" height="126" rx="6" style="fill:none"/>
     <text x="8" y="113.0" class="s-bold s-small">Best score</text>
     <text x="8" y="128.0" class="s-small">90% or more</text>
-    <rect class="s-e" x="116" y="59" width="93" height="34" rx="5"/>
-    <text x="162.5" y="73" text-anchor="middle" class="s-bold s-small">MMLU-Pro</text>
-    <text x="162.5" y="87" text-anchor="middle" class="s-small">91.0</text>
-    <rect class="s-e" x="116" y="98" width="93" height="34" rx="5"/>
-    <text x="162.5" y="112" text-anchor="middle" class="s-bold s-small">GPQA Diamond</text>
-    <text x="162.5" y="126" text-anchor="middle" class="s-small">94.3</text>
-    <rect class="s-e" x="116" y="137" width="93" height="34" rx="5"/>
-    <text x="162.5" y="151" text-anchor="middle" class="s-bold s-small">MMLU</text>
-    <text x="162.5" y="165" text-anchor="middle" class="s-small">91.8 †</text>
-    <rect class="s-e" x="217" y="59" width="93" height="34" rx="5"/>
-    <text x="263.5" y="73" text-anchor="middle" class="s-bold s-small">HMMT Feb 2026</text>
-    <text x="263.5" y="87" text-anchor="middle" class="s-small">97.7</text>
-    <rect class="s-e" x="217" y="98" width="93" height="34" rx="5"/>
-    <text x="263.5" y="112" text-anchor="middle" class="s-bold s-small">MATH-500</text>
-    <text x="263.5" y="126" text-anchor="middle" class="s-small">97.3 †</text>
-    <rect class="s-e" x="217" y="137" width="93" height="34" rx="5"/>
-    <text x="263.5" y="151" text-anchor="middle" class="s-bold s-small">GSM8K</text>
-    <text x="263.5" y="165" text-anchor="middle" class="s-small">over 95 †</text>
-    <rect class="s-e" x="318" y="59" width="93" height="34" rx="5"/>
-    <text x="364.5" y="73" text-anchor="middle" class="s-bold s-small">LiveCodeBench</text>
-    <text x="364.5" y="87" text-anchor="middle" class="s-small">93.5</text>
-    <rect class="s-e" x="621" y="59" width="93" height="34" rx="5"/>
-    <text x="667.5" y="73" text-anchor="middle" class="s-bold s-small">MRCR 1M</text>
-    <text x="667.5" y="87" text-anchor="middle" class="s-small">92.9</text>
+    <rect class="s-e" x="96.0" y="59" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="73" text-anchor="middle" class="s-bold s-small" style="font-size:10px">MMLU-Pro</text>
+    <text x="144.3" y="87" text-anchor="middle" class="s-small">91.0</text>
+    <rect class="s-e" x="96.0" y="98" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="112" text-anchor="middle" class="s-bold s-small" style="font-size:10px">GPQA Diamond</text>
+    <text x="144.3" y="126" text-anchor="middle" class="s-small">94.3</text>
+    <rect class="s-e" x="96.0" y="137" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="151" text-anchor="middle" class="s-bold s-small" style="font-size:10px">MMLU</text>
+    <text x="144.3" y="165" text-anchor="middle" class="s-small">91.8 †</text>
+    <rect class="s-e" x="200.6" y="59" width="96.6" height="34" rx="5"/>
+    <text x="248.89999999999998" y="73" text-anchor="middle" class="s-bold s-small" style="font-size:10px">HMMT Feb 2026</text>
+    <text x="248.89999999999998" y="87" text-anchor="middle" class="s-small">97.7</text>
+    <rect class="s-e" x="200.6" y="98" width="96.6" height="34" rx="5"/>
+    <text x="248.89999999999998" y="112" text-anchor="middle" class="s-bold s-small" style="font-size:10px">MATH-500</text>
+    <text x="248.89999999999998" y="126" text-anchor="middle" class="s-small">97.3 †</text>
+    <rect class="s-e" x="200.6" y="137" width="96.6" height="34" rx="5"/>
+    <text x="248.89999999999998" y="151" text-anchor="middle" class="s-bold s-small" style="font-size:10px">GSM8K</text>
+    <text x="248.89999999999998" y="165" text-anchor="middle" class="s-small">over 95 †</text>
+    <rect class="s-e" x="305.2" y="59" width="96.6" height="34" rx="5"/>
+    <text x="353.5" y="73" text-anchor="middle" class="s-bold s-small" style="font-size:10px">LiveCodeBench</text>
+    <text x="353.5" y="87" text-anchor="middle" class="s-small">93.5</text>
+    <rect class="s-e" x="619.0" y="59" width="96.6" height="34" rx="5"/>
+    <text x="667.3" y="73" text-anchor="middle" class="s-bold s-small" style="font-size:10px">MRCR 1M</text>
+    <text x="667.3" y="87" text-anchor="middle" class="s-small">92.9</text>
     <rect class="s-box" x="0" y="184" width="720" height="87" rx="6" style="fill:none"/>
     <text x="8" y="225.5" class="s-bold s-small">Best score</text>
     <text x="8" y="240.5" class="s-small">60 to 90%</text>
-    <rect class="s-a" x="116" y="191" width="93" height="34" rx="5"/>
-    <text x="162.5" y="205" text-anchor="middle" class="s-bold s-small">SimpleQA-Ver.</text>
-    <text x="162.5" y="219" text-anchor="middle" class="s-small">75.6</text>
-    <rect class="s-a" x="318" y="191" width="93" height="34" rx="5"/>
-    <text x="364.5" y="205" text-anchor="middle" class="s-bold s-small">SWE-bench Ver.</text>
-    <text x="364.5" y="219" text-anchor="middle" class="s-small">80.8</text>
-    <rect class="s-a" x="520" y="191" width="93" height="34" rx="5"/>
-    <text x="566.5" y="205" text-anchor="middle" class="s-bold s-small">BrowseComp</text>
-    <text x="566.5" y="219" text-anchor="middle" class="s-small">85.9</text>
-    <rect class="s-a" x="520" y="230" width="93" height="34" rx="5"/>
-    <text x="566.5" y="244" text-anchor="middle" class="s-bold s-small">Terminal-Bench 2</text>
-    <text x="566.5" y="258" text-anchor="middle" class="s-small">75.1</text>
-    <rect class="s-a" x="621" y="191" width="93" height="34" rx="5"/>
-    <text x="667.5" y="205" text-anchor="middle" class="s-bold s-small">CorpusQA 1M</text>
-    <text x="667.5" y="219" text-anchor="middle" class="s-small">71.7</text>
+    <rect class="s-a" x="96.0" y="191" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="205" text-anchor="middle" class="s-bold s-small" style="font-size:10px">SimpleQA-Ver.</text>
+    <text x="144.3" y="219" text-anchor="middle" class="s-small">75.6</text>
+    <rect class="s-a" x="305.2" y="191" width="96.6" height="34" rx="5"/>
+    <text x="353.5" y="205" text-anchor="middle" class="s-bold s-small" style="font-size:10px">SWE-bench Ver.</text>
+    <text x="353.5" y="219" text-anchor="middle" class="s-small">80.8</text>
+    <rect class="s-a" x="514.4" y="191" width="96.6" height="34" rx="5"/>
+    <text x="562.6999999999999" y="205" text-anchor="middle" class="s-bold s-small" style="font-size:10px">BrowseComp</text>
+    <text x="562.6999999999999" y="219" text-anchor="middle" class="s-small">85.9</text>
+    <rect class="s-a" x="514.4" y="230" width="96.6" height="34" rx="5"/>
+    <text x="562.6999999999999" y="244" text-anchor="middle" class="s-bold s-small" style="font-size:10px">Terminal-Bench</text>
+    <text x="562.6999999999999" y="258" text-anchor="middle" class="s-small">2.0: 75.1</text>
+    <rect class="s-a" x="619.0" y="191" width="96.6" height="34" rx="5"/>
+    <text x="667.3" y="205" text-anchor="middle" class="s-bold s-small" style="font-size:10px">CorpusQA 1M</text>
+    <text x="667.3" y="219" text-anchor="middle" class="s-small">71.7</text>
     <rect class="s-box" x="0" y="277" width="720" height="48" rx="6" style="fill:none"/>
     <text x="8" y="299.0" class="s-bold s-small">Best score</text>
     <text x="8" y="314.0" class="s-small">under 60%</text>
-    <rect class="s-d" x="116" y="284" width="93" height="34" rx="5"/>
-    <text x="162.5" y="298" text-anchor="middle" class="s-bold s-small">HLE</text>
-    <text x="162.5" y="312" text-anchor="middle" class="s-small">44.4</text>
-    <rect class="s-d" x="318" y="284" width="93" height="34" rx="5"/>
-    <text x="364.5" y="298" text-anchor="middle" class="s-bold s-small">SWE-bench Pro</text>
-    <text x="364.5" y="312" text-anchor="middle" class="s-small">58.6</text>
-    <rect class="s-d" x="520" y="284" width="93" height="34" rx="5"/>
-    <text x="566.5" y="298" text-anchor="middle" class="s-bold s-small">Toolathlon</text>
-    <text x="566.5" y="312" text-anchor="middle" class="s-small">54.6</text>
+    <rect class="s-d" x="96.0" y="284" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="298" text-anchor="middle" class="s-bold s-small" style="font-size:10px">HLE</text>
+    <text x="144.3" y="312" text-anchor="middle" class="s-small">44.4</text>
+    <rect class="s-d" x="305.2" y="284" width="96.6" height="34" rx="5"/>
+    <text x="353.5" y="298" text-anchor="middle" class="s-bold s-small" style="font-size:10px">SWE-bench Pro</text>
+    <text x="353.5" y="312" text-anchor="middle" class="s-small">58.6</text>
+    <rect class="s-d" x="514.4" y="284" width="96.6" height="34" rx="5"/>
+    <text x="562.6999999999999" y="298" text-anchor="middle" class="s-bold s-small" style="font-size:10px">Toolathlon</text>
+    <text x="562.6999999999999" y="312" text-anchor="middle" class="s-small">54.6</text>
     <rect class="s-box" x="0" y="331" width="720" height="126" rx="6" style="fill:none"/>
     <text x="8" y="392.0" class="s-bold s-small">No 2026 score</text>
     <text x="8" y="407.0" class="s-small">checked here</text>
-    <rect class="s-plain s-dash" x="116" y="338" width="93" height="34" rx="5"/>
-    <text x="162.5" y="359" text-anchor="middle" class="s-bold s-small">BBH</text>
-    <rect class="s-plain s-dash" x="217" y="338" width="93" height="34" rx="5"/>
-    <text x="263.5" y="359" text-anchor="middle" class="s-bold s-small">AIME</text>
-    <rect class="s-plain s-dash" x="217" y="377" width="93" height="34" rx="5"/>
-    <text x="263.5" y="398" text-anchor="middle" class="s-bold s-small">FrontierMath</text>
-    <rect class="s-plain s-dash" x="318" y="338" width="93" height="34" rx="5"/>
-    <text x="364.5" y="359" text-anchor="middle" class="s-bold s-small">HumanEval</text>
-    <rect class="s-plain s-dash" x="318" y="377" width="93" height="34" rx="5"/>
-    <text x="364.5" y="398" text-anchor="middle" class="s-bold s-small">MBPP</text>
-    <rect class="s-plain s-dash" x="419" y="338" width="93" height="34" rx="5"/>
-    <text x="465.5" y="359" text-anchor="middle" class="s-bold s-small">IFEval</text>
-    <rect class="s-plain s-dash" x="419" y="377" width="93" height="34" rx="5"/>
-    <text x="465.5" y="398" text-anchor="middle" class="s-bold s-small">AlpacaEval LC</text>
-    <rect class="s-plain s-dash" x="419" y="416" width="93" height="34" rx="5"/>
-    <text x="465.5" y="437" text-anchor="middle" class="s-bold s-small">Arena-Hard</text>
-    <rect class="s-plain s-dash" x="520" y="338" width="93" height="34" rx="5"/>
-    <text x="566.5" y="359" text-anchor="middle" class="s-bold s-small">τ-bench</text>
-    <rect class="s-plain s-dash" x="621" y="338" width="93" height="34" rx="5"/>
-    <text x="667.5" y="359" text-anchor="middle" class="s-bold s-small">NIAH / RULER</text>
-    <rect class="s-plain s-dash" x="621" y="377" width="93" height="34" rx="5"/>
-    <text x="667.5" y="398" text-anchor="middle" class="s-bold s-small">ARC-AGI-2</text>
-    <text x="8" y="475" class="s-small s-muted">Scores: best of the six models in DeepSeek-V4 Table 6 (Apr 2026). † = older source (R1 Table 8, Jan 2025; GSM1k, 2024). Dashed = not in that table.</text>
+    <rect class="s-plain s-dash" x="96.0" y="338" width="96.6" height="34" rx="5"/>
+    <text x="144.3" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">BBH</text>
+    <rect class="s-plain s-dash" x="200.6" y="338" width="96.6" height="34" rx="5"/>
+    <text x="248.89999999999998" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">AIME</text>
+    <rect class="s-plain s-dash" x="200.6" y="377" width="96.6" height="34" rx="5"/>
+    <text x="248.89999999999998" y="398" text-anchor="middle" class="s-bold s-small" style="font-size:10px">FrontierMath</text>
+    <rect class="s-plain s-dash" x="305.2" y="338" width="96.6" height="34" rx="5"/>
+    <text x="353.5" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">HumanEval</text>
+    <rect class="s-plain s-dash" x="305.2" y="377" width="96.6" height="34" rx="5"/>
+    <text x="353.5" y="398" text-anchor="middle" class="s-bold s-small" style="font-size:10px">MBPP</text>
+    <rect class="s-plain s-dash" x="409.79999999999995" y="338" width="96.6" height="34" rx="5"/>
+    <text x="458.09999999999997" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">IFEval</text>
+    <rect class="s-plain s-dash" x="409.79999999999995" y="377" width="96.6" height="34" rx="5"/>
+    <text x="458.09999999999997" y="398" text-anchor="middle" class="s-bold s-small" style="font-size:10px">AlpacaEval LC</text>
+    <rect class="s-plain s-dash" x="409.79999999999995" y="416" width="96.6" height="34" rx="5"/>
+    <text x="458.09999999999997" y="437" text-anchor="middle" class="s-bold s-small" style="font-size:10px">Arena-Hard</text>
+    <rect class="s-plain s-dash" x="514.4" y="338" width="96.6" height="34" rx="5"/>
+    <text x="562.6999999999999" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">τ-bench</text>
+    <rect class="s-plain s-dash" x="619.0" y="338" width="96.6" height="34" rx="5"/>
+    <text x="667.3" y="359" text-anchor="middle" class="s-bold s-small" style="font-size:10px">NIAH / RULER</text>
+    <rect class="s-plain s-dash" x="619.0" y="377" width="96.6" height="34" rx="5"/>
+    <text x="667.3" y="398" text-anchor="middle" class="s-bold s-small" style="font-size:10px">ARC-AGI-2</text>
+    <text x="8" y="475" class="s-small s-muted">Scores: best of the six models in DeepSeek-V4 Table 6 (Apr 2026). † = older source (R1 Table 8, GSM1k).</text>
+    <text x="8" y="489" class="s-small s-muted">Dashed chips: benchmarks that table does not report. Terminal-Bench is version 2.0.</text>
     </svg>
-    <figcaption><b>Figure 1.</b> Benchmark map. Columns are capability domains, rows are bands of the best score among the six models in DeepSeek-V4's April 2026 comparison table <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Tab. 6]</a>, which collects other vendors' numbers itself. Notice that the knowledge and math columns are almost entirely in the top band, while the frontier rows are dominated by agentic and expert-written sets. Chips with a dagger come from older tables (<a href="https://arxiv.org/abs/2501.12948">R1, Tab. 8</a>; <a href="https://arxiv.org/abs/2405.00332">GSM1k, §2</a>), and dashed chips are benchmarks that table does not report. Position is a rough guide to how informative a benchmark is today, not a ranking of difficulty.</figcaption>
+    <figcaption><b>Figure 1.</b> Benchmark map. Columns are capability domains, rows are bands of the best score among the six models in DeepSeek-V4's April 2026 comparison table <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Tab. 6]</a>, which collects other vendors' numbers itself. Notice that the classic knowledge and math sets (MMLU family, GPQA Diamond, GSM8K, MATH-500) sit at 90% or more, while the sets built later (HLE, SWE-bench Pro, agentic tool use) are well below. Chips with a dagger come from older tables (<a href="https://arxiv.org/abs/2501.12948">R1, Tab. 8</a>; <a href="https://arxiv.org/abs/2405.00332">GSM1k</a>), and dashed chips are benchmarks that table does not report. Position shows headroom, meaning how far the best model is from the ceiling, and is not a ranking of difficulty.</figcaption>
   </figure>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Benchmark</th><th>What it measures</th><th>Size and format</th><th>Known issue</th></tr></thead>
     <tbody>
-      <tr><td><strong>MMLU</strong></td><td>Broad academic knowledge, 57 subjects</td><td>4-choice; 14,079 test questions in the paper, 14,042 in the common release <a href="https://arxiv.org/abs/2009.03300">[§3]</a></td><td>About 6.49% erroneous questions <a href="https://arxiv.org/abs/2406.04127">[Gema]</a>; format-sensitive; saturated</td></tr>
-      <tr><td><strong>MMLU-Pro</strong></td><td>Knowledge plus multi-step reasoning</td><td>12,032 questions, 14 domains, up to 10 options (mean 9.47) <a href="https://arxiv.org/abs/2406.01574">[§3]</a></td><td>Still multiple choice. Needs chain of thought: +19.1 points for GPT-4o with it, +1.5 on MMLU</td></tr>
+      <tr><td><strong>MMLU</strong></td><td>Broad academic knowledge, 57 subjects</td><td>4-choice; 14,079 test questions in the paper, 14,042 in the common release <a href="https://arxiv.org/abs/2009.03300">[Hendrycks et al. 2020]</a></td><td>About 6.49% erroneous questions <a href="https://arxiv.org/abs/2406.04127">[Gema]</a>; format-sensitive; saturated</td></tr>
+      <tr><td><strong>MMLU-Pro</strong></td><td>Knowledge plus multi-step reasoning</td><td>12,032 questions, 14 domains, up to 10 options (mean 9.47) <a href="https://arxiv.org/abs/2406.01574">[MMLU-Pro]</a></td><td>Still multiple choice. Needs chain of thought: +19.1 points for GPT-4o with it, +1.5 on MMLU</td></tr>
       <tr><td><strong>GPQA Diamond</strong></td><td>Graduate science that web search does not solve</td><td>198 of 448 questions; kept only if both experts were right and most non-experts wrong <a href="https://arxiv.org/abs/2311.12022">[§2.3]</a></td><td>Tiny \(n\). Validators score 65% overall (74% excluding their own clear mistakes), so the label-noise ceiling is unclear</td></tr>
-      <tr><td><strong>BBH</strong></td><td>23 hard BIG-Bench tasks, mostly algorithmic</td><td>6,511 examples <a href="https://arxiv.org/abs/2210.09261">[§2]</a></td><td>Answer-only prompting underestimates: PaLM-540B 52.3% becomes 65.2% with chain of thought</td></tr>
-      <tr><td><strong>GSM8K</strong></td><td>Grade-school word problems, 2 to 8 steps</td><td>8.5K problems, 7.5K train; 1,319 in the released test split <a href="https://arxiv.org/abs/2110.14168">[§2]</a></td><td>Over 95% for top models by mid 2024 <a href="https://arxiv.org/abs/2405.00332">[GSM1k, §2]</a>; about 1.7% of problems are ambiguous or wrong</td></tr>
-      <tr><td><strong>MATH, MATH-500</strong></td><td>Competition math, 7 subjects, 5 levels</td><td>12,500 problems (5,000 test), boxed answer, exact match <a href="https://arxiv.org/abs/2103.03874">[§3.1]</a>. MATH-500 is a uniform random 500-problem test subset, because 4,500 test problems went into PRM800K training <a href="https://arxiv.org/abs/2305.20050">[Lightman, App. C]</a></td><td>Answer-equivalence graders; problems discussed online</td></tr>
+      <tr><td><strong>BBH</strong></td><td>23 hard BIG-Bench tasks, mostly algorithmic</td><td>6,511 examples <a href="https://arxiv.org/abs/2210.09261">[BBH, Tab. 2]</a></td><td>Answer-only prompting underestimates: PaLM-540B 52.3% becomes 65.2% with chain of thought</td></tr>
+      <tr><td><strong>GSM8K</strong></td><td>Grade-school word problems, 2 to 8 steps</td><td>8.5K problems, 7.5K train; 1,319 in the released test split <a href="https://arxiv.org/abs/2110.14168">[Cobbe et al.]</a></td><td>Over 95% for top models by mid 2024 <a href="https://arxiv.org/abs/2405.00332">[Zhang et al.]</a>; about 1.7% of problems are ambiguous or wrong</td></tr>
+      <tr><td><strong>MATH, MATH-500</strong></td><td>Competition math, 7 subjects, 5 levels</td><td>12,500 problems (5,000 test), boxed answer, exact match <a href="https://arxiv.org/abs/2103.03874">[Hendrycks et al. 2021]</a>. MATH-500 is a uniform random 500-problem test subset, because 4,500 test problems went into PRM800K training <a href="https://arxiv.org/abs/2305.20050">[Lightman, App. C]</a></td><td>Answer-equivalence graders; problems discussed online</td></tr>
       <tr><td><strong>AIME</strong></td><td>Olympiad-style problems with integer answers</td><td>30 problems per year (two contests of 15)</td><td>One problem is 3.3 points; averaged samples and many seeds are mandatory (<a href="#reasoning">below</a>)</td></tr>
       <tr><td><strong>HumanEval</strong></td><td>Function synthesis from docstrings</td><td>164 hand-written problems, 7.7 unit tests each on average <a href="https://arxiv.org/abs/2107.03374">[Chen, §2.2]</a></td><td>Weak tests: EvalPlus adds 80 times more tests and cuts pass@k by up to 19.3 to 28.9% <a href="https://arxiv.org/abs/2305.01210">[Liu et al.]</a></td></tr>
-      <tr><td><strong>MBPP</strong></td><td>Short Python tasks</td><td>974 tasks, three asserts each, 500 in the test split <a href="https://arxiv.org/abs/2108.07732">[§2.1]</a></td><td>Ambiguous statements: the authors hand-edited a 426-question subset</td></tr>
-      <tr><td><strong>LiveCodeBench</strong></td><td>Contest programming, plus repair, execution and output prediction</td><td>511 problems dated May 2023 to May 2024 from LeetCode, AtCoder, CodeForces; about 17 tests each <a href="https://arxiv.org/abs/2403.07974">[§3]</a></td><td>Dated problems allow post-cutoff windows, but small windows are noisy (1 to 1.5 points) <a href="https://arxiv.org/abs/2403.07974">[§7]</a></td></tr>
-      <tr><td><strong>SWE-bench Verified</strong></td><td>Resolve real GitHub issues in a repository</td><td>500 human-validated tasks from 2,294 across 12 Python repositories; pass means fail-to-pass and pass-to-pass tests hold <a href="https://arxiv.org/abs/2310.06770">[§2]</a></td><td>Harness-dependent. <span class="unverified" title="Primary OpenAI post returned HTTP 403 to our tools; the date and reasons come from secondary coverage of https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/">OpenAI stopped reporting it in February 2026, citing flawed tests and contamination.</span></td></tr>
-      <tr><td><strong>IFEval</strong></td><td>Verifiable formatting instructions</td><td>541 prompts, 25 instruction types; strict and loose, prompt-level and instruction-level scores <a href="https://arxiv.org/abs/2311.07911">[§1 to §3]</a></td><td>Checks form, not content. Loose mode adds false positives</td></tr>
-      <tr><td><strong>Chatbot Arena</strong> (now Arena)</td><td>Pairwise human preference</td><td>Over 240K votes from about 90K users by January 2024; Bradley-Terry ratings <a href="https://arxiv.org/abs/2403.04132">[§3, §4]</a></td><td>User-population and style bias; private pre-release testing (<a href="#judge">below</a>)</td></tr>
-      <tr><td><strong>AlpacaEval LC</strong></td><td>LLM-judged win rate against a baseline</td><td>805 instructions <a href="https://arxiv.org/abs/2404.04475">[Dubois, §2]</a></td><td>Verbosity gaming: raw win rate moves 22.9% to 64.3% with the prompt alone</td></tr>
+      <tr><td><strong>MBPP</strong></td><td>Short Python tasks</td><td>974 tasks, three asserts each, 500 in the test split <a href="https://arxiv.org/abs/2108.07732">[Austin et al.]</a></td><td>Ambiguous statements: the authors hand-edited a 426-question subset</td></tr>
+      <tr><td><strong>LiveCodeBench</strong></td><td>Contest programming, plus repair, execution and output prediction</td><td>511 problems dated May 2023 to May 2024 from LeetCode, AtCoder, CodeForces; about 17 tests each <a href="https://arxiv.org/abs/2403.07974">[Jain et al.]</a></td><td>Dated problems allow post-cutoff windows, but small windows are noisy (1 to 1.5 points) <a href="https://arxiv.org/abs/2403.07974">[§7]</a></td></tr>
+      <tr><td><strong>SWE-bench Verified</strong></td><td>Resolve real GitHub issues in a repository</td><td>500 human-validated tasks from 2,294 across 12 Python repositories; pass means fail-to-pass and pass-to-pass tests hold <a href="https://arxiv.org/abs/2310.06770">[Jimenez et al.]</a></td><td>Harness-dependent. <span class="unverified" title="Primary OpenAI post returned HTTP 403 to our tools; the date and reasons come from secondary coverage of https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/">OpenAI stopped reporting it in February 2026, citing flawed tests and contamination.</span></td></tr>
+      <tr><td><strong>IFEval</strong></td><td>Verifiable formatting instructions</td><td>541 prompts, 25 instruction types; strict and loose, prompt-level and instruction-level scores <a href="https://arxiv.org/abs/2311.07911">[Zhou et al.]</a></td><td>Checks form, not content. Loose mode adds false positives</td></tr>
+      <tr><td><strong>Chatbot Arena</strong> (now Arena)</td><td>Pairwise human preference</td><td>Over 240K votes from about 90K users by January 2024; Bradley-Terry ratings <a href="https://arxiv.org/abs/2403.04132">[Chiang et al.]</a></td><td>User-population and style bias; private pre-release testing (<a href="#judge">below</a>)</td></tr>
+      <tr><td><strong>AlpacaEval LC</strong></td><td>LLM-judged win rate against a baseline</td><td>805 instructions <a href="https://arxiv.org/abs/2404.04475">[Dubois et al.]</a></td><td>Verbosity gaming: raw win rate moves 22.9% to 64.3% with the prompt alone</td></tr>
       <tr><td><strong>Arena-Hard-Auto</strong></td><td>LLM-judged hard prompts mined from Arena</td><td>500 prompts <a href="https://arxiv.org/abs/2406.11939">[Li et al.]</a></td><td>Authors report 98.6% correlation with human preference rankings and 3 times MT-Bench's separation; still a judge</td></tr>
-      <tr><td><strong>&tau;-bench</strong></td><td>Tool-agent-user dialogue under domain policies</td><td>115 retail and 50 airline tasks; LM-simulated user; reward is the final database state <a href="https://arxiv.org/abs/2406.12045">[§3, Tab. 1]</a></td><td>Simulated user adds noise; designed around pass^k</td></tr>
+      <tr><td><strong>&tau;-bench</strong></td><td>Tool-agent-user dialogue under domain policies</td><td>115 retail and 50 airline tasks; LM-simulated user; reward is the final database state <a href="https://arxiv.org/abs/2406.12045">[Yao et al.]</a></td><td>Simulated user adds noise; designed around pass^k</td></tr>
       <tr><td><strong>Terminal-Bench 2.0</strong></td><td>Hard command-line tasks</td><td>89 tasks <a href="https://arxiv.org/abs/2601.11868">[Merrill et al. 2026]</a></td><td>Environment defects: DeepSeek reports about 72.0 on a "Verified" subset against 67.9 on the original <a href="https://arxiv.org/abs/2606.19348">[V4, §5.3.1]</a></td></tr>
-      <tr><td><strong>HLE</strong></td><td>Closed-ended expert questions</td><td>2,500 questions, 24% multiple choice, about 14% multimodal; filtered against frontier models; private held-out set <a href="https://arxiv.org/abs/2501.14249">[§3]</a></td><td>Estimated expert disagreement 15.4% (about 18% in biology, chemistry, health) <a href="https://arxiv.org/abs/2501.14249">[App. B.3]</a></td></tr>
+      <tr><td><strong>HLE</strong></td><td>Closed-ended expert questions</td><td>2,500 questions, 24% multiple choice, about 14% multimodal; filtered against frontier models; private held-out set <a href="https://arxiv.org/abs/2501.14249">[HLE]</a></td><td>Estimated expert disagreement 15.4% (about 18% in biology, chemistry, health) <a href="https://arxiv.org/abs/2501.14249">[HLE]</a></td></tr>
       <tr><td><strong>FrontierMath</strong></td><td>Research-level mathematics</td><td>Hundreds of original problems; under 2% solved at release <a href="https://arxiv.org/abs/2411.04872">[Glazer et al. 2024]</a></td><td>Small and mostly private, so hard to audit</td></tr>
       <tr><td><strong>ARC-AGI</strong></td><td>Few-shot abstract grid puzzles</td><td>Introduced by Chollet <a href="https://arxiv.org/abs/1911.01547">[2019]</a>; ARC-AGI-2 aims to stay easy for humans and hard for AI <a href="https://arxiv.org/abs/2505.11831">[2025]</a></td><td>Scores depend heavily on test-time compute and scaffolding</td></tr>
     </tbody>
@@ -249,9 +250,9 @@ def continuation_logprob(model, tok, context, continuation):
   </table></div>
   <p class="small muted">Highlighted cells are each rule's winner. Raw picks the short wrong answer, per-token and PMI pick Canberra, per-character picks Melbourne. Same model, four answers.</p>
 
-  <p>OLMES resolves this empirically per task rather than by principle: PMI for ARC-Challenge, CommonsenseQA and OpenBookQA (whose answer strings are unusual phrases), character normalization for ARC-Easy, HellaSwag, MMLU, PIQA and SIQA, none for BoolQ and WinoGrande <a href="https://arxiv.org/abs/2406.08446">[OLMES, Tab. 2]</a>.</p>
+  <p>OLMES resolves this empirically per task rather than by principle: PMI for ARC-Challenge, CommonsenseQA and OpenBookQA (whose answer strings are unusual phrases), character normalization for ARC-Easy, HellaSwag, MMLU, PIQA and SIQA, none for BoolQ and WinoGrande <a href="https://arxiv.org/abs/2406.08446">[OLMES, §3.3, Tab. 3]</a>.</p>
 
-  <p><strong>Which formulation, when.</strong> MCF is at chance for weak models and better for strong ones. OLMo-7B-0424 on MMLU is at chance in MCF until roughly 400B training tokens, while CF gives signal from the start <a href="https://arxiv.org/abs/2406.08446">[OLMES, Fig. 1]</a>. In a 7B run of 210B tokens, standard MMLU sat at chance with seed standard deviation 0.57 points, while MMLU-cloze scored 37.5 with standard deviation 0.22 <a href="https://arxiv.org/abs/2406.10229">[Madaan et al. 2024, Tab. 1]</a>. For strong models the order flips: Llama-3-70B scores 78.7 on standard MMLU and 60.6 on cloze, and ARC-Challenge 93.7 (MCF) against 69.0 (CF) <a href="https://arxiv.org/abs/2406.10229">[Madaan, §3.3]</a>, <a href="https://arxiv.org/abs/2406.08446">[OLMES, §3.4]</a>. The two formulations correlate strongly across 70 fully trained models (Pearson 0.92), so CF is a good early proxy for final MCF quality.</p>
+  <p><strong>Which formulation, when.</strong> MCF is at chance for weak models and better for strong ones. OLMo-7B-0424 on MMLU is at chance in MCF until roughly 400B training tokens, while CF gives signal from the start <a href="https://arxiv.org/abs/2406.08446">[OLMES, Fig. 1]</a>. In a 7B run of 210B tokens, standard MMLU sat at chance with seed standard deviation 0.57 points, while MMLU-cloze scored 37.5 with standard deviation 0.22 <a href="https://arxiv.org/abs/2406.10229">[Madaan et al. 2024, Tab. 1]</a>. For strong models the order flips: Llama-3-70B scores 78.7 on standard MMLU and 60.6 on cloze, and ARC-Challenge 93.7 (MCF) against 69.0 (CF) <a href="https://arxiv.org/abs/2406.10229">[Madaan, §3.3]</a>, <a href="https://arxiv.org/abs/2406.08446">[OLMES, Tab. 6]</a>. The two formulations correlate strongly across 70 fully trained models (Pearson 0.92), so CF is a good early proxy for final MCF quality <a href="https://arxiv.org/abs/2406.10229">[Madaan, §3.3]</a>.</p>
 
   <div class="decision">
     <div class="decision-title">Cloze first, multiple choice later</div>
@@ -261,12 +262,12 @@ def continuation_logprob(model, tok, context, continuation):
       <dt>Why it works</dt><dd>Cloze measures how well the language model already predicts the right text, which improves smoothly from the start. MCF also requires a format skill that appears abruptly, around 400B to 800B tokens in the runs cited.</dd>
       <dt>Evidence</dt><dd>MMLU-cloze monotonicity 0.95 against 0.09 for standard MMLU at 7B, 210B tokens <a href="https://arxiv.org/abs/2406.10229">[Madaan, Tab. 1]</a>; OLMES reports the better of the two per model.</dd>
       <dt>Cost</dt><dd>Cloze underrates strong models (ARC-Challenge 69.0 against 93.7 for Llama-3-70B) and cannot handle "none of the above". It measures surface-form likelihood, not the ability to compare options.</dd>
-      <dt>Used by</dt><dd>OLMES and the OLMo evaluation suite, DataDecide, DCLM and FineWeb ablations (see <a href="12-pretraining-data.html#signal">page 12</a>).</dd>
+      <dt>Used by</dt><dd>OLMES (developed with the OLMo models), DataDecide and the FineWeb ablations (see <a href="12-pretraining-data.html#signal">page 12</a>).</dd>
     </dl>
   </div>
 
   <h3 id="generative">Generation with answer extraction</h3>
-  <p>Chain-of-thought and open-ended tasks need generation: sample a solution, extract the final answer, compare it to the reference by exact match, symbolic equivalence, unit tests or a judge. Every step can fail for reasons unrelated to capability. MMLU-Pro extracts with two regular expressions and falls back to a random option; in GPT-4o's error analysis 5% of errors were "no selection made" and 1% were extraction errors <a href="https://arxiv.org/abs/2406.01574">[MMLU-Pro, §4, §5.3]</a>. MATH fixes a canonical answer format and equivalence rules so exact match works <a href="https://arxiv.org/abs/2103.03874">[Hendrycks et al. 2021, §3.1]</a>. IFEval reports a strict score and a loose one that also tries eight transformations of the response; the loose score removes false negatives at the cost of false positives <a href="https://arxiv.org/abs/2311.07911">[IFEval, §2.2]</a>. HLE grades free-form answers with a judge model against the reference <a href="https://arxiv.org/abs/2501.14249">[HLE, §4.1]</a>.</p>
+  <p>Chain-of-thought and open-ended tasks need generation: sample a solution, extract the final answer, compare it to the reference by exact match, symbolic equivalence, unit tests or a judge. Every step can fail for reasons unrelated to capability. MMLU-Pro extracts with two regular expressions and falls back to a random option; in GPT-4o's error analysis 5% of errors were "no selection made" and 1% were extraction errors <a href="https://arxiv.org/abs/2406.01574">[MMLU-Pro, §4, §5.3]</a>. MATH fixes a canonical answer format and equivalence rules so exact match works <a href="https://arxiv.org/abs/2103.03874">[Hendrycks et al. 2021]</a>. IFEval reports a strict score and a loose one that also tries eight transformations of the response; the loose score removes false negatives at the cost of false positives <a href="https://arxiv.org/abs/2311.07911">[IFEval]</a>. HLE grades free-form answers with a judge model against the reference <a href="https://arxiv.org/abs/2501.14249">[HLE]</a>.</p>
   <p>Generation also changes the conclusion. On BBH, answer-only prompting understates capability by 13 to 17 points for three model families (PaLM-540B 52.3 to 65.2; code-davinci-002 56.6 to 73.9) <a href="https://arxiv.org/abs/2210.09261">[BBH, Tab. 2]</a>. Likelihood scoring measures direct-answer knowledge, generation measures the ability to compute an answer, and a benchmark can rank models differently under the two.</p>
 
   <h3 id="passk">Sampling metrics: pass@k and majority vote</h3>
@@ -307,8 +308,8 @@ def benchmark_pass_at_k(correct_counts, n, k):
   <p class="small muted">Check by the product form at \(k=5\): \(\tfrac{13}{18}\cdot\tfrac{14}{19}\cdot\tfrac{15}{20} = 0.7222 \times 0.7368 \times 0.75 = 0.3991\). The plug-in is 4.5 points low at \(k=5\) and 9.2 at \(k=10\).</p>
 
   <figure class="fig">
-    <svg viewBox="0 0 720 330" role="img" aria-labelledby="fig-18-3-title">
-    <title id="fig-18-3-title">Unbiased pass at k, the plug-in estimate and pass hat k versus k for a problem with 3 correct samples out of 20</title>
+    <svg viewBox="0 0 720 290" role="img" aria-labelledby="fig-18-2-title">
+    <title id="fig-18-2-title">Unbiased pass at k, the plug-in estimate and pass hat k versus k for a problem with 3 correct samples out of 20</title>
     <line class="s-line" style="stroke-opacity:.35" x1="64" y1="240.0" x2="700" y2="240.0"/>
     <text x="56" y="244.0" text-anchor="end" class="s-small s-muted">0</text>
     <line class="s-line" style="stroke-opacity:.35" x1="64" y1="186.5" x2="700" y2="186.5"/>
@@ -340,13 +341,13 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <circle class="s-fill-a" cx="365.3" cy="48.5" r="3.5"/>
     <text x="191.9" y="102.4" text-anchor="end" class="s-small s-ta s-bold">pass@5 = 0.601</text>
     <text x="359.3" y="39.5" text-anchor="end" class="s-small s-ta s-bold">pass@10 = 0.895</text>
-    <text x="72.0" y="199.9" class="s-small s-ta s-bold">k = 1: 0.150</text>
+    <text x="117" y="218.6" class="s-small s-ta s-bold">k = 1: all three curves equal 0.150</text>
     <rect class="s-plain" x="430" y="152" width="262" height="76" rx="6"/>
     <line class="s-line-a" x1="440" y1="170" x2="468" y2="170"/><text x="476" y="174" class="s-small">unbiased pass@k (Chen et al.)</text>
     <line class="s-line-b s-dash" x1="440" y1="190" x2="468" y2="190"/><text x="476" y="194" class="s-small">plug-in 1 − (1 − c/n)<tspan baseline-shift="super" font-size="9">k</tspan></text>
     <line class="s-line-c" x1="440" y1="210" x2="468" y2="210"/><text x="476" y="214" class="s-small">pass^k = C(c,k)/C(n,k), all k correct</text>
     </svg>
-    <figcaption><b>Figure 3.</b> One problem with 3 correct samples out of 20. The unbiased pass@k (blue) lies above the plug-in (dashed orange) and reaches 1 at \(k=18\), where every 18-subset must contain a correct sample, which is a statement about the sample, not the model, so keep \(k\) well below \(n\). The reliability metric pass^k (green) collapses: \(0.150\), \(0.016\), \(0.0009\) for \(k=1,2,3\) and 0 beyond, because \(c=3\).</figcaption>
+    <figcaption><b>Figure 2.</b> One problem with 3 correct samples out of 20. The unbiased pass@k (blue) lies above the plug-in (dashed orange) and reaches 1 at \(k=18\), where every 18-subset must contain a correct sample, which is a statement about the sample, not the model, so keep \(k\) well below \(n\). The reliability metric pass^k (green) collapses: \(0.150\), \(0.016\), \(0.0009\) for \(k=1,2,3\) and 0 beyond, because \(c=3\).</figcaption>
   </figure>
 
   <div class="decision">
@@ -361,18 +362,18 @@ def benchmark_pass_at_k(correct_counts, n, k):
     </dl>
   </div>
 
-  <p><strong>Two relatives.</strong> <em>Reliability</em> asks that all \(k\) attempts succeed: \(\text{pass}^k = \E[\binom{c}{k}/\binom{n}{k}]\), which \(\tau\)-bench introduced because a customer-service agent that solves a task only sometimes is not deployable <a href="https://arxiv.org/abs/2406.12045">[Yao et al. 2024, §3]</a>. GPT-4o's success on \(\tau\)-retail was 61.2% for one trial and below 25% for \(\text{pass}^8\) <a href="https://arxiv.org/abs/2406.12045">[§5]</a>. <em>Majority vote</em> (self-consistency <span class="zh">自洽性</span>, cons@\(k\)) needs no checker: sample \(k\) reasoning paths and return the most common final answer. PaLM-540B on GSM8K goes from 56.5% (greedy) to 74.4% with 40 paths <a href="https://arxiv.org/abs/2203.11171">[Wang et al. 2023, Tab. 2]</a>. DeepSeek-R1 on AIME 2024 reports 79.8% pass@1, 86.7% cons@64 and 90.0% pass@64, three different quantities <a href="https://arxiv.org/abs/2501.12948">[R1, Supp. E]</a>. Pass@\(k\) uses an oracle; cons@\(k\) does not.</p>
+  <p><strong>Two relatives.</strong> <em>Reliability</em> asks that all \(k\) attempts succeed: \(\text{pass}^k = \E[\binom{c}{k}/\binom{n}{k}]\), which \(\tau\)-bench introduced because a customer-service agent that solves a task only sometimes is not deployable <a href="https://arxiv.org/abs/2406.12045">[Yao et al. 2024]</a>. GPT-4o's success on \(\tau\)-retail was 61.2% for one trial and below 25% for \(\text{pass}^8\) <a href="https://arxiv.org/abs/2406.12045">[Yao et al.]</a>. <em>Majority vote</em> (self-consistency <span class="zh">自洽性</span>, cons@\(k\)) needs no checker: sample \(k\) reasoning paths and return the most common final answer. PaLM-540B on GSM8K goes from 56.5% (greedy) to 74.4% with 40 paths <a href="https://arxiv.org/abs/2203.11171">[Wang et al. 2023]</a>. DeepSeek-R1 on AIME 2024 reports 79.8% pass@1, 86.7% cons@64 and 90.0% pass@64, three different quantities <a href="https://arxiv.org/abs/2501.12948">[R1]</a>. Pass@\(k\) uses an oracle; cons@\(k\) does not.</p>
 
   <h3 id="judge">LLM-as-judge and human preference</h3>
 
-  <p>For open-ended chat there is no checker, so a strong model judges: pairwise (which answer is better), single-answer grading, or reference-guided grading <a href="https://arxiv.org/abs/2306.05685">[Zheng et al. 2023, §3]</a>. It scales, and GPT-4 agreed with expert humans 85% of the time on non-tied MT-Bench votes against 81% human-human agreement <a href="https://arxiv.org/abs/2306.05685">[§4.2]</a>. But judges have measurable biases:</p>
+  <p>For open-ended chat there is no checker, so a strong model judges: pairwise (which answer is better), single-answer grading, or reference-guided grading <a href="https://arxiv.org/abs/2306.05685">[Zheng et al. 2023, §3.1]</a>. It scales, and GPT-4 agreed with expert humans 85% of the time on non-tied MT-Bench votes against 81% human-human agreement <a href="https://arxiv.org/abs/2306.05685">[§4.2]</a>. But judges have measurable biases:</p>
   <ul>
     <li><strong>Position bias.</strong> Swapping the order of two near-identical answers, GPT-4 was consistent in only 65.0% of cases and Claude-v1 in 23.8% <a href="https://arxiv.org/abs/2306.05685">[Zheng, Tab. 2]</a>.</li>
     <li><strong>Verbosity bias.</strong> Padding an answer with a rephrased duplicate list fooled Claude-v1 and GPT-3.5 91.3% of the time and GPT-4 8.7% <a href="https://arxiv.org/abs/2306.05685">[Tab. 3]</a>.</li>
     <li><strong>Self-preference.</strong> GPT-4 favored itself with a 10-point higher win rate and Claude-v1 with 25, though the authors could not separate bias from real quality <a href="https://arxiv.org/abs/2306.05685">[§3.3]</a>. Models can recognize their own outputs, and after fine-tuning self-recognition correlates linearly with self-preference <a href="https://arxiv.org/abs/2404.13076">[Panickssery et al. 2024]</a>.</li>
     <li><strong>Weak grading of reasoning.</strong> On 10 math questions the default judge accepted a wrong answer in 14 of 20 trials, falling to 3 of 20 when given a reference solution <a href="https://arxiv.org/abs/2306.05685">[Tab. 4]</a>.</li>
   </ul>
-  <p>Mitigations: judge both orders and count a win only if it holds in both (else a tie); few-shot judge examples raised GPT-4's swap consistency from 65.0% to 77.5% <a href="https://arxiv.org/abs/2306.05685">[§3.4]</a>; give a reference answer for verifiable questions; use a judge from a different family than the models judged; and control length statistically.</p>
+  <p>Mitigations: judge both orders and count a win only if it holds in both (else a tie); few-shot judge examples raised GPT-4's swap consistency from 65.0% to 77.5% <a href="https://arxiv.org/abs/2306.05685">[App. D.2]</a>; give a reference answer for verifiable questions; use a judge from a different family than the models judged; and control length statistically.</p>
 
   <div class="decision">
     <div class="decision-title">Length-controlled win rate</div>
@@ -386,7 +387,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     </dl>
   </div>
 
-  <p><strong>Human preference arenas</strong> replace the judge with crowds. Chatbot Arena shows two anonymous models, collects a vote, and fits Bradley-Terry coefficients: \(P(m \text{ beats } m') = 1/(1+e^{\xi_{m'}-\xi_m})\), estimated by maximum likelihood with sandwich-estimator confidence intervals <a href="https://arxiv.org/abs/2403.04132">[Chiang et al. 2024, §4, §5]</a>. Crowd votes agreed with experts 72 to 83% of the time, close to the 79 to 90% expert-expert agreement (Tab. 3). The weaknesses are the population (hobbyists and researchers), style effects, and the incentives of a public leaderboard: <em>The Leaderboard Illusion</em> reports that Meta tested 27 private variants before releasing Llama 4, that two large labs received about 19.2% and 20.4% of all arena data against 29.7% for 83 open-weight models combined, and that access to arena data can lift relative performance on the arena distribution by up to 112% <a href="https://arxiv.org/abs/2504.20879">[Singh et al. 2025]</a>. The platform has since been rebranded <span class="unverified" title="Rebrand date (January 28, 2026, LMArena to Arena) taken from Wikipedia and secondary coverage; the primary announcement was not fetched.">Arena (January 2026)</span>.</p>
+  <p><strong>Human preference arenas</strong> replace the judge with crowds. Chatbot Arena shows two anonymous models, collects a vote, and fits Bradley-Terry coefficients: \(P(m \text{ beats } m') = 1/(1+e^{\xi_{m'}-\xi_m})\), estimated by maximum likelihood with sandwich-estimator confidence intervals <a href="https://arxiv.org/abs/2403.04132">[Chiang et al. 2024]</a>. Crowd votes agreed with experts 72 to 83% of the time, close to the 79 to 90% expert-expert agreement (Tab. 3). The weaknesses are the population (hobbyists and researchers), style effects, and the incentives of a public leaderboard: <em>The Leaderboard Illusion</em> reports that Meta tested as many as 27 private variants in one month in the lead-up to Llama 4, that two large labs received about 19.2% and 20.4% of all arena data against 29.7% for 83 open-weight models combined, and that training on more arena data raised ArenaHard performance by up to 112% in relative terms <a href="https://arxiv.org/abs/2504.20879">[Singh et al. 2025]</a>. The platform has since been rebranded <span class="unverified" title="Rebrand date (January 28, 2026, LMArena to Arena) taken from Wikipedia and secondary coverage; the primary announcement was not fetched.">Arena (January 2026)</span>.</p>
 </section>
 
 <section>
@@ -401,7 +402,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <li><strong>Fresh or dated slices</strong> to catch contamination, and regression checks for capabilities that must not degrade (other languages, safety behavior).</li>
   </ol>
 
-  <p><strong>Know your noise.</strong> Two notions matter. <em>Signal</em> is how far apart different models score, and <em>noise</em> is how much one model's score jitters, measured as the relative standard deviation over its final checkpoints. Their ratio predicts whether a small-scale ranking transfers: the correlation of signal-to-noise with decision accuracy was 0.79 across OLMES tasks, while signal alone or noise alone were nearly uncorrelated with it <a href="https://arxiv.org/abs/2508.13144">[Heineman, §3, §4.1]</a>. On a 1B model's last 30 checkpoints, ARC-Challenge accuracy ranged over 1.7 points. Averaging the last several checkpoints, and using bits per byte instead of accuracy, both raised the ratio. Seed noise is also measurable directly. Across ten 7B runs on 210B tokens, the seed standard deviation was 0.21 for HellaSwag, 0.41 for PIQA, 0.55 for SIQA, 0.80 for ARC-Challenge and 1.11 for HumanEval, and generally below the 95% interval from the question count <a href="https://arxiv.org/abs/2406.10229">[Madaan, Tab. 1]</a>. Run-to-run standard deviations at 1B parameters reach 2 accuracy points for some data recipes <a href="https://arxiv.org/abs/2504.11393">[DataDecide, §2.1]</a>.</p>
+  <p><strong>Know your noise.</strong> Two notions matter. <em>Signal</em> is how far apart different models score, and <em>noise</em> is how much one model's score jitters, measured as the relative standard deviation over its final checkpoints. Their ratio predicts whether a small-scale ranking transfers: the correlation of signal-to-noise with decision accuracy was 0.79 across OLMES tasks, while signal alone or noise alone were nearly uncorrelated with it <a href="https://arxiv.org/abs/2508.13144">[Heineman, §3, §4.1]</a>. On a 1B model's last 30 checkpoints, ARC-Challenge accuracy ranged over 1.7 points. Averaging the last several checkpoints, and using bits per byte instead of accuracy, both raised the ratio. Seed noise is also measurable directly. Across ten 7B runs on 210B tokens, the seed standard deviation was 0.21 for HellaSwag, 0.41 for PIQA, 0.55 for SIQA, 0.80 for ARC-Challenge and 1.11 for HumanEval, and generally below the 95% interval from the question count <a href="https://arxiv.org/abs/2406.10229">[Madaan, Tab. 1]</a>. Run-to-run standard deviations at 1B parameters reach 2 accuracy points for some data recipes <a href="https://arxiv.org/abs/2504.11393">[DataDecide]</a>.</p>
 
   <p>A practical rule that follows: two runs differ only if the gap exceeds \(\sqrt{2}\) times the seed standard deviation of that benchmark, times about 2 for confidence. For HellaSwag that is about 0.6 points, for ARC-Challenge about 2.3. Checkpoints taken at different points of the learning-rate schedule are not comparable, so compare after the decay phase (<a href="14-optimization.html">page 14</a>).</p>
 
@@ -419,11 +420,11 @@ def benchmark_pass_at_k(correct_counts, n, k):
   \[ \text{SE} = \sqrt{\frac{\hat p\,(1-\hat p)}{n}}, \qquad \text{CI}_{95\%} = \hat p \pm 1.96\,\text{SE} \]
   <div class="eq-label">Miller 2024, Eq. 2 and 3. Largest at \(\hat p = 0.5\).</div>
   </div>
-  <p><strong>Worked numbers</strong> for \(\hat p = 0.7\). With \(n=500\): \(\text{SE} = \sqrt{0.21/500} = \sqrt{0.00042} = 0.0205\), so 2.05 points and a 95% interval of \(\pm 4.02\) (66.0 to 74.0). With \(n = 14{,}000\): \(\sqrt{0.21/14000} = 0.00387\), so 0.39 points and \(\pm 0.76\). The interval shrinks as \(1/\sqrt{n}\): 28 times more questions buys a 5.3 times narrower interval. Figure 2 shows the curve with benchmark sizes marked.</p>
+  <p><strong>Worked numbers</strong> for \(\hat p = 0.7\). With \(n=500\): \(\text{SE} = \sqrt{0.21/500} = \sqrt{0.00042} = 0.0205\), so 2.05 points and a 95% interval of \(\pm 4.02\) (66.0 to 74.0). With \(n = 14{,}000\): \(\sqrt{0.21/14000} = 0.00387\), so 0.39 points and \(\pm 0.76\). The interval shrinks as \(1/\sqrt{n}\): 28 times more questions buys a 5.3 times narrower interval. Figure 3 shows the curve with benchmark sizes marked.</p>
 
   <figure class="fig">
-    <svg viewBox="0 0 720 330" role="img" aria-labelledby="fig-18-2-title">
-    <title id="fig-18-2-title">Half-width of a 95 percent confidence interval on an accuracy versus the number of test questions, with benchmark sizes marked</title>
+    <svg viewBox="0 0 720 290" role="img" aria-labelledby="fig-18-3-title">
+    <title id="fig-18-3-title">Half-width of a 95 percent confidence interval on an accuracy versus the number of test questions, with benchmark sizes marked</title>
     <line class="s-line" style="stroke-opacity:.35" x1="64" y1="236.0" x2="700" y2="236.0"/>
     <text x="56" y="240.0" text-anchor="end" class="s-small s-muted">0</text>
     <line class="s-line" style="stroke-opacity:.35" x1="64" y1="184.0" x2="700" y2="184.0"/>
@@ -453,7 +454,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <polyline class="s-line-b" points="64.0,32.2 72.1,40.6 80.1,48.7 88.2,56.5 96.2,63.9 104.3,71.0 112.3,77.9 120.4,84.4 128.4,90.7 136.5,96.7 144.5,102.5 152.6,108.0 160.6,113.3 168.7,118.4 176.7,123.3 184.8,127.9 192.8,132.4 200.9,136.7 208.9,140.8 217.0,144.8 225.0,148.5 233.1,152.2 241.1,155.6 249.2,159.0 257.2,162.2 265.3,165.2 273.3,168.1 281.4,171.0 289.4,173.7 297.5,176.2 305.5,178.7 313.6,181.1 321.6,183.4 329.7,185.5 337.7,187.6 345.8,189.6 353.8,191.6 361.9,193.4 369.9,195.2 378.0,196.9 386.0,198.5 394.1,200.0 402.1,201.5 410.2,202.9 418.2,204.3 426.3,205.6 434.3,206.9 442.4,208.1 450.4,209.2 458.5,210.4 466.5,211.4 474.6,212.4 482.6,213.4 490.7,214.3 498.7,215.2 506.8,216.1 514.8,216.9 522.9,217.7 530.9,218.5 539.0,219.2 547.0,219.9 555.1,220.6 563.1,221.2 571.2,221.8 579.2,222.4 587.3,223.0 595.3,223.5 603.4,224.0 611.4,224.5 619.5,225.0 627.5,225.5 635.6,225.9 643.6,226.3 651.7,226.7 659.7,227.1 667.8,227.5 675.8,227.8 683.9,228.2 691.9,228.5 700.0,228.8"/>
     <polyline class="s-line-a" points="64.0,113.7 72.1,118.8 80.1,123.6 88.2,128.3 96.2,132.7 104.3,137.0 112.3,141.1 120.4,145.0 128.4,148.8 136.5,152.4 144.5,155.9 152.6,159.2 160.6,162.4 168.7,165.4 176.7,168.4 184.8,171.2 192.8,173.8 200.9,176.4 208.9,178.9 217.0,181.3 225.0,183.5 233.1,185.7 241.1,187.8 249.2,189.8 257.2,191.7 265.3,193.5 273.3,195.3 281.4,197.0 289.4,198.6 297.5,200.1 305.5,201.6 313.6,203.1 321.6,204.4 329.7,205.7 337.7,207.0 345.8,208.2 353.8,209.3 361.9,210.4 369.9,211.5 378.0,212.5 386.0,213.5 394.1,214.4 402.1,215.3 410.2,216.2 418.2,217.0 426.3,217.8 434.3,218.5 442.4,219.3 450.4,219.9 458.5,220.6 466.5,221.3 474.6,221.9 482.6,222.4 490.7,223.0 498.7,223.5 506.8,224.1 514.8,224.6 522.9,225.0 530.9,225.5 539.0,225.9 547.0,226.3 555.1,226.7 563.1,227.1 571.2,227.5 579.2,227.8 587.3,228.2 595.3,228.5 603.4,228.8 611.4,229.1 619.5,229.4 627.5,229.7 635.6,229.9 643.6,230.2 651.7,230.4 659.7,230.7 667.8,230.9 675.8,231.1 683.9,231.3 691.9,231.5 700.0,231.7"/>
     <line class="s-line s-dash" x1="64" y1="225.6" x2="700" y2="225.6"/>
-    <text x="696" y="220.6" text-anchor="end" class="s-small s-muted">1 point</text>
+    <text x="100" y="220.6" class="s-small s-muted">1 point</text>
     <text x="147.3" y="96.4" class="s-small s-tb s-bold">p = 0.5</text>
     <text x="147.3" y="149.1" class="s-small s-ta s-bold">p = 0.9</text>
     <line class="s-line" style="stroke-opacity:.6" x1="81.3" y1="49.9" x2="81.3" y2="236"/>
@@ -464,8 +465,6 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <circle class="s-fill-b" cx="260.9" cy="163.6" r="3.5"/>
     <line class="s-line" style="stroke-opacity:.6" x1="349.0" y1="190.4" x2="349.0" y2="236"/>
     <circle class="s-fill-b" cx="349.0" cy="190.4" r="3.5"/>
-    <line class="s-line" style="stroke-opacity:.6" x1="356.5" y1="192.2" x2="356.5" y2="236"/>
-    <circle class="s-fill-b" cx="356.5" cy="192.2" r="3.5"/>
     <line class="s-line" style="stroke-opacity:.6" x1="441.3" y1="207.9" x2="441.3" y2="236"/>
     <circle class="s-fill-b" cx="441.3" cy="207.9" r="3.5"/>
     <line class="s-line" style="stroke-opacity:.6" x1="502.2" y1="215.6" x2="502.2" y2="236"/>
@@ -476,15 +475,14 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <circle class="s-fill-b" cx="666.3" cy="227.4" r="3.5"/>
     <text x="87.3" y="53.9" text-anchor="start" class="s-small">AIME</text>
     <text x="250.0" y="152.4" text-anchor="start" class="s-small">HumanEval</text>
-    <text x="267.9" y="177.6" text-anchor="start" class="s-small">GPQA-D</text>
-    <text x="349.0" y="180.4" text-anchor="middle" class="s-small">SWE-V, MATH-500</text>
-    <text x="356.5" y="169.2" text-anchor="middle" class="s-small">IFEval</text>
+    <text x="266.9" y="188.6" text-anchor="start" class="s-small">GPQA-D</text>
+    <text x="355.0" y="182.4" text-anchor="start" class="s-small">SWE-V, MATH-500</text>
     <text x="441.3" y="197.9" text-anchor="middle" class="s-small">GSM8K</text>
     <text x="502.2" y="207.6" text-anchor="middle" class="s-small">HLE</text>
     <text x="649.7" y="216.7" text-anchor="end" class="s-small">MMLU-Pro</text>
     <text x="672.3" y="203.4" text-anchor="end" class="s-small">MMLU</text>
     </svg>
-    <figcaption><b>Figure 2.</b> Half-width of the 95% confidence interval on an accuracy versus number of questions, for \(p=0.5\) (orange, the worst case) and \(p=0.9\) (blue). Dots mark benchmark sizes on the worst-case curve. Notice that AIME (30) and HumanEval (164) sit above 7 points, MMLU-scale sets (12 to 14 thousand) below 1, and that the dashed 1-point line is reached only around ten thousand questions even for a single model.</figcaption>
+    <figcaption><b>Figure 3.</b> Half-width of the 95% confidence interval on an accuracy versus number of questions, for \(p=0.5\) (orange, the worst case) and \(p=0.9\) (blue). Dots mark benchmark sizes on the worst-case curve. Notice that AIME (30) and HumanEval (164) sit above 7 points, MMLU-scale sets (12 to 14 thousand) below 1, and that the dashed 1-point line is reached only around ten thousand questions even for a single model.</figcaption>
   </figure>
 
   <p>The Wald form fails near 0 and 1 and at small \(n\): with 0 correct of 30 it gives the interval \([0, 0]\), while the Wilson score interval gives \([0, 11.4\%]\) (\(z^2/(n+z^2)\) at the upper end). The drill implements both.</p>
@@ -492,7 +490,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
   <h3 id="comparing">Comparing two models</h3>
   <p>Unpaired, the difference has \(\text{SE}_{A-B} = \sqrt{\text{SE}_A^2 + \text{SE}_B^2}\). For two 70% models at \(n=500\) that is \(\sqrt{2}\times 2.05 = 2.90\) points, so a difference must exceed \(1.96 \times 2.90 = 5.7\) points before the interval excludes zero. At \(n=14{,}000\) the threshold is 1.07 points. But both models answer the <em>same</em> questions, and question difficulty is shared. Working with the per-question differences \(d_i = s_{A,i} - s_{B,i}\) gives a <strong>paired</strong> standard error that shrinks with the correlation \(\rho\) of the two models' scores:</p>
   \[ \text{SE}_{A-B,\text{paired}} = \sqrt{\text{SE}_A^2 + \text{SE}_B^2 - 2\rho\,\text{SE}_A\text{SE}_B} \;=\; \sqrt{\frac{\mathrm{Var}(d)}{n}} \;\approx\; \sqrt{\frac{\delta}{n}}, \]
-  <p>where \(\delta\) is the fraction of questions on which the models disagree (the approximation holds when the true gap is small). For Bernoulli scores at \(p=0.7\), \(\delta = 2p(1-p)(1-\rho) = 0.42\,(1-\rho)\), so \(\delta = 0.20\) means \(\rho \approx 0.52\), close to the 0.37 to 0.64 correlations in Miller's examples <a href="https://arxiv.org/abs/2411.00640">[§4.2, Tab. 5]</a>.</p>
+  <p>where \(\delta\) is the fraction of questions on which the models disagree (the approximation holds when the true gap is small). For Bernoulli scores at \(p=0.7\), \(\delta = 2p(1-p)(1-\rho) = 0.42\,(1-\rho)\), so \(\delta = 0.20\) means \(\rho \approx 0.52\), close to the 0.37 to 0.64 correlations in Miller's illustrative example <a href="https://arxiv.org/abs/2411.00640">[§4.2, Tab. 5]</a>.</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th></th><th class="num">\(n=500\)</th><th class="num">\(n=14{,}000\)</th></tr></thead>
@@ -547,10 +545,10 @@ def benchmark_pass_at_k(correct_counts, n, k):
 
   <p>Contamination is any path by which test information reaches training: exact copies, near-duplicates, paraphrases and translations, the same source material, synthetic data from a model that saw the benchmark, or tuning checkpoints and hyperparameters on the test set. Data-side filtering by n-gram overlap is on <a href="12-pretraining-data.html#contamination">page 12</a>. The evaluation-side toolbox has four parts:</p>
   <ul>
-    <li><strong>Likelihood-based detection.</strong> Min-K% Prob averages the log-probability of the 20% least likely tokens of a text, on the idea that unseen text contains a few surprising tokens while seen text does not <a href="https://arxiv.org/abs/2310.16789">[Shi et al. 2024, §3, §4.3]</a>. On WikiMIA (394 recent events as non-members) it reached AUC 0.72 on average against 0.67 for plain perplexity, and 0.86 against 0.84 for detecting benchmark examples injected into continued pretraining. That is modest, and detection is harder for short texts and low duplication counts.</li>
-    <li><strong>Order tests.</strong> If the benchmark is exchangeable, no ordering should be likelier than another. Compare the model's log-likelihood of the canonical order with shuffled orders, with a permutation test that has a false-positive guarantee <a href="https://arxiv.org/abs/2310.17623">[Oren et al. 2023, §3]</a>. On a 1.4B model with injected test sets it detected duplication of 10 or more but not a single copy, and it found <em>p</em> = 0.014 (LLaMA-2) and 0.011 (Mistral) for MMLU after filtering non-exchangeable subsets. Test sets can also carry a canary string so training corpora can filter them out, as GPQA does <a href="https://arxiv.org/abs/2311.12022">[GPQA, §1]</a>.</li>
-    <li><strong>Fresh or rewritten variants.</strong> GSM1k measures the gap between GSM8K and a matched, never-released set. Drops reached 8 points (Phi and Mistral families), and the per-character likelihood of GSM8K samples correlated with the gap (Spearman 0.36), while frontier models showed almost no drop <a href="https://arxiv.org/abs/2405.00332">[Zhang et al., §4, §5]</a>. The correlation is modest: overfitting also arises indirectly, for instance from training on benchmark-shaped data or selecting checkpoints on the test set.</li>
-    <li><strong>Temporal splits.</strong> LiveCodeBench dates each problem, so a model can be scored only on problems released after its cutoff. DeepSeek-Instruct and GPT-4o dropped sharply on LeetCode problems released after their training cutoffs, and DS-Base-33B fell from about 60 pass@1 on May problems to about 0 on September ones <a href="https://arxiv.org/abs/2403.07974">[LiveCodeBench, §5.1]</a>.</li>
+    <li><strong>Likelihood-based detection.</strong> Min-K% Prob averages the log-probability of the 20% least likely tokens of a text, on the idea that unseen text contains a few surprising tokens while seen text does not <a href="https://arxiv.org/abs/2310.16789">[Shi et al. 2024]</a>. On WikiMIA (394 recent events as non-members) it reached AUC 0.72 on average against 0.67 for plain perplexity, and 0.86 against 0.84 for detecting benchmark examples injected into continued pretraining. That is modest, and detection is harder for short texts and low duplication counts.</li>
+    <li><strong>Order tests.</strong> If the benchmark is exchangeable, no ordering should be likelier than another. Compare the model's log-likelihood of the canonical order with shuffled orders, with a permutation test that has a false-positive guarantee <a href="https://arxiv.org/abs/2310.17623">[Oren et al. 2023]</a>. On a 1.4B model with injected test sets it detected duplication of 10 or more but not a single copy, and it found <em>p</em> = 0.014 (LLaMA-2) and 0.011 (Mistral) for MMLU after filtering non-exchangeable subsets. Test sets can also carry a canary string so training corpora can filter them out, as GPQA does <a href="https://arxiv.org/abs/2311.12022">[GPQA]</a>.</li>
+    <li><strong>Fresh or rewritten variants.</strong> GSM1k measures the gap between GSM8K and a matched, never-released set. Drops reached 8 points (Phi and Mistral families), and the per-character likelihood of GSM8K samples correlated with the gap (Spearman 0.36), while frontier models showed almost no drop <a href="https://arxiv.org/abs/2405.00332">[Zhang et al., §5.4]</a>. The correlation is modest: overfitting also arises indirectly, for instance from training on benchmark-shaped data or selecting checkpoints on the test set.</li>
+    <li><strong>Temporal splits.</strong> LiveCodeBench dates each problem, so a model can be scored only on problems released after its cutoff. DeepSeek models drop sharply on LeetCode problems released after August 2023, GPT-4-O declines on problems since November 2023 (its stated cutoff), and DeepSeek-Base-33B fell from about 60 pass@1 on May problems to about 0 on September LeetCode ones <a href="https://arxiv.org/abs/2403.07974">[LiveCodeBench, §5.1]</a>.</li>
   </ul>
 
   <div class="decision">
@@ -561,11 +559,11 @@ def benchmark_pass_at_k(correct_counts, n, k):
       <dt>Why it works</dt><dd>A problem published after the cutoff cannot be in the training data, so the score estimates performance on unseen problems without any detector.</dd>
       <dt>Evidence</dt><dd>Sharp performance drops at the cutoff for models known to have trained on contest archives <a href="https://arxiv.org/abs/2403.07974">[LiveCodeBench, Fig. 1, §5.1]</a>.</dd>
       <dt>Cost</dt><dd>The post-cutoff window is small and shrinks for newer models: a 349-problem window had 1 to 1.5 points of bootstrap variation <a href="https://arxiv.org/abs/2403.07974">[§7]</a>. Needs a source of fresh, gradable, high-quality problems, which is why code and contest math dominate.</dd>
-      <dt>Used by</dt><dd>LiveCodeBench, Codeforces-based ratings (DeepSeek-V4 uses 14 Division 1 contests from May to November 2025), Arena's live prompts, and private held-out sets such as HLE's.</dd>
+      <dt>Used by</dt><dd>LiveCodeBench, Codeforces-based ratings (DeepSeek-V4 uses 14 Division 1 contests), Arena's live prompts, and private held-out sets such as HLE's.</dd>
     </dl>
   </div>
 
-  <p><strong>Limits.</strong> N-gram filters miss paraphrase and translation: rephrased test items evaded 10-gram matching entirely, and embedding similarity needs subject-specific thresholds while an LLM decontaminator did better <a href="https://arxiv.org/abs/2311.04850">[Yang et al., §5.2]</a>. Short multiple-choice items create n-gram false positives. Detectors have power only above some duplication level, so "not detected" is weak evidence. A clean-subset versus full-set comparison is itself biased when the clean subset differs in difficulty. Contamination effects also vary by benchmark and model size, and DeepSeek-R1's report itself notes that 10-gram decontamination cannot stop paraphrase <a href="https://arxiv.org/abs/2501.12948">[R1, Supp. D.1]</a>. A defensible practice: decontaminate before training, evaluate on dated or private sets, keep a held-out slice you never publish, and read a benchmark's score against its release date.</p>
+  <p><strong>Limits.</strong> N-gram filters miss paraphrase and translation: rephrased test items evaded 10-gram matching entirely, and embedding similarity needs subject-specific thresholds while an LLM decontaminator did better <a href="https://arxiv.org/abs/2311.04850">[Yang et al., §5.2.1]</a>. Short multiple-choice items create n-gram false positives. Detectors have power only above some duplication level, so "not detected" is weak evidence. A clean-subset versus full-set comparison is itself biased when the clean subset differs in difficulty. Contamination effects also vary by benchmark and model size, and DeepSeek-R1's report itself notes that 10-gram decontamination cannot stop paraphrase <a href="https://arxiv.org/abs/2501.12948">[R1, Supp. D.1]</a>. A defensible practice: decontaminate before training, evaluate on dated or private sets, keep a held-out slice you never publish, and read a benchmark's score against its release date.</p>
 </section>
 
 <section>
@@ -574,8 +572,8 @@ def benchmark_pass_at_k(correct_counts, n, k):
   <p>Long chains of thought, stochastic sampling, a token budget that changes results, and tool harnesses all add sources of variance. The reporting conventions that have emerged:</p>
   <ul>
     <li><strong>Sample, do not go greedy, and average.</strong> DeepSeek-R1 found that greedy decoding of long-output reasoning models raised repetition and gave large variability across checkpoints, so it reports pass@1 as the mean correctness over \(k\) samples at temperature 0.6 and top-\(p\) 0.95, with \(k=64\) for AIME and GPQA, 16 for MATH and Codeforces, 8 for LiveCodeBench, and outputs capped at 32,768 tokens <a href="https://arxiv.org/abs/2501.12948">[R1, Supp. D.1]</a>. That estimator is just \(\frac{1}{k}\sum_i p_i\). It matches Miller's advice against lowering temperature to reduce variance, since that changes the quantity being estimated <a href="https://arxiv.org/abs/2411.00640">[§3.3]</a>.</li>
-    <li><strong>Report the token budget or effort level.</strong> DeepSeek-V4 trains three modes with different length penalties and evaluates them with context windows of 8K, 128K and 384K tokens. V4-Pro scores 7.7, 34.5 and 37.7 on HLE and 72.9, 89.1 and 90.1 on GPQA Diamond across the three <a href="https://arxiv.org/abs/2606.19348">[V4, §5.3.1, Tab. 7]</a>. A model's "score" without its effort level is not a number. Models are also very sensitive to a maximum-token cap because truncation is scored as failure <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert, Fig. 8]</a>. The right object is an accuracy-versus-tokens curve.</li>
-    <li><strong>Use many seeds on small sets, and test paired.</strong> On AIME'24 a single question is 3.3 points and improvements claimed for 1.5B RL-trained models often fell within the seed variance of the base model. Re-evaluated with a paired test over 10 seeds, OpenRS showed no significant gain over its R1-Distill baseline <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert, §4.3]</a>.</li>
+    <li><strong>Report the token budget or effort level.</strong> DeepSeek-V4 offers three modes (Non-think, High, Max) and evaluates them with context windows of 8K, 128K and 384K tokens. V4-Pro scores 7.7, 34.5 and 37.7 on HLE and 72.9, 89.1 and 90.1 on GPQA Diamond across the three <a href="https://arxiv.org/abs/2606.19348">[V4, §5.3.1, Tab. 7]</a>. A model's "score" without its effort level is not a number. Models are also very sensitive to a maximum-token cap because truncation is scored as failure <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert, Fig. 8]</a>. The right object is an accuracy-versus-tokens curve.</li>
+    <li><strong>Use many seeds on small sets, and test paired.</strong> On AIME'24 a single question is 3.3 points and a claimed gain has to beat that noise. Re-evaluated with a paired t-test against the R1-Distill 1.5B baseline, the OpenRS models showed no statistically significant improvement <a href="https://arxiv.org/abs/2504.07086">[Hochlehnert, §4.3]</a>.</li>
     <li><strong>Report the harness for agents.</strong> DeepSeek-V4's code-agent runs use a minimal bash-plus-file-edit harness with at most 500 steps and a 512K context <a href="https://arxiv.org/abs/2606.19348">[V4, §5.3.1]</a>. Scores depend on tools, step limits, timeouts and environment fixes, which is why the Terminal-Bench "Verified" subset differs by about 4 points. Add reliability: pass^k on stochastic tasks, not just pass@1.</li>
   </ul>
   <p>A compact reporting checklist: number of questions and clustering; samples per question; temperature and top-\(p\); token budget or effort; extraction and grader; harness, tools and step limit; seeds; a standard error or interval; the model's data cutoff against the benchmark's release date.</p>
@@ -672,7 +670,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> How do you detect benchmark contamination?</summary>
     <div class="answer">
-      <p>It depends on what you can access. With the training data: n-gram overlap (GPT-3 used 13-grams, Llama 3 8-grams) plus embedding or LLM-based matching for paraphrases. Without it, statistical tests on the model: Min-K% Prob (mean log-probability of the 20% least likely tokens; AUC about 0.72 on WikiMIA against 0.67 for perplexity), and order tests that compare the log-likelihood of the canonical benchmark order with shuffled orders (detects duplication of 10 or more in a 1.4B model with a false-positive guarantee, but not one copy). Behavioral checks: a matched fresh set (GSM1k showed drops up to 8 points), rephrased variants, and temporal splits (LiveCodeBench shows sharp drops after a model's cutoff). Canary strings help filtering.</p>
+      <p>It depends on what you can access. With the training data: n-gram overlap (GPT-3 used 13-grams, DeepSeek-R1 10-grams) plus embedding or LLM-based matching for paraphrases. Without it, statistical tests on the model: Min-K% Prob (mean log-probability of the 20% least likely tokens; AUC about 0.72 on WikiMIA against 0.67 for perplexity), and order tests that compare the log-likelihood of the canonical benchmark order with shuffled orders (detects duplication of 10 or more in a 1.4B model with a false-positive guarantee, but not one copy). Behavioral checks: a matched fresh set (GSM1k showed drops up to 8 points), rephrased variants, and temporal splits (LiveCodeBench shows sharp drops after a model's cutoff). Canary strings help filtering.</p>
       <p>Limits: paraphrase and translation defeat n-grams (rephrased MMLU took Llama-2-13B from 54.8 to 85.9 undetected); detectors have power only above some duplication level; and indirect leakage (benchmark-shaped data, checkpoint selection) leaves no overlap at all. So combine detection with evaluation designed to be robust: dated or private sets and a clean-versus-full comparison.</p>
     </div>
   </details>
@@ -711,7 +709,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <summary><span class="tier">Deep-dive</span> Design question: you must choose between two pretraining data mixtures using 1B-parameter proxy runs. Design the evaluation and the decision rule.</summary>
     <div class="answer">
       <p><strong>Evidence to plan around.</strong> Ranking data recipes at 150M predicts the 1B winner for about 80% of pairs, and none of eight scaling-law baselines did better; seed standard deviation at 1B reaches 2 points for some recipes; continuous likelihood metrics are more predictable at small scale <a href="https://arxiv.org/abs/2504.11393">[DataDecide]</a>.</p>
-      <p><strong>Design.</strong> (a) Match compute and tokens across arms and use at least two seeds each (FineWeb used two seeds and different random data subsets). (b) Choose tasks by signal-to-noise on existing runs, not by name: keep those above chance at the proxy size with monotone curves, drop those at chance (MMLU multiple choice at 1B). (c) Use cloze formulations with OLMES normalizations, plus bits per byte on held-out domains and a continuous proxy for code and math. (d) Average the last several checkpoints to cut checkpoint noise. (e) Decision rule: pre-declare a primary aggregate; call a winner only if the paired difference exceeds \(2\sqrt{2}\,\sigma_{\text{seed}}\) on it and the arms agree in sign on most individual tasks and on held-out loss; else run more seeds or a second scale. (f) Confirm finalists at a larger scale, since recipes can cross over with scale and some effects (dedup, repetition, unique-token supply) are invisible in small runs. (g) Check for contamination differences between mixtures and do not tune the mixture on a benchmark you will report.</p>
+      <p><strong>Design.</strong> (a) Match compute and tokens across arms and use at least two seeds each (FineWeb used two seeds). (b) Choose tasks by signal-to-noise on existing runs, not by name: keep those above chance at the proxy size with monotone curves, drop those at chance (MMLU multiple choice at 1B). (c) Use cloze formulations with OLMES normalizations, plus bits per byte on held-out domains and a continuous proxy for code and math. (d) Average the last several checkpoints to cut checkpoint noise. (e) Decision rule: pre-declare a primary aggregate; call a winner only if the paired difference exceeds \(2\sqrt{2}\,\sigma_{\text{seed}}\) on it and the arms agree in sign on most individual tasks and on held-out loss; else run more seeds or a second scale. (f) Confirm finalists at a larger scale, since recipes can cross over with scale and some effects (dedup, repetition, unique-token supply) are invisible in small runs. (g) Check for contamination differences between mixtures and do not tune the mixture on a benchmark you will report.</p>
       <p>Trade-off: bigger proxies and more seeds cost compute but reduce wrong decisions, so spend it on the closest pairs, where a wrong call is most likely.</p>
     </div>
   </details>
@@ -731,7 +729,7 @@ def benchmark_pass_at_k(correct_counts, n, k):
     <div class="answer">
       <p>The judge's preference is modeled by a logistic regression with three terms: a model-identity term \(\theta_m - \theta_b\), a length term \(\phi_{m,b}\tanh(\Delta\text{len}/\text{std}(\Delta\text{len}))\), and an instruction-difficulty term \((\psi_m - \psi_b)\gamma_x\), fit by cross-entropy with L2 regularization. The length-controlled win rate is the model's implied win rate with the length term set to 0: \(\text{winrate}_{LC} = 100\cdot\E_x[\sigma(\theta_m-\theta_b + (\psi_m-\psi_b)\gamma_x)]\). This is a counterfactual (a controlled direct effect): what would the preference be if both answers had equal length. The \(\tanh\) gives diminishing returns to length differences in log-odds, and the form keeps the baseline at 50% and preserves swap symmetry.</p>
       <p>Assumptions: length is the only confounder you modeled (formatting, lists and tone remain), the effect of length on preference is additive in log-odds and shared in form across models, and equal-length comparison is what you want. It cut the gap between concise and verbose prompting (22.9 to 64.3% raw versus 41.9 to 51.6%) and raised Arena correlation from 0.94 to 0.98.</p>
-      <p>Gaming: because the regression predicts the win rate at zero length difference, a model that truncates most outputs to a few characters but keeps a few strong ones has its poor cases explained by "short length", so the counterfactual win rate rises (from 3.7 to 25.9 in the unregularized attack). The authors add weak regularization on the length coefficient, bringing this to 12.2. The lesson is that any post-hoc correction becomes a new optimization target.</p>
+      <p>Gaming: the authors test an adversarial case, truncating GPT-4's outputs. The raw AlpacaEval 2 win rate is 3.7%, but without regularization the length-controlled one rises to 25.9%, presumably because the regression can blame the poor results of very short outputs on the length term, which is then zeroed. Regularizing the length term so that the model terms explain performance first brings it down to 12.2% <a href="https://arxiv.org/abs/2404.04475">[Dubois et al., §4.3]</a>. The lesson is that any post-hoc correction becomes a new optimization target.</p>
     </div>
   </details>
 </section>

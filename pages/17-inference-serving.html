@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Inference optimization &amp; serving · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="17" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part III · Pretraining &amp; systems · Page 17</div>
+  <h1>Inference optimization &amp; serving</h1>
+  <div class="meta">
+    <span class="badge p1">P1</span>
+    <span>~60 min</span>
+    <span>Prereqs: <a href="06-decoding-kv-cache.html">06 KV cache</a>, <a href="07-kv-efficient-attention.html">07 KV-efficient attention</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="16-gpus-kernels.html">16 GPUs &amp; kernels</a></span>
+  </div>
+  <p class="lede">Frontier labs choose architectures partly by what they cost to serve. This page covers the serving stack a model builder must understand: batching and memory management, prefill/decode disaggregation, quantization, speculative decoding, and how MoE and long-context models are served, with the arithmetic to reason about each one.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The cost model:</strong> "What does a million tokens cost, and what moves it?" Expect to combine batch size, context length, weight bytes and KV bytes into a tokens-per-second estimate, and to separate throughput from goodput under an SLO.</li>
+    <li><strong>Batching and memory:</strong> continuous batching, PagedAttention, prefix caching and chunked prefill: what each one fixes, what it costs, and why PagedAttention makes attention <em>slower</em> yet raises throughput.</li>
+    <li><strong>Quantization:</strong> why W4A16 helps decode but not prefill, why W8A8 is harder (activation outliers), what SmoothQuant does algebraically, and where FP8 and FP4 fit.</li>
+    <li><strong>Speculative decoding:</strong> derive the acceptance rule, prove the output distribution is exactly the target's, compute expected tokens per step, and say when it stops helping.</li>
+    <li><strong>Disaggregation and MoE serving:</strong> why prefill and decode want different GPUs, what expert parallelism does to per-expert batch size, why redundant experts exist, and how DeepSeek-V3 is deployed.</li>
+    <li><strong>Architecture meets serving:</strong> how GQA, MLA, MoE, an MTP head or a diffusion decoder shows up in the serving bill.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Compute cost per million tokens from batch size, context length, hardware and price, and explain why goodput under an SLO is the right objective.</li>
+    <li>Explain and draw continuous batching and PagedAttention (block table, copy-on-write), and estimate KV waste for a given length distribution.</li>
+    <li>Say what prefix caching, chunked prefill and prefill/decode disaggregation each buy and what each costs.</li>
+    <li>Choose among W4A16, W8A8, FP8, FP4 and KV-cache quantization from the bottleneck, and explain activation outliers and SmoothQuant.</li>
+    <li>Derive the speculative-decoding acceptance rule and its exactness, compute expected tokens per step and speedup, and implement the rule.</li>
+    <li>Reason about serving a large MoE (expert parallelism, per-expert batch, redundant experts) and about long-context serving.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="cost-model">Serving metrics and the cost model</h2>
+
+  <p>Page <a href="06-decoding-kv-cache.html#performance">06</a> derived that one decode step costs about (weight bytes + KV bytes) divided by HBM bandwidth, and defined TTFT, TPOT and throughput (<a href="06-decoding-kv-cache.html#metrics">metrics</a>). <strong>Inference optimization</strong> <span class="zh">推理优化</span> is the set of techniques that shrink one term of that expression, or keep the batch full without breaking a latency promise. Each technique below is easiest to judge by asking which term it changes and what it gives up.</p>
+
+  <p>Raw throughput is the wrong objective because it is easy to inflate: keep raising the batch until TPOT is terrible. Production systems promise a <strong>service-level objective</strong> (SLO) <span class="zh">服务等级目标</span>, for example p90 TTFT of at most 0.25 s and p90 TPOT of at most 0.1 s (the chatbot setting DistServe uses for OPT-13B <a href="https://arxiv.org/abs/2401.09670">[Zhong et al. 2024, Tab. 1]</a>). The quantity to maximize is <strong>goodput</strong> <span class="zh">有效吞吐</span>: the highest request rate a deployment sustains while a target fraction of requests (say 90%) meets the SLO, per GPU provisioned <a href="https://arxiv.org/abs/2401.09670">[Zhong et al. 2024, §1]</a>. Cost per token is then a division:</p>
+
+  <div class="eq-box">
+  \[ \frac{\$}{\text{M output tokens}} = \frac{p_{\text{GPU-h}} \cdot N_{\text{GPU}}}{3600 \cdot (\text{tokens/s within SLO})} \times 10^{6} \]
+  <div class="eq-label">\(p_{\text{GPU-h}}\): price per GPU-hour. The denominator counts only requests that met the SLO.</div>
+  </div>
+
+  <h3 id="cost-numbers">Worked numbers: cost versus batch and context</h3>
+  <p>Take Llama-3-8B in bf16 on one H100 (16.06 GB of weights, 128 KiB of KV per token, 3.35 TB/s; the model from <a href="06-decoding-kv-cache.html#batching">page 06</a>) and an <em>assumed</em> price of $2 per GPU-hour (the H800 lease price DeepSeek assumes in its own accounting; treat it as an assumption, not a quote). Step time is the roofline bound \((16.06\text{ GB} + B\,S\,\kappa)/3.35\text{ TB/s}\), and tokens per second is \(B\) divided by the step time. The batch cap is KV capacity, with 72 GB usable:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Context S</th><th class="num">Batch B</th><th class="num">KV per sequence</th><th class="num">Step time (ms)</th><th class="num">Tokens/s</th><th class="num">$ per M tokens</th></tr></thead>
+    <tbody>
+      <tr><td class="num" rowspan="3">4,096</td><td class="num">1</td><td class="num" rowspan="3">0.54 GB</td><td class="num">4.95</td><td class="num">202</td><td class="num">2.75</td></tr>
+      <tr><td class="num">32</td><td class="num">9.92</td><td class="num">3,225</td><td class="num">0.17</td></tr>
+      <tr class="hl"><td class="num">104 (capacity)</td><td class="num">21.46</td><td class="num">4,846</td><td class="num">0.115</td></tr>
+      <tr><td class="num" rowspan="3">32,768</td><td class="num">1</td><td class="num" rowspan="3">4.29 GB</td><td class="num">6.08</td><td class="num">165</td><td class="num">3.38</td></tr>
+      <tr><td class="num">8</td><td class="num">15.05</td><td class="num">532</td><td class="num">1.05</td></tr>
+      <tr class="hl"><td class="num">13 (capacity)</td><td class="num">21.46</td><td class="num">606</td><td class="num">0.92</td></tr>
+      <tr><td class="num" rowspan="2">131,072</td><td class="num">1</td><td class="num" rowspan="2">17.2 GB</td><td class="num">9.92</td><td class="num">101</td><td class="num">5.51</td></tr>
+      <tr class="hl"><td class="num">3 (capacity)</td><td class="num">20.18</td><td class="num">149</td><td class="num">3.74</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Roofline lower bounds on step time (upper bounds on tokens/s), so real costs are higher. The 32K row with \(B = 8\) has the same step time (15.05 ms) as page 06's 4K row with \(B = 64\): both read 34.4 GB of KV per step.</p>
+
+  <ul>
+    <li><strong>Batching is the first lever.</strong> At 4K context the cost falls 24× (from $2.75 to $0.115) between \(B = 1\) and the capacity limit, because the 16 GB of weights are streamed once for every sequence in the batch.</li>
+    <li><strong>Context is the second.</strong> At capacity, 128K context costs $3.74 per million tokens, 32× the 4K figure: each sequence brings 17.2 GB of KV, so only 3 fit and the KV read, which no batching can amortize, dominates every step.</li>
+    <li><strong>Memory capacity turns into cost.</strong> The capacity limit \(B_{\max}\) is set by how well KV memory is used, which is why PagedAttention and KV quantization (below) are cost techniques, not just memory tricks.</li>
+  </ul>
+
+  <h3 id="cost-anchor">A production anchor: DeepSeek's published accounting</h3>
+  <p>DeepSeek published a 24-hour accounting of its V3/R1 service on H800 GPUs <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[DeepSeek inference system overview, Feb 2025]</a>. The service averaged 226.75 nodes of 8 GPUs; at an assumed $2 per GPU-hour that is \(226.75 \times 8 \times 24 \times 2 = 87{,}072\) dollars per day. It processed 608B input tokens (342B, or 56.3%, hit an on-disk KV cache) and 168B output tokens. Per node it reports about 73.7k input tokens/s during prefill (cache hits included) or about 14.8k output tokens/s during decode. Two checks show the numbers are coherent: \(168\text{B}/14.8\text{k}/3600 = 3{,}153\) node-hours of decode plus \(608\text{B}/73.7\text{k}/3600 = 2{,}292\) of prefill sum to 5,445, against \(226.75 \times 24 = 5{,}442\) available; and pricing the tokens at R1's list prices ($0.14 per M cached input, $0.55 uncached, $2.19 output) gives \(47.9\text{k} + 146.3\text{k} + 367.9\text{k} = 562{,}100\) dollars, matching the reported theoretical revenue of 562,027 dollars.</p>
+  <p>At $16 per node-hour, a node that only decoded at 14.8k tokens/s would cost \(16/(14.8\text{k} \times 3600) \times 10^6 = \$0.30\) per million output tokens, and a node that only prefilled, $0.06 per million input tokens. Decode accounts for 58% of the GPU time and 65% of the revenue. DeepSeek itself calls the revenue figure theoretical, because web and app access is free, V3 is priced lower than R1 and off-peak discounts apply. Use the structure, not the margin: <strong>output tokens dominate both cost and revenue, and a 56% cache hit rate is worth a 3.9× price difference between cached and uncached input</strong>.</p>
+
+  <h3 id="lever-map">Map of the levers</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Lever</th><th>What it attacks</th><th>What it buys</th><th>What it costs</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#continuous">Continuous batching</a></td><td>Slots idle behind the longest request</td><td>Throughput at equal latency</td><td>Scheduler complexity; prefill joins running decodes</td></tr>
+      <tr><td><a href="#paged">PagedAttention</a></td><td>KV fragmentation and duplication</td><td>Batch size (capacity)</td><td>20% to 26% slower attention kernel</td></tr>
+      <tr><td><a href="#prefix">Prefix caching</a></td><td>Recomputing shared prefixes</td><td>TTFT, prefill FLOPs, capacity</td><td>Cache memory; only helps shared prefixes</td></tr>
+      <tr><td><a href="#chunked">Chunked prefill</a></td><td>Long prefills stalling decodes</td><td>Tail TPOT at high throughput</td><td>Chunk overhead; slower TTFT for the chunked prompt</td></tr>
+      <tr><td><a href="#disaggregation">Disaggregation</a></td><td>Prefill/decode interference, coupled parallelism</td><td>Goodput under both SLOs</td><td>KV transfer; two pools to size</td></tr>
+      <tr><td><a href="#quantization">Weight quantization</a></td><td>Weight bytes (decode bandwidth, capacity)</td><td>Tokens/s per GPU, fewer GPUs</td><td>Quality risk; gain fades when compute-bound</td></tr>
+      <tr><td><a href="#quant-kv">KV quantization</a></td><td>KV bytes</td><td>Batch size and bandwidth at long context</td><td>Accuracy on hard tasks</td></tr>
+      <tr><td><a href="#speculative">Speculative decoding</a></td><td>Sequential steps at low batch</td><td>Latency (tokens per weight read)</td><td>Wasted FLOPs; fades at large batch</td></tr>
+      <tr><td><a href="#moe-serving">Expert parallelism</a></td><td>Expert weight reads for MoE</td><td>Cost per token of a large MoE</td><td>All-to-all traffic, load imbalance, big minimum deployment</td></tr>
+      <tr><td><a href="#long-context">Sparse attention, offload</a></td><td>Long-context KV reads</td><td>Context per GPU</td><td>Approximation, PCIe or disk latency</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="batching">Batching and memory management</h2>
+
+  <h3 id="continuous">Static versus continuous batching</h3>
+  <p>A <strong>static</strong> (request-level) batch runs until its longest sequence finishes. Decode steps are memory-bound, so step time barely depends on how many sequences are still alive, and a slot occupied by a finished sequence costs as much as a working one while producing nothing. <strong>Continuous batching</strong> <span class="zh">连续批处理</span>, introduced by Orca as <em>iteration-level scheduling</em>, invokes the model for a single iteration, then returns finished sequences and admits waiting ones before the next iteration <a href="https://www.usenix.org/conference/osdi22/presentation/yu">[Yu et al. 2022, OSDI]</a>. One complication: attention cannot be batched across sequences of different lengths, since their keys and values have different shapes. Orca therefore applies <em>selective batching</em>, batching only the operations that allow it. Concretely, the dense layers (QKV and output projections, the FFN) see one flat matrix of all tokens in the iteration, whatever sequence they belong to, and attention runs per sequence. Orca reports 36.9× the throughput of NVIDIA FasterTransformer at the same latency on GPT-3 175B. That is a comparison against a request-level engine on a workload with variable lengths, so it measures the value of removing idle slots, not a universal constant.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 352" role="img" aria-labelledby="fig-17-1-title">
+<title id="fig-17-1-title">Timeline of 8 requests on 4 batch slots: static batching runs two batches of 4 and takes 15 decode steps; continuous batching refills a slot as soon as its request finishes and takes 10</title>
+<text x="8" y="16" class="s-bold">(a) Static (request-level) batching</text>
+<text x="8" y="43" class="s-small s-muted">slot 1</text>
+<rect class="s-a" x="78" y="28" width="360" height="22" rx="3"/>
+<text x="258.0" y="43" text-anchor="middle" class="s-small s-bold">A (10)</text>
+<rect class="s-e" x="438" y="28" width="108" height="22" rx="3"/>
+<text x="492.0" y="43" text-anchor="middle" class="s-small s-bold">E (3)</text>
+<rect class="s-plain s-dash" x="546" y="28" width="72" height="22" rx="3"/>
+<text x="8" y="69" class="s-small s-muted">slot 2</text>
+<rect class="s-b" x="78" y="54" width="108" height="22" rx="3"/>
+<text x="132.0" y="69" text-anchor="middle" class="s-small s-bold">B (3)</text>
+<rect class="s-plain s-dash" x="186" y="54" width="252" height="22" rx="3"/>
+<text x="312.0" y="69" text-anchor="middle" class="s-small s-muted">idle</text>
+<rect class="s-a" x="438" y="54" width="72" height="22" rx="3"/>
+<text x="474.0" y="69" text-anchor="middle" class="s-small s-bold">F (2)</text>
+<rect class="s-plain s-dash" x="510" y="54" width="108" height="22" rx="3"/>
+<text x="564.0" y="69" text-anchor="middle" class="s-small s-muted">idle</text>
+<text x="8" y="95" class="s-small s-muted">slot 3</text>
+<rect class="s-c" x="78" y="80" width="72" height="22" rx="3"/>
+<text x="114.0" y="95" text-anchor="middle" class="s-small s-bold">C (2)</text>
+<rect class="s-plain s-dash" x="150" y="80" width="288" height="22" rx="3"/>
+<text x="294.0" y="95" text-anchor="middle" class="s-small s-muted">idle</text>
+<rect class="s-b" x="438" y="80" width="180" height="22" rx="3"/>
+<text x="528.0" y="95" text-anchor="middle" class="s-small s-bold">G (5)</text>
+<text x="8" y="121" class="s-small s-muted">slot 4</text>
+<rect class="s-d" x="78" y="106" width="144" height="22" rx="3"/>
+<text x="150.0" y="121" text-anchor="middle" class="s-small s-bold">D (4)</text>
+<rect class="s-plain s-dash" x="222" y="106" width="216" height="22" rx="3"/>
+<text x="330.0" y="121" text-anchor="middle" class="s-small s-muted">idle</text>
+<rect class="s-c" x="438" y="106" width="108" height="22" rx="3"/>
+<text x="492.0" y="121" text-anchor="middle" class="s-small s-bold">H (3)</text>
+<rect class="s-plain s-dash" x="546" y="106" width="72" height="22" rx="3"/>
+<line class="s-line s-dash" x1="618" y1="24" x2="618" y2="132"/>
+<text x="618" y="20" text-anchor="end" class="s-small s-bold">all done at step 15</text>
+<text x="78" y="146" class="s-small s-muted">32 of 60 slot-steps do useful work (53%). E to H wait 10 steps before starting.</text>
+<text x="8" y="180" class="s-bold">(b) Continuous (iteration-level) batching</text>
+<text x="8" y="207" class="s-small s-muted">slot 1</text>
+<rect class="s-a" x="78" y="192" width="360" height="22" rx="3"/>
+<text x="258.0" y="207" text-anchor="middle" class="s-small s-bold">A (10)</text>
+<text x="8" y="233" class="s-small s-muted">slot 2</text>
+<rect class="s-b" x="78" y="218" width="108" height="22" rx="3"/>
+<text x="132.0" y="233" text-anchor="middle" class="s-small s-bold">B (3)</text>
+<rect class="s-a" x="186" y="218" width="72" height="22" rx="3"/>
+<text x="222.0" y="233" text-anchor="middle" class="s-small s-bold">F (2)</text>
+<rect class="s-c" x="258" y="218" width="108" height="22" rx="3"/>
+<text x="312.0" y="233" text-anchor="middle" class="s-small s-bold">H (3)</text>
+<rect class="s-plain s-dash" x="366" y="218" width="72" height="22" rx="3"/>
+<text x="8" y="259" class="s-small s-muted">slot 3</text>
+<rect class="s-c" x="78" y="244" width="72" height="22" rx="3"/>
+<text x="114.0" y="259" text-anchor="middle" class="s-small s-bold">C (2)</text>
+<rect class="s-e" x="150" y="244" width="108" height="22" rx="3"/>
+<text x="204.0" y="259" text-anchor="middle" class="s-small s-bold">E (3)</text>
+<rect class="s-plain s-dash" x="258" y="244" width="180" height="22" rx="3"/>
+<text x="348.0" y="259" text-anchor="middle" class="s-small s-muted">idle</text>
+<text x="8" y="285" class="s-small s-muted">slot 4</text>
+<rect class="s-d" x="78" y="270" width="144" height="22" rx="3"/>
+<text x="150.0" y="285" text-anchor="middle" class="s-small s-bold">D (4)</text>
+<rect class="s-b" x="222" y="270" width="180" height="22" rx="3"/>
+<text x="312.0" y="285" text-anchor="middle" class="s-small s-bold">G (5)</text>
+<rect class="s-plain s-dash" x="402" y="270" width="36" height="22" rx="3"/>
+<line class="s-line s-dash" x1="438" y1="188" x2="438" y2="296"/>
+<text x="438" y="184" text-anchor="end" class="s-small s-bold">all done at step 10</text>
+<text x="78" y="310" class="s-small s-muted">32 of 40 slot-steps (80%). E to H start at steps 2, 3, 4 and 5.</text>
+<line class="s-line" x1="78" y1="330" x2="78" y2="335"/>
+<text x="78" y="346" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" x1="258" y1="330" x2="258" y2="335"/>
+<text x="258" y="346" text-anchor="middle" class="s-small s-muted">5</text>
+<line class="s-line" x1="438" y1="330" x2="438" y2="335"/>
+<text x="438" y="346" text-anchor="middle" class="s-small s-muted">10</text>
+<line class="s-line" x1="618" y1="330" x2="618" y2="335"/>
+<text x="618" y="346" text-anchor="middle" class="s-small s-muted">15</text>
+<line class="s-line" x1="78" y1="335" x2="618" y2="335"/>
+<text x="634" y="346" class="s-small s-muted">decode steps</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Eight requests (letter, output length in tokens) on four batch slots. Static batching (top) runs two batches of four and each takes as long as its longest member: 15 steps, 53% of slot-steps useful. Continuous batching (bottom) refills a slot the step after its request finishes: 10 steps, 80% useful, and the last four requests start after 2 to 5 steps instead of 10. Each decode step is assumed to cost the same, which is the memory-bound regime. A joining request also needs its prefill in the iteration it enters, which the figure omits.</figcaption>
+  </figure>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p>In the memory-bound regime the cost of a decode step is almost independent of how many slots are useful, so <strong>slot utilization is cost</strong>. Continuous batching converts the variance in output lengths from wasted slots into throughput. Once it is in place, the interesting scheduling questions are what to put into each iteration (prefill chunks, decodes, speculative tokens) and how much KV memory that iteration may hold.</p>
+  </aside>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Jets have variable numbers of constituents, and you handled that by padding or masking to a maximum. Static LLM batching is the same idea, padding in <em>time</em>: every sequence occupies its slot until the longest one ends. Two things differ. A jet's size is known before the forward pass, while an output's length is not. And a tagger's padded slots are wasted once, in one forward pass, whereas in a decode loop they are wasted at every step, which is why serving engines re-form the batch every iteration.</p>
+  </aside>
+
+  <h3 id="paged">PagedAttention</h3>
+  <p>Continuous batching keeps slots busy only if enough sequences fit in memory, and the KV cache decides that (<a href="06-decoding-kv-cache.html#kv-size">page 06</a>). For OPT-13B one token needs 800 KB of KV, so a 2,048-token request needs up to 1.6 GB <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §3]</a>. Frameworks want each sequence's KV as one contiguous tensor, and output length is unknown in advance, so earlier systems reserved room for the maximum length. That produces three kinds of waste: <em>reservation</em> (slots that will be used later but block other requests meanwhile), <em>internal fragmentation</em> (slots never used) and <em>external fragmentation</em> (allocator gaps). Kwon et al. measured that only 20.4%, 26.8% and 38.2% of KV memory held real token states in three Orca variants (labelled Max, Pow2 and Oracle in their figure), against 96.3% for vLLM <a href="https://arxiv.org/abs/2309.06180">[Fig. 2]</a>.</p>
+
+  <p><strong>PagedAttention</strong> <span class="zh">分页注意力</span> borrows virtual memory from operating systems. The KV cache is split into fixed-size <em>blocks</em> (16 tokens by default in vLLM) allocated on demand. Each sequence has a <em>block table</em> mapping its logical blocks to physical ones, and the attention kernel gathers keys and values through that table, so they need not be contiguous. Waste is limited to the unfilled tail of each sequence's last block, and because all blocks have one size there is no external fragmentation. Blocks also carry a <em>reference count</em>, which enables sharing: parallel samples from one prompt map the same physical prompt blocks, and when a sample must write into a shared block it gets a private copy first (<strong>copy-on-write</strong>). Beam search forks the same way, and only the last, partly filled block is ever copied.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 384" role="img" aria-labelledby="fig-17-2-title">
+<title id="fig-17-2-title">PagedAttention: two samples of one request map logical KV blocks to physical blocks through block tables; the shared prompt block has reference count 2, and the partly filled last block is copied when the first sample writes to it</title>
+<defs><marker id="arrow-17-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="14" y="22" class="s-bold">Sample 1 block table</text>
+<text x="14" y="38" class="s-small s-muted">logical block → physical block</text>
+<rect class="s-a" x="14" y="48" width="214" height="28" rx="4"/>
+<text x="22" y="66" class="s-small">logical 0 (t1-t4, full)</text>
+<text x="220" y="66" text-anchor="end" class="s-small s-bold">physical 1</text>
+<rect class="s-a" x="14" y="82" width="214" height="28" rx="4"/>
+<text x="22" y="100" class="s-small">logical 1 (t5-t7, 3 of 4)</text>
+<text x="220" y="100" text-anchor="end" class="s-small s-bold">physical 0</text>
+<text x="250" y="22" class="s-bold">Sample 2 block table</text>
+<text x="250" y="38" class="s-small s-muted">logical block → physical block</text>
+<rect class="s-b" x="250" y="48" width="214" height="28" rx="4"/>
+<text x="258" y="66" class="s-small">logical 0 (t1-t4, full)</text>
+<text x="456" y="66" text-anchor="end" class="s-small s-bold">physical 1</text>
+<rect class="s-b" x="250" y="82" width="214" height="28" rx="4"/>
+<text x="258" y="100" class="s-small">logical 1 (t5-t7, 3 of 4)</text>
+<text x="456" y="100" text-anchor="end" class="s-small s-bold">physical 2</text>
+<text x="482" y="22" class="s-bold">Steps</text>
+<text x="482" y="40" class="s-small">1. Prefill writes the prompt blocks</text>
+<text x="482" y="55" class="s-small">   once; both samples map to them</text>
+<text x="482" y="70" class="s-small">   (ref = 2).</text>
+<text x="482" y="85" class="s-small">2. Sample 1 appends u to logical</text>
+<text x="482" y="100" class="s-small">   block 1, but ref &gt; 1: allocate</text>
+<text x="482" y="115" class="s-small">   physical 0, copy t5-t7, ref(old) = 1.</text>
+<text x="482" y="130" class="s-small">3. Sample 2 now owns physical 2</text>
+<text x="482" y="145" class="s-small">   alone and appends v in place.</text>
+<rect class="s-a" x="14" y="214" width="132" height="44" rx="5"/>
+<rect class="s-plain" x="22" y="223" width="26" height="26" rx="3"/>
+<text x="35" y="240" text-anchor="middle" class="s-small">t5</text>
+<rect class="s-plain" x="51" y="223" width="26" height="26" rx="3"/>
+<text x="64" y="240" text-anchor="middle" class="s-small">t6</text>
+<rect class="s-plain" x="80" y="223" width="26" height="26" rx="3"/>
+<text x="93" y="240" text-anchor="middle" class="s-small">t7</text>
+<rect class="s-plain" x="109" y="223" width="26" height="26" rx="3"/>
+<text x="122" y="240" text-anchor="middle" class="s-small">u</text>
+<text x="80.0" y="274" text-anchor="middle" class="s-small s-bold">physical 0 · ref 1</text>
+<text x="80.0" y="289" text-anchor="middle" class="s-small s-muted">sample 1, private copy</text>
+<rect class="s-c" x="154" y="214" width="132" height="44" rx="5"/>
+<rect class="s-plain" x="162" y="223" width="26" height="26" rx="3"/>
+<text x="175" y="240" text-anchor="middle" class="s-small">t1</text>
+<rect class="s-plain" x="191" y="223" width="26" height="26" rx="3"/>
+<text x="204" y="240" text-anchor="middle" class="s-small">t2</text>
+<rect class="s-plain" x="220" y="223" width="26" height="26" rx="3"/>
+<text x="233" y="240" text-anchor="middle" class="s-small">t3</text>
+<rect class="s-plain" x="249" y="223" width="26" height="26" rx="3"/>
+<text x="262" y="240" text-anchor="middle" class="s-small">t4</text>
+<text x="220.0" y="274" text-anchor="middle" class="s-small s-bold">physical 1 · ref 2</text>
+<text x="220.0" y="289" text-anchor="middle" class="s-small s-muted">shared prompt block</text>
+<rect class="s-b" x="294" y="214" width="132" height="44" rx="5"/>
+<rect class="s-plain" x="302" y="223" width="26" height="26" rx="3"/>
+<text x="315" y="240" text-anchor="middle" class="s-small">t5</text>
+<rect class="s-plain" x="331" y="223" width="26" height="26" rx="3"/>
+<text x="344" y="240" text-anchor="middle" class="s-small">t6</text>
+<rect class="s-plain" x="360" y="223" width="26" height="26" rx="3"/>
+<text x="373" y="240" text-anchor="middle" class="s-small">t7</text>
+<rect class="s-plain" x="389" y="223" width="26" height="26" rx="3"/>
+<text x="402" y="240" text-anchor="middle" class="s-small">v</text>
+<text x="360.0" y="274" text-anchor="middle" class="s-small s-bold">physical 2 · ref 1</text>
+<text x="360.0" y="289" text-anchor="middle" class="s-small s-muted">sample 2</text>
+<rect class="s-plain s-dash" x="434" y="214" width="132" height="44" rx="5"/>
+<rect class="s-plain" x="442" y="223" width="26" height="26" rx="3"/>
+<rect class="s-plain" x="471" y="223" width="26" height="26" rx="3"/>
+<rect class="s-plain" x="500" y="223" width="26" height="26" rx="3"/>
+<rect class="s-plain" x="529" y="223" width="26" height="26" rx="3"/>
+<text x="500.0" y="274" text-anchor="middle" class="s-small s-bold">physical 3 · free</text>
+<text x="500.0" y="289" text-anchor="middle" class="s-small s-muted">available to any sequence</text>
+<rect class="s-box" x="574" y="214" width="132" height="44" rx="5"/>
+<rect class="s-plain" x="582" y="223" width="26" height="26" rx="3"/>
+<text x="595" y="240" text-anchor="middle" class="s-small">r1</text>
+<rect class="s-plain" x="611" y="223" width="26" height="26" rx="3"/>
+<text x="624" y="240" text-anchor="middle" class="s-small">r2</text>
+<rect class="s-plain" x="640" y="223" width="26" height="26" rx="3"/>
+<text x="653" y="240" text-anchor="middle" class="s-small">r3</text>
+<rect class="s-plain" x="669" y="223" width="26" height="26" rx="3"/>
+<text x="640.0" y="274" text-anchor="middle" class="s-small s-bold">physical 4 · ref 1</text>
+<text x="640.0" y="289" text-anchor="middle" class="s-small s-muted">another request</text>
+<path class="s-line-a" d="M228,62 L236,62 L236,184 L238.0,184 L238.0,214" marker-end="url(#arrow-17-2)" fill="none"/>
+<path class="s-line-a" d="M154,110 L154,166 L80.0,166 L80.0,214" marker-end="url(#arrow-17-2)" fill="none"/>
+<path class="s-line-b" d="M250,62 L244,62 L244,196 L260.0,196 L260.0,214" marker-end="url(#arrow-17-2)" fill="none"/>
+<path class="s-line-b" d="M390,110 L390,166 L360.0,166 L360.0,214" marker-end="url(#arrow-17-2)" fill="none"/>
+<text x="14" y="316" class="s-bold">Physical KV blocks in GPU memory (4 slots each here, 16 in vLLM)</text>
+<text x="14" y="336" class="s-small">Waste per sequence is at most one partly filled block (block size minus 1 slots).</text>
+<text x="14" y="352" class="s-small">Nothing is reserved for tokens that do not exist yet, and attention kernels follow the block table,</text>
+<text x="14" y="368" class="s-small">so a sequence needs no contiguous memory. t1-t7: prompt tokens. u, v: new tokens. r1-r3: another request.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Two samples share the 7-token prompt. Prefill fills the physical prompt blocks once. When sample 1 appends its first new token, the block it must write to has reference count 2, so it copies the block and writes there. Sample 2 then owns the original alone. Block size 4 for legibility; vLLM uses 16. Only physical block 1 is shared for the whole prompt, and no memory is reserved for tokens that have not been generated.</figcaption>
+  </figure>
+
+<pre><code class="language-python">class BlockManager:
+    def __init__(self, n_blocks, block_size=16):
+        self.free = list(range(n_blocks)); self.ref = [0] * n_blocks; self.bs = block_size
+        self.table, self.length = {}, {}         # seq_id -> [physical block ids], seq_id -> tokens stored
+
+    def append_token(self, seq):
+        n = self.length.get(seq, 0)
+        if n % self.bs == 0:                     # no partly filled block: allocate a fresh one
+            b = self.free.pop(); self.ref[b] = 1
+            self.table.setdefault(seq, []).append(b)
+        else:
+            b = self.table[seq][-1]
+            if self.ref[b] > 1:                  # shared with a forked sequence: copy on write
+                nb = self.free.pop(); self.ref[b] -= 1; self.ref[nb] = 1
+                copy_block(src=b, dst=nb)        # placeholder for a GPU copy of at most bs tokens of K/V
+                self.table[seq][-1] = b = nb
+        self.length[seq] = n + 1
+        return b, n % self.bs                    # physical block and slot where the kernel writes this token
+
+    def fork(self, parent, child):               # parallel sampling or beam search: share every block
+        self.table[child] = list(self.table[parent]); self.length[child] = self.length[parent]
+        for b in self.table[parent]: self.ref[b] += 1
+
+    def free_seq(self, seq):
+        for b in self.table.pop(seq):
+            self.ref[b] -= 1
+            if self.ref[b] == 0: self.free.append(b)
+        del self.length[seq]
+</code></pre>
+  <p>When the free list runs empty the scheduler must preempt a sequence, either by moving its blocks out of GPU memory or by dropping them and redoing the work later <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §3]</a>.</p>
+
+  <h3 id="paged-numbers">Worked numbers: how much memory does paging save?</h3>
+  <p>Assumptions (illustrative, not measured): Llama-3-8B (128 KiB of KV per token), <code>max_model_len</code> 4,096, and final sequence lengths (prompt plus output) drawn from a lognormal distribution with median 600 tokens and \(\sigma = 0.8\), clipped to [16, 4096], giving a mean of 813 tokens and a 95th percentile of 2,222. Contiguous reservation gives every request 4,096 slots; the paged allocator gives each \(\lceil L/16 \rceil \times 16\).</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Allocation policy</th><th class="num">Useful fraction of KV memory</th><th class="num">Waste</th></tr></thead>
+    <tbody>
+      <tr><td>Contiguous, reserve 4,096 tokens</td><td class="num">19.8%</td><td class="num">80.2%</td></tr>
+      <tr class="hl"><td>Paged, 16-token blocks</td><td class="num">99.1%</td><td class="num">0.9% (7.4 tokens per sequence)</td></tr>
+      <tr><td>Paged, 64-token blocks</td><td class="num">96.3%</td><td class="num">3.7%</td></tr>
+      <tr><td>Paged, 256-token blocks</td><td class="num">86.6%</td><td class="num">13.4%</td></tr>
+    </tbody>
+  </table></div>
+  <p>The contiguous figure is close to the 20.4% Kwon et al. measured for max-length reservation, though this model is a caricature: it uses final lengths, and at any instant running sequences are shorter than their final length, which makes reservation look even worse and the paged tail relatively larger. In a 52 GiB KV budget the contiguous scheme fits \(52 \cdot 1024 / (4096 \cdot 0.125) = 104\) sequences. The paged scheme fits \(53{,}248\text{ MiB} / (820 \times 0.125\text{ MiB}) \approx 519\), about 5× as many. Block size is a real trade-off: small blocks waste less, but a kernel that reads 1 or 2 tokens per block cannot use the GPU's parallelism, and larger blocks reduce sharing. Kwon et al. found 16 large enough to run efficiently and small enough to avoid fragmentation in most workloads, and that short-sequence traces (Alpaca) degraded with big blocks <a href="https://arxiv.org/abs/2309.06180">[§7.2, Fig. 18]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">PagedAttention</div>
+    <dl>
+      <dt>Problem</dt><dd>Contiguous per-request KV reservations waste 62% to 80% of memory (fragmentation, reservation) and cannot share prompts between samples, which caps the batch size and so the throughput.</dd>
+      <dt>Idea</dt><dd>Store KV in fixed-size blocks allocated on demand, indexed by a per-sequence block table, with reference counts and copy-on-write.</dd>
+      <dt>Why it works</dt><dd>Decode is memory-bound and throughput scales with batch size until KV capacity or bandwidth binds. Recovering wasted capacity directly enlarges the batch. Sharing is free because equal prefixes have equal KV.</dd>
+      <dt>Evidence</dt><dd>96.3% useful KV memory versus 20.4% to 38.2% in Orca variants; 2 to 4× throughput over FasterTransformer and Orca at similar latency; 2.2× and 4.3× more concurrent requests than Orca (Oracle) and Orca (Max) on OPT-13B; beam search saves 37.6% to 55.2% of blocks on Alpaca <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, Fig. 2, 13, 15]</a>.</dd>
+      <dt>Cost</dt><dd>The attention kernel is 20% to 26% slower than FasterTransformer's because of block-table indirection and variable lengths <a href="https://arxiv.org/abs/2309.06180">[§7.1]</a>. That is a good trade only because attention is a small part of decode time at moderate context and capacity buys a much larger batch.</dd>
+      <dt>Used by</dt><dd>vLLM. SGLang's RadixAttention stores KV in the same kind of non-contiguous paged layout with 1-token pages <a href="https://arxiv.org/abs/2312.07104">[Zheng et al. 2023, §3]</a>, and DistServe and Sarathi-Serve build on vLLM's implementation.</dd>
+    </dl>
+  </div>
+
+  <h3 id="prefix">Prefix caching and RadixAttention</h3>
+  <p>A token's keys and values depend only on the tokens before it, so two requests that start with the same tokens (system prompt, few-shot examples, a shared document, earlier chat turns) have identical KV for that prefix and can share it <span class="zh">前缀缓存</span>. There are two common index structures. A <em>hash chain</em> keys each block by a hash of its tokens concatenated with the previous block's key, so a lookup walks the request's blocks until the first miss (the scheme Mooncake describes, noting that vLLM implements similar local reuse <a href="https://arxiv.org/abs/2407.00079">[Qin et al., §6.1]</a>). SGLang's <strong>RadixAttention</strong> keeps a <em>radix tree</em> over token sequences whose edges carry token runs, with LRU eviction of leaves first (so a shared ancestor survives until its last descendant is evicted) and per-node reference counters that protect nodes used by the running batch. The cache shares one memory pool with running requests, so cached tokens are evicted whenever a larger batch needs the room <a href="https://arxiv.org/abs/2312.07104">[Zheng et al. 2023, §3]</a>.</p>
+  <p>Two refinements matter. <em>Cache-aware scheduling</em> runs waiting requests in longest-shared-prefix-first order, which is a depth-first traversal of the radix tree and achieves the optimal hit rate offline when the cache holds at least the longest request (Theorem 3.1), at the risk of starving unlucky requests. And distributed serving needs affinity: SGLang keeps a meta-tree at the router to send requests to the worker holding their prefix, trading data locality against load balance <a href="https://arxiv.org/abs/2312.07104">[App. A.4]</a>.</p>
+  <p>Reported numbers: up to 6.4× throughput across SGLang's workloads (the gain combines KV reuse with other runtime optimizations), hit rates of 52.4% (LLaVA-NeXT-34B) and 74.1% (Vicuna-33B) in the Chatbot Arena deployment with 1.7× lower first-token latency for Vicuna-33B, and under 0.3% overhead when nothing is reusable (0.2 s of tree management in a 74.3 s run) <a href="https://arxiv.org/abs/2312.07104">[§6]</a>. Real traffic can be less friendly: Mooncake found that in Kimi's traces at most about 50% of KV blocks are reusable even with infinite storage, though some products reach 90% <a href="https://arxiv.org/abs/2407.00079">[§9]</a>. On the price side, DeepSeek's 56.3% hit rate and its $0.14 versus $0.55 per million tokens for cached versus uncached input make caching a billing feature, and DeepSeek-V4 stores compressed KV entries on disk for exactly this purpose <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.5.2]</a>.</p>
+  <p>What it does <em>not</em> do: each decode step still reads the whole KV cache, so prefix caching improves TTFT, prefill FLOPs and capacity (shared blocks are stored once, which enlarges the batch), but not the per-token cost of a step.</p>
+
+  <h3 id="chunked">Chunked prefill and stall-free batching</h3>
+  <p>Continuous batching admits a new request by running its prefill in an iteration. A long prompt makes that iteration take much longer than a decode step, and every decode in the batch waits: TPOT spikes for all users. Sarathi-Serve calls this a <em>generation stall</em> and finds prefill-prioritizing schedulers (Orca, vLLM) prone to them, with stalls of several seconds <a href="https://arxiv.org/abs/2403.02310">[Agrawal et al. 2024, §3.2, Fig. 1]</a>. Its measurements of LLaMA-2-70B show why there is room to fix this: while a batch has fewer tokens than the compute-bound threshold, its execution time is nearly flat, since weights dominate the time. A decode-only batch is far below that threshold, so it can carry extra prefill tokens almost for free.</p>
+  <p><strong>Chunked prefill</strong> <span class="zh">分块预填充</span> exploits this. Split each prompt into chunks and build every iteration as: all running decodes, then a prefill chunk that fills the remaining <em>token budget</em> \(\tau\) (<strong>stall-free batching</strong>). Each iteration then has a bounded, near-uniform cost, independent of prompt length. Choosing \(\tau\) is a trade-off: smaller \(\tau\) gives lower per-iteration latency (better TPOT), but more chunks, each re-reading the KV of all earlier chunks of the same prompt (an \(N\)-chunk prompt does \(N(N-1)/2\) chunk-sized KV reads, though prefill attention stays compute-bound) and a lower GPU efficiency when the batch drops below the ridge point. Tile quantization is a concrete hazard: a chunk of 257 tokens can cost 32% more than one of 256. Sarathi-Serve finds the compute-bound threshold near 200 tokens on A100 in theory and 500 to 600 in practice with high tensor-parallel degree, and picks \(\tau\) by profiling against the TPOT SLO <a href="https://arxiv.org/abs/2403.02310">[§4.3]</a>. On an H100 in bf16 the ridge is about 295 tokens (page 06), so budgets of a few hundred to a couple of thousand tokens are typical.</p>
+  <p>Numbers: hybrid batching with an unchunked prompt raises time-between-tokens by up to 28.3× over a decode-only batch, and stall-free batching raises serving capacity under tail-latency SLOs by 2.6× (Mistral-7B, one A100), 3.7× (Yi-34B, two A100s) and 5.6× (Falcon-180B with pipeline parallelism, where uniform iterations also remove pipeline bubbles), all relative to vLLM <a href="https://arxiv.org/abs/2403.02310">[Agrawal et al. 2024, Fig. 9, Abstract]</a>. The limitation, which motivates the next section: chunking only <em>reduces</em> interference. DistServe argues it trades TTFT for TPOT and cannot eliminate the coupling <a href="https://arxiv.org/abs/2401.09670">[Zhong et al. 2024, §2.2]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Chunked prefill with stall-free batching</div>
+    <dl>
+      <dt>Problem</dt><dd>A long prefill in the same iteration as decodes stalls them for its full duration, spiking TPOT; the alternative (prefill only when the batch is empty) wastes throughput.</dd>
+      <dt>Idea</dt><dd>Cap the tokens per iteration at a budget \(\tau\). Fill it with all running decodes first, then with a chunk of a pending prompt.</dd>
+      <dt>Why it works</dt><dd>Below the ridge point an iteration's time is set by streaming weights, so decode tokens leave compute idle that prefill tokens can use without lengthening the step. Uniform iterations also help pipeline parallelism.</dd>
+      <dt>Evidence</dt><dd>2.6× to 5.6× serving capacity under SLOs versus vLLM; up to 28.3× TBT inflation avoided <a href="https://arxiv.org/abs/2403.02310">[Sarathi-Serve, Fig. 9, Abstract]</a>.</dd>
+      <dt>Cost</dt><dd>A prompt's TTFT grows because its prefill is spread over many iterations, KV is re-read per chunk, and tile quantization punishes odd chunk sizes. Interference is bounded, not removed.</dd>
+      <dt>Used by</dt><dd>Sarathi-Serve, and chunked prefill as a scheduling option in vLLM and SGLang <span class="unverified" title="Widely documented in engine docs, but I did not fetch them for this page; the primary source verified here is Sarathi-Serve, and DistServe describes DeepSpeed-MII as chunking prompts.">(both expose it as a scheduler option)</span>; Mooncake's prefill nodes chunk and pipeline long prompts <a href="https://arxiv.org/abs/2407.00079">[§5]</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="disaggregation">Prefill/decode disaggregation</h2>
+
+  <p>Prefill is compute-bound (the weight-matmul intensity equals the prompt length, thousands of tokens against an H100 ridge of about 295) and decode is memory-bound (intensity equals the batch size). Co-locating them on one GPU, as continuous batching does, has two costs that DistServe names <a href="https://arxiv.org/abs/2401.09670">[Zhong et al. 2024, §1, §2.3]</a>. First, <em>interference</em>: a prefill step takes far longer than a decode step, so decodes batched with it see their TPOT stretched, while decodes riding along slow the prefill and raise TTFT. Second, <em>coupling</em>: one resource allocation and one parallelism plan must serve two phases that want different ones. <strong>Prefill-decode disaggregation</strong> <span class="zh">预填充-解码分离</span> gives each phase its own GPUs. The prefill instance computes the prompt's KV cache and first token, ships the KV cache to a decode instance, and the decode instance runs the token loop.</p>
+
+  <h3 id="disagg-goodput">Why it raises goodput: DistServe's example</h3>
+  <p>DistServe's motivating measurement uses a 13B model on 80 GB A100s, 512-token inputs and 64-token outputs, and a 90% SLO attainment target. A single GPU serving both phases sustains 1.6 requests per second within the SLO. A GPU doing only prefill sustains 5.6 requests per second and one doing only decode sustains 10. Provision <strong>two prefill GPUs and one decode GPU</strong>: prefill capacity is \(2 \times 5.6 = 11.2\) requests per second, decode capacity is 10, so the system serves 10 requests per second on 3 GPUs, or 3.3 per GPU: <strong>2.1× the goodput</strong> of colocation <a href="https://arxiv.org/abs/2401.09670">[Zhong et al. 2024, §1, Fig. 1]</a>. Across chatbot, code-completion and summarization workloads on OPT models, DistServe reports serving up to 7.4× more requests (against DeepSpeed-MII) or meeting a 12.6× tighter SLO (against vLLM) while keeping over 90% of requests within their latency constraints. Against vLLM alone the request-rate gains are 2.0 to 4.6× for the chatbot workload and 4.3× for summarization <a href="https://arxiv.org/abs/2401.09670">[§6.2]</a>.</p>
+  <p>The two phases also prefer different parallelism. Prefill wants low per-prompt latency, so intra-operator (tensor) parallelism that shortens execution helps TTFT. Decode wants a large batch and enough memory for KV. For OPT-175B DistServe's placement search chose different plans for the two instance types: pipeline degree 3 with tensor degree 3 for prefill, and 3 with 4 for decode <a href="https://arxiv.org/abs/2401.09670">[§6.2]</a>. DeepSeek-V3's deployment is the same idea at scale (below).</p>
+  <p>Splitwise makes the hardware argument. The token phase does not need the newest compute: its clusters can use older or power-capped GPUs. Splitwise-designed clusters reach up to 1.4× the throughput at 20% lower cost than a homogeneous cluster, or 2.35× the throughput under the same power and cost budgets <a href="https://arxiv.org/abs/2311.18677">[Patel et al. 2023, Abstract]</a>.</p>
+
+  <h3 id="kv-transfer">The price: moving the KV cache</h3>
+  <p>The transfer is \(\text{KV bytes per token} \times \text{prompt tokens} / \text{link bandwidth}\). For Llama-3-70B (80 layers, 8 KV heads of 128, bf16: 320 KiB per token) a 2,048-token prompt is 671 MB. On one 400 Gb/s (50 GB/s) InfiniBand link that is 13 ms, and on 25 Gb/s Ethernet 215 ms. The prefill itself costs \(2 N T = 2.89 \times 10^{14}\) FLOPs, or about 73 ms on 8 H100s at 50% of peak, so a fast fabric makes the transfer a modest fraction of prefill and a slow one makes it dominant. Architecture matters here too: DeepSeek-V3's MLA cache (70,272 B per token, <a href="07-kv-efficient-attention.html#mla-numbers">page 07</a>) makes the same prompt 144 MB, 4.7× smaller.</p>
+  <p>Measured overheads are small when the placement is careful. Splitwise streams each layer's KV asynchronously while the next layer computes; the visible overhead is about 5 ms on H100 and 8 ms on A100, under 7% of prompt computation time, and the second token is 16.5% slower instead of 64% with a serialized transfer <a href="https://arxiv.org/abs/2311.18677">[Patel et al. 2023, §VI-A]</a>. DistServe keeps matching prefill and decode stages on the same node so the transfer uses NVLink; for OPT-175B the transfer is under 0.1% of total latency and over 95% of requests see less than 30 ms even though the cross-node network is only 25 Gb/s <a href="https://arxiv.org/abs/2401.09670">[§6.3]</a>.</p>
+
+  <h3 id="disagg-prod">In production: Mooncake and DeepSeek-V3</h3>
+  <p><strong>Mooncake</strong>, the serving platform of Moonshot's Kimi, is disaggregated and <em>KV-cache-centric</em>: separate prefill and decode pools plus a distributed KV pool built from the GPU nodes' otherwise idle CPU memory, SSD and RDMA network. A global scheduler picks a (prefill, decode) pair per request to maximize prefix reuse subject to TTFT and TBT SLOs, long prompts are prefilled with chunked pipeline parallelism across nodes, and KV is streamed layer by layer to the decode node. Because real deployments are overloaded, it also predicts decode-slot availability and rejects requests <em>before</em> prefill when they could not finish, to avoid wasting prefill compute. Against vLLM it reports up to 525% higher throughput in simulated long-context scenarios (50% to 525%) and 75% more requests on real Kimi traces at the same SLOs; the experiments use a dummy model with LLaMA2-70B's architecture <a href="https://arxiv.org/abs/2407.00079">[Qin et al. 2024, §1, §8]</a>.</p>
+  <p><strong>DeepSeek-V3</strong> separates the stages "to simultaneously ensure both the SLO for online services and high throughput" and parallelizes them differently <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.4]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Prefill unit</th><th>Decode unit</th></tr></thead>
+    <tbody>
+      <tr><td>Size (V3 report)</td><td>4 nodes, 32 GPUs</td><td>40 nodes, 320 GPUs</td></tr>
+      <tr><td>Attention</td><td>TP4 with sequence parallelism, DP8</td><td>TP4 with sequence parallelism, DP80</td></tr>
+      <tr><td>MoE</td><td>EP32; 32 redundant experts (each GPU hosts its 8 experts plus 1 redundant)</td><td>EP320; one expert per GPU, 64 GPUs host redundant and shared experts</td></tr>
+      <tr><td>Overlap</td><td>two micro-batches: one's attention and MoE hide the other's dispatch and combine</td><td>attention of one micro-batch overlaps dispatch, MoE and combine of another (explored in the report; a 5-stage pipeline in production)</td></tr>
+      <tr><td>Production (Feb 2025)</td><td>EP32, DP32, 4 nodes (9 routed and 1 shared expert per GPU)</td><td>EP144, DP144, 18 nodes (2 routed and 1 shared expert per GPU)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: V3 report §3.4.1 and §3.4.2 for the first four rows; the DeepSeek inference system overview for the production row. The report calls its own decode unit "relatively large" for small teams (§6), and the later production system used a smaller decode unit, so treat 320 GPUs as the published reference design, not the only one.</p>
+
+  <div class="decision">
+    <div class="decision-title">Prefill/decode disaggregation</div>
+    <dl>
+      <dt>Problem</dt><dd>Colocated prefill and decode interfere (each phase's latency depends on the other's batch), and both are forced onto one parallelism plan and one GPU type.</dd>
+      <dt>Idea</dt><dd>Run prefill and decode on separate GPU pools and transfer the KV cache between them, sizing and parallelizing each pool for its own SLO.</dd>
+      <dt>Why it works</dt><dd>Removing the interference lets each pool run near its own efficient operating point, and goodput is limited by the slower phase per GPU, which the 2:1 style allocation balances.</dd>
+      <dt>Evidence</dt><dd>2.1× goodput in DistServe's example, up to 7.4× requests or 12.6× tighter SLO <a href="https://arxiv.org/abs/2401.09670">[DistServe]</a>; 1.4× throughput at 20% lower cost <a href="https://arxiv.org/abs/2311.18677">[Splitwise]</a>; 75% more real requests <a href="https://arxiv.org/abs/2407.00079">[Mooncake]</a>.</dd>
+      <dt>Cost</dt><dd>KV transfer bandwidth and latency; two pools whose ratio must track the prompt/output mix (DistServe simulates the workload to choose it; Mooncake presets it); weights held twice; more moving parts. It pays least when prompts are short, when prefix-cache hit rates are high (little prefill left), or when the cluster is too small to split.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3/R1 serving, Mooncake (Kimi), and the DistServe and Splitwise research systems.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="quantization">Quantization</h2>
+
+  <h3 id="quant-what">What can be quantized, and what each choice helps</h3>
+  <p><strong>Quantization</strong> <span class="zh">量化</span> stores numbers in fewer bits. Three tensors can be quantized, and they attack different bottlenecks, which is why a scheme is named WxAy (x-bit weights, y-bit activations) plus a KV format:</p>
+  <ul>
+    <li><strong>Weights</strong> are static and read once per decode step. Fewer bits cut the bytes streamed (decode bandwidth) and the capacity needed. Because they are known offline, expensive calibration is affordable.</li>
+    <li><strong>Activations</strong> only matter for speed if <em>both</em> matmul operands are low precision, so the tensor cores can run their faster INT8 or FP8 mode. That helps compute-bound phases (prefill, large batch). Activations are dynamic and have outliers.</li>
+    <li><strong>The KV cache</strong> is read per token per sequence, so it dominates at long context and large batch. New entries arrive online, which constrains the algorithms.</li>
+  </ul>
+  <p>The basic uniform quantizer maps \(x\) to \(Q(x) = \Delta \cdot \operatorname{round}(x/\Delta)\) with \(\Delta = \max|x| / (2^{N-1} - 1)\), using one scale per tensor, per channel or per group of \(g\) values. Finer scales confine outliers but cost bits: with \(g = 128\) and an fp16 scale a "4-bit" weight costs \(4 + 16/128 = 4.125\) bits (4.25 with an fp16 zero point). Post-training quantization (PTQ) <span class="zh">训练后量化</span> converts a trained model with a small calibration set (GPTQ, AWQ, SmoothQuant below). Quantization-aware training (QAT) <span class="zh">量化感知训练</span> trains or fine-tunes with the quantizer in the loop; it is how Gemma 4 ships its quantized checkpoints and how DeepSeek-V4 obtains FP4 experts <a href="https://arxiv.org/abs/2607.02770">[Gemma 4 report, §2.5]</a>, <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.2.1]</a>.</p>
+
+  <h3 id="quant-arith">The arithmetic: INT4 weights for a 70B model, and where the gain stops</h3>
+  <p>Llama-3-70B has 80 layers, \(d = 8192\), \(n_{kv} = 8\), \(d_{ff} = 28672\), \(V = 128{,}256\), which gives \(N = 70.55\)B parameters (from the same accounting as page 04). At batch 1 each token reads every weight once, so on an H100 (3.35 TB/s, 80 GB):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th class="num">bf16</th><th class="num">INT4, group 128 (W4A16)</th></tr></thead>
+    <tbody>
+      <tr><td>Weight bytes</td><td class="num">141.1 GB</td><td class="num">36.4 GB (4.125 bits per weight)</td></tr>
+      <tr><td>GPUs needed for weights alone</td><td class="num">2 (70.6 GB each)</td><td class="num">1</td></tr>
+      <tr><td>Weight-read time per token at batch 1</td><td class="num">21.1 ms on each of 2 GPUs</td><td class="num">10.9 ms on 1 GPU</td></tr>
+      <tr><td>Upper bound on tokens/s</td><td class="num">47</td><td class="num">92</td></tr>
+      <tr class="hl"><td>Tokens/s per GPU</td><td class="num">23.7</td><td class="num">92.1 (3.9×)</td></tr>
+      <tr><td>Memory left for KV (73.6 GB usable per GPU)</td><td class="num">6.1 GB on 2 GPUs: 4 sequences of 4K</td><td class="num">37.2 GB on 1 GPU: 27 sequences of 4K</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Assumptions: 92% of HBM usable, KV in bf16 (327,680 B per token, 1.34 GB per 4K sequence), communication and activations ignored. The ideal ratio is \(16/4.125 = 3.88\).</p>
+  <p>The capacity effect (4 to 27 concurrent sequences) is larger than the bandwidth effect. But the bandwidth gain has a ceiling. In W4A16 each weight is dequantized into bf16 registers and multiplied on bf16 tensor cores, so per weight the GPU still does \(2m\) FLOPs for \(m\) tokens in the batch, now for only \(4.125/8 = 0.516\) bytes: intensity \(3.88\,m\) FLOPs per byte. That crosses the H100 ridge of 295 at \(m \approx 76\) tokens per step, against \(m \approx 295\) for bf16. Beyond that batch the step is compute-bound in bf16 and the dequantization is extra work. Marlin, an optimized W4A16 kernel, shows exactly this curve: near-ideal 3.87× per-layer speedup up to batch 16 to 32 on an A10 (whose ridge is lower than an H100's), fading to about 1.5× at batch 128; end to end in vLLM on Llama-2-7B the speedup is 2.93× at batch 1, 2.74× at 16, 1.78× at 64 and 1.20× at 128 <a href="https://arxiv.org/abs/2408.11743">[Frantar et al. 2024, Fig. 1, Tab. 2]</a>. Two corollaries: weight-only quantization does nothing for prefill (compute-bound), and it is a latency and capacity tool for low-to-moderate batch. FP8 W8A8 changes both operands: FP8 tensor cores run at 1,979 TFLOP/s dense on H100, twice bf16's 989.4 <a href="https://www.nvidia.com/en-us/data-center/h100/">[NVIDIA H100]</a> (the page lists 3,958 with sparsity), and a weight costs 1 byte, so the threshold is again \(m \approx 295\) but at twice the FLOP rate.</p>
+
+  <h3 id="quant-weight">Weight-only PTQ: GPTQ and AWQ</h3>
+  <p><strong>GPTQ</strong> quantizes one linear layer at a time to minimize \(\lVert WX - \hat{W}X \rVert_2^2\) on calibration inputs \(X\) (128 random 2,048-token C4 segments). It descends from Optimal Brain Quantization: quantize a weight, then update the not-yet-quantized weights to compensate for the error using the inverse of the layer Hessian \(H = 2XX^\top\). OBQ picks the next weight greedily and costs \(O(d_{\text{row}} d_{\text{col}}^3)\). GPTQ's observation is that an arbitrary fixed order works about as well on large layers, so every row shares the same column order and the same \(H^{-1}\) updates, dropping the cost to \(O(\max(d_{\text{row}} d_{\text{col}}^2, d_{\text{col}}^3))\). Two engineering steps make it run on GPUs: "lazy batch updates" over blocks of \(B = 128\) columns (the update is memory-bound otherwise), and a Cholesky reformulation for numerical stability <a href="https://arxiv.org/abs/2210.17323">[Frantar et al. 2022, §4]</a>. Results: OPT-175B quantizes in about 4 GPU-hours (4.2 h on one A100); WikiText-2 perplexity at 4 bits is 8.37 against 8.34 for fp16 while round-to-nearest (RTN) gives 10.54, and at 3 bits GPTQ gives 8.68 while RTN collapses to \(7.3 \times 10^3\) <a href="https://arxiv.org/abs/2210.17323">[Tab. 3, 5]</a>. The speedup comes only from fewer bytes ("no computational reductions"): the 3-bit OPT-175B (about 63 GB) runs on one A100 at 71 ms per token against 230 ms for fp16 on five, 3.25× at batch 1 <a href="https://arxiv.org/abs/2210.17323">[Tab. 6]</a>.</p>
+  <p><strong>AWQ</strong> starts from a different observation: only 0.1% to 1% of weight channels are salient, and they are identified by the <em>activation</em> magnitude, not the weight magnitude. On OPT-6.7B at INT3 with group 128, keeping the 1% of channels with the largest activations in fp16 brings perplexity from 23.54 (RTN) to 11.39, while choosing the 1% by weight norm gives 22.37 and a random 1% gives 24.23 <a href="https://arxiv.org/abs/2306.00978">[Lin et al. 2024, Tab. 1]</a>. Mixed precision is hardware-hostile, so AWQ protects those channels by scaling instead. Multiply the salient weight by \(s > 1\) and divide its input by \(s\): the layer output is unchanged, but the quantization error of that weight, \(\Delta' \cdot \operatorname{RoundErr}(ws/\Delta') \cdot x/s\), shrinks by about \(1/s\) provided the group's maximum (hence its step \(\Delta\)) barely changes. Too large an \(s\) inflates \(\Delta\) for the neighbors, so AWQ uses \(s = s_X^{\alpha}\) with \(s_X\) the per-channel mean activation magnitude and picks \(\alpha\) by a 20-point grid search on \([0, 1]\) against the layer's output error, with no backpropagation or regression. That makes it less prone to overfit the calibration set: moving the calibration data between two domains costs AWQ 0.5 to 0.6 perplexity and GPTQ 2.3 to 4.9 <a href="https://arxiv.org/abs/2306.00978">[§3.2, §5.3]</a>. Its TinyChat kernels give 3.2 to 3.3× average speedup over the Hugging Face fp16 implementation at batch 1.</p>
+
+  <h3 id="quant-w8a8">Weights and activations: outliers, LLM.int8() and SmoothQuant</h3>
+  <p>W4A16 quantizes only weights, which are well behaved, and dequantizes them before an fp16 matmul. W8A8 must also quantize activations, and there the trouble starts.</p>
+  <ol>
+    <li><strong>Activations have outlier channels.</strong> LLM.int8() finds that above roughly 6.7B parameters, a handful of hidden dimensions carry values up to 20× larger than the rest: they appear in about 25% of layers at smaller scales, then in every layer and about 75% of positions at 6.7B (roughly 150,000 outlier entries per 2,048-token sequence, concentrated in 6 dimensions). They are not noise: zeroing them halves the mean top-1 attention probability (from about 40% to 20%) and raises perplexity 600% to 1,000%, while zeroing 7 random dimensions changes perplexity by 0.1% <a href="https://arxiv.org/abs/2208.07339">[Dettmers et al. 2022, §4]</a>. SmoothQuant measures the outliers at about 100× the typical value. With one scale per tensor, the step is set by the outliers, so a normal channel with maximum \(m_i\) gets about \(2^8 m_i/m\) levels, "2-3" in practice <a href="https://arxiv.org/abs/2211.10438">[Xiao et al. 2023, §3]</a>.</li>
+    <li><strong>The fix that works for accuracy does not fit the hardware.</strong> Outliers persist in fixed <em>input channels</em>, so per-channel activation quantization would be accurate (OPT-175B average accuracy 71.4% against 71.6% in fp16, versus about 32% for per-tensor or per-token INT8). But an INT8 GEMM can apply scales only along its outer dimensions (per token, per output channel), not along the inner input-channel dimension where the accumulation runs <a href="https://arxiv.org/abs/2211.10438">[SmoothQuant, Tab. 1, §3]</a>.</li>
+    <li><strong>LLM.int8()</strong> works around it with a decomposition: input dimensions whose magnitude exceeds 6.0 (about 0.1% of dimensions) go through an fp16 matmul, the other 99.9% through INT8 with per-row and per-column scales, and the results are added. It loses no accuracy up to 175B, but the mixed-precision path is slow: SmoothQuant measures it as slower than fp16 in most settings, and the LLM.int8() paper itself reports slowdowns below 6.7B parameters and about 2× faster only for very large matmuls.</li>
+  </ol>
+  <p><strong>SmoothQuant</strong> removes the outliers algebraically. For \(Y = XW\) with input channels indexed by \(j\), any positive vector \(s\) gives the same output:</p>
+  <div class="eq-box">
+  \[ Y = \big(X\,\mathrm{diag}(s)^{-1}\big)\big(\mathrm{diag}(s)\,W\big) = \hat X \hat W, \qquad s_j = \frac{\max|X_j|^{\alpha}}{\max|W_j|^{\,1-\alpha}} \]
+  <div class="eq-label">Migrate quantization difficulty from activations to weights; \(\alpha\) sets how much</div>
+  </div>
+  <p>Dividing the activation channels by \(s\) is fused offline into the preceding LayerNorm or linear layer, so at runtime the model is a plain INT8 GEMM, even with static per-tensor scales. Taking \(\alpha = 0.5\) equalizes the two ranges. Worked example: an outlier channel with \(\max|X_j| = 100\) and \(\max|W_j| = 0.5\) gets \(s_j = 10/0.707 = 14.1\), after which both activation and weight range are 7.07. A normal channel with \(\max|X_j| = 1\) gets \(s_j = 1.41\) and an activation range of 0.71, so against a per-tensor range that fell from 100 to 7.07 it now has \(127 \times 0.71/7.07 = 12.7\) levels instead of \(127 \times 1/100 = 1.3\), a 10× improvement. The weights, which had slack, absorb the change. \(\alpha\) is a per-model hyperparameter: 0.5 for OPT and BLOOM (a sweet spot of 0.4 to 0.6 on OPT-175B), 0.75 for GLM-130B, and 0.85 to 0.9 for Llama-2 <a href="https://arxiv.org/abs/2211.10438">[§4, §5, Tab. 7]</a>. It achieves W8A8 with negligible accuracy loss on OPT-175B, BLOOM-176B and MT-NLG 530B, up to 1.56× lower latency and about 2× less memory than fp16 in FasterTransformer (context stage; up to 1.42× in decoding), and lets a 530B model run on one 8×A100 node.</p>
+
+  <div class="decision">
+    <div class="decision-title">Weight-only INT4 (GPTQ, AWQ) versus W8A8 (SmoothQuant, FP8)</div>
+    <dl>
+      <dt>Problem</dt><dd>Decode reads all weights per step (bandwidth-bound) and big models need many GPUs just to hold them; prefill and large batches are compute-bound.</dd>
+      <dt>Idea</dt><dd>W4A16 cuts weight bytes 3.9× and keeps math in 16 bits. W8A8 cuts bytes 2× and runs both operands on the fast 8-bit tensor-core path.</dd>
+      <dt>Why it works</dt><dd>Weights are smooth and calibratable, so 4 bits with group scales suffices. Activations have outliers, so 8-bit activations need a range fix (SmoothQuant) or a floating-point format with more dynamic range (FP8).</dd>
+      <dt>Evidence</dt><dd>OPT-175B 4-bit perplexity 8.37 vs 8.34, 3.25× decode speedup at batch 1 <a href="https://arxiv.org/abs/2210.17323">[GPTQ]</a>; lossless W8A8 up to 530B, up to 1.56× faster <a href="https://arxiv.org/abs/2211.10438">[SmoothQuant]</a>; W4A16 speedup 2.93× at batch 1 fading to 1.20× at 128 <a href="https://arxiv.org/abs/2408.11743">[Marlin]</a>.</dd>
+      <dt>Cost</dt><dd>W4A16 gives no prefill speedup and fades beyond \(m \approx 76\) tokens per step on an H100; group scales add bits; calibration can overfit. W8A8 needs INT8 or FP8 kernels end to end and a tuned \(\alpha\); both need quality evaluation on the target workload (long context and reasoning are most sensitive).</dd>
+      <dt>Used by</dt><dd>AWQ lists adoption in Hugging Face Transformers, NVIDIA TensorRT-LLM and vLLM among others <a href="https://arxiv.org/abs/2306.00978">[Lin et al. 2024, §1]</a>. FP8 is used by DeepSeek-V3, whose released weights are FP8 only and whose serving uses FP8 for matmuls and dispatch <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3">[model card]</a>, and by Llama 3 405B (below).</dd>
+    </dl>
+  </div>
+
+  <h3 id="quant-fp">FP8 and FP4 on new hardware</h3>
+  <p>Floating-point formats spend bits on an exponent, so they tolerate outliers better than INT8 at the same width. <strong>FP8</strong> has two variants, E4M3 (maximum magnitude 448) and E5M2, and H100 tensor cores run either at 1,979 TFLOP/s dense. DeepSeek-V3 uses <em>fine-grained scaling</em>: an online maximum per 1×128 activation tile and per 128×128 weight block <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3.2]</a>; its production serving uses FP8 for matrix multiplications and expert dispatch and BF16 for the core MLA computation and expert combine <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[inference overview]</a>. The V3 checkpoint ships only in FP8, so its 671B parameters are 671 GB, and the release notes give a script to convert to bf16 (1.34 TB).</p>
+  <p>Llama 3 405B is the cautionary tale for FP8 serving. In bf16 it does not fit on one 8×H100 machine, so Meta serves it on 16 GPUs with tensor parallelism inside each node and pipeline parallelism across the two. FP8 matmuls and activations in the feedforward layers (about 50% of inference compute time) give up to 50% higher prefill throughput and a better decode throughput-latency trade-off. Making that lossless took three changes: skip the first and last Transformer layers, use row-wise rather than tensor-wise scales, and cap the dynamic scaling factor at 1,200, because high-perplexity tokens such as dates create large activations, huge scales and underflows that corrupted some responses. Standard benchmarks did not reveal the problem, so Meta compared the reward-model score distributions of 100,000 bf16 and FP8 responses instead <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §6.1-6.2]</a>.</p>
+  <p><strong>FP4</strong> comes in two block-scaled variants on Blackwell. <em>MXFP4</em> stores E2M1 values (magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6) in blocks of 32 that share one power-of-two scale (UE8M0): \(4 + 8/32 = 4.25\) bits per value. <em>NVFP4</em> uses blocks of 16 with an E4M3 scale plus a per-tensor FP32 scale: \(4 + 8/16 = 4.5\) bits, and its finer, non-power-of-two scaling represents block maxima more precisely <a href="https://arxiv.org/abs/2509.25149">[NVIDIA 2026, §2]</a>. NVIDIA reports FP4 tensor-core throughput of 2× (GB200) and 3× (GB300) that of FP8, and the DGX B200 listing gives 72 PFLOP/s dense FP4 per 8 GPUs, about 9 PFLOP/s per GPU <a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">[NVIDIA DGX B200]</a>. Two production uses show the pattern. gpt-oss quantizes only its MoE weights, over 90% of parameters, to MXFP4, which is what lets the 116.83B-parameter model fit a 60.8 GiB checkpoint on one 80 GB GPU <a href="https://arxiv.org/abs/2508.10925">[OpenAI 2025, §2.1]</a>. DeepSeek-V4 applies FP4 quantization-aware training to its routed experts and to the indexer's query-key path; because FP8 has more exponent range, dequantizing FP4 to FP8 is lossless as long as the scale ratios inside a block stay bounded. On today's hardware FP4×FP8 has the same peak as FP8×FP8, so the gain is memory and bandwidth, with about one third more compute efficiency possible on future hardware <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §1, §5.2.1]</a>. The general lesson: quantize the tensors that dominate bytes (experts), and match the format to what the tensor cores natively support.</p>
+
+  <h3 id="quant-kv">KV-cache quantization</h3>
+  <p>For long context or large batch the KV cache, not the weights, dominates bytes (<a href="#cost-numbers">the cost table</a>). Naive per-token 2-bit quantization of both keys and values wrecks accuracy (Llama-2-13B CoQA drops from 66.37 to 52.93), and 4-bit per-token is fine. <strong>KIVI</strong> finds why 2 bits can work if keys and values are treated differently <a href="https://arxiv.org/abs/2402.02750">[Liu et al. 2024, §3]</a>. Keys have a few fixed channels with very large magnitude, like activations, so they are quantized <em>per channel</em>, confining the error to the outlier channels. Values have no channel pattern, and because attention is sparse the output is a mixture of a few tokens' values, so an error confined to one token (<em>per-token</em> quantization) stays confined; per-channel value quantization gave errors about 15× larger. Keys per channel need a group of tokens, which arrive one at a time, so KIVI keeps the newest at most 128 tokens in full precision (the residual window) and quantizes a block when it fills. Settings: 2 bits, group size 32, residual length 128. Results on Llama-2-7B: 2.6× lower peak memory including weights, up to 4× larger batch and 2.35 to 3.47× throughput on an A100. Quality holds on easy tasks (CoQA 66.37 to 66.23 for Llama-2-13B) but drops on hard generation (GSM8K 22.67 to 20.77) <a href="https://arxiv.org/abs/2402.02750">[Tab. 3, Fig. 5]</a>.</p>
+  <p>Arithmetic for Llama-3-8B at 128K context: bf16 KV is 16 GiB per sequence, INT8 halves it to 8 GiB, and a 2-bit KIVI-style format with fp16 scale and zero point per group of 32 costs \(2 + 32/32 = 3\) bits per element, so 3 GiB (5.3×) before the fp16 residual window. Modern architectures apply the same thinking at design time: DeepSeek-V4 stores its KV entries in FP8 except the RoPE dimensions (bf16), nearly halving the cache relative to bf16 <a href="https://arxiv.org/abs/2606.19348">[§2.3.4]</a>. Quantizing KV composes with GQA and MLA (<a href="07-kv-efficient-attention.html#other-levers">page 07</a>), and it should be evaluated at full context length, since long-context retrieval is the most sensitive test.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Quantizes</th><th>Core idea</th><th>Verified result</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td>GPTQ</td><td>W3 or W4</td><td>Hessian-based error compensation, one column at a time</td><td>OPT-175B 4-bit ppl 8.37 vs 8.34; ~4 GPU-hours; 3.25× decode at batch 1</td><td>Calibration overfit; no compute saving</td></tr>
+      <tr><td>AWQ</td><td>W4 (W3)</td><td>Scale salient channels by \(s_X^\alpha\)</td><td>OPT-6.7B INT3-g128: ppl 23.54 to 11.39; 3.2 to 3.3× vs fp16 at batch 1</td><td>Weight-only; fades with batch</td></tr>
+      <tr><td>LLM.int8()</td><td>W8A8</td><td>fp16 for outlier dimensions, INT8 for the rest</td><td>No loss to 175B; 1.96× less memory (BLOOM-176B)</td><td>Often slower than fp16</td></tr>
+      <tr><td>SmoothQuant</td><td>W8A8</td><td>Divide activation channels by \(s\), multiply weights</td><td>Lossless to 530B; up to 1.56× faster, ~2× less memory</td><td>Per-model \(\alpha\); INT8 kernels</td></tr>
+      <tr><td>FP8 with tile scales</td><td>W8A8</td><td>Fine-grained scales per 1×128 and 128×128</td><td>V3 trained and served with FP8 matmuls</td><td>Needs Hopper-class FP8</td></tr>
+      <tr><td>MXFP4 / NVFP4</td><td>W4 (A4)</td><td>Block-scaled 4-bit floats</td><td>gpt-oss 116.83B params in 60.8 GiB; V4 FP4 experts</td><td>Best with QAT; native on Blackwell</td></tr>
+      <tr><td>KIVI</td><td>KV, 2-bit</td><td>Keys per channel, values per token</td><td>2.6× less memory, 4× batch, 2.35 to 3.47× throughput</td><td>Hard tasks degrade</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="speculative">Speculative decoding</h2>
+
+  <p>Page <a href="06-decoding-kv-cache.html#serving">06</a> sketched this idea. A decode step reads every weight to emit one token, but scoring several tokens in the same pass costs almost the same, because \(\gamma + 1\) tokens per weight read raise the intensity from about 1 to \(\gamma + 1\) FLOPs per byte, still far below the H100 ridge of 295. <strong>Speculative decoding</strong> <span class="zh">投机解码</span> uses the slack. A cheap <em>draft</em> distribution \(q\) <span class="zh">草稿模型</span> proposes \(\gamma\) tokens, the <em>target</em> model with distribution \(p\) scores all \(\gamma + 1\) positions in one forward pass, and an acceptance rule keeps a prefix of the proposals plus one more token, in a way that leaves the output distribution exactly \(p\). Leviathan et al. (Google; arXiv November 2022, ICML 2023) and Chen et al. (DeepMind, February 2023) found it independently <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al.]</a>, <a href="https://arxiv.org/abs/2302.01318">[Chen et al.]</a>. I use Leviathan's notation; Chen et al. swap the letters (their \(q\) is the target).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 404" role="img" aria-labelledby="fig-17-3-title">
+<title id="fig-17-3-title">One speculative decoding step with draft length 4: the draft model proposes four tokens, the target scores all five positions in one forward pass, tokens are accepted left to right until the first rejection, which is resampled from the residual distribution; if all are accepted a bonus token is sampled from the target</title>
+<defs><marker id="arrow-17-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="36" class="s-bold">1. Draft q</text>
+<text x="8" y="52" class="s-small s-muted">4 cheap steps</text>
+<text x="8" y="122" class="s-bold">2. Target p</text>
+<text x="8" y="138" class="s-small s-muted">one pass, 5 positions</text>
+<text x="8" y="212" class="s-bold">3a. Reject at 3</text>
+<text x="8" y="228" class="s-small s-muted">3 tokens out</text>
+<text x="8" y="316" class="s-bold">3b. All accepted</text>
+<text x="8" y="332" class="s-small s-muted">5 tokens out</text>
+<rect class="s-box" x="86" y="18" width="52" height="32" rx="5"/>
+<text x="112" y="38" text-anchor="middle" class="s-small">context</text>
+<rect class="s-a" x="150" y="18" width="104" height="32" rx="5"/>
+<text x="202.0" y="31" text-anchor="middle" class="s-small s-bold">x1 = sat</text>
+<text x="202.0" y="44" text-anchor="middle" class="s-small">q(x1) = 0.40</text>
+<path class="s-line" d="M138,34 L150,34" marker-end="url(#arrow-17-3)"/>
+<path class="s-line" d="M202.0,50 L202.0,80" marker-end="url(#arrow-17-3)"/>
+<rect class="s-a" x="264" y="18" width="104" height="32" rx="5"/>
+<text x="316.0" y="31" text-anchor="middle" class="s-small s-bold">x2 = on</text>
+<text x="316.0" y="44" text-anchor="middle" class="s-small">q(x2) = 0.35</text>
+<path class="s-line" d="M254,34 L264,34" marker-end="url(#arrow-17-3)"/>
+<path class="s-line" d="M316.0,50 L316.0,80" marker-end="url(#arrow-17-3)"/>
+<rect class="s-a" x="378" y="18" width="104" height="32" rx="5"/>
+<text x="430.0" y="31" text-anchor="middle" class="s-small s-bold">x3 = the</text>
+<text x="430.0" y="44" text-anchor="middle" class="s-small">q(x3) = 0.60</text>
+<path class="s-line" d="M368,34 L378,34" marker-end="url(#arrow-17-3)"/>
+<path class="s-line" d="M430.0,50 L430.0,80" marker-end="url(#arrow-17-3)"/>
+<rect class="s-a" x="492" y="18" width="104" height="32" rx="5"/>
+<text x="544.0" y="31" text-anchor="middle" class="s-small s-bold">x4 = mat</text>
+<text x="544.0" y="44" text-anchor="middle" class="s-small">q(x4) = 0.30</text>
+<path class="s-line" d="M482,34 L492,34" marker-end="url(#arrow-17-3)"/>
+<path class="s-line" d="M544.0,50 L544.0,80" marker-end="url(#arrow-17-3)"/>
+<rect class="s-d" x="150" y="82" width="568" height="26" rx="5"/>
+<text x="434" y="99" text-anchor="middle" class="s-small s-bold">target forward pass over [context, x1, x2, x3, x4]: weights and KV cache read once</text>
+<rect class="s-plain" x="150" y="118" width="104" height="34" rx="5"/>
+<text x="202.0" y="132" text-anchor="middle" class="s-small">p(x1) = 0.52</text>
+<text x="202.0" y="146" text-anchor="middle" class="s-small s-muted">p/q = 1.30</text>
+<rect class="s-plain" x="264" y="118" width="104" height="34" rx="5"/>
+<text x="316.0" y="132" text-anchor="middle" class="s-small">p(x2) = 0.28</text>
+<text x="316.0" y="146" text-anchor="middle" class="s-small s-muted">p/q = 0.80</text>
+<rect class="s-plain" x="378" y="118" width="104" height="34" rx="5"/>
+<text x="430.0" y="132" text-anchor="middle" class="s-small">p(x3) = 0.15</text>
+<text x="430.0" y="146" text-anchor="middle" class="s-small s-muted">p/q = 0.25</text>
+<rect class="s-plain" x="492" y="118" width="104" height="34" rx="5"/>
+<text x="544.0" y="132" text-anchor="middle" class="s-small">p(x4) = 0.36</text>
+<text x="544.0" y="146" text-anchor="middle" class="s-small s-muted">p/q = 1.20</text>
+<rect class="s-plain" x="606" y="118" width="104" height="34" rx="5"/>
+<text x="658.0" y="132" text-anchor="middle" class="s-small">p over vocab</text>
+<text x="658.0" y="146" text-anchor="middle" class="s-small s-muted">at position 5</text>
+<rect class="s-c" x="150" y="186" width="104" height="54" rx="5"/>
+<text x="202.0" y="202" text-anchor="middle" class="s-small s-bold">accept: sat</text>
+<text x="202.0" y="217" text-anchor="middle" class="s-small">accept prob 1</text>
+<text x="202.0" y="232" text-anchor="middle" class="s-small s-muted">p/q above 1</text>
+<rect class="s-c" x="264" y="186" width="104" height="54" rx="5"/>
+<text x="316.0" y="202" text-anchor="middle" class="s-small s-bold">accept: on</text>
+<text x="316.0" y="217" text-anchor="middle" class="s-small">accept prob 0.80</text>
+<text x="316.0" y="232" text-anchor="middle" class="s-small s-muted">u = 0.50 &lt; 0.80</text>
+<rect class="s-b" x="378" y="186" width="104" height="54" rx="5"/>
+<text x="430.0" y="202" text-anchor="middle" class="s-small s-bold">reject: the</text>
+<text x="430.0" y="217" text-anchor="middle" class="s-small">accept prob 0.25</text>
+<text x="430.0" y="232" text-anchor="middle" class="s-small s-muted">u = 0.60 &gt; 0.25</text>
+<rect class="s-plain s-dash" x="492" y="186" width="104" height="54" rx="5"/>
+<text x="544.0" y="206" text-anchor="middle" class="s-small s-muted">x4 discarded:</text>
+<text x="544.0" y="221" text-anchor="middle" class="s-small s-muted">its context</text>
+<text x="544.0" y="235" text-anchor="middle" class="s-small s-muted">was rejected</text>
+<rect class="s-e" x="378" y="252" width="332" height="28" rx="5"/>
+<text x="544.0" y="270" text-anchor="middle" class="s-small s-bold">correction "a" ~ norm(max(0, p − q)) at position 3</text>
+<path class="s-line" d="M430.0,240 L430.0,252" marker-end="url(#arrow-17-3)"/>
+<text x="150" y="270" class="s-small s-bold">emitted: sat, on, a</text>
+<rect class="s-c" x="150" y="296" width="104" height="36" rx="5"/>
+<text x="202.0" y="311" text-anchor="middle" class="s-small s-bold">accept: sat</text>
+<text x="202.0" y="325" text-anchor="middle" class="s-small s-muted">u below prob</text>
+<rect class="s-c" x="264" y="296" width="104" height="36" rx="5"/>
+<text x="316.0" y="311" text-anchor="middle" class="s-small s-bold">accept: on</text>
+<text x="316.0" y="325" text-anchor="middle" class="s-small s-muted">u below prob</text>
+<rect class="s-c" x="378" y="296" width="104" height="36" rx="5"/>
+<text x="430.0" y="311" text-anchor="middle" class="s-small s-bold">accept: the</text>
+<text x="430.0" y="325" text-anchor="middle" class="s-small s-muted">u below prob</text>
+<rect class="s-c" x="492" y="296" width="104" height="36" rx="5"/>
+<text x="544.0" y="311" text-anchor="middle" class="s-small s-bold">accept: mat</text>
+<text x="544.0" y="325" text-anchor="middle" class="s-small s-muted">u below prob</text>
+<rect class="s-e" x="606" y="296" width="104" height="36" rx="5"/>
+<text x="658.0" y="311" text-anchor="middle" class="s-small s-bold">bonus: "."</text>
+<text x="658.0" y="325" text-anchor="middle" class="s-small s-muted">sampled from p</text>
+<text x="150" y="354" class="s-small s-bold">emitted: sat, on, the, mat, "."</text>
+<text x="150" y="372" class="s-small s-muted">Every step emits between 1 and γ + 1 = 5 tokens. Probabilities are illustrative.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One step with \(\gamma = 4\). The draft proposes four tokens sequentially (cheap). The target scores all five positions in a single pass. Tokens are accepted left to right with probability \(\min(1, p/q)\). At the first rejection the token is resampled from the residual \(\text{norm}(\max(0, p - q))\) and later drafts are discarded (case a: three tokens out). If every draft is accepted, the same pass already produced \(p\) for the next position, so a bonus token is sampled from it (case b: five tokens out). The step always yields between 1 and \(\gamma + 1\) tokens.</figcaption>
+  </figure>
+
+  <h3 id="spec-proof">The acceptance rule and why it is exact</h3>
+  <p>Fix a prefix. The target next-token distribution is \(p\), the draft's is \(q\). For one position, sample \(x \sim q\) and accept it with probability \(\min(1, p(x)/q(x))\); on rejection, sample instead from the <em>residual</em> \(p'(x) = \max(0, p(x) - q(x)) / (1 - \beta)\). Claim: the returned token has distribution exactly \(p\).</p>
+  <ol>
+    <li><strong>Mass through acceptance.</strong> A token \(x\) is proposed with probability \(q(x)\) and then accepted with probability \(\min(1, p(x)/q(x))\), so it is emitted this way with probability \(q(x)\min(1, p(x)/q(x)) = \min(p(x), q(x))\).</li>
+    <li><strong>Rejection probability.</strong> Summing, the acceptance probability is \(\beta = \sum_x \min(p(x), q(x)) = 1 - \mathrm{TV}(p, q)\), where \(\mathrm{TV}\) is the total-variation distance \(\tfrac12 \lVert p - q \rVert_1\). Since \(p - \min(p, q) = \max(0, p - q)\) and \(\sum_x p(x) = 1\), the rejection probability is \(1 - \beta = \sum_x \max(0, p(x) - q(x))\). This is exactly the normalizer of \(p'\).</li>
+    <li><strong>Mass through rejection.</strong> A token \(x\) is emitted after a rejection with probability \((1 - \beta)\,p'(x) = \max(0, p(x) - q(x))\).</li>
+    <li><strong>Sum.</strong> \(\Pr[\text{emit } x] = \min(p(x), q(x)) + \max(0, p(x) - q(x)) = p(x)\). \(\blacksquare\)</li>
+  </ol>
+  <p>The intuition: where \(q(x) > p(x)\) the draft over-proposes \(x\), and rejecting a fraction \(1 - p/q\) of those proposals leaves exactly \(p(x)\); where \(q(x) < p(x)\) it under-proposes, and the residual supplies exactly the deficit \(p(x) - q(x)\) and only there. Resampling from \(p\) itself on rejection would double-count the mass already delivered by acceptance, and resampling from the plain difference \(q - p\) has the wrong sign; the tests in the exercise catch both.</p>
+  <p><strong>Extending to \(\gamma\) tokens</strong> is an induction. Suppose the tokens emitted so far are distributed as the target's. At draft position \(i\), if all earlier drafts were accepted, the target row \(p_i\) was computed conditioned on exactly the true prefix (the causal mask makes the verification pass equal to teacher-forced scoring), so the single-position result applies to token \(i\). Rows after a rejection were computed conditioned on the <em>rejected</em> token, so they are discarded. If all \(\gamma\) drafts are accepted, the extra row \(p_{\gamma+1}\) is conditioned on the true prefix and the bonus token is an exact sample. Hence every step emits a valid prefix of a target sample, and the whole sequence has the target's distribution, for <em>any</em> draft \(q\). A poor draft only lowers the acceptance rate.</p>
+  <p>Three practical points. (1) Top-\(k\), top-\(p\) and temperature are applied to both \(p\) and \(q\) before the rule, so the output matches the target's <em>actual sampling distribution</em>; a greedy target is a one-hot \(p\) and the rule reduces to "accept iff the draft equals the argmax, else emit the argmax". (2) Exactness is in distribution, not bit for bit: different batch shapes give different floating-point numerics, and Chen et al. note that a single token deviating "could result in two sequences diverging wildly". (3) Exactness can be given up deliberately: Medusa's "typical acceptance" accepts any sufficiently probable draft token, which raises acceptance but no longer matches the target's distribution <a href="https://arxiv.org/abs/2401.10774">[Cai et al. 2024, §2.3]</a>, whereas trees drafted by EAGLE keep exactness by applying the rejection rule recursively over sibling candidates ("multi-round speculative sampling") <a href="https://arxiv.org/abs/2401.15077">[Li et al. 2024, App. A.2]</a>.</p>
+
+  <h3 id="spec-math">Expected tokens, speedup and the choice of \(\gamma\)</h3>
+  <p>Assume each draft token is accepted independently with the same probability \(\alpha = \mathbb{E}[\beta]\). The probability that the first \(k\) drafts are accepted is \(\alpha^k\), and a step emits (accepted drafts) + 1 tokens with at most \(\gamma\) accepted, so</p>
+  <div class="eq-box">
+  \[ \mathbb{E}[\text{tokens per step}] = \sum_{k=0}^{\gamma} \alpha^k = \frac{1 - \alpha^{\gamma+1}}{1 - \alpha}, \qquad \text{speedup} = \frac{1 - \alpha^{\gamma+1}}{(1-\alpha)(1 + \gamma c)} \]
+  <div class="eq-label">\(c\) = (time of one draft pass) / (time of one target pass); Leviathan et al. Eq. 1 and Thm. 3.8</div>
+  </div>
+  <p>A step costs \(\gamma\) draft passes plus one target pass, \((1 + \gamma c)\) in target-pass units, and plain decoding yields one token per unit. The gain requires \(\alpha > c\) (Corollary 3.9 guarantees an improvement of at least \((1+\alpha)/(1+c)\) for \(\gamma = 1\)). The arithmetic cost rises too: \((1-\alpha)(\gamma \hat c + \gamma + 1)/(1 - \alpha^{\gamma+1})\) times the baseline's operations, with \(\hat c\) the draft-to-target ratio of operations per token (Thm. 3.11). At \(\alpha = 0.8\), \(\gamma = 5\), \(c = \hat c = 0\), the speedup is 3.69× for 1.63× more operations <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al., Tab. 1]</a>. Computing the formulas for the three acceptance rates in the brief:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Expected tokens per step</th><th class="num">\(\gamma=1\)</th><th class="num">2</th><th class="num">3</th><th class="num">4</th><th class="num">5</th><th class="num">limit \(1/(1-\alpha)\)</th></tr></thead>
+    <tbody>
+      <tr><td>\(\alpha = 0.6\)</td><td class="num">1.60</td><td class="num">1.96</td><td class="num">2.18</td><td class="num">2.31</td><td class="num">2.38</td><td class="num">2.5</td></tr>
+      <tr class="hl"><td>\(\alpha = 0.8\)</td><td class="num">1.80</td><td class="num">2.44</td><td class="num">2.95</td><td class="num">3.36</td><td class="num">3.69</td><td class="num">5</td></tr>
+      <tr><td>\(\alpha = 0.9\)</td><td class="num">1.90</td><td class="num">2.71</td><td class="num">3.44</td><td class="num">4.10</td><td class="num">4.69</td><td class="num">10</td></tr>
+    </tbody>
+  </table></div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Wall-clock speedup, \(c = 0.05\)</th><th class="num">\(\gamma=1\)</th><th class="num">2</th><th class="num">3</th><th class="num">4</th><th class="num">5</th><th class="num">best \(\gamma\)</th></tr></thead>
+    <tbody>
+      <tr><td>\(\alpha = 0.6\)</td><td class="num">1.52</td><td class="num">1.78</td><td class="num">1.89</td><td class="num">1.92</td><td class="num">1.91</td><td class="num">4 (1.92×)</td></tr>
+      <tr class="hl"><td>\(\alpha = 0.8\)</td><td class="num">1.71</td><td class="num">2.22</td><td class="num">2.57</td><td class="num">2.80</td><td class="num">2.95</td><td class="num">8 (3.09×)</td></tr>
+      <tr><td>\(\alpha = 0.9\)</td><td class="num">1.81</td><td class="num">2.46</td><td class="num">2.99</td><td class="num">3.41</td><td class="num">3.75</td><td class="num">13 (4.67×)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Computed from the formulas above with Python (they reproduce Leviathan et al.'s Table 1 at \(c = 0\): 1.96× for \(\alpha = 0.6, \gamma = 2\); 3.69× for \(\alpha = 0.8, \gamma = 5\); 6.86× for \(\alpha = 0.9, \gamma = 10\)). The two headline cells, \(\alpha = 0.8, \gamma = 4\): 3.36 tokens per step and a 2.80× speedup, match page 06.</p>
+  <p>Read the tables for three lessons. Returns diminish fast: at \(\alpha = 0.6\) the ceiling is 2.5 tokens per step and \(\gamma = 4\) already gets within 8% of it. The optimal \(\gamma\) rises with \(\alpha\) and falls with \(c\) (for \(c = 0.05\): 4, 8 and 13 at \(\alpha = 0.6, 0.8, 0.9\)), so a fixed \(\gamma\) is a compromise. And a slightly better drafter is worth more than a much cheaper one once \(c\) is small: moving \(\alpha\) from 0.8 to 0.9 at \(\gamma = 4\) adds 22% more tokens per step, while \(c\) from 0.05 to 0.02 changes the denominator from 1.20 to 1.08 (11%).</p>
+
+<pre><code class="language-python">def speculative_accept(p, q, draft, gen):
+    # p: (gamma+1, V) target probs; q: (gamma, V) draft probs; draft: (gamma,) tokens sampled from q
+    out, u = [], torch.rand(len(draft), generator=gen)
+    for i, x in enumerate(draft.tolist()):
+        if u[i] &lt; min(1.0, (p[i, x] / q[i, x]).item()):     # accept with probability min(1, p/q)
+            out.append(x)
+            continue
+        resid = (p[i] - q[i]).clamp_min(0)                   # first rejection: sample norm(max(0, p - q))
+        resid = resid if resid.sum() &gt; 0 else p[i]           # p == q up to rounding: fall back to p
+        return out + [torch.multinomial(resid, 1, generator=gen).item()]
+    return out + [torch.multinomial(p[len(draft)], 1, generator=gen).item()]   # all accepted: bonus token
+</code></pre>
+
+  <h3 id="spec-drafts">Where the drafts come from</h3>
+  <ul>
+    <li><strong>A small model from the same family.</strong> Leviathan et al. used T5-small (77M) to draft for T5-XXL (11B): 3.4× at temperature 0 and 2.6× at temperature 1 on English-German translation with \(\gamma = 7\) (\(\alpha = 0.75\) and 0.62), and 3.1× and 2.3× on summarization <a href="https://arxiv.org/abs/2211.17192">[Tab. 2]</a>. Chen et al. trained a 4B draft for Chinchilla 70B that is wide and shallow (8 layers against 80, \(d = 6144\)), because a shallow draft needs fewer sequential communication steps: 1.8 ms per token against 14.1 ms. With \(K = 4\) they measured 1.92× (nucleus) and 2.01× (greedy) on XSum and 2.46× on HumanEval, and found the best \(K\) on XSum was 3 <a href="https://arxiv.org/abs/2302.01318">[Tab. 1, Fig. 1]</a>. The drafter must share the tokenizer, be served and kept aligned with the target, and fit \(c\) on your hardware topology.</li>
+    <li><strong>Free drafts.</strong> Even a bigram model gets \(\alpha \approx 0.2\), a 1.25× speedup at \(\gamma = 3\) with zero model cost (\(c \approx 0\)) on T5-XXL translation; copying spans from the context helps when the output repeats the input (edits, summaries, code) <a href="https://arxiv.org/abs/2211.17192">[§3.6, §4.2]</a>.</li>
+    <li><strong>Medusa heads.</strong> Add \(K\) small heads on the target's last hidden state, head \(k\) predicting the token \(k+1\) positions ahead (one residual layer and an LM-head-sized projection each), and verify a <em>tree</em> of candidates: the Cartesian product of each head's top few predictions, with an attention mask that lets each node see only its ancestors. No separate model to serve. Medusa-1 (frozen backbone; 5 hours on one A100 for Vicuna-7B on 60k ShareGPT samples) reaches 2.18× on 7B and 2.33× on 13B, and Medusa-2 (heads trained jointly with the backbone) 2.83× on both. The heads predict independently, so acceptance decays with depth <a href="https://arxiv.org/abs/2401.10774">[Cai et al. 2024, §2, Fig. 3]</a>.</li>
+    <li><strong>EAGLE.</strong> The drafter autoregresses over the target's second-to-top-layer <em>features</em>, and the key fix is to also feed the token sampled one step ahead, which resolves the uncertainty feature-only drafting cannot. The draft is a fully connected layer over the concatenation of feature and token embedding, one decoder layer, and the target's own embedding and LM head: 0.24B parameters for a 7B target and 0.99B for 70B, trained on ShareGPT in 1 to 2 days on 4 A100s for the 70B target. It reports 2.7 to 3.5× lower latency on LLaMA2-Chat 70B and about 2× higher throughput at the largest batch that fits, losslessly <a href="https://arxiv.org/abs/2401.15077">[Li et al. 2024, §3, §4]</a>. <strong>EAGLE-3</strong> drops the feature-regression loss (which stopped the drafter from benefiting from more data), fuses low-, middle- and high-layer features, and trains the drafter on its own multi-step outputs ("training-time test"). It reports up to 6.5×, a mean of 5.51× and 6.62 tokens per step on Vicuna-13B at temperature 0, and in SGLang on one H100 with Llama-3.1-8B, batch-1 decoding rises from 158 to 373 tokens/s <a href="https://arxiv.org/abs/2503.01840">[Li et al. 2025, Tab. 1, 4]</a>.</li>
+    <li><strong>The MTP module.</strong> DeepSeek-V3 trains a multi-token-prediction module as an auxiliary objective (<a href="11-stability-tweaks.html">page 11</a>) and reuses it at inference as a depth-1 drafter that proposes token \(t+2\). The acceptance rate of that second token is 85% to 90% across topics, and decoding is 1.8× faster <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §5.4.3]</a>. Check with the formulas: for \(\gamma = 1\), \(\mathbb{E}[\text{tokens}] = 1 + \alpha = 1.85\) to 1.90, so a 1.8× gain implies only about 3% to 6% overhead per step (my inference, not a reported figure). V4 keeps the same depth-1 MTP.</li>
+    <li><strong>Gemma 4 MTP drafters.</strong> A small autoregressive head with its own embedder and a 4-layer transformer block that cross-attends to the <em>main model's KV cache</em>, so it needs no prefill of its own and supports any draft length <a href="https://arxiv.org/abs/2607.02770">[Gemma 4 report, §2.6]</a>. Google reports up to 3× speedup, and for the 26B MoE on Apple silicon at batch 4 to 8, up to about 2.2× <a href="https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/">[Google, May 2026]</a>.</li>
+  </ul>
+  <p>The trend across these is that drafters increasingly <em>share the target's computation</em> (its features, its KV cache, its embedding and LM head) instead of being separate models. That lowers \(c\) and raises \(\alpha\) at the same time, because the drafter sees the target's own hidden state.</p>
+
+  <h3 id="spec-limits">When speculative decoding stops helping</h3>
+  <p>Write the speedup with the verification cost made explicit, following MoESD's decomposition <a href="https://arxiv.org/abs/2505.19645">[Huang et al. 2025, Eq. 4]</a>: \(\text{speedup} \approx \mathbb{E}[\text{tokens}] \,/\, (\gamma c + T_T(B, \gamma{+}1)/T_T(B, 1))\), where \(T_T(B, n)\) is the target's time for a pass over \(n\) tokens per sequence at batch \(B\). The last ratio, the inverse of the "target efficiency", is 1 when the pass is memory-bound and approaches \(\gamma + 1\) when it is compute-bound. Everything that hurts speculation acts through \(c\), \(\alpha\) or that ratio.</p>
+  <ol>
+    <li><strong>Large batch (compute-bound verification).</strong> A weight read serves \(B(\gamma+1)\) tokens, and the pass stays memory-bound only while that stays below the ridge of about 295: \(B \lesssim 98\) for \(\gamma = 2\), 59 for \(\gamma = 4\), 37 for \(\gamma = 7\) on an H100 in bf16. Beyond it the ratio approaches \(\gamma + 1\) and the speedup collapses toward \(\mathbb{E}[\text{tokens}]/(\gamma + 1 + \gamma c)\), which is 0.65 for \(\alpha = 0.8, \gamma = 4, c = 0.05\): slower than plain decoding. Measured: SGLang on an H100 with Llama-3.1-8B and 3-token chains gives EAGLE 1.40×, 1.23×, 1.02×, 0.94×, 0.99× at batch 2, 8, 16, 32, 64, and EAGLE-3 1.81×, 1.62×, 1.48×, 1.32×, 1.38× <a href="https://arxiv.org/abs/2503.01840">[EAGLE-3, Tab. 3]</a>. The fade is gradual and starts before the sharp roofline threshold, so measure on your engine.</li>
+    <li><strong>Low acceptance.</strong> If \(\alpha\) is not above \(c\) there is no \(\gamma\) that helps. Acceptance depends on the task and on temperature: it fell from 0.75 to 0.62 going from temperature 0 to 1 for T5-small drafting T5-XXL, and it is highest for predictable text (HumanEval 2.46× against XSum 1.92× in Chen et al.; Medusa-2's extraction and coding categories reach 3.62× and 3.29× against about 2.6× for humanities).</li>
+    <li><strong>MoE targets at small batch.</strong> Verifying \(n\) tokens touches more experts than one token. If routing were uniform and independent, the expected number of distinct experts touched per layer by \(n\) tokens in a model with \(E\) routed experts and top-\(k\) is \(E\,[1 - ((E-k)/E)^n]\). For a V3-shaped layer (\(E = 256\), \(k = 8\)): 8 experts at \(n = 1\), 37.6 at \(n = 5\), 102 at \(n = 16\). So verifying a 5-token draft at batch 1 reads about 4.7× the expert weights of a normal step, and the "free verification" assumption fails. Real routing is skewed, so this overestimates: DiffusionGemma measured about 84 distinct experts per 256-token canvas per layer for a 128-expert, top-8 model where the uniform formula predicts about 128. The regime that matters is <em>moderate</em> batch, where every expert is already read each step: there verification adds no expert traffic, and MoESD reports up to 2.29× for Qwen2-57B-A14B, more than for a dense model at the same batch, because sparse experts see fewer tokens per weight read and stay memory-bound longer <a href="https://arxiv.org/abs/2505.19645">[Huang et al. 2025, §3, §4]</a>. The speedup rises and then falls with batch size.</li>
+    <li><strong>Expensive or misplaced drafters.</strong> \(c\) is a property of your hardware and software. A draft on a separate device set, a draft that is not shallow enough, or a drafter whose KV cache competes for memory all raise it. This is one reason EAGLE, Medusa and MTP reuse the target's states.</li>
+    <li><strong>Tail latency.</strong> Longer drafts raise the variance of time to complete a sequence, which matters for P90 and P99 SLOs <a href="https://arxiv.org/abs/2302.01318">[Chen et al., §Evaluation]</a>.</li>
+    <li><strong>The counter-case: long context.</strong> Attention KV reads are per sequence and cannot be amortized across the batch, but they <em>are</em> amortized across the \(\gamma + 1\) verified tokens, since one pass reads the KV once. MagicDec-style analyses argue speculation therefore helps large batches at long sequence lengths, which MoESD cites <a href="https://arxiv.org/abs/2505.19645">[§2]</a>. <span class="unverified" title="Second-hand: MoESD's related-work section describes MagicDec's claim. I read MoESD, not MagicDec itself.">I have not checked the MagicDec paper itself.</span></li>
+  </ol>
+
+  <div class="decision">
+    <div class="decision-title">Speculative decoding</div>
+    <dl>
+      <dt>Problem</dt><dd>At low to moderate batch, decode is memory-bound and sequential: each step reads all weights (and KV) for one token per sequence.</dd>
+      <dt>Idea</dt><dd>A cheap drafter proposes \(\gamma\) tokens. The target verifies all of them in one pass, and accept/resample rejection sampling keeps the exact target distribution.</dd>
+      <dt>Why it works</dt><dd>Verification of \(\gamma + 1\) tokens is nearly free while the pass is memory-bound, and the rule \(\min(1, p/q)\) plus the residual \(\max(0, p - q)\) delivers exactly \(p\), for any draft.</dd>
+      <dt>Evidence</dt><dd>2.3 to 3.4× on T5-XXL <a href="https://arxiv.org/abs/2211.17192">[Leviathan]</a>; 1.92 to 2.46× on Chinchilla 70B <a href="https://arxiv.org/abs/2302.01318">[Chen]</a>; EAGLE-3 up to 6.5× at batch 1 and 1.32 to 1.81× throughput at batches 2 to 64 in SGLang <a href="https://arxiv.org/abs/2503.01840">[EAGLE-3]</a>; V3's MTP head: 85% to 90% acceptance, 1.8× TPS <a href="https://arxiv.org/abs/2412.19437">[V3]</a>.</dd>
+      <dt>Cost</dt><dd>Extra FLOPs (1.5 to 1.6× in the examples above) and a drafter to build, train and serve. The gain fades once \(B(\gamma+1)\) approaches the ridge, drops when \(\alpha\) is low, and is subtle for MoE targets.</dd>
+      <dt>Used by</dt><dd>The original papers' setups, EAGLE-style drafters in SGLang, the MTP head in DeepSeek-V3/V4, Gemma 4's MTP drafters.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="non-ar">Non-autoregressive decoding as a speed lever</h2>
+
+  <p>Speculative decoding raises tokens per weight read by guessing a few tokens ahead of an autoregressive model. <strong>Diffusion language models</strong> raise it by changing the model: they generate a whole block of tokens in parallel and refine it over several denoising passes. Two recent systems make the trade-off concrete, and both are built by converting an autoregressive checkpoint rather than pretraining from scratch.</p>
+  <p><strong>DiffusionGemma</strong> (Google DeepMind, July 2026) is Gemma 4 26B A4B (25.2B total, 3.8B activated parameters) fine-tuned with less than 10% of its original token budget. It refines <em>canvases</em> of 256 tokens with bidirectional attention inside the canvas and causal attention to the KV cache of everything before it. With adaptive stopping a canvas takes about 12 denoising steps (at most 48), and averaged over the paper's benchmarks the model emits about 20 tokens per forward pass (19.74) and about 1,500 output tokens/s (1,479 measured, 1,456 from the formula \(\text{TPS} = \text{TPF}/t_{\text{fwd}}\) with \(t_{\text{fwd}} = 13.56\) ms) on one H100 at FP8 and batch size 1. The same setup gives 204 tokens/s for the autoregressive Gemma 4 and 303 with its MTP drafter (1.40 tokens per pass), so diffusion is 7.1× and 4.8× faster respectively <a href="https://arxiv.org/abs/2608.00146">[DiffusionGemma report, §6, Tab. 3]</a>.</p>
+  <p>The speed comes from the same roofline logic as everything else on this page. A denoising step processes 256 tokens but takes only 3.2× as long as a single-token AR step, because the pass is memory-bound: attention is 4× slower and sampling (a full-vocabulary self-conditioning matmul and softmax over 262k tokens) takes 3.06 ms against 0.56 ms, and the MoE kernel is 4.3× slower because a canvas activates about 84 distinct experts per layer against 8 for one token. This is the speculative-verification expert penalty at larger scale, and the report notes that a dense model would avoid most of it. The trade has three costs. <strong>Quality:</strong> the diffusion mode scores below its AR parent, for example AIME 2026 69.1 against 84.2, GPQA-Diamond 73.2 against 79.8 and LiveCodeBench-v6 69.1 against 71.4 (both in thinking mode, single-model comparison from the same report). <strong>Concurrency:</strong> the higher FLOPs per token mean the AR model with MTP overtakes it around 32 concurrent requests in the authors' unoptimized multi-user measurement (Fig. 12; AR with MTP uses draft length 4). <strong>Independence:</strong> tokens updated in the same step cannot see each other's samples, which can create local inconsistencies, so the sampler needs entropy-bounded token selection and self-conditioning to work well.</p>
+  <p><strong>LLaDA 2.0</strong> (Ant Group, December 2025) scales the same idea to 16B (mini) and 100B (flash) total parameters MoE models converted from AR checkpoints with a three-phase warmup-stable-decay schedule over the <em>block size</em>: grow the block toward full-sequence diffusion, train there, then shrink back to a compact block. Decoding uses blocks of 32 with a confidence threshold of 0.95 and reuses KV cache across blocks, which lets it run in SGLang-like engines. A confidence-aware training stage raises tokens per forward from 3.18 to 4.65 at some quality cost (12-benchmark average 78.57 to 76.85), giving 535 tokens/s against 383 without it and 256 and 237 for the AR baselines Ling-flash-2.0 and Qwen3-30B-A3B on four code and math benchmarks, up to 2.1× <a href="https://arxiv.org/abs/2512.15745">[LLaDA2.0, §5, §7.3]</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>An encoder tagger classifies a whole jet in one pass with bidirectional attention over every particle. A diffusion language model does the same computation on a block of positions, repeated a dozen times. That is why its cost profile looks like your tagger's: heavy FLOPs per pass and light bandwidth per token. It wins at batch 1, where the GPU has spare compute, and loses at batch 32, where autoregressive decoding with batching has already filled it.</p>
+  </aside>
+
+  <p>The lesson for interviews is not that diffusion "replaces" autoregression. It is that speculative decoding, MTP heads and diffusion decoding are three ways to spend FLOPs to save weight and KV bandwidth, and all three are <em>latency</em> tools for low concurrency. Speculative decoding preserves the target's distribution exactly. Diffusion decoding changes the model and pays a measurable quality cost for a much larger tokens-per-pass. As of September 2026 both DiffusionGemma and the MTP drafters are early: DiffusionGemma is an experimental release and the authors say its multi-user behavior is untuned.</p>
+</section>
+
+<section>
+  <h2 id="moe-serving">Serving Mixture-of-Experts models</h2>
+
+  <p>A Mixture-of-Experts model (<a href="08-mixture-of-experts.html">page 08</a>) has many parameters \(N\) but activates only \(N_{\text{act}}\) per token, which makes <em>training compute</em> cheap. Serving is different in two ways. Memory scales with the <em>total</em> parameter count, because any expert may be needed by some token. And the bandwidth a decode step consumes depends on how many distinct experts the batch touches, which grows with the batch. The reference case is DeepSeek-V3: 671B total, 37B activated, 61 layers of which 58 are MoE with 1 shared and 256 routed experts (expert hidden width 2,048, 8 routed experts per token) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §2]</a>.</p>
+
+  <h3 id="moe-memory">Memory: every parameter must be resident</h3>
+  <p>The released V3 weights are FP8, so the 671B parameters occupy 671 GB (bf16 would be 1.34 TB). An 80 GB GPU cannot hold even a ninth of it (\(671/80 = 8.4\), so at least 9 GPUs for weights alone). Eight H200s have 8 × 141 GB = 1,128 GB <a href="https://www.nvidia.com/en-us/data-center/h200/">[NVIDIA H200]</a>, which fits the FP8 model with 457 GB left for KV cache and activations; a DGX B200 lists 1,440 GB across its 8 GPUs. The routed experts hold almost everything: \(58 \times 256 \times 3 \times 7168 \times 2048 = 653.9\)B parameters, 97.5% of the total (each expert is a SwiGLU with three \(7168 \times 2048\) matrices). So quantizing experts is where the bytes are, which is why gpt-oss and DeepSeek-V4 go to 4 bits on exactly those tensors (<a href="#quant-fp">FP8 and FP4</a>). Meanwhile V3's KV cache is small: with MLA at 68.6 KiB per token, DeepSeek's average served context of 4,989 tokens is about 350 MB per sequence. V3 serving is <em>weight-dominated</em>, the opposite of dense long-context serving.</p>
+
+  <h3 id="moe-batch">Per-expert batch size: why MoE needs a huge batch</h3>
+  <p>With \(B\) tokens in the current step across the whole expert-parallel group, top-\(k\) routing over \(E\) routed experts sends on average \(B k / E\) tokens to each expert. For V3, that is \(B \cdot 8/256 = B/32\). An expert's matmul is efficient only when its token count \(m_e\) approaches the ridge (about 295 for FP8 weights on an H100-class GPU: 1,979 TFLOP/s over 3.35 TB/s, with 2 FLOPs per 1-byte weight per token). Reaching \(m_e = 295\) needs \(B \approx 9{,}440\) tokens per step across the group, about 118 sequences on each of 80 data-parallel attention replicas. DeepSeek states the decode-side reality: the batch per expert "is relatively small (usually within 256 tokens)", so the MoE part is memory-bound, not compute-bound <a href="https://arxiv.org/abs/2412.19437">[V3, §3.4.2]</a>. That is close to the ridge, and it is why the design pools tokens from many replicas: attention runs data-parallel (DP80, small TP4) while the experts run in a very wide expert-parallel group (EP320). The inference overview states the logic directly: with only 8 of 256 experts active, "the model's high sparsity necessitates an extremely large overall batch size" so each expert sees enough tokens <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[inference overview]</a>.</p>
+  <p>The same effect determines how many expert weights each step reads. If routing were uniform and independent, the expected fraction of the 256 experts touched in a layer by \(B\) tokens is \(1 - (248/256)^{B}\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Tokens in the step \(B\)</th><th class="num">1</th><th class="num">8</th><th class="num">32</th><th class="num">64</th><th class="num">128</th><th class="num">512</th></tr></thead>
+    <tbody>
+      <tr><td class="num">Distinct experts read per layer (of 256)</td><td class="num">8</td><td class="num">57</td><td class="num">163</td><td class="num">222</td><td class="num">252</td><td class="num">256</td></tr>
+      <tr class="hl"><td class="num">Fraction of routed weights read</td><td class="num">3%</td><td class="num">22%</td><td class="num">64%</td><td class="num">87%</td><td class="num">98%</td><td class="num">100%</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Uniform independent routing is an idealization: real routing is skewed, so real coverage is lower (DiffusionGemma measured about 84 distinct experts of 128 for a 256-token canvas, where the formula gives about 128). The trend, not the exact fractions, is the point.</p>
+  <p>Beyond about 100 tokens per step, essentially all experts are read every step and the "37B active parameters" bandwidth advantage is gone. An 8×H200 node (4.8 TB/s per GPU) shows the size of the effect: at batch 1 a step reads about 37 GB, roughly 1 ms of weight traffic across the node, while at batch 128 it reads about 660 GB, 17.2 ms, an 18× jump in step time for a 128× larger batch (idealized: perfect sharding, no communication). Per-GPU weight traffic is what expert parallelism attacks. Sharding the 256 routed experts (FP8, 58 layers, 2.55 GB per expert across all layers) over more GPUs cuts what each GPU reads per step:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>GPUs sharing the routed experts</th><th class="num">8</th><th class="num">16</th><th class="num">32</th><th class="num">64</th><th class="num">256 (1 expert/GPU)</th></tr></thead>
+    <tbody>
+      <tr><td>Experts per GPU</td><td class="num">32</td><td class="num">16</td><td class="num">8</td><td class="num">4</td><td class="num">1</td></tr>
+      <tr><td>Expert weights per GPU</td><td class="num">81.7 GB (does not fit)</td><td class="num">40.9 GB</td><td class="num">20.4 GB</td><td class="num">10.2 GB</td><td class="num">2.55 GB</td></tr>
+      <tr class="hl"><td>Read time per step at 3.35 TB/s</td><td class="num">24.4 ms</td><td class="num">12.2 ms</td><td class="num">6.1 ms</td><td class="num">3.05 ms</td><td class="num">0.76 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">All experts touched (large batch), FP8 experts, attention and shared-expert weights and redundant copies excluded. V3's decode unit is one expert per GPU on 256 GPUs plus 64 more for redundant and shared experts.</p>
+  <p>This is the latency argument for very wide EP: DeepSeek says each GPU "processing only a small subset of experts" reduces memory-access demand and therefore latency, while EP also "significantly scales the batch size" for the matrix multiplications. The price is cross-node all-to-all dispatch and combine at every MoE layer. V3 hides it by overlapping two micro-batches so one micro-batch's communication runs under the other's compute, sends tokens across InfiniBand with direct point-to-point transfers and IBGDA in decode, and quantizes the dispatched activations to FP8 while keeping the combine in BF16 <a href="https://arxiv.org/abs/2412.19437">[V3, §3.4]</a>, <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[inference overview]</a>.</p>
+
+  <h3 id="moe-balance">Load imbalance and redundant experts</h3>
+  <p>An MoE layer finishes when its <em>slowest</em> GPU finishes, so a popular expert creates a straggler. Training-time balancing (the auxiliary-loss-free bias of <a href="08-mixture-of-experts.html">page 08</a>) does not guarantee balance on live traffic; the V3 report names "domain-shift-induced load imbalance during inference" as the second challenge and answers it with <strong>redundant experts</strong> <a href="https://arxiv.org/abs/2412.19437">[V3, §4.5, §3.4]</a>. The high-load experts are detected from online statistics and duplicated, and the set is re-chosen periodically (for example every 10 minutes). In prefill the deployment uses 32 redundant experts, so each GPU hosts its 8 original experts plus one copy, and experts are rearranged within a node using observed load without increasing cross-node traffic. In decode there is one expert per GPU, so no rearrangement is needed: 64 GPUs host redundant and shared experts, and the shared expert is treated as a routed expert that every token selects (9 experts per token). DeepSeek was also exploring <em>dynamic</em> redundancy, where each GPU hosts 16 experts but only 9 are activated per step, with a globally optimal routing computed on the fly.</p>
+  <p>There are three balancers in the production system, since data parallelism adds its own imbalance: in prefill it balances core-attention compute and the number of input tokens sent per GPU; in decode it balances KV-cache usage and request counts per GPU; and the expert-parallel balancer minimizes the maximum dispatch-receive load <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[inference overview]</a>.</p>
+
+  <h3 id="moe-econ">Serving a 671B model economically</h3>
+  <p>The published numbers put the payoff in perspective. At $16 per node-hour, DeepSeek's 14.8k output tokens/s per decode node is $0.30 per million tokens, within about 3× of the $0.115 per million tokens that the roofline gives for an <em>8B dense</em> model at its capacity limit (<a href="#cost-numbers">the cost table</a>; different hardware price bases and a measured versus a roofline figure, so compare only the order of magnitude). A 671B-parameter model gets there by combining: 37B activated parameters, FP8 weights and matmuls, a tiny MLA cache, large-batch wide EP with redundant experts, prefill/decode disaggregation, and a 1.8× MTP speedup. For a team without a 320-GPU pool, the levers are different. An 8×H200 node holds the FP8 model, with the idealized weight-traffic limit above (about 17 ms per step at large batch, so no more than about 58 tokens/s per user). Four-bit experts would shrink the 654 GB of routed weights to about 347 GB (\(653.9 \times 4.25/8\), MXFP4-style), but that is only safe with QAT as in DeepSeek-V4 and gpt-oss, and quality must be measured. Speculative decoding helps at moderate batch, where all experts are read anyway (<a href="#spec-limits">when it helps</a>). The V3 report itself concedes that its recommended deployment unit "might pose a burden for small-sized teams" <a href="https://arxiv.org/abs/2412.19437">[V3, §6]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Expert-parallel MoE serving with redundant experts</div>
+    <dl>
+      <dt>Problem</dt><dd>A sparse MoE reads few weights per token at batch 1 but nearly all of them at batch of about 100 or more, and each expert sees too few tokens (\(B k/E\)) to use the tensor cores.</dd>
+      <dt>Idea</dt><dd>Spread experts over a very wide EP group (tens to hundreds of GPUs), pool tokens from many data-parallel attention replicas into that group, duplicate hot experts, and overlap the all-to-all with compute.</dd>
+      <dt>Why it works</dt><dd>Pooling raises per-expert batch toward the ridge, and giving each GPU only 1 to 2 experts cuts per-step weight reads from tens of GB to a few GB, so step time and thus TPOT stay low at high aggregate throughput. Redundant experts cap the straggler effect.</dd>
+      <dt>Evidence</dt><dd>V3 decode: EP320 with DP80, per-expert batch up to about 256 tokens <a href="https://arxiv.org/abs/2412.19437">[V3, §3.4.2]</a>; production accounting of 14.8k output tokens/s per node <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">[overview]</a>.</dd>
+      <dt>Cost</dt><dd>A large minimum deployment, all-to-all latency and bandwidth at every layer, engineering for overlap and load balancing, and wasted capacity at low traffic (DeepSeek reassigns idle nodes to research at night).</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3/R1 serving (prefill EP32, decode EP144 in production and EP320 in the report's reference design).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="long-context">Long-context serving</h2>
+
+  <p>Long context multiplies every KV term. The cost table showed Llama-3-8B fitting only 3 sequences of 128K per H100, and a decode step at 128K reads 17.2 GB of KV, more than the 16 GB of weights: with a single sequence the KV read takes 5.1 ms against 4.8 ms for the weights. Recall the factorization from <a href="07-kv-efficient-attention.html#after-mla">page 07</a>: KV bytes are layers × tokens × features per token × bytes per feature. The serving levers line up with those factors.</p>
+  <ul>
+    <li><strong>Fewer features per token</strong>: GQA and MLA (<a href="07-kv-efficient-attention.html">page 07</a>). This is a training-time decision and the biggest single factor.</li>
+    <li><strong>Fewer bytes per feature</strong>: FP8 or INT4-style KV quantization (<a href="#quant-kv">above</a>). It halves or quarters both capacity and bandwidth cost with no retraining, at an accuracy risk that is worst at full context.</li>
+    <li><strong>Fewer tokens read per step</strong>: sparse attention selects a subset of cached tokens per query (DeepSeek Sparse Attention reads the top 2,048), and sliding-window layers read only a window (<a href="09-beyond-full-attention.html">page 09</a>). These cut bandwidth and FLOPs but, unless combined with offloading, not capacity.</li>
+    <li><strong>Fewer tokens stored</strong>: sliding-window layers cap the cache (gpt-oss alternates dense layers with a 128-token banded window; Gemma 4 uses a 5:1 local-to-global ratio), and DeepSeek-V4 merges entries along the sequence (4 tokens per entry in CSA, 128 in HCA), reaching about 10% of V3.2's KV cache at 1M tokens and about 2% of a BF16 GQA-8 baseline <a href="https://arxiv.org/abs/2508.10925">[gpt-oss, §2.2]</a>, <a href="https://arxiv.org/abs/2607.02770">[Gemma 4, §2]</a>, <a href="https://arxiv.org/abs/2606.19348">[V4, §2.3]</a>.</li>
+    <li><strong>Move cold KV out of HBM</strong>: offload to CPU memory or SSD. Mooncake pools CPU DRAM, SSD and RDMA across the cluster as a KV store <a href="https://arxiv.org/abs/2407.00079">[Qin et al.]</a>, and DeepSeek-V4 keeps compressed KV on disk and reloads it for shared prefixes, with separate policies for the uncompressed sliding-window entries (store all, checkpoint periodically, or recompute) <a href="https://arxiv.org/abs/2606.19348">[V4, §3.5.2]</a>.</li>
+  </ul>
+  <p>Offloading has a bandwidth wall. HBM delivers 3.35 TB/s, while a host link is on the order of tens of GB/s (I assume an effective 50 GB/s for PCIe Gen5 x16, <span class="unverified" title="Assumed effective PCIe bandwidth for illustration; not taken from a datasheet checked for this page.">an assumption, not a measured figure</span>), roughly 67× less. So offloaded KV cannot be read on every decode step of a dense-attention model. It pays in two cases. First, <em>prefix reuse</em>: load once instead of recomputing. Loading the 16 GiB KV cache of a 128K-token Llama-3-8B prefix takes about 0.34 s at 50 GB/s, while recomputing it costs at least \(2NT = 2.1 \times 10^{15}\) FLOPs, 4.3 s at 50% of an H100's peak even before attention, about 12× more. Second, <em>sparse selection</em>, where only the top-\(k\) blocks are fetched per step.</p>
+  <p>Long prompts also stress prefill. The attention term grows as \(T^2\): for Llama-3-70B and a 32K prompt the linear part is \(2NT = 4.6 \times 10^{15}\) FLOPs and attention adds \(2 L d T^2 = 1.4 \times 10^{15}\) (23% of the total), so 6.0 PFLOPs, or 1.5 s on 8 H100s at 50% of peak. Levers are the ones already covered: FP8 prefill (Llama 3 405B reports up to 50% higher prefill throughput <a href="https://arxiv.org/abs/2407.21783">[§6.2]</a>), prefix caching, chunked pipeline parallelism across nodes for a single long prompt (Mooncake), and disaggregation so that long prefills do not stall decoding. That last point is measured: in Mooncake's real-workload replay only 57% of vLLM's requests met the TBT SLO while almost all of Mooncake's did <a href="https://arxiv.org/abs/2407.00079">[§8.1.3]</a>. Finally, evaluate every one of these levers <em>at full context length</em>. Retrieval and multi-needle tasks are where quantized, sparse or compressed caches fail first.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Continuous batching makes each request faster."</strong> It removes idle slots, so throughput at a given latency rises. A step with a fuller batch is not faster per token; TPOT does not improve (page 06's batching table shows it worsens).</li>
+    <li><strong>"PagedAttention speeds up attention."</strong> The kernel is 20% to 26% <em>slower</em> than a contiguous one. The gain is capacity: less fragmentation and free sharing mean a larger batch, and that raises throughput.</li>
+    <li><strong>"Prefix caching speeds up decoding."</strong> It saves prefill compute and TTFT and (through sharing) capacity. Every decode step still reads the whole KV cache. How much it saves depends on traffic: Mooncake found at most about 50% of KV reusable in Kimi's traces.</li>
+    <li><strong>"INT4 weights make a model 4× faster."</strong> Only weight reads shrink (3.88× with group scales), only while the step is memory-bound (about 76 tokens per step on an H100), and KV cache and activations stay in 16 bits. Prefill gets nothing. Marlin's end-to-end gain on Llama-2-7B is 2.93× at batch 1 and 1.20× at batch 128.</li>
+    <li><strong>"W8A8 is just INT8 weights plus INT8 activations."</strong> Activation outliers (values up to 20× to 100× typical, in a few fixed channels) make naive per-tensor INT8 collapse accuracy at 6.7B and above (OPT-175B falls to about 32% average accuracy). LLM.int8() and SmoothQuant exist to fix this, and INT8 GEMM hardware forbids per-input-channel activation scales.</li>
+    <li><strong>"Speculative decoding is an approximation."</strong> The accept/resample rule makes the output distribution exactly the target's, for any draft (numerics aside). Approximate variants exist (Medusa's typical acceptance) but that is a different algorithm. Conversely, speculative decoding is <em>not</em> always faster: at large batch verification is compute-bound and it can be slower than plain decoding.</li>
+    <li><strong>"Disaggregation is always better."</strong> It adds KV transfer and a pool-sizing problem, and pays least for short prompts, high cache-hit rates or small clusters. Chunked prefill on colocated GPUs is the lighter alternative.</li>
+    <li><strong>"A 671B MoE costs like a 37B dense model to serve."</strong> All 671B parameters must be resident, and beyond about 100 tokens per step nearly all experts are read every step. It is cheap only with wide expert parallelism and very large pooled batches.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Define TTFT, TPOT, throughput and goodput. Why do labs optimize goodput under an SLO instead of raw throughput?</summary>
+    <div class="answer">
+      <p><strong>TTFT</strong> is arrival to first output token (queueing + prefill + network). <strong>TPOT</strong> is \((\text{end-to-end latency} - \text{TTFT})/(n - 1)\), the average gap between later tokens. <strong>Throughput</strong> is output tokens per second across all requests. <strong>Goodput</strong> is the highest request rate per GPU at which a target fraction (say 90%) of requests meet both the TTFT and TPOT SLOs.</p>
+      <p>Throughput alone is easy to inflate: keep growing the batch until TPOT is unusable, or ignore requests that queued for a minute. Users experience the latency tails, and the cost that matters is dollars per <em>useful</em> token, which is price divided by the SLO-compliant token rate. DistServe's example shows the gap: a colocated GPU sustains 1.6 requests/s within the SLO, while 2 prefill GPUs plus 1 decode GPU sustain 10 requests/s on 3 GPUs (3.3 per GPU, 2.1× higher) with an identical SLO. Total token throughput would hide this, because it does not ask whether each request met its SLO. Mooncake goes further by counting a request only if it completes within its SLO and rejecting early those that cannot.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate the weight memory and per-token time for Llama-3-70B in bf16 versus INT4 (group 128) at batch 1 on an H100.</summary>
+    <div class="answer">
+      <p>Llama-3-70B has \(N = 70.55\)B parameters (80 layers, \(d = 8192\), \(n_{kv} = 8\), \(d_{ff} = 28672\)). bf16: \(70.55 \times 2 = 141.1\) GB, so at least 2 GPUs (70.6 GB each). INT4 with an fp16 scale per group of 128 is \(4 + 16/128 = 4.125\) bits per weight: \(70.55 \times 4.125/8 = 36.4\) GB, one GPU with about 37 GB left for KV and activations (of 73.6 GB usable).</p>
+      <p>At batch 1 every token reads all weights once, so time is bytes over bandwidth: bf16 on 2 GPUs reads 70.6 GB each, \(70.6/3350 = 21.1\) ms (47 tokens/s, ignoring communication); INT4 on 1 GPU reads 36.4 GB, 10.9 ms (92 tokens/s). Per GPU that is 23.7 versus 92.1 tokens/s, a 3.9× gain, matching the ideal \(16/4.125 = 3.88\). Caveats: KV cache and activations stay 16-bit; the gain fades once the batch exceeds about \(295/3.88 \approx 76\) tokens per step because bf16 tensor-core math becomes the limit; and prefill, being compute-bound, does not speed up.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate the expected tokens per step and the speedup for speculative decoding with \(\alpha = 0.8\), \(\gamma = 4\), \(c = 0.05\).</summary>
+    <div class="answer">
+      <p>Expected tokens per step: \((1 - 0.8^5)/(1 - 0.8) = (1 - 0.32768)/0.2 = 3.36\). One step costs the target pass plus four draft passes, \(1 + \gamma c = 1.2\) target-pass units, so the speedup is \(3.36/1.2 = 2.80\times\). The extra arithmetic, with \(\hat c = 0.05\), is \((1-\alpha)(\gamma \hat c + \gamma + 1)/(1 - \alpha^{\gamma+1}) = 0.2 \times 5.2/0.672 = 1.55\times\) the baseline's operations, which is fine while decoding is memory-bound. Sensitivity: a drafter with \(c = 0.3\) gives only \(3.36/2.2 = 1.53\times\), and one with \(\alpha = 0.6\) gives \(2.31/1.2 = 1.92\times\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain continuous batching and PagedAttention. What problems do they solve?</summary>
+    <div class="answer">
+      <p><strong>Continuous batching.</strong> With static batching a batch runs until its longest sequence finishes. Decode is memory-bound, so step time barely depends on how many sequences are still live, and finished sequences leave idle slots that cost the same as useful ones. Orca's iteration-level scheduling returns finished requests and admits waiting ones at every iteration. Dense layers treat all tokens as one flat batch, and attention, which cannot be batched across different lengths, runs per sequence (selective batching). In the 8-request example of Figure 1, static batching needs 15 steps at 53% slot utilization and continuous batching 10 steps at 80%, and queued requests start after 2 to 5 steps instead of 10. Orca reports 36.9× throughput over FasterTransformer at equal latency on GPT-3 175B.</p>
+      <p><strong>PagedAttention.</strong> Continuous batching makes the batch size depend on KV memory, and lengths are unknown in advance. Contiguous max-length reservations lose to reservation, internal and external fragmentation: only 20.4% to 38.2% of KV memory held real tokens in the Orca variants measured, and parallel samples could not share prompts. PagedAttention stores KV in fixed blocks (16 tokens) allocated on demand and located through a per-sequence block table, so waste is at most the unfilled tail of the last block (96.3% useful). Reference counts allow sharing, with copy-on-write when a shared block must be modified (parallel sampling and beam search save 6% to 10% and 38% to 55% of blocks on Alpaca). The cost is a 20% to 26% slower attention kernel from the indirection, worthwhile because the recovered capacity enlarges the batch: 2 to 4× throughput over FasterTransformer and Orca at similar latency. In short, continuous batching keeps the <em>slots</em> full and PagedAttention keeps the <em>memory</em> full.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A GPU has 52 GiB free for the KV cache of Llama-3-8B, max length 4,096 and mean length 600. How many concurrent sequences fit with contiguous reservation versus 16-token blocks? Is capacity then the limit?</summary>
+    <div class="answer">
+      <p>KV is 128 KiB per token. Contiguous reservation gives each request 4,096 tokens, 512 MiB, so \(52 \times 1024/512 = 104\) sequences. With 16-token blocks a sequence of 600 tokens occupies \(\lceil 600/16 \rceil = 38\) blocks (608 tokens); on average the tail wastes half a block, so about 607.5 tokens, 75.9 MiB, and \(53{,}248/75.9 = 701\) sequences, 6.7× more.</p>
+      <p>Capacity is then no longer the only limit. 701 sequences read 52 GiB (55.8 GB) of KV per step plus 16 GB of weights, 21.5 ms at 3.35 TB/s, i.e. about 32,700 tokens/s at the roofline, against 4,850 for 104 sequences at the same bytes per step. The matmul compute for 701 tokens is 11.4 ms, about half the memory time, so the step is approaching compute-bound. The TPOT SLO, not memory, sets the operating point from here, and the estimate assumes that most sequences really are short.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the speculative-decoding acceptance rule. Why is the output distribution unchanged?</summary>
+    <div class="answer">
+      <p>Let \(p\) be the target and \(q\) the draft distribution for the next token. Sample \(x \sim q\), accept with probability \(\min(1, p(x)/q(x))\), and on rejection sample from the residual \(p'(x) = \max(0, p(x) - q(x))/(1 - \beta)\), where \(\beta = \sum_x \min(p(x), q(x))\) is the acceptance probability.</p>
+      <p>Probability of emitting \(x\) via acceptance: \(q(x)\min(1, p(x)/q(x)) = \min(p(x), q(x))\). The rejection probability is \(1 - \beta = \sum_x [p(x) - \min(p(x), q(x))] = \sum_x \max(0, p(x) - q(x))\), which is exactly the residual's normalizer, so emitting \(x\) via rejection has probability \((1 - \beta)p'(x) = \max(0, p(x) - q(x))\). Adding: \(\min(p, q) + \max(0, p - q) = p\). So the token is distributed exactly as \(p\), for any \(q\) (with \(q(x) > 0\) wherever a draft can land). Intuitively, acceptance delivers at most \(p\) on tokens the draft over-proposes and the residual supplies exactly the shortfall on tokens it under-proposes.</p>
+      <p>For \(\gamma\) tokens use induction. If the previous drafts were accepted, the target row for position \(i\) was computed on the true prefix (causal masking makes the single verification pass equal to teacher-forced scoring), so token \(i\) is exact. After the first rejection, later rows were conditioned on a rejected token and are discarded. If all \(\gamma\) are accepted, the extra row \(p_{\gamma+1}\) is also conditioned on the true prefix, so a bonus token from it is exact. Each step emits between 1 and \(\gamma + 1\) tokens. Sampling controls (temperature, top-\(p\)) are applied to both \(p\) and \(q\) first, and a greedy target is one-hot \(p\) (accept iff draft equals argmax). Note that the guarantee is distributional: floating-point numerics differ across batch shapes.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> When does speculative decoding stop helping?</summary>
+    <div class="answer">
+      <p>Write speedup \(\approx \mathbb{E}[\text{tokens}]/(\gamma c + r)\), with \(r = T_{\text{target}}(B, \gamma+1)/T_{\text{target}}(B, 1)\) the extra cost of verifying \(\gamma + 1\) tokens instead of one. It stops helping when:</p>
+      <ul>
+        <li><strong>Verification is no longer free (large batch).</strong> The pass is memory-bound only while \(B(\gamma + 1)\) tokens per weight read stay below the ridge of about 295 (\(B \lesssim 59\) for \(\gamma = 4\) on an H100 in bf16). Beyond that \(r \to \gamma + 1\) and the speedup tends to \(\mathbb{E}[\text{tokens}]/(\gamma + 1 + \gamma c)\), 0.65 for \(\alpha = 0.8\), \(\gamma = 4\). Measured in SGLang on H100 (Llama-3.1-8B): EAGLE 1.40× at batch 2 falls to about 1× by batch 16 to 64, and EAGLE-3 goes from 1.81× to 1.32 to 1.38×.</li>
+        <li><strong>Acceptance is low or the drafter is slow.</strong> Need \(\alpha > c\), and returns saturate at \(1/(1-\alpha)\) tokens. Acceptance drops at high temperature and on unpredictable text (T5-small drafting T5-XXL: \(\alpha\) 0.75 to 0.62 from temperature 0 to 1).</li>
+        <li><strong>Small-batch MoE targets.</strong> Verifying 5 tokens touches up to about 4.7× the experts of one token in a V3-shaped layer under uniform routing (37.6 versus 8 of 256). At moderate batch, when every expert is read anyway, it helps again (MoESD: up to 2.29×).</li>
+        <li><strong>Tail-latency and variance</strong> grow with \(\gamma\), and it costs extra FLOPs (about 1.5 to 1.6× in the examples), which matters when the cluster is compute-bound.</li>
+      </ul>
+      <p>It helps most at low concurrency with predictable output (code, extraction, structured text), and at long context where the KV read is amortized over the verified tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why is W8A8 quantization harder than W4A16? What does SmoothQuant do?</summary>
+    <div class="answer">
+      <p>W4A16 quantizes only weights: static, smooth distributions, calibrated offline with group-wise scales (GPTQ, AWQ), then dequantized into 16-bit for the matmul. W8A8 must also quantize <em>activations</em>, which have systematic outliers: above roughly 6.7B parameters a few fixed hidden channels carry values up to 20× (LLM.int8()) to 100× (SmoothQuant) larger than the rest, and they matter (zeroing them halves top-1 attention mass and raises perplexity 600% to 1,000%). With per-tensor scales the outliers set the step size and normal channels get 2 to 3 effective levels; OPT-175B collapses to about 32% average accuracy. Per-channel activation scales would fix accuracy (71.4% versus 71.6%), but an INT8 GEMM can only apply scales on its outer dimensions (per token, per output channel), not along the input channel where outliers live. LLM.int8() sidesteps this by running the outlier dimensions (magnitude at least 6) in fp16 and the other 99.9% in INT8, which is accurate but slow.</p>
+      <p><strong>SmoothQuant</strong> applies an equivalent transformation \(Y = (X\,\mathrm{diag}(s)^{-1})(\mathrm{diag}(s)W)\) with \(s_j = \max|X_j|^\alpha/\max|W_j|^{1-\alpha}\). It divides outlier activation channels by \(s_j\) and multiplies the matching weight rows, moving the difficulty into the weights, which have slack. The scaling is folded into the previous LayerNorm or linear layer offline, so runtime is a plain INT8 GEMM. Example: an outlier channel with maxima 100 (activation) and 0.5 (weight) at \(\alpha = 0.5\) gets \(s = 14.1\) and both ranges become 7.07, which gives normal channels about 12.7 levels instead of 1.3. Results: lossless W8A8 on OPT-175B, BLOOM-176B and MT-NLG 530B, up to 1.56× faster and about 2× less memory, with \(\alpha\) tuned per model (0.5 for OPT, 0.85 to 0.9 for Llama-2).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why separate prefill and decode onto different GPUs? What does it cost?</summary>
+    <div class="answer">
+      <p>Prefill is compute-bound (intensity equals the prompt length, thousands, against a ridge of about 295) and decode is memory-bound (intensity equals the batch). Colocated, they interfere: a prefill in the batch stretches every co-running decode's TPOT, and decodes riding along slow the prefill and raise TTFT. They are also coupled to one parallelism plan and one hardware type although they want different ones (prefill benefits from tensor parallelism to cut latency; decode wants a big batch and memory). Separate pools let each run near its own efficient point and be sized independently, so goodput per GPU rises. DistServe's example: colocated 1.6 requests/s per GPU against 3.3 with a 2:1 prefill-to-decode split (2.1×), and up to 7.4× more requests or 12.6× tighter SLO overall. Splitwise reports up to 1.4× throughput at 20% lower cost, using older or power-capped GPUs for decode. DeepSeek-V3 uses different parallelism per phase (prefill EP32, decode EP144 to EP320).</p>
+      <p>Costs: the KV cache must move. For Llama-3-70B a 2,048-token prompt is 671 MB, 13 ms on a 400 Gb/s link but 215 ms on 25 Gb/s Ethernet, so placement, NVLink locality and layer-wise streaming matter (measured under 0.1% of latency for OPT-175B in DistServe; under 7% of prompt time in Splitwise). MLA or GQA shrink the transfer (V3: 144 MB for the same prompt). You also carry two pools whose ratio must track the prompt/output mix, two weight copies, and more complexity. It pays least for short prompts, high prefix-cache hit rates or small clusters, where chunked prefill on colocated GPUs is the simpler fix.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does chunked prefill work, and how do you choose the token budget?</summary>
+    <div class="answer">
+      <p>Without it, a long prompt joining a batch makes that iteration take seconds and stalls every decode in it. Below the compute-bound threshold an iteration's time is set by streaming weights, so a decode-only batch has spare compute. Sarathi-Serve's stall-free batching builds each iteration from all running decodes plus a chunk of a pending prefill sized to a token budget \(\tau\), so every iteration has bounded, near-uniform cost regardless of prompt length. It raised serving capacity under SLOs 2.6× (Mistral-7B, one A100), 3.7× (Yi-34B, two A100s) and 5.6× (Falcon-180B with pipeline parallelism, where uniform iterations also remove bubbles) against vLLM, and avoided up to 28.3× TBT inflation from unchunked hybrid batches.</p>
+      <p>Choosing \(\tau\): large enough that the iteration is near the ridge (roughly 200 to 600 tokens on A100 depending on tensor parallelism; about 295 tokens as the H100 bf16 ridge), small enough that the iteration time meets the TPOT SLO with the decode batch included. Profile iteration time against token count on the target hardware. Too small a chunk wastes efficiency, re-reads the KV of earlier chunks (\(N(N-1)/2\) chunk-sized reads for \(N\) chunks) and suffers tile quantization (a 257-token chunk can cost 32% more than 256). The trade-off is TTFT for TPOT: a chunked prompt finishes prefill later, and DistServe argues interference is only reduced, not removed.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How do you serve a 671B MoE model economically?</summary>
+    <div class="answer">
+      <p>Walk through the bottlenecks in order. <strong>Memory:</strong> all 671B parameters must be resident: 671 GB in FP8 (V3 ships FP8), so at least 9 H100s or one 8×H200 node (1,128 GB, 457 GB spare). 97.5% of the bytes are routed experts, so precision work (FP8, FP4 experts as in V4 and gpt-oss) targets them. The KV cache is small thanks to MLA (68.6 KiB per token), so serving is weight-dominated.</p>
+      <p><strong>Batch:</strong> with top-8 of 256 experts each expert sees \(B/32\) tokens, so reaching the FP8 ridge (about 295 tokens per expert) needs \(B \approx 9{,}400\) tokens per step across the group. Pool tokens from many data-parallel attention replicas into a wide expert-parallel group: V3 decode uses attention TP4 with DP80 and EP320, one expert per GPU. That also cuts per-GPU expert weight reads to about 2.55 GB per step (0.76 ms) from tens of GB, keeping TPOT low at high aggregate throughput. Beyond about 100 tokens per step essentially every expert is read every step (98% at 128 tokens under uniform routing), so the "37B active" bandwidth advantage only exists at tiny batch.</p>
+      <p><strong>Communication and balance:</strong> all-to-all dispatch and combine at every layer, hidden by overlapping two micro-batches (FP8 dispatch, BF16 combine, IBGDA in decode). Live traffic is imbalanced, and a layer waits for its slowest GPU, so duplicate high-load experts (32 redundant experts in prefill, 64 GPUs for redundant and shared experts in decode), re-chosen from online statistics every ~10 minutes, plus DP-level balancers for KV usage and token counts. <strong>Phases:</strong> disaggregate prefill (EP32) from decode (EP144 to EP320) since they want different parallelism. <strong>Latency levers:</strong> the depth-1 MTP head gives 1.8× TPS (85% to 90% acceptance).</p>
+      <p><strong>Economics:</strong> DeepSeek's accounting is 14.8k output tokens/s per 8-GPU node, about $0.30 per million output tokens at $2 per GPU-hour, with a 56% cache hit rate on input. The minimum unit is big, which the V3 report admits, so a small team should use an 8×H200 node with FP8 (idealized limit about 17 ms per step at large batch), consider 4-bit experts only with QAT and measured quality, and use speculative decoding at moderate batch.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you must serve Llama-3-70B (bf16 baseline) at 32K context on one 8×H100 node with TTFT under 1 s and TPOT under 50 ms. What is your plan?</summary>
+    <div class="answer">
+      <p><strong>Quantify.</strong> KV is \(80 \times 2 \times 8 \times 128 \times 2\) B = 320 KiB per token, so a 32K session is 10 GiB. TP8: 17.6 GB of weights and 1.34 GB per session per GPU (one KV head each). With 73.6 GB usable, about 41 concurrent 32K sessions fit. A decode step at 41 sessions reads \(17.6 + 41 \times 1.34 = 72.6\) GB per GPU, 21.7 ms at 3.35 TB/s, so TPOT under 50 ms is feasible in bf16 before communication. <strong>Prefill is the problem:</strong> a 32K prompt costs \(2NT = 4.6 \times 10^{15}\) FLOPs plus \(2LdT^2 = 1.4 \times 10^{15}\) for attention, 6.0 PFLOPs, which is 1.5 s on the node at 50% MFU, above the 1 s TTFT before any queueing.</p>
+      <p><strong>Plan.</strong> (1) FP8 W8A8 for prefill (2× tensor-core rate; Llama 3 405B saw up to 50% more prefill throughput), giving about 0.76 s, with quality checked at full context and the Llama 3 lessons applied (row-wise scales, cap dynamic scales, skip first and last layers). (2) Prefill/decode disaggregation or at least chunked prefill so long prompts never stall the 41 decodes, and so prefill capacity scales independently; the 32K KV is 10.7 GB, 215 ms on one 400 Gb/s link, so stream it layer by layer over several NICs. (3) Prefix caching if sessions share a long document or system prompt, which removes most of the prefill work. (4) INT8 KV doubles sessions to about 82 if concurrency binds. (5) Speculative decoding is optional: \(41 \times 5 = 205\) tokens per weight read is still under the ridge, but TPOT is already met. (6) Add admission control and early rejection so overload does not blow the TTFT tail (Mooncake). (7) Validate every quantization at full 32K length with retrieval tests, since that is where it fails first.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compare a separate draft model, Medusa, EAGLE and an MTP head as speculative drafters. Which preserve the target distribution?</summary>
+    <div class="answer">
+      <p><strong>Separate draft model</strong> (Leviathan, Chen): an independent small model, e.g. T5-small for T5-XXL or a 4B wide-shallow draft for Chinchilla 70B. Needs the same tokenizer, its own serving, and its own KV cache; \(c\) is set by its size and topology. Exact. <strong>Medusa:</strong> extra heads on the target's last hidden state, each predicting a different future position independently, verified as a tree with tree attention. No second model and trainable in hours (Medusa-1: 5 hours on one A100), 2.18× to 2.83×, but the heads do not see each other's drafted tokens so acceptance decays with depth, and its "typical acceptance" is not distribution-preserving (rejection sampling can be used instead, at lower acceptance). <strong>EAGLE:</strong> drafts autoregressively at the feature level and also inputs the token sampled one step earlier, which removes the ambiguity of predicting a feature after a random sample, using one decoder layer plus the target's embedding and LM head (0.24B to 0.99B parameters); tree drafts with multi-round rejection sampling, so it is exact, at 2.7 to 3.5× on LLaMA2-Chat 70B. EAGLE-3 drops the feature-regression loss so the drafter scales with data, fuses low, middle and high layer features, and trains on its own outputs (up to 6.5×, 1.38× at batch 64 in SGLang). <strong>MTP head</strong> (DeepSeek-V3, Gemma 4): a module trained with the model (V3) or alongside it (Gemma 4's 4-layer block that cross-attends to the target's KV), used as a depth-1 or short-chain drafter with the standard rejection rule; V3 sees 85% to 90% acceptance for the second token and 1.8× TPS.</p>
+      <p>The pattern is that better drafters reuse the target's own hidden states and KV cache, which lowers \(c\) and raises \(\alpha\) together. Exactness comes from the verification rule, not the drafter: any drafter is exact under the standard (or multi-round, for trees) rejection rule, and only heuristic acceptance schemes give it up.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> DiffusionGemma emits about 20 tokens per forward pass, versus 3 to 6 for speculative decoding. When does a diffusion language model win against an autoregressive model with MTP drafting, and when not?</summary>
+    <div class="answer">
+      <p>Both trade FLOPs for fewer weight and KV reads per token, so both help while the GPU is bandwidth-bound. DiffusionGemma refines 256-token canvases in about 12 denoising steps. Each step processes 256 tokens yet costs only about 3× a single-token autoregressive step (3.2× in GPU kernel time; 13.56 ms against about 4.9 ms per token end to end), so throughput is roughly TPF divided by that cost ratio, \(19.74/2.77 \approx 7.1\) times the autoregressive rate: about 1,456 tokens/s at batch 1 on an H100 in FP8, against 204 for the autoregressive model and 303 with its MTP drafter (only 1.40 tokens per pass). So it wins at <strong>low concurrency</strong> and high latency sensitivity: 7.1× and 4.8× faster in the report.</p>
+      <p>It loses when (a) <strong>concurrency rises</strong>: each denoising step spends about 256× the FLOPs per pass, the autoregressive model with batching already fills the tensor cores, and the report measures the crossover near 32 concurrent requests (in an unoptimized multi-user setup); (b) the <strong>architecture penalizes wide passes</strong>: a 256-token canvas touches about 84 distinct experts per layer against 8 for a token, making the MoE kernel 4.3× slower (a dense model would avoid most of it), and sampling over a 262k vocabulary costs 3.06 ms against 0.56 ms; and (c) <strong>quality matters</strong>: the converted model trails its parent (AIME 2026 69.1 against 84.2, GPQA-Diamond 73.2 against 79.8), while speculative decoding is lossless by construction. Diffusion also needs a converted or trained model, whereas an MTP or EAGLE drafter attaches to an existing one. A sensible system routes by latency target and concurrency, and the report itself points to hybrid decoding since the model retains an autoregressive mode.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Speculative decoding, the lossless rule.</strong> Implement <code>speculative_accept</code> (accept each drafted token with probability \(\min(1, p/q)\), stop at the first rejection, resample from \(\text{norm}(\max(0, p - q))\), or sample a bonus token when everything is accepted), plus the closed forms <code>acceptance_rate</code>, <code>expected_tokens_per_step</code> and <code>speedup</code>. The tests check the marginal of the first token and the joint distribution of the first three tokens against a bigram "target" over thousands of Monte-Carlo runs, so a rule that resamples from \(p\) instead of the residual, or trusts the draft, fails. An interviewer would expect the core function in 20 to 30 minutes; the closed forms take five. <span class="ex-path">exercises/drills/speculative.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_speculative.py</code>; add <code>--solutions</code> to check the reference. For extra practice, implement the <code>BlockManager</code> from the PagedAttention section with a test that forks a sequence, appends to both children and checks reference counts and copy-on-write.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2309.06180">Kwon et al. (2023). Efficient Memory Management for Large Language Model Serving with PagedAttention.</a> <span class="why">Why read it: Fig. 2 quantifies KV waste; the block table and copy-on-write design; the kernel-overhead and block-size ablations.</span></li>
+    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al. (2022). Orca (OSDI)</a> and <a href="https://arxiv.org/abs/2312.07104">Zheng et al. (2023). SGLang.</a> <span class="why">Why read it: iteration-level scheduling and selective batching; RadixAttention, cache-aware scheduling and its optimality theorem.</span></li>
+    <li><a href="https://arxiv.org/abs/2403.02310">Agrawal et al. (2024). Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve.</a> <span class="why">Why read it: generation stalls, chunked prefill, stall-free batching and the token-budget trade-off.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.09670">Zhong et al. (2024). DistServe</a>, <a href="https://arxiv.org/abs/2311.18677">Patel et al. (2023). Splitwise</a> and <a href="https://arxiv.org/abs/2407.00079">Qin et al. (2024). Mooncake.</a> <span class="why">Why read it: goodput and disaggregation (DistServe §1 and Fig. 1), heterogeneous hardware and KV transfer (Splitwise), and KV-centric scheduling under overload (Mooncake).</span></li>
+    <li><a href="https://arxiv.org/abs/2210.17323">Frantar et al. (2022). GPTQ</a>, <a href="https://arxiv.org/abs/2306.00978">Lin et al. (2023). AWQ</a> and <a href="https://arxiv.org/abs/2408.11743">Frantar et al. (2024). MARLIN.</a> <span class="why">Why read it: Hessian-based versus activation-aware weight quantization, and why the speedup fades with batch size (Marlin's roofline).</span></li>
+    <li><a href="https://arxiv.org/abs/2208.07339">Dettmers et al. (2022). LLM.int8()</a>, <a href="https://arxiv.org/abs/2211.10438">Xiao et al. (2022). SmoothQuant</a> and <a href="https://arxiv.org/abs/2402.02750">Liu et al. (2024). KIVI.</a> <span class="why">Why read it: the outlier-feature analysis, the smoothing transformation, and per-channel key versus per-token value KV quantization.</span></li>
+    <li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al. (2023). Fast Inference from Transformers via Speculative Decoding</a> and <a href="https://arxiv.org/abs/2302.01318">Chen et al. (2023). Accelerating LLM Decoding with Speculative Sampling.</a> <span class="why">Why read it: the acceptance rule, the exactness proof (Leviathan App. A.1, Chen Thm. 1), and the speedup analysis (Leviathan §3).</span></li>
+    <li><a href="https://arxiv.org/abs/2401.10774">Cai et al. (2024). Medusa</a>, <a href="https://arxiv.org/abs/2401.15077">Li et al. (2024). EAGLE</a> and <a href="https://arxiv.org/abs/2503.01840">Li et al. (2025). EAGLE-3.</a> <span class="why">Why read it: tree-verified draft heads, feature-level drafting, training-time test, and batch-size throughput data (EAGLE-3 §4.3).</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report</a> and the <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">DeepSeek-V3/R1 inference system overview (2025).</a> <span class="why">Why read it: §3.4 deployment (prefill and decode units, redundant experts), §5.4.3 MTP acceptance, and the published cost accounting.</span></li>
+    <li><a href="https://arxiv.org/abs/2608.00146">DiffusionGemma Team (2026). DiffusionGemma Technical Report</a> and <a href="https://arxiv.org/abs/2512.15745">Bie et al. (2025). LLaDA2.0.</a> <span class="why">Why read it: tokens per forward and the batch-size crossover against AR with MTP (§6), and converting AR checkpoints to block diffusion.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>Cost: \(\$/\text{M tokens} = p_{\text{GPU-h}} N_{\text{GPU}} / (3600 \cdot \text{tokens/s in SLO}) \times 10^6\). Llama-3-8B, H100, $2/h (roofline): $2.75 at \(B = 1\), $0.115 at the 4K-context capacity limit (B = 104); 128K context at capacity (B = 3): $3.74. Optimize goodput, not throughput.</li>
+      <li>Continuous batching: iteration-level scheduling, slot utilization is cost (Orca 36.9× vs FasterTransformer). PagedAttention: 16-token blocks, block table, refcount + copy-on-write; 96.3% useful KV vs 20.4% to 38.2%; attention kernel 20% to 26% slower.</li>
+      <li>Prefix caching: hash-chained blocks or a radix tree with LRU leaves; helps TTFT and capacity, not per-token decode; DeepSeek 56.3% hit rate, cached input 3.9× cheaper.</li>
+      <li>Chunked prefill: token budget \(\tau\), decodes first, then a prefill chunk; near the ridge (about 295 tokens on H100 bf16) but under the TPOT SLO; 2.6× to 5.6× capacity vs vLLM.</li>
+      <li>Disaggregation: prefill compute-bound, decode memory-bound. DistServe 2 prefill : 1 decode GPU = 3.3 vs 1.6 rps/GPU (2.1×). KV transfer = KV/token × prompt / link (Llama-3-70B, 2K tokens: 671 MB; V3 MLA: 144 MB). V3: prefill EP32, decode EP320 (production EP144).</li>
+      <li>Quantization: \(\Delta = \max|x|/(2^{N-1}-1)\); group 128 with fp16 scale = 4.125 bits; MXFP4 4.25, NVFP4 4.5. W4A16 ideal 3.88×, fades beyond about 76 tokens per step on H100 (FP8/bf16 ridge: 295). 70B: 141 GB to 36 GB, 23.7 to 92 tokens/s/GPU.</li>
+      <li>GPTQ: layer-wise Hessian error compensation (OPT-175B 4-bit ppl 8.37 vs 8.34). AWQ: scale salient channels \(s = s_X^\alpha\). W8A8: outliers up to 20× to 100×; SmoothQuant \(s_j = \max|X_j|^\alpha/\max|W_j|^{1-\alpha}\), fused offline, \(\alpha \approx 0.5\) to 0.9. KIVI: keys per channel, values per token, 2-bit.</li>
+      <li>Speculative decoding: accept \(\min(1, p/q)\), resample \(\text{norm}(\max(0, p - q))\), bonus token from \(p_{\gamma+1}\). Exact because \(\min(p,q) + \max(0,p-q) = p\). \(\beta = 1 - \mathrm{TV}(p,q)\); \(\mathbb{E}[\text{tokens}] = (1-\alpha^{\gamma+1})/(1-\alpha)\); speedup \(= \mathbb{E}/(1 + \gamma c)\). \(\alpha = 0.8, \gamma = 4\): 3.36 tokens, 2.80× at \(c = 0.05\).</li>
+      <li>Speculation fades when \(B(\gamma+1)\) nears the ridge (\(B \lesssim 59\) at \(\gamma = 4\)); EAGLE-3 in SGLang: 1.81× at batch 2, 1.38× at 64. MoE: 8 experts per token vs 37.6 for 5 verified tokens at batch 1 (uniform routing). V3 MTP: 85% to 90% acceptance, 1.8× TPS.</li>
+      <li>Diffusion LMs: DiffusionGemma about 20 tokens per pass, about 1,500 tokens/s on one H100 at batch 1 (AR 204, AR+MTP 303), loses beyond about 32 concurrent users; LLaDA2.0 TPF 3.2 to 4.7.</li>
+      <li>MoE serving: memory scales with total \(N\) (V3 FP8: 671 GB; routed experts 97.5%). Tokens per expert = \(Bk/E = B/32\). Experts read per layer \(= E[1 - ((E-k)/E)^B]\): 64% at \(B = 32\), 98% at 128. Wide EP: 1 expert per GPU is 2.55 GB, 0.76 ms per step. Redundant experts and DP balancers fight stragglers.</li>
+      <li>Long context: KV read at 128K (17.2 GB) exceeds the weights; levers by factor: fewer features (GQA/MLA), fewer bytes (KV quantization), fewer tokens read (sparse), fewer stored (window, compression), offload only for prefix reuse (bandwidth wall about 67×).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

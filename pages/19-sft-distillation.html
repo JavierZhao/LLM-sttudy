@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · SFT, instruction tuning &amp; distillation · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="19" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part IV · Post-training: SFT &amp; preferences · Page 19</div>
+  <h1>SFT, instruction tuning &amp; distillation</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~55 min</span>
+    <span>Prereqs: <a href="01-big-picture.html">01 Big picture</a>, <a href="02-tokenization.html">02 Tokenization</a>, <a href="06-decoding-kv-cache.html">06 Decoding</a></span>
+  </div>
+  <p class="lede">A pretrained model continues documents; supervised finetuning turns it into an assistant by training the same cross-entropy on demonstrations, with the loss on the response only. This page covers the mechanics that decide whether that works (chat templates, loss masks, packing, normalization), how SFT data is built, and distillation, the technique behind most small open models: training a student on a stronger teacher's tokens (off-policy) or on its own samples scored by the teacher (on-policy).</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>What SFT does and does not teach:</strong> format and behavior versus knowledge, the superficial alignment hypothesis with its counter-evidence, and why demonstrations of facts the model lacks teach it to guess.</li>
+    <li><strong>The plumbing bugs:</strong> which tokens carry loss (including the end-of-turn token), what breaks when the training and inference templates differ, and what naive packing does to attention and to loss weighting.</li>
+    <li><strong>Data judgment:</strong> how you would build a dataset for a coding assistant, quality versus quantity versus diversity, synthetic data from a stronger model, decontamination.</li>
+    <li><strong>Distillation, exactly:</strong> forward versus reverse KL and which is mode-seeking, on-policy versus off-policy as a separate axis, and why DeepSeek-V4, Qwen3 and MiMo distill from teachers on the student's own samples.</li>
+    <li><strong>Why distill instead of running RL:</strong> the R1 evidence and its limits, and how rejection-sampling finetuning relates to RL.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Write the SFT loss with its response mask, and explain what SFT changes (format, stopping, behavior) and where the superficial alignment hypothesis breaks down.</li>
+    <li>Render a conversation in ChatML, Llama 3 and Gemma style templates, mark exactly which tokens are targets (including the end-of-turn token), and list the template mismatches that silently degrade a finetuned model.</li>
+    <li>Explain cross-document contamination in packed sequences, build the block-diagonal causal mask, and compute token-weighted versus sequence-weighted loss for a packed batch.</li>
+    <li>Design an SFT dataset (sources, filtering, decontamination, mixture) and pick a learning rate, epoch count and evaluation loop from published recipes.</li>
+    <li>Derive the temperature KD loss and its \(T^2\) factor, state forward versus reverse KL with a worked numerical example, and place any distillation method on the axes data source (fixed, teacher samples, student samples) and divergence.</li>
+    <li>Describe how DeepSeek-R1's distilled models, Qwen3's strong-to-weak distillation and DeepSeek-V4's multi-teacher on-policy distillation work, and argue when distillation beats RL.</li>
+    <li>Describe rejection-sampling finetuning and STaR, and relate them to policy gradient.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ 1 -->
+<section>
+  <h2 id="what-sft">What SFT changes, and what it does not</h2>
+
+  <p>Recall from <a href="01-big-picture.html#pipeline">page 01</a> that a pretrained model is a document continuer: fed a question, it may emit more questions. <strong>Supervised finetuning</strong> <span class="zh">监督微调</span> (SFT) continues training with the <em>same</em> next-token cross-entropy on (prompt, response) pairs rendered as one token sequence. <strong>Instruction tuning</strong> <span class="zh">指令微调</span> is SFT on data whose prompts are instructions; in practice the two terms are used interchangeably. The one change from pretraining is which positions carry loss. With \(\mathcal R\) the set of response positions (the assistant's tokens including its end-of-turn token):</p>
+
+  <div class="eq-box">
+  \[ \mathcal L_{\text{SFT}}(\theta) = -\frac{1}{|\mathcal R|} \sum_{t \in \mathcal R} \log p_\theta\big(x_t \mid x_{\lt t}\big) \]
+  <div class="eq-label">Prompt tokens are inputs only. Llama 3: "standard cross entropy loss on the target tokens (while masking loss on prompt tokens)" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.3]</a></div>
+  </div>
+
+  <p>This is behavior cloning <span class="zh">行为克隆</span>: the model learns the conditional distribution of a demonstrator (a human labeler or a stronger model) and nothing else. The consequences follow from that fact.</p>
+
+  <h3 id="behavior">What it changes: format, stopping, behavior</h3>
+  <p>The visible effects of SFT are the ones a base model lacks. Chung et al. list the failures of PaLM before instruction finetuning: it continues generating related text instead of answering, repeats the question with small changes, and does not know when to stop, "likely an artifact of not using end-of-sequence tokens in pre-training" <a href="https://arxiv.org/abs/2210.11416">[Chung et al. 2022, §6]</a>. SFT teaches the role structure, the answer style, refusal behavior, tool-call syntax and a termination habit. The effect is large per unit of compute: instruction finetuning Flan-PaLM 540B used about 0.2% of its pretraining compute <a href="https://arxiv.org/abs/2210.11416">[Chung et al. 2022, Tab. 2]</a>, and a 1.3B InstructGPT was preferred by labelers to the 175B GPT-3 <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §4.1]</a>.</p>
+
+  <h3 id="sah">The superficial alignment hypothesis, and its limits</h3>
+  <p>LIMA fine-tuned a 65B LLaMA on only 1,000 curated examples (750 from community forums, 250 written or adapted by the authors) and defined the <strong>Superficial Alignment Hypothesis</strong>: "A model's knowledge and capabilities are learnt almost entirely during pretraining, while alignment teaches it which subdistribution of formats should be used when interacting with users." In a human study its responses were equivalent to or preferred over GPT-4's in 43% of cases, over Bard's in 58% and over the RLHF-trained DaVinci003's in 65% <a href="https://arxiv.org/abs/2305.11206">[Zhou et al. 2023, Abstract, §2, §7]</a>. The authors also list the limits: building such examples takes significant effort that is hard to scale, and LIMA was less robust than product-grade models. Three lines of evidence say how far the hypothesis holds.</p>
+  <ul>
+    <li><strong>New facts are learned slowly and cost hallucination.</strong> In a controlled closed-book QA study, fine-tuning examples whose answers the model did not already know ("Unknown") were fit much more slowly than known ones, and once fit they increased hallucination about facts the model did know, roughly linearly in the number fit. Early stopping or filtering out Unknown examples removed most of the damage. The same study finds that selection matters beyond style: training only on the most certain examples ("HighlyKnown") did not give the best result, and adding "MaybeKnown" examples improved how the model used its pre-existing knowledge <a href="https://arxiv.org/abs/2405.05904">[Gekhman et al. 2024, §4 to §5]</a>. So SFT does more than set style, but it does not reliably add knowledge.</li>
+    <li><strong>Imitating a stronger model copies style faster than capability.</strong> Models fine-tuned on ChatGPT outputs (1.5B to 13B, 0.3M to 150M tokens) were rated close to ChatGPT by crowd workers, yet closed little of the gap on targeted benchmarks; on Natural Questions a 13B model went from 20 to 15 after broad imitation data, but to 27 (ChatGPT: 31) when trained on data targeted at that task <a href="https://arxiv.org/abs/2305.15717">[Gudibande et al. 2023, §4]</a>.</li>
+    <li><strong>Reasoning is the counter-example.</strong> With long chains of thought, SFT moves capability a lot: on AIME 2024, Qwen2.5-32B-Instruct scores 26.7, s1-32B (1,000 curated traces, 26 minutes on 16 H100s, with test-time "budget forcing") 56.7 (50.0 without it), and R1-Distill-Qwen-32B (800K traces) 72.6 <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, Tab. 1]</a>. The s1 authors themselves read this as activation of reasoning already present after pretraining, in the spirit of LIMA.</li>
+  </ul>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p>SFT is imitation. The student is trained to reproduce the demonstrator's conditional distribution, so it learns whatever the data teaches about <em>form</em> quickly, learns skills that the base model already half-has with modest data, and can only fit facts it lacks by memorizing or guessing. Data quality and the match between demonstrator knowledge and student knowledge matter more than volume.</p>
+  </aside>
+
+  <div class="decision">
+    <div class="decision-title">Supervised finetuning on demonstrations</div>
+    <dl>
+      <dt>Problem</dt><dd>A pretrained model does not follow instructions, keep a role, or stop; prompting it works poorly and unreliably.</dd>
+      <dt>Idea</dt><dd>Continue training with next-token cross-entropy on (prompt, response) demonstrations rendered with a chat template, loss on response tokens only.</dd>
+      <dt>Why it works</dt><dd>The base model already contains the knowledge and many skills. The demonstrations select the sub-distribution of behaviors to expose and teach the turn structure and the end-of-turn token, all with the same objective and infrastructure as pretraining.</dd>
+      <dt>Evidence</dt><dd>1,000 curated examples were enough for a competitive assistant <a href="https://arxiv.org/abs/2305.11206">[LIMA]</a>; Flan-PaLM cost 0.2% of pretraining compute <a href="https://arxiv.org/abs/2210.11416">[Chung et al., Tab. 2]</a>; unknown facts raise hallucination <a href="https://arxiv.org/abs/2405.05904">[Gekhman et al.]</a>.</dd>
+      <dt>Cost</dt><dd>It clones the demonstrator's mistakes and style, cannot exceed it, and can degrade capabilities the data does not cover (<a href="#recipe">below</a>). It optimizes likelihood of demonstrations, not what humans prefer, which is the job of <a href="21-preference-optimization.html">preference optimization</a> and <a href="24-rlvr-reasoning.html">RL</a>.</dd>
+      <dt>Used by</dt><dd>Every post-trained model in this course: InstructGPT, Llama 3, Tulu 3, DeepSeek-V3 and R1, Qwen3, Gemma.</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ============================================================ 2 -->
+<section>
+  <h2 id="templates">Chat templates, special tokens and loss masking</h2>
+
+  <p>A <strong>chat template</strong> <span class="zh">聊天模板</span> serializes a list of role-tagged messages into one token sequence using special tokens (<a href="02-tokenization.html#special-tokens">page 02</a>). At training time we render the full conversation. At inference we render the conversation up to the <strong>generation prompt</strong>, the header that opens the assistant turn, and sample until the model emits its end-of-turn token. The model can only learn to stop if that token is a training target. Formats differ per model family, and the exact strings matter:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Family</th><th>Assistant turn on the wire</th><th>Tokens that end generation</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3 (ChatML style)</td><td><code>&lt;|im_start|&gt;assistant\n</code> … <code>&lt;|im_end|&gt;\n</code></td><td><code>&lt;|im_end|&gt;</code> (id 151645, the tokenizer's eos); pad is <code>&lt;|endoftext|&gt;</code></td><td>Thinking inside <code>&lt;think&gt;</code> tags; <code>enable_thinking=False</code> adds an empty think block to the generation prompt; reasoning of turns before the last user message is dropped when rendering history; tool calls are JSON inside <code>&lt;tool_call&gt;</code> tags <a href="https://huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json">[Qwen3-8B tokenizer_config]</a></td></tr>
+      <tr><td>Llama 3.1</td><td><code>&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;\n\n</code> … <code>&lt;|eot_id|&gt;</code></td><td><code>&lt;|eot_id|&gt;</code> (turn over), <code>&lt;|eom_id|&gt;</code> (message over, a tool result is expected)</td><td>Roles system, user, assistant, ipython; built-in tool call is <code>&lt;|python_tag|&gt;brave_search.call(query="…")&lt;|eom_id|&gt;</code> <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/prompt_format.md">[Llama 3.1 prompt format]</a>, <a href="02-tokenization.html#special-tokens">page 02</a></td></tr>
+      <tr><td>Gemma 3</td><td><code>&lt;start_of_turn&gt;model\n</code> … <code>&lt;end_of_turn&gt;\n</code></td><td><code>&lt;end_of_turn&gt;</code> for instruction-tuned models, <code>&lt;eos&gt;</code> for pretrained ones</td><td>The assistant role is called "model". BOS must be added explicitly and the text "[BOS]" must not be tokenized. "Fine-tuning either model type thus requires adding their respective end tokens" <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §3]</a></td></tr>
+      <tr><td>Gemma 4</td><td><code>&lt;|turn&gt;model\n</code> … <code>&lt;turn|&gt;</code></td><td><code>&lt;turn|&gt;</code></td><td>Thinking trace as <code>&lt;|channel&gt;thought … &lt;channel|&gt;</code>; a <code>&lt;|think|&gt;</code> token in the system turn toggles thinking <a href="https://arxiv.org/abs/2607.02770">[Gemma 4, App. Tab. 11]</a></td></tr>
+      <tr><td>Tulu 3</td><td><code>&lt;|assistant|&gt;\n</code> … eos token, then <code>\n</code></td><td>eos</td><td>On an intermediate SFT mix, five template variants spanned 51.6 to 53.0 average score (Llama 3 template lowest, "replace \n with eos" highest) <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, Tab. 13]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="mismatch">The train and inference template mismatch bug</h3>
+  <p>An SFT model learns the exact string distribution of its template. Any difference at inference is a distribution shift it was never trained on, and the symptoms are quiet: slightly worse answers, a model that does not stop, a model that treats the system prompt as user text. The usual causes:</p>
+  <ul>
+    <li><strong>Whitespace and newlines.</strong> The Transformers documentation warns that "adding extra whitespace that was not present during model training can harm performance" and that a template "should always match the format the model was trained with" <a href="https://huggingface.co/docs/transformers/main/en/chat_templating_writing">[HF chat templating]</a>. Tulu 3 tested moving the trailing newline for exactly this reason.</li>
+    <li><strong>The wrong end token.</strong> Pretrained and instruction-tuned checkpoints of the same family end generation with different tokens (Gemma table above), so training a base checkpoint with an instruct template's stop token, or the reverse, produces a model whose generation loop never sees its stop condition.</li>
+    <li><strong>BOS handling.</strong> Doubled or missing BOS, or tokenizing the literal string "[BOS]" instead of adding the token id <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §3]</a>.</li>
+    <li><strong>History rewriting.</strong> Qwen3's template strips the reasoning of earlier turns. If you train one long conversation in a single pass with the reasoning left in, the context the model saw in training differs from the context it gets in deployment (see multi-turn masking below).</li>
+    <li><strong>Special tokens in user text.</strong> If user strings are parsed with special tokens enabled, a user can forge turn boundaries (<a href="02-tokenization.html#special-tokens">page 02</a>).</li>
+  </ul>
+
+  <h3 id="tools">Tool-call formatting</h3>
+  <p>Tool use adds three ingredients to the template: a place where tool definitions are declared (the system turn or first turn), a delimited structured call the assistant emits, and a channel for the result. Qwen3 emits a JSON object inside <code>&lt;tool_call&gt;</code> tags and returns results wrapped in <code>&lt;tool_response&gt;</code> inside a user turn. Llama 3.1 emits <code>&lt;|python_tag|&gt;</code> followed by the call and ends the message with <code>&lt;|eom_id|&gt;</code> instead of <code>&lt;|eot_id|&gt;</code>, then receives the result in an <code>ipython</code> turn. The loss rule is the same everywhere: the call tokens and the message-end token are targets, because the model generates them; the tool output is masked, because the environment produced it and training on it would teach the model to invent tool results. The <code>&lt;|eom_id|&gt;</code> versus <code>&lt;|eot_id|&gt;</code> split is what lets the serving loop know whether to run a tool or hand the turn back to the user.</p>
+
+  <h3 id="masking">Loss masking, multi-turn conversations and EOS</h3>
+  <p>The mask is a boolean per token. Two ways to build it. Hugging Face's <code>apply_chat_template(..., return_assistant_tokens_mask=True)</code> returns one, but "only for chat templates that support it via the <code>{% generation %}</code> keyword" <a href="https://huggingface.co/docs/transformers/en/internal/tokenization_utils">[Transformers docs]</a>, and many published templates lack it. The robust alternative is to build the sequence from segments (header, content, end token, separator), tokenize each separately and record whether the segment is a target; segment boundaries at special tokens are exact because special tokens are atomic. Splitting at plain text can differ from whole-string tokenization (a BPE merge across the boundary), so verify once that the concatenated ids equal the tokenization of the rendered string, or use character offsets.</p>
+
+<pre><code class="language-python">import torch.nn.functional as F
+
+IGNORE = -100
+
+def sft_loss(logits, input_ids, loss_mask):
+    # logits (B, T, V); input_ids (B, T); loss_mask (B, T) bool: True = this token is a target
+    labels = input_ids.masked_fill(~loss_mask, IGNORE)                 # (B, T)
+    return F.cross_entropy(logits[:, :-1].flatten(0, 1),               # position t predicts token t+1,
+                           labels[:, 1:].flatten(),                     # so the mask shifts with the labels
+                           ignore_index=IGNORE)                         # mean over the counted targets only
+
+def render(messages, tokenize, tpl):
+    ids, mask = [], []
+    def emit(text, trained):                                           # segment-wise: boundaries are exact
+        toks = tokenize(text) if text else []
+        ids.extend(toks); mask.extend([trained] * len(toks))
+    emit(tpl.bos, False)
+    for m in messages:
+        t = m["role"] in tpl.train_roles
+        emit(tpl.header[m["role"]], False)      # the generation prompt is supplied at inference: not a target
+        emit(m["content"], t)
+        emit(tpl.end, t)                        # the end-of-turn token IS a target: this is how the model learns to stop
+        emit(tpl.sep, False)                    # text after the stop token is never generated
+    return ids, mask
+</code></pre>
+
+  <p><strong>Why mask the prompt.</strong> The quantity we want is \(p(\text{response} \mid \text{prompt})\), and the prompt is supplied at inference. Loss on prompt tokens adds a different objective (modeling user text) and, when prompts are long, swamps the useful one. Llama 3's long-context SFT examples average 37,395 tokens of context and 740 tokens of final response <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 7]</a>, so 98.1% of the tokens (\(37{,}395.2 / 38{,}135.7\)) would otherwise be memorization of documents.</p>
+
+  <p><strong>Multi-turn conversations.</strong> For a causal model, a single forward pass with loss on every assistant turn produces exactly the same per-token losses as training on \(N\) separate examples, one per assistant turn, each with its history as context, provided the rendering of the first \(k\) turns is a prefix of the rendering of the first \(k+1\). It costs one pass instead of \(N\). The two exceptions are templates that rewrite history (Qwen3 drops earlier reasoning) and any setup where you want to train only some turns. Llama 3 goes the other way: each SFT example is a context (all turns but the last) and a final response, with an average of 4.7 turns per dialog <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 7]</a>. DeepSeek-R1's SFT set is almost entirely single-turn (average 1.0 to 1.1 rounds) and the authors list multi-turn data as future work <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. B.3.3, Tab. 5]</a>.</p>
+
+  <p><strong>EOS and end-of-turn handling.</strong> Train the end-of-turn token, and not the separator after it. LIMA used a dedicated end-of-turn token rather than the pretraining EOS "to avoid conflation with any other meaning that the pre-existing EOS token may have" <a href="https://arxiv.org/abs/2305.11206">[Zhou et al. 2023, §3]</a>. Two silent failures: (1) if you mask padding by token value and the pad token equals the EOS token (a common default), you erase the EOS supervision from every example; mask padding by position, not by id. (2) Truncating an over-long example deletes its ending. In s1, training with a 4,096-token limit cut off 74% of the samples, which removed their answer sections and end tokens; the resulting model reasoned much longer at test time (average 20,721 thinking tokens on AIME24 at 30.0% accuracy, against 6,984 tokens at 50.0% with a 32,768 limit) <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, App. D.1]</a>.</p>
+</section>
+
+<!-- ============================================================ 3 -->
+<section>
+  <h2 id="packing">Packing, document masks and loss normalization</h2>
+
+  <p>SFT examples are short and of very different lengths: Llama 3's SFT mix averages 846 tokens per example <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 7]</a>. Padding every example to a 4,096-token row would waste \(1 - 846/4096 = 79\%\) of the slots. <strong>Packing</strong> <span class="zh">序列打包</span> concatenates several examples into one row up to the maximum length. FLAN and Flan-PaLM used it, separating inputs from targets with an end-of-sequence token <a href="https://arxiv.org/abs/2109.01652">[Wei et al. 2021, §2.4]</a> and masking attention "to prevent the tokens from attending to others across the packed example boundary" <a href="https://arxiv.org/abs/2210.11416">[Chung et al. 2022, §2.2]</a>.</p>
+
+  <h3 id="contamination">Cross-document contamination and the fix</h3>
+  <p>Concatenation alone is not enough. Under an ordinary causal mask, the tokens of example 2 attend to all of example 1, so the model is trained to condition its answer on an unrelated earlier conversation that never exists at inference. The fix has two parts, both in Figure 1:</p>
+  <ol>
+    <li><strong>A document-aware attention mask.</strong> Query \(i\) may attend key \(j\) only if \(j \le i\) and both belong to the same document: a block-diagonal causal mask. Fused kernels implement it without materializing a \(T \times T\) matrix (FlashAttention's <code>flash_attn_varlen_func</code> takes cumulative sequence lengths); Ding et al. report no perceivable overhead from document-wise block attention in FlashAttention-2 <a href="https://arxiv.org/abs/2404.10830">[Ding et al. 2024, App. C.1]</a>.</li>
+    <li><strong>Position ids that restart per document.</strong> This is required for absolute or learned position embeddings. With RoPE it is optional in exact arithmetic: the score \(q_i \cdot k_j\) depends only on \(i - j\), which restarting does not change inside a document. Ding et al. do not adjust position ids for that reason (same appendix).</li>
+    <li><strong>Loss hygiene.</strong> The first token of a document must never be a target predicted from the previous document's last token.</li>
+  </ol>
+
+  <p>How much does it matter? Llama 3 found the document mask had "limited impact during standard pre-training" but was "important in continued pre-training on very long sequences" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. Ding et al.'s ablation at 2K context: masking cross-document attention lowered validation perplexity from 9.64 to 9.53, and their best-fit packing (which avoids splitting documents in the first place) helped downstream tasks more than the mask alone <a href="https://arxiv.org/abs/2404.10830">[Ding et al. 2024, Tab. 10]</a>. The honest summary: the effect is often small for short-example SFT, nonzero, and cheap to remove; it grows with sequence length.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 428" role="img" aria-labelledby="fig-19-1-title">
+<title id="fig-19-1-title">A packed row of three chat examples: block-diagonal causal attention mask, position ids, document ids and loss mask</title>
+<text x="8" y="22" text-anchor="start" class="s-bold">Attention mask (row = query, column = key)</text>
+<text x="8" y="38" text-anchor="start" class="s-small s-muted">one packed row, max_len = 13</text>
+<text x="43.5" y="78" text-anchor="middle" class="s-small">P</text>
+<text x="26" y="97.5" text-anchor="middle" class="s-small">P</text>
+<text x="62.5" y="78" text-anchor="middle" class="s-small">P</text>
+<text x="26" y="116.5" text-anchor="middle" class="s-small">P</text>
+<text x="81.5" y="78" text-anchor="middle" class="s-small">R</text>
+<text x="26" y="135.5" text-anchor="middle" class="s-small">R</text>
+<text x="100.5" y="78" text-anchor="middle" class="s-small">E</text>
+<text x="26" y="154.5" text-anchor="middle" class="s-small">E</text>
+<text x="119.5" y="78" text-anchor="middle" class="s-small">P</text>
+<text x="26" y="173.5" text-anchor="middle" class="s-small">P</text>
+<text x="138.5" y="78" text-anchor="middle" class="s-small">P</text>
+<text x="26" y="192.5" text-anchor="middle" class="s-small">P</text>
+<text x="157.5" y="78" text-anchor="middle" class="s-small">R</text>
+<text x="26" y="211.5" text-anchor="middle" class="s-small">R</text>
+<text x="176.5" y="78" text-anchor="middle" class="s-small">R</text>
+<text x="26" y="230.5" text-anchor="middle" class="s-small">R</text>
+<text x="195.5" y="78" text-anchor="middle" class="s-small">E</text>
+<text x="26" y="249.5" text-anchor="middle" class="s-small">E</text>
+<text x="214.5" y="78" text-anchor="middle" class="s-small">P</text>
+<text x="26" y="268.5" text-anchor="middle" class="s-small">P</text>
+<text x="233.5" y="78" text-anchor="middle" class="s-small">R</text>
+<text x="26" y="287.5" text-anchor="middle" class="s-small">R</text>
+<text x="252.5" y="78" text-anchor="middle" class="s-small">E</text>
+<text x="26" y="306.5" text-anchor="middle" class="s-small">E</text>
+<text x="271.5" y="78" text-anchor="middle" class="s-small">·</text>
+<text x="26" y="325.5" text-anchor="middle" class="s-small">·</text>
+<rect class="s-a" x="34" y="84" width="18" height="18" rx="2"/>
+<rect class="s-a" x="34" y="103" width="18" height="18" rx="2"/>
+<rect class="s-a" x="53" y="103" width="18" height="18" rx="2"/>
+<rect class="s-a" x="34" y="122" width="18" height="18" rx="2"/>
+<rect class="s-a" x="53" y="122" width="18" height="18" rx="2"/>
+<rect class="s-a" x="72" y="122" width="18" height="18" rx="2"/>
+<rect class="s-a" x="34" y="141" width="18" height="18" rx="2"/>
+<rect class="s-a" x="53" y="141" width="18" height="18" rx="2"/>
+<rect class="s-a" x="72" y="141" width="18" height="18" rx="2"/>
+<rect class="s-a" x="91" y="141" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="160" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="160" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="160" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="160" width="18" height="18" rx="2"/>
+<rect class="s-a" x="110" y="160" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="179" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="179" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="179" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="179" width="18" height="18" rx="2"/>
+<rect class="s-a" x="110" y="179" width="18" height="18" rx="2"/>
+<rect class="s-a" x="129" y="179" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="198" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="198" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="198" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="198" width="18" height="18" rx="2"/>
+<rect class="s-a" x="110" y="198" width="18" height="18" rx="2"/>
+<rect class="s-a" x="129" y="198" width="18" height="18" rx="2"/>
+<rect class="s-a" x="148" y="198" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="217" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="217" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="217" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="217" width="18" height="18" rx="2"/>
+<rect class="s-a" x="110" y="217" width="18" height="18" rx="2"/>
+<rect class="s-a" x="129" y="217" width="18" height="18" rx="2"/>
+<rect class="s-a" x="148" y="217" width="18" height="18" rx="2"/>
+<rect class="s-a" x="167" y="217" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="236" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="236" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="236" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="236" width="18" height="18" rx="2"/>
+<rect class="s-a" x="110" y="236" width="18" height="18" rx="2"/>
+<rect class="s-a" x="129" y="236" width="18" height="18" rx="2"/>
+<rect class="s-a" x="148" y="236" width="18" height="18" rx="2"/>
+<rect class="s-a" x="167" y="236" width="18" height="18" rx="2"/>
+<rect class="s-a" x="186" y="236" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="110" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="129" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="148" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="167" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="186" y="255" width="18" height="18" rx="2"/>
+<rect class="s-a" x="205" y="255" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="110" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="129" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="148" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="167" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="186" y="274" width="18" height="18" rx="2"/>
+<rect class="s-a" x="205" y="274" width="18" height="18" rx="2"/>
+<rect class="s-a" x="224" y="274" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="110" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="129" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="148" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="167" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="186" y="293" width="18" height="18" rx="2"/>
+<rect class="s-a" x="205" y="293" width="18" height="18" rx="2"/>
+<rect class="s-a" x="224" y="293" width="18" height="18" rx="2"/>
+<rect class="s-a" x="243" y="293" width="18" height="18" rx="2"/>
+<rect class="s-b" x="34" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="53" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="72" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="91" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="110" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="129" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="148" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="167" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="186" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="205" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="224" y="312" width="18" height="18" rx="2"/>
+<rect class="s-b" x="243" y="312" width="18" height="18" rx="2"/>
+<rect class="s-a" x="262" y="312" width="18" height="18" rx="2"/>
+<text x="72.0" y="62" text-anchor="middle" class="s-small s-muted">doc 0</text>
+<text x="157.5" y="62" text-anchor="middle" class="s-small s-muted">doc 1</text>
+<text x="233.5" y="62" text-anchor="middle" class="s-small s-muted">doc 2</text>
+<text x="543.0" y="22" text-anchor="middle" class="s-bold">The same row, token by token</text>
+<text x="392" y="77" text-anchor="end" class="s-small s-mono">tokens</text>
+<text x="392" y="112" text-anchor="end" class="s-small s-mono">position_ids</text>
+<text x="392" y="138" text-anchor="end" class="s-small s-mono">doc_ids</text>
+<text x="392" y="164" text-anchor="end" class="s-small s-mono">loss_mask</text>
+<rect class="s-box" x="400" y="60" width="20" height="26" rx="3"/>
+<text x="410.0" y="77" text-anchor="middle" class="s-small">P</text>
+<text x="410.0" y="112" text-anchor="middle" class="s-small">0</text>
+<text x="410.0" y="138" text-anchor="middle" class="s-small">0</text>
+<text x="410.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-box" x="422" y="60" width="20" height="26" rx="3"/>
+<text x="432.0" y="77" text-anchor="middle" class="s-small">P</text>
+<text x="432.0" y="112" text-anchor="middle" class="s-small">1</text>
+<text x="432.0" y="138" text-anchor="middle" class="s-small">0</text>
+<text x="432.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-c" x="444" y="60" width="20" height="26" rx="3"/>
+<text x="454.0" y="77" text-anchor="middle" class="s-small">R</text>
+<text x="454.0" y="112" text-anchor="middle" class="s-small">2</text>
+<text x="454.0" y="138" text-anchor="middle" class="s-small">0</text>
+<text x="454.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-d" x="466" y="60" width="20" height="26" rx="3"/>
+<text x="476.0" y="77" text-anchor="middle" class="s-small">E</text>
+<text x="476.0" y="112" text-anchor="middle" class="s-small">3</text>
+<text x="476.0" y="138" text-anchor="middle" class="s-small">0</text>
+<text x="476.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-box" x="488" y="60" width="20" height="26" rx="3"/>
+<text x="498.0" y="77" text-anchor="middle" class="s-small">P</text>
+<text x="498.0" y="112" text-anchor="middle" class="s-small">0</text>
+<text x="498.0" y="138" text-anchor="middle" class="s-small">1</text>
+<text x="498.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-box" x="510" y="60" width="20" height="26" rx="3"/>
+<text x="520.0" y="77" text-anchor="middle" class="s-small">P</text>
+<text x="520.0" y="112" text-anchor="middle" class="s-small">1</text>
+<text x="520.0" y="138" text-anchor="middle" class="s-small">1</text>
+<text x="520.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-c" x="532" y="60" width="20" height="26" rx="3"/>
+<text x="542.0" y="77" text-anchor="middle" class="s-small">R</text>
+<text x="542.0" y="112" text-anchor="middle" class="s-small">2</text>
+<text x="542.0" y="138" text-anchor="middle" class="s-small">1</text>
+<text x="542.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-c" x="554" y="60" width="20" height="26" rx="3"/>
+<text x="564.0" y="77" text-anchor="middle" class="s-small">R</text>
+<text x="564.0" y="112" text-anchor="middle" class="s-small">3</text>
+<text x="564.0" y="138" text-anchor="middle" class="s-small">1</text>
+<text x="564.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-d" x="576" y="60" width="20" height="26" rx="3"/>
+<text x="586.0" y="77" text-anchor="middle" class="s-small">E</text>
+<text x="586.0" y="112" text-anchor="middle" class="s-small">4</text>
+<text x="586.0" y="138" text-anchor="middle" class="s-small">1</text>
+<text x="586.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-box" x="598" y="60" width="20" height="26" rx="3"/>
+<text x="608.0" y="77" text-anchor="middle" class="s-small">P</text>
+<text x="608.0" y="112" text-anchor="middle" class="s-small">0</text>
+<text x="608.0" y="138" text-anchor="middle" class="s-small">2</text>
+<text x="608.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-c" x="620" y="60" width="20" height="26" rx="3"/>
+<text x="630.0" y="77" text-anchor="middle" class="s-small">R</text>
+<text x="630.0" y="112" text-anchor="middle" class="s-small">1</text>
+<text x="630.0" y="138" text-anchor="middle" class="s-small">2</text>
+<text x="630.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-d" x="642" y="60" width="20" height="26" rx="3"/>
+<text x="652.0" y="77" text-anchor="middle" class="s-small">E</text>
+<text x="652.0" y="112" text-anchor="middle" class="s-small">2</text>
+<text x="652.0" y="138" text-anchor="middle" class="s-small">2</text>
+<text x="652.0" y="164" text-anchor="middle" class="s-small s-bold">1</text>
+<rect class="s-plain s-dash" x="664" y="60" width="20" height="26" rx="3"/>
+<text x="674.0" y="77" text-anchor="middle" class="s-small">·</text>
+<text x="674.0" y="112" text-anchor="middle" class="s-small">0</text>
+<text x="674.0" y="138" text-anchor="middle" class="s-small">-1</text>
+<text x="674.0" y="164" text-anchor="middle" class="s-small s-muted">0</text>
+<rect class="s-box" x="310" y="196" width="14" height="12" rx="2"/>
+<text x="332" y="206" text-anchor="start" class="s-small">prompt token, masked</text>
+<rect class="s-c" x="310" y="216" width="14" height="12" rx="2"/>
+<text x="332" y="226" text-anchor="start" class="s-small">response token, trained</text>
+<rect class="s-d" x="310" y="236" width="14" height="12" rx="2"/>
+<text x="332" y="246" text-anchor="start" class="s-small">end-of-turn token, trained</text>
+<rect class="s-a" x="310" y="256" width="14" height="12" rx="2"/>
+<text x="332" y="266" text-anchor="start" class="s-small">attention allowed (same document)</text>
+<rect class="s-b" x="310" y="276" width="14" height="12" rx="2"/>
+<text x="332" y="286" text-anchor="start" class="s-small">causal but blocked: leaks under a plain causal mask</text>
+<text x="310" y="322" text-anchor="start" class="s-small s-bold">Weight of a trained token (2, 3, 2 per doc):</text>
+<text x="310" y="339" text-anchor="start" class="s-small">token mean: every trained token weighs 1/7</text>
+<text x="310" y="356" text-anchor="start" class="s-small">sequence mean: a token of doc d weighs 1/(3 n_d),</text>
+<text x="310" y="373" text-anchor="start" class="s-small">which is 1/6, 1/9 and 1/6 for docs 0, 1 and 2</text>
+<text x="8" y="362" text-anchor="start" class="s-small s-muted">With RoPE, resetting position_ids changes</text>
+<text x="8" y="378" text-anchor="start" class="s-small s-muted">nothing once the mask blocks other documents:</text>
+<text x="8" y="394" text-anchor="start" class="s-small s-muted">scores depend only on offsets. Absolute</text>
+<text x="8" y="410" text-anchor="start" class="s-small s-muted">embeddings do need the reset.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> One packed row of three chat examples (13 slots). Blue cells are the attention pattern the document mask allows: block-diagonal and causal. Orange cells are causal but blocked; a plain causal mask would let document 1 and 2 attend to earlier documents through them. Position ids and document ids restart, padding has document id −1, and only response and end-of-turn tokens carry loss. The weights at the right preview the normalization choice discussed next.</figcaption>
+  </figure>
+
+<pre><code class="language-python">import torch
+
+def document_causal_mask(doc_ids):
+    # doc_ids: (B, T) int, -1 on padding  ->  bool (B, T, T), True = query i may attend key j
+    same = doc_ids.unsqueeze(-1) == doc_ids.unsqueeze(-2)                  # (B, T, T) same document
+    causal = torch.ones(doc_ids.shape[-1], doc_ids.shape[-1], dtype=torch.bool).tril()
+    return same &amp; causal        # padding (-1) sees only padding, so no row is empty and softmax stays finite
+</code></pre>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your batches were jets with different numbers of constituents, padded to a common length with a mask so that padded slots never influence real ones and jets never attend to each other. A packed SFT row is the same idea run the other way: many small sets (conversations) are concatenated into one long set, and a block-diagonal mask restores the independence that the batch dimension gave you for free. The question of whether the loss averages over jets or over constituents is the token-versus-sequence question below.</p>
+  </aside>
+
+  <h3 id="normalization">Token-weighted versus sequence-weighted loss</h3>
+  <p>Once several documents share a row (and several rows share a batch, and several micro-batches share an optimizer step), "the mean loss" is ambiguous. Two natural definitions, with \(n_d\) trained tokens in document \(d\) and \(D\) documents:</p>
+  \[ \mathcal L_{\text{token}} = \frac{\sum_d \sum_{t \in d} \ell_t}{\sum_d n_d}, \qquad \mathcal L_{\text{seq}} = \frac{1}{D} \sum_d \frac{1}{n_d} \sum_{t \in d} \ell_t . \]
+  <p>Under \(\mathcal L_{\text{token}}\) every trained token has weight \(1/\sum n_d\), so a document's share of the gradient is proportional to its length: <strong>long examples dominate</strong> and short answers are underweighted. Under \(\mathcal L_{\text{seq}}\) every document has weight \(1/D\), so a token's weight is \(1/(D\,n_d)\): short examples' tokens are upweighted and long chains of thought are downweighted. Neither is correct; they encode different priorities. A worked case (the same three documents as in the drill test):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Document</th><th class="num">Trained tokens \(n_d\)</th><th class="num">Mean NLL</th><th class="num">Sum NLL</th><th class="num">Share of token-mean weight</th><th class="num">Per-token weight, token mean</th><th class="num">Per-token weight, sequence mean</th></tr></thead>
+    <tbody>
+      <tr><td>A: short answer</td><td class="num">4</td><td class="num">0.5</td><td class="num">2.0</td><td class="num">4%</td><td class="num">1/100</td><td class="num">1/12 (8.3×)</td></tr>
+      <tr><td>B: medium answer</td><td class="num">6</td><td class="num">1.0</td><td class="num">6.0</td><td class="num">6%</td><td class="num">1/100</td><td class="num">1/18 (5.6×)</td></tr>
+      <tr><td>C: long reasoning</td><td class="num">90</td><td class="num">0.4</td><td class="num">36.0</td><td class="num">90%</td><td class="num">1/100</td><td class="num">1/270 (0.37×)</td></tr>
+      <tr class="hl"><td><strong>Batch</strong></td><td class="num">100</td><td class="num"></td><td class="num">44.0</td><td class="num"></td><td class="num"></td><td class="num"></td></tr>
+    </tbody>
+  </table></div>
+  <p>Token mean: \(44.0 / 100 = 0.440\). Sequence mean: \((0.5 + 1.0 + 0.4)/3 = 0.633\). Document C carries 90% of the token-mean gradient but a third of the sequence-mean gradient. The same effect appears at dataset scale. DeepSeek-R1's SFT data has 804,745 samples with mean length 5,355 tokens; by domain (samples, mean tokens) it is math (395,285; 6,094), code (211,129; 7,436), STEM (10,124; 4,929), logic (10,395; 2,739) and general (177,812; 1,420) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. Tab. 5]</a>. Taking the table's "Avg Tokens" as tokens per sample (it does not say whether prompts are included), general data is 22.1% of the samples but only about 5.9% of the tokens (\(177{,}812 \times 1{,}420 / (804{,}745 \times 5{,}355)\)), so a token-level mean gives it a quarter of the influence its sample share suggests, while math and code make up about 92% of the gradient.</p>
+
+  <div class="callout warn">
+    <div class="callout-title">Pitfall: gradient accumulation silently changes the weighting</div>
+    <p>Tulu 3's authors found a performance gap between training stacks that came from "averaging the loss across padding tokens without taking into account gradient accumulation or distributed training setups": feeding two samples in one batch weights every token equally, while feeding them as two accumulated micro-batches with per-micro-batch means weights every <em>micro-batch</em> equally <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, §4.3.2]</a>. With a 100-token micro-batch of mean 0.44 and a 10-token one of mean 1.0, the correct global token mean is \((44 + 10)/110 = 0.491\) but the mean of micro-batch means is \((0.44 + 1.0)/2 = 0.72\). Their fix was a <em>sum</em> loss (no denominator, so all tokens weigh the same) with the learning rate retuned: in their sweep, a sum loss with LR 5e-6 worked best, and they report that equal token weighting gave generally better performance on their initial mixtures. In distributed training divide by the <em>global</em> count of trained tokens (<a href="01-big-picture.html#loss-code">page 01</a> shows the small-number version of the same point).</p>
+  </div>
+</section>
+
+<!-- ============================================================ 4 -->
+<section>
+  <h2 id="data">SFT data: what goes into the mix</h2>
+
+  <p>SFT results are dominated by the data, and the public record has a few decisive experiments. This section goes from where data comes from, to what makes it good, to its hazards, to the two special cases that matter most for frontier models: long chain-of-thought data and code.</p>
+
+  <h3 id="sources">Where SFT data comes from</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Dataset</th><th>Size and construction</th><th>Finding worth remembering</th></tr></thead>
+    <tbody>
+      <tr><td>FLAN (2021) and Flan (2022)</td><td>62 public datasets in twelve task clusters, ten instruction templates each <a href="https://arxiv.org/abs/2109.01652">[Wei et al. 2021, §2]</a>; scaled to 1,836 tasks <a href="https://arxiv.org/abs/2210.11416">[Chung et al. 2022, §2.1]</a></td><td>Zero-shot FLAN 137B beat zero-shot GPT-3 175B on 20 of 25 datasets, but instruction tuning <em>hurt</em> held-out tasks for models of 8B and below. Most of the gain from more tasks came by 282 tasks, and nine chain-of-thought datasets were needed to keep reasoning (<a href="#recipe">below</a>).</td></tr>
+      <tr><td>InstructGPT SFT</td><td>About 13k prompts with labeler demonstrations <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.2]</a></td><td>A 175B GPT-3 fine-tuned on about 1M FLAN or T0 examples did slightly worse than the demonstration SFT baseline on real API prompts. Win rates against that baseline were 73.4% for InstructGPT, 29.8% for the FLAN model and 26.8% for T0 <a href="https://arxiv.org/abs/2203.02155">[§1, §3.5]</a>: public NLP task mixtures are not how people use assistants.</td></tr>
+      <tr><td>Self-Instruct</td><td>175 seed tasks; GPT-3 generates instructions (6 human and 2 earlier model-generated examples per prompt), then inputs and outputs; instructions with ROUGE-L similarity 0.7 or more to the pool are dropped; result: 52,445 instructions, 82,439 instances <a href="https://arxiv.org/abs/2212.10560">[Wang et al. 2022, §2 to §3]</a></td><td>Fine-tuning GPT-3 on its own generated data raised ROUGE-L on SuperNI from 6.8 to 39.9, close to InstructGPT-001 (40.8). Regenerating the outputs with InstructGPT-003 gave a model about 10% better on their human-rated set (§4.5, Fig. 7).</td></tr>
+      <tr><td>Alpaca</td><td>52K Self-Instruct-style examples from text-davinci-003 (175 seeds), under $500 of API cost; LLaMA 7B fine-tuned for 3 hours on 8 A100s <a href="https://crfm.stanford.edu/2023/03/13/alpaca.html">[Stanford CRFM 2023]</a></td><td>The authors note that "hallucination in particular seems to be a common failure mode for Alpaca, even compared to text-davinci-003."</td></tr>
+      <tr><td>LIMA</td><td>1,000 examples: Stack Exchange 400, wikiHow 200, WritingPrompts 150, Super-NaturalInstructions 50, 200 written by the authors <a href="https://arxiv.org/abs/2305.11206">[Zhou et al. 2023, Tab. 1]</a></td><td>Quality filtering (+0.5 on a 6-point scale) and prompt diversity mattered; doubling the data from 2K to 32K examples of the same kind did not help (§5).</td></tr>
+      <tr><td>Tulu 3 SFT mix</td><td>939,344 prompts drawn from 23.3M candidates: public sets (WildChat GPT-4 subset 100,000; FLAN v2 89,982; Aya 100,000; Evol-CodeAlpaca 107,276; NuminaMath-TIR 64,312; …) plus new persona-driven synthetic sets (math 149,960, grade-school math 49,980, algebra 20,000, Python 34,999, precise instruction following 29,980) <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, Tab. 7]</a></td><td>Every skill-specific slice paid for itself (ablations below); decontaminated against the eval suite.</td></tr>
+      <tr><td>DeepSeek-R1 SFT set</td><td>804,745 samples: about 600K reasoning (rejection-sampled) and 200K non-reasoning <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. B.3.3]</a></td><td>Used for the second SFT stage and, unchanged, to distill six smaller models (<a href="#reasoning-distill">below</a>).</td></tr>
+      <tr><td>s1K</td><td>1,000 questions chosen from 59,029 by quality, difficulty and diversity; traces from Gemini Thinking Experimental <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, §2]</a></td><td>Random 1K: 36.7% AIME24; s1K: 50.0%; all 59K: 53.3% but 394 H100-hours against 7.</td></tr>
+    </tbody>
+  </table></div>
+    <h3 id="quality">What matters: quality, diversity, difficulty</h3>
+  <p>The ablations agree more than the headline numbers suggest. LIMA's controlled comparisons (7B models, 2,000 examples per condition): filtered Stack Exchange 3.83 versus unfiltered 3.33 on a 6-point ChatGPT-graded scale (quality), filtered Stack Exchange versus wikiHow's homogeneous "how to" prompts 3.83 versus 3.49 (diversity), and no gain from 2K to 32K examples of the same source (quantity) <a href="https://arxiv.org/abs/2305.11206">[Zhou et al. 2023, §5]</a>. s1 finds the same trio for reasoning: on AIME24, 1K random traces 36.7, 1K most diverse 26.7, 1K longest 33.3, the combined-criteria s1K 50.0 <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, Tab. 2]</a>. Llama 3's curation pipeline operationalizes it at scale: a topic classifier (a fine-tuned Llama 3 8B) for balancing, reward-model and LLM-judge quality scores (top RM quartile, or maximum LLM score), difficulty scores (Instag intention counts and an LLM rating), and semantic deduplication by clustering and greedy selection sorted by quality times difficulty <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.2.3]</a>. Difficulty filtering has a model-relative form too: s1 drops any question that either of two Qwen2.5 models already solves, and Qwen3's cold-start set removes queries that Qwen2.5-72B-Instruct answers correctly without chain of thought <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.1]</a>.</p>
+  <p>Small data suffices for style; skills scale with skill-specific data. Tulu 3's leave-one-out ablations on the 8B SFT model (average 60.1) show it: without WildChat the average falls to 58.9 and AlpacaEval 2 from 12.4 to 7.5; without safety data the safety score falls from 93.1 to 74.7; without persona data IFEval falls from 72.8 to 53.6; without math data GSM8K falls from 76.2 to 64.1 and MATH from 31.5 to 23.5 <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, Tab. 10]</a>. Their subsampling curve keeps rising with more data on average (TruthfulQA is the exception and falls), which is compatible with LIMA: a thousand examples set the style, but they do not teach GSM8K.</p>
+
+  <h3 id="synthetic">Synthetic data from stronger models</h3>
+  <p>Most modern SFT data is model-generated: Llama 3 notes that "many of the training targets are model-generated" and still calls the stage SFT <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.3]</a>. The recurring lessons:</p>
+  <ul>
+    <li><strong>Seed for diversity.</strong> Self-Instruct seeds instructions with 175 human tasks; Tulu 3 seeds with personas; Magicoder's OSS-Instruct seeds coding problems with 1 to 15 consecutive lines of real open-source code (80K seeds, 75K resulting examples). Direct fine-tuning on the raw comment-function pairs from the same seed documents <em>hurt</em> (HumanEval+ 34.1, the base model's score; MultiPL-E 24.1, below the base's 29.6), while the LLM-rewritten problem-and-solution pairs reached 55.5 and 37.8 <a href="https://arxiv.org/abs/2312.02120">[Wei et al. 2024, Tab. 6]</a>: data correctness and coherence, not surface format, drive code SFT.</li>
+    <li><strong>Filter with checkable signals.</strong> Llama 3 filters code by execution and model-as-judge signals and uses a generate, backtranslate, filter loop (generate documentation, regenerate the code from it, score fidelity to the original) for over 2.7M synthetic code examples <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.3.1]</a>. For prompts with verifiable answers, use the verifier (<a href="#rft">rejection sampling below</a>).</li>
+    <li><strong>The student inherits the teacher's errors and style.</strong> Only 53.6% of s1K's Gemini-generated traces were graded correct; the authors kept them because the goal was to capture the reasoning process <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, §2.2]</a>. Alpaca's hallucination and Gudibande's style-copying result (<a href="#sah">above</a>) are the same phenomenon.</li>
+    <li><strong>Scrub identity and contamination.</strong> Tulu 3 removes responses that mention models or their developers and regenerates weak responses with GPT-4o <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, §4.1.1]</a>. Data derived from real chat logs (ShareGPT, WildChat, LMSYS) "are likely to overlap with test sets of existing benchmarks" (same paper, App. B.2).</li>
+  </ul>
+
+  <h3 id="decontam">Decontamination</h3>
+  <p>Tulu 3's procedure is a template. Matching uses 8-grams on the <em>prompt</em> only (completions are often regenerated): a test instance counts as significantly overlapping a training instance if more than 50% of its tokens sit inside 8-gram matches with that one instance; a training set is contaminated if more than 2% of the instances of any evaluation overlap it. Sets contaminated with unseen evaluations are dropped; for development-set contamination the whole dataset is dropped only if that costs nothing, otherwise just the matching instances. Removal rates were 11.3% of NuminaMath-TIR (against MATH), 5.4% of the WildChat GPT-4 subset, 3.5% of Evol-CodeAlpaca (against HumanEval) <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, §3.2, Tab. 8]</a>. R1 used 10-gram filtering and only pre-2023 competition sources for its math SFT data, and states that n-gram methods cannot catch paraphrases <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. D.1]</a>.</p>
+
+  <h3 id="longcot">Long chain-of-thought data</h3>
+  <p>Reasoning SFT data differs in three ways: responses are long (R1's mean is 5,355 tokens; math 6,094 and code 7,436), correctness is checkable, and the style of the thinking is itself a design choice. R1's second-stage data comes from rejection sampling on the RL checkpoint: several responses per prompt, only correct ones kept, a generative judge (DeepSeek-V3) for answers that rules cannot verify, and removal of chains with mixed languages, overlong paragraphs or code blocks for readability <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. B.3.3]</a>. Qwen3's cold start filters six ways (wrong final answer, heavy repetition, guesswork without reasoning, thinking-summary inconsistency, language mixing, resemblance to validation items) and is deliberately small, since RL follows and "it is preferable to minimize both the number of training samples and the training steps" <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.1]</a>. When there is no RL stage afterwards (distilling into small models) the same recipe is used at 800K scale. The truncation trap from <a href="#masking">above</a> applies with force: set the training context above the length of your longest kept chain.</p>
+</section>
+
+<!-- ============================================================ 5 -->
+<section>
+  <h2 id="recipe">Hyperparameters and failure modes</h2>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Recipe</th><th>Peak LR</th><th>Epochs / steps</th><th>Batch</th><th>Other</th></tr></thead>
+    <tbody>
+      <tr><td>Llama 3 405B SFT <a href="https://arxiv.org/abs/2407.21783">[§4.1.3]</a></td><td class="num">1e-5</td><td class="num">8.5K to 9K steps</td><td class="num">n/a</td><td>Pretraining peak was 8e-5 (§3.4.1); SFT LR is 1/8 of it</td></tr>
+      <tr><td>Tulu 3 8B / 70B <a href="https://arxiv.org/abs/2411.15124">[Tab. 11]</a></td><td class="num">5e-6 / 2e-6</td><td class="num">2 epochs</td><td class="num">128</td><td>Linear decay, 3% warmup, 4,096 max length, sum loss</td></tr>
+      <tr><td>InstructGPT <a href="https://arxiv.org/abs/2203.02155">[App. C.1]</a></td><td class="num">9.65e-6 (1.3B, 6B); 5.03e-6 (175B)</td><td class="num">16 epochs</td><td class="num">32 / 8</td><td>Cosine to 10% of peak, no warmup, residual dropout 0.2</td></tr>
+      <tr><td>LIMA <a href="https://arxiv.org/abs/2305.11206">[§3]</a></td><td class="num">1e-5 → 1e-6 (linear)</td><td class="num">15 epochs</td><td class="num">32</td><td>Weight decay 0.1, residual dropout 0 → 0.3 across layers, checkpoint chosen from epochs 5 to 10 on a 50-example dev set</td></tr>
+      <tr><td>DeepSeek-R1 SFT stages <a href="https://arxiv.org/abs/2501.12948">[B.4.2]</a></td><td class="num">5e-5 → 5e-6 (cosine)</td><td class="num">2 to 3 epochs</td><td class="num">128</td><td>32,768 context</td></tr>
+      <tr><td>R1 distillation <a href="https://arxiv.org/abs/2501.12948">[B.4.3, Tab. 6]</a></td><td class="num">1e-4 (1.5B) … 6e-5 (32B) … 2e-5 (70B)</td><td class="num">2 to 3 epochs</td><td class="num">64</td><td>Cosine to 1/10 of peak, 32,768 context</td></tr>
+      <tr><td>s1 <a href="https://arxiv.org/abs/2501.19393">[App. D]</a></td><td class="num">1e-5 (cosine, 5% warmup)</td><td class="num">5 epochs = 315 steps</td><td class="num">16</td><td>Loss on reasoning trace and answer only</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Patterns worth memorizing: the SFT learning rate is roughly an order of magnitude below the pretraining peak; larger models get smaller learning rates (Tulu 3: 5e-6 to 2e-6; R1 distillation: 1e-4 to 2e-5); epoch counts run from 2 to 3 for \(10^5\) to \(10^6\) examples up to 15 or 16 for about a thousand examples, where dropout is used as the regularizer. <strong>Validation loss is a poor selection criterion.</strong> InstructGPT's SFT models "overfit on validation loss after 1 epoch" yet more epochs helped reward-model score and human preference <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.5]</a>; LIMA found perplexity uncorrelated with generation quality; Gekhman's Unknown-example damage also appears only late in training. Select checkpoints on generation-based evaluations. Seeds matter: Tulu 3's SFT average ranged from 59.8 to 60.1 across five seeds at 8B and from 70.0 to 72.6 across three at 70B <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, Tab. 14]</a>, so a 1-point difference between two runs is inside the noise.</p>
+
+  <h3 id="forgetting">Forgetting, regressions and mixing pretraining data</h3>
+  <p>SFT can quietly break capabilities the mix does not cover. Documented cases: Gudibande et al. saw MMLU, Natural Questions and HumanEval accuracy fall as they added ChatGPT-imitation data and left open whether mixing in pretraining data would fix it <a href="https://arxiv.org/abs/2305.15717">[§4.3]</a>. Llama 3 found that a short-context-only SFT mix "resulted in significant regressions in long-context capabilities", and that mixing in 0.1% synthetic long-context data was best across short and long benchmarks <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.3.4]</a>. Flan found that instruction finetuning without chain-of-thought data <em>degrades</em> chain-of-thought performance, fixed by adding nine CoT datasets to the mixture <a href="https://arxiv.org/abs/2210.11416">[Chung et al. 2022, §4]</a>. The standard mitigations are replay of general or pretraining data (InstructGPT mixed 10% pretraining data into its SFT initialization for RLHF <a href="https://arxiv.org/abs/2203.02155">[App. C.3]</a>; MiniLLM adds a pretraining language-modeling loss <a href="https://arxiv.org/abs/2306.08543">[Gu et al. 2024, Alg. 1]</a>), a small learning rate and few epochs, and parameter-efficient methods (<a href="20-peft-lora.html">page 20</a>). The lesson for mixture design is the Tulu 3 one: every capability you want to keep needs data in the mix and an evaluation in the loop.</p>
+
+  <h3 id="style">Style overfitting and sycophancy</h3>
+  <p>A model that imitates a teacher's assertive, well-structured register can look strong to crowd workers while being less factual (<a href="#sah">above</a>). Sycophancy, agreeing with the user's stated beliefs over the truth, was measured across five production assistants and is driven in part by human preference judgments; the authors note that its presence at the start of RL suggests pretraining and SFT also contribute <a href="https://arxiv.org/abs/2310.13548">[Sharma et al. 2023, §4.2]</a>. For SFT this is a data-composition issue: demonstrations where the assistant flatters or defers teach the behavior, so include examples that correct a false premise and check for it (<a href="21-preference-optimization.html">page 21</a> covers the preference-optimization side).</p>
+</section>
+
+<!-- ============================================================ 6 -->
+<section>
+  <h2 id="distillation">Knowledge distillation: logits, sequences and student rollouts</h2>
+
+  <p><strong>Knowledge distillation</strong> <span class="zh">知识蒸馏</span> trains a student model to reproduce a teacher's behavior. For autoregressive models it involves two separate design choices that are often conflated: <em>on which sequences</em> the loss is evaluated (fixed text, teacher samples, or the student's own samples), and <em>what signal and divergence</em> is used at each position (the teacher's full distribution or sampled text; forward or reverse KL). Keeping those axes apart is the key to reading the literature.</p>
+
+  <h3 id="logit-kd">Logit distillation with temperature</h3>
+  <p>Hinton et al. train the student on the teacher's "soft targets", the full output distribution, because the relative probabilities of wrong answers carry information about how the teacher generalizes. With logits \(z\), temperature softmax \(p^{(T)}_i = \exp(z_i/T) / \sum_j \exp(z_j/T)\), and a small weight on the hard-label loss:</p>
+  <div class="eq-box">
+  \[ \mathcal L_{\text{KD}} = (1-\alpha)\,\mathrm{CE}(y,\, p_S) \;+\; \alpha\, T^2\, \KL\!\big(p_T^{(T)} \,\|\, p_S^{(T)}\big) \]
+  <div class="eq-label">The teacher distribution is the first argument of the KL: this is the forward KL. Both use the same T; at deployment T = 1. <a href="https://arxiv.org/abs/1503.02531">[Hinton et al. 2015, §2]</a></div>
+  </div>
+  <p><strong>Why \(T^2\).</strong> With student logits \(z_i\), teacher probabilities \(p_i\) and student probabilities \(q_i\) at temperature \(T\), the gradient is \(\partial \mathcal L / \partial z_i = \tfrac{1}{T}(q_i - p_i)\). When \(T\) is large compared with the logits and they are zero-meaned, this is approximately \(\tfrac{1}{N T^2}(z_i - v_i)\): distillation becomes matching logits, and the gradient shrinks like \(1/T^2\). Hinton et al.: "the magnitudes of the gradients produced by the soft targets scale as \(1/T^2\) it is important to multiply them by \(T^2\)", so the soft and hard terms keep their relative weight when you change \(T\). A check with teacher logits \((4, 2, 0, -2)\) and student logits \((3, 3, 0, -3)\): the forward KL is 0.3239, 0.1004 and 0.0244 at \(T = 1, 2, 4\), and times \(T^2\) it is 0.324, 0.402, 0.390. The raw value collapses 13-fold; the scaled one does not.</p>
+  <p><strong>What is different for LLMs.</strong> Temperature 1 is the norm. Kim and Rush tried \(\tau \in \{1, 1.5, 2\}\) for translation and found 1 best <a href="https://arxiv.org/abs/1606.07947">[Kim &amp; Rush 2016, §2.2 note]</a>, and GKD keeps the student's training temperature at 1 <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, §3.1]</a>. Softening mattered in Hinton's setting (a few classes, tiny students); with a 100K+ vocabulary the informative tail is already visible at \(T = 1\). LLM distillation works at scale in pretraining too. Gemma 2's 2B and 9B models are trained by minimizing \(-\sum_x P_T(x \mid x_c)\log P_S(x \mid x_c)\) against a larger teacher, for token budgets over 50 times the compute-optimal amount; in an ablation, a 2B model trained on 500B tokens scored 67.7 (three-benchmark average) when distilled from a 7B teacher against 60.3 from scratch <a href="https://arxiv.org/abs/2408.00118">[Gemma 2, §1, §3.2, Tab. 6]</a>. Gemma 3 makes it cheaper by sampling 256 logits per token, weighted by teacher probability, and renormalizing the teacher's target over those samples <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2.2]</a>, and finds that a smaller teacher is better for short training horizons and a larger one for long horizons (Fig. 8), a capacity-gap effect.</p>
+  <p>The cost is memory. Full-vocabulary teacher logits for Llama-3's \(V = 128{,}256\) in bf16 are \(128{,}256 \times 2 = 256{,}512\) bytes (250.5 KiB) per token, or 239 GiB per million tokens per teacher. That is why practice stores top-\(k\) or sampled logits (Gemma 3) or, as in DeepSeek-V4 below, the teacher's last hidden state (\(d = 4096\), 8 KiB per token, 31 times smaller).</p>
+
+  <h3 id="seq-kd">Sequence-level distillation</h3>
+  <p>Word-level KD matches the teacher at every position of <em>given</em> text. Kim and Rush ask for the sequence-level distribution: \(\mathcal L_{\text{SEQ-KD}} = -\sum_{t \in \mathcal T} q(t \mid s)\log p(t \mid s)\), a sum over exponentially many sequences. Their cheapest approximation replaces the teacher's distribution by its mode, found by beam search, giving \(\mathcal L \approx -\log p(\hat y \mid s)\): ordinary training on the teacher's outputs <a href="https://arxiv.org/abs/1606.07947">[Kim &amp; Rush 2016, §3.2]</a>. On English to German a \(2 \times 500\) student trained this way gained 4.2 BLEU over an undistilled student with greedy decoding and ran about 10 times faster than the 4 by 1000 teacher with beam search, at similar quality. Their explanation: the student models "only relevant parts of the teacher distribution (i.e. around the teacher's mode) instead of wasting parameters" on the rest, and indeed the student's test perplexity rose (22.7 against 8.2) because its distribution became more peaked. Today's version is sampling at temperature around 0.6 to 1 rather than beam search: Alpaca, Vicuna-style chat models and DeepSeek-R1's distilled models are all sequence-level distillation, and it needs only the teacher's text, so it works through an API.</p>
+
+  <h3 id="forward-reverse">Forward versus reverse KL</h3>
+  <p>Fix a prefix and let \(p_T\) and \(p_S\) be the teacher and student next-token distributions.</p>
+  <div class="eq-box">
+  \[ \underbrace{\KL(p_T \,\|\, p_S)}_{\text{forward}} = \sum_v p_T(v) \log \frac{p_T(v)}{p_S(v)} \qquad\qquad \underbrace{\KL(p_S \,\|\, p_T)}_{\text{reverse}} = \sum_v p_S(v) \log \frac{p_S(v)}{p_T(v)} \]
+  <div class="eq-label">Forward: expectation under the teacher, infinite where p_S(v) = 0 but p_T(v) &gt; 0 (mode-covering). Reverse: expectation under the student, infinite where p_S(v) &gt; 0 but p_T(v) = 0 (mode-seeking).</div>
+  </div>
+  <p>Ordinary SFT and cross-entropy against teacher probabilities are forward KL (SFT is the forward KL to the empirical data distribution, whose one-hot target makes it maximum likelihood <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, §2]</a>). GKD states the behavior: given a capacity mismatch, minimizing the forward and reverse KL "results in mean and mode-seeking behavior" respectively. MiniLLM's argument for reverse KL in generation: forward KL "forces the student to cover all modes" of a teacher whose distribution has more modes than the student can express, so the student assigns "unreasonably high probabilities to the void regions" of the teacher and produces samples the teacher finds unlikely; reverse KL instead has the student concentrate on the teacher's major modes <a href="https://arxiv.org/abs/2306.08543">[Gu et al. 2024, §1, §2.1]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 304" role="img" aria-labelledby="fig-19-2-title">
+<title id="fig-19-2-title">A two-mode teacher distribution fitted by one student distribution under forward KL (covers both modes) and reverse KL (locks onto one mode)</title>
+<text x="213" y="22" text-anchor="middle" class="s-bold">Teacher p: two modes. Student q: one Gaussian.</text>
+<path class="s-box" d="M30.0,258.0 L31.1,258.0 L32.3,258.0 L33.4,258.0 L34.6,258.0 L35.7,258.0 L36.9,258.0 L38.0,258.0 L39.2,258.0 L40.3,258.0 L41.4,258.0 L42.6,258.0 L43.7,258.0 L44.9,258.0 L46.0,258.0 L47.2,258.0 L48.3,258.0 L49.4,258.0 L50.6,258.0 L51.7,258.0 L52.9,258.0 L54.0,258.0 L55.2,258.0 L56.3,257.9 L57.5,257.9 L58.6,257.9 L59.7,257.9 L60.9,257.9 L62.0,257.8 L63.2,257.8 L64.3,257.8 L65.5,257.7 L66.6,257.7 L67.7,257.6 L68.9,257.6 L70.0,257.5 L71.2,257.4 L72.3,257.3 L73.5,257.2 L74.6,257.0 L75.8,256.9 L76.9,256.7 L78.0,256.5 L79.2,256.3 L80.3,256.0 L81.5,255.7 L82.6,255.4 L83.8,255.0 L84.9,254.6 L86.0,254.1 L87.2,253.6 L88.3,253.0 L89.5,252.4 L90.6,251.7 L91.8,250.9 L92.9,250.1 L94.0,249.1 L95.2,248.1 L96.3,247.0 L97.5,245.8 L98.6,244.5 L99.8,243.1 L100.9,241.6 L102.1,240.0 L103.2,238.3 L104.3,236.4 L105.5,234.5 L106.6,232.4 L107.8,230.3 L108.9,228.0 L110.1,225.6 L111.2,223.1 L112.3,220.6 L113.5,217.9 L114.6,215.2 L115.8,212.3 L116.9,209.5 L118.1,206.5 L119.2,203.5 L120.4,200.5 L121.5,197.5 L122.6,194.5 L123.8,191.5 L124.9,188.5 L126.1,185.6 L127.2,182.7 L128.4,179.9 L129.5,177.3 L130.7,174.7 L131.8,172.3 L132.9,170.0 L134.1,167.9 L135.2,165.9 L136.4,164.2 L137.5,162.7 L138.7,161.3 L139.8,160.2 L140.9,159.4 L142.1,158.8 L143.2,158.4 L144.4,158.3 L145.5,158.4 L146.7,158.8 L147.8,159.4 L148.9,160.2 L150.1,161.3 L151.2,162.7 L152.4,164.2 L153.5,165.9 L154.7,167.9 L155.8,170.0 L157.0,172.3 L158.1,174.7 L159.2,177.3 L160.4,179.9 L161.5,182.7 L162.7,185.6 L163.8,188.5 L165.0,191.5 L166.1,194.5 L167.2,197.5 L168.4,200.5 L169.5,203.5 L170.7,206.5 L171.8,209.5 L173.0,212.3 L174.1,215.2 L175.3,217.9 L176.4,220.6 L177.5,223.1 L178.7,225.6 L179.8,228.0 L181.0,230.3 L182.1,232.4 L183.3,234.5 L184.4,236.4 L185.5,238.2 L186.7,240.0 L187.8,241.6 L189.0,243.1 L190.1,244.5 L191.3,245.8 L192.4,247.0 L193.6,248.1 L194.7,249.1 L195.8,250.0 L197.0,250.8 L198.1,251.6 L199.3,252.2 L200.4,252.9 L201.6,253.4 L202.7,253.9 L203.8,254.3 L205.0,254.7 L206.1,255.0 L207.3,255.2 L208.4,255.4 L209.6,255.6 L210.7,255.7 L211.9,255.8 L213.0,255.8 L214.1,255.8 L215.3,255.7 L216.4,255.6 L217.6,255.4 L218.7,255.2 L219.9,255.0 L221.0,254.7 L222.2,254.3 L223.3,253.9 L224.4,253.4 L225.6,252.9 L226.7,252.2 L227.9,251.6 L229.0,250.8 L230.2,250.0 L231.3,249.1 L232.4,248.1 L233.6,247.0 L234.7,245.8 L235.9,244.5 L237.0,243.1 L238.2,241.6 L239.3,240.0 L240.4,238.2 L241.6,236.4 L242.7,234.5 L243.9,232.4 L245.0,230.3 L246.2,228.0 L247.3,225.6 L248.5,223.1 L249.6,220.6 L250.7,217.9 L251.9,215.2 L253.0,212.3 L254.2,209.5 L255.3,206.5 L256.5,203.5 L257.6,200.5 L258.8,197.5 L259.9,194.5 L261.0,191.5 L262.2,188.5 L263.3,185.6 L264.5,182.7 L265.6,179.9 L266.8,177.3 L267.9,174.7 L269.0,172.3 L270.2,170.0 L271.3,167.9 L272.5,165.9 L273.6,164.2 L274.8,162.7 L275.9,161.3 L277.1,160.2 L278.2,159.4 L279.3,158.8 L280.5,158.4 L281.6,158.3 L282.8,158.4 L283.9,158.8 L285.1,159.4 L286.2,160.2 L287.3,161.3 L288.5,162.7 L289.6,164.2 L290.8,165.9 L291.9,167.9 L293.1,170.0 L294.2,172.3 L295.3,174.7 L296.5,177.3 L297.6,179.9 L298.8,182.7 L299.9,185.6 L301.1,188.5 L302.2,191.5 L303.4,194.5 L304.5,197.5 L305.6,200.5 L306.8,203.5 L307.9,206.5 L309.1,209.5 L310.2,212.3 L311.4,215.2 L312.5,217.9 L313.7,220.6 L314.8,223.1 L315.9,225.6 L317.1,228.0 L318.2,230.3 L319.4,232.4 L320.5,234.5 L321.7,236.4 L322.8,238.3 L323.9,240.0 L325.1,241.6 L326.2,243.1 L327.4,244.5 L328.5,245.8 L329.7,247.0 L330.8,248.1 L331.9,249.1 L333.1,250.1 L334.2,250.9 L335.4,251.7 L336.5,252.4 L337.7,253.0 L338.8,253.6 L340.0,254.1 L341.1,254.6 L342.2,255.0 L343.4,255.4 L344.5,255.7 L345.7,256.0 L346.8,256.3 L348.0,256.5 L349.1,256.7 L350.2,256.9 L351.4,257.0 L352.5,257.2 L353.7,257.3 L354.8,257.4 L356.0,257.5 L357.1,257.6 L358.3,257.6 L359.4,257.7 L360.5,257.7 L361.7,257.8 L362.8,257.8 L364.0,257.8 L365.1,257.9 L366.3,257.9 L367.4,257.9 L368.6,257.9 L369.7,257.9 L370.8,258.0 L372.0,258.0 L373.1,258.0 L374.3,258.0 L375.4,258.0 L376.6,258.0 L377.7,258.0 L378.8,258.0 L380.0,258.0 L381.1,258.0 L382.3,258.0 L383.4,258.0 L384.6,258.0 L385.7,258.0 L386.8,258.0 L388.0,258.0 L389.1,258.0 L390.3,258.0 L391.4,258.0 L392.6,258.0 L393.7,258.0 L394.9,258.0 L396.0,258.0 L396.0,258 L30.0,258 Z"/>
+<path class="s-line-b" d="M30.0,255.4 L31.1,255.3 L32.3,255.2 L33.4,255.1 L34.6,255.0 L35.7,254.9 L36.9,254.7 L38.0,254.6 L39.2,254.5 L40.3,254.4 L41.4,254.2 L42.6,254.1 L43.7,253.9 L44.9,253.8 L46.0,253.6 L47.2,253.4 L48.3,253.3 L49.4,253.1 L50.6,252.9 L51.7,252.7 L52.9,252.6 L54.0,252.4 L55.2,252.2 L56.3,252.0 L57.5,251.8 L58.6,251.5 L59.7,251.3 L60.9,251.1 L62.0,250.9 L63.2,250.6 L64.3,250.4 L65.5,250.1 L66.6,249.9 L67.7,249.6 L68.9,249.3 L70.0,249.1 L71.2,248.8 L72.3,248.5 L73.5,248.2 L74.6,247.9 L75.8,247.6 L76.9,247.3 L78.0,246.9 L79.2,246.6 L80.3,246.3 L81.5,245.9 L82.6,245.6 L83.8,245.2 L84.9,244.9 L86.0,244.5 L87.2,244.1 L88.3,243.7 L89.5,243.3 L90.6,242.9 L91.8,242.5 L92.9,242.1 L94.0,241.7 L95.2,241.3 L96.3,240.8 L97.5,240.4 L98.6,239.9 L99.8,239.5 L100.9,239.0 L102.1,238.5 L103.2,238.1 L104.3,237.6 L105.5,237.1 L106.6,236.6 L107.8,236.1 L108.9,235.6 L110.1,235.1 L111.2,234.6 L112.3,234.0 L113.5,233.5 L114.6,233.0 L115.8,232.4 L116.9,231.9 L118.1,231.3 L119.2,230.8 L120.4,230.2 L121.5,229.7 L122.6,229.1 L123.8,228.5 L124.9,227.9 L126.1,227.4 L127.2,226.8 L128.4,226.2 L129.5,225.6 L130.7,225.0 L131.8,224.4 L132.9,223.8 L134.1,223.2 L135.2,222.6 L136.4,222.0 L137.5,221.4 L138.7,220.8 L139.8,220.2 L140.9,219.6 L142.1,219.0 L143.2,218.4 L144.4,217.8 L145.5,217.2 L146.7,216.6 L147.8,216.0 L148.9,215.4 L150.1,214.8 L151.2,214.2 L152.4,213.6 L153.5,213.0 L154.7,212.4 L155.8,211.9 L157.0,211.3 L158.1,210.7 L159.2,210.1 L160.4,209.6 L161.5,209.0 L162.7,208.5 L163.8,207.9 L165.0,207.4 L166.1,206.9 L167.2,206.4 L168.4,205.8 L169.5,205.3 L170.7,204.8 L171.8,204.4 L173.0,203.9 L174.1,203.4 L175.3,202.9 L176.4,202.5 L177.5,202.1 L178.7,201.6 L179.8,201.2 L181.0,200.8 L182.1,200.4 L183.3,200.0 L184.4,199.7 L185.5,199.3 L186.7,199.0 L187.8,198.6 L189.0,198.3 L190.1,198.0 L191.3,197.7 L192.4,197.4 L193.6,197.2 L194.7,196.9 L195.8,196.7 L197.0,196.4 L198.1,196.2 L199.3,196.0 L200.4,195.9 L201.6,195.7 L202.7,195.6 L203.8,195.4 L205.0,195.3 L206.1,195.2 L207.3,195.1 L208.4,195.0 L209.6,195.0 L210.7,195.0 L211.9,194.9 L213.0,194.9 L214.1,194.9 L215.3,195.0 L216.4,195.0 L217.6,195.0 L218.7,195.1 L219.9,195.2 L221.0,195.3 L222.2,195.4 L223.3,195.6 L224.4,195.7 L225.6,195.9 L226.7,196.0 L227.9,196.2 L229.0,196.4 L230.2,196.7 L231.3,196.9 L232.4,197.2 L233.6,197.4 L234.7,197.7 L235.9,198.0 L237.0,198.3 L238.2,198.6 L239.3,199.0 L240.4,199.3 L241.6,199.7 L242.7,200.0 L243.9,200.4 L245.0,200.8 L246.2,201.2 L247.3,201.6 L248.5,202.1 L249.6,202.5 L250.7,202.9 L251.9,203.4 L253.0,203.9 L254.2,204.4 L255.3,204.8 L256.5,205.3 L257.6,205.8 L258.8,206.4 L259.9,206.9 L261.0,207.4 L262.2,207.9 L263.3,208.5 L264.5,209.0 L265.6,209.6 L266.8,210.1 L267.9,210.7 L269.0,211.3 L270.2,211.9 L271.3,212.4 L272.5,213.0 L273.6,213.6 L274.8,214.2 L275.9,214.8 L277.1,215.4 L278.2,216.0 L279.3,216.6 L280.5,217.2 L281.6,217.8 L282.8,218.4 L283.9,219.0 L285.1,219.6 L286.2,220.2 L287.3,220.8 L288.5,221.4 L289.6,222.0 L290.8,222.6 L291.9,223.2 L293.1,223.8 L294.2,224.4 L295.3,225.0 L296.5,225.6 L297.6,226.2 L298.8,226.8 L299.9,227.4 L301.1,227.9 L302.2,228.5 L303.4,229.1 L304.5,229.7 L305.6,230.2 L306.8,230.8 L307.9,231.3 L309.1,231.9 L310.2,232.4 L311.4,233.0 L312.5,233.5 L313.7,234.0 L314.8,234.6 L315.9,235.1 L317.1,235.6 L318.2,236.1 L319.4,236.6 L320.5,237.1 L321.7,237.6 L322.8,238.1 L323.9,238.5 L325.1,239.0 L326.2,239.5 L327.4,239.9 L328.5,240.4 L329.7,240.8 L330.8,241.3 L331.9,241.7 L333.1,242.1 L334.2,242.5 L335.4,242.9 L336.5,243.3 L337.7,243.7 L338.8,244.1 L340.0,244.5 L341.1,244.9 L342.2,245.2 L343.4,245.6 L344.5,245.9 L345.7,246.3 L346.8,246.6 L348.0,246.9 L349.1,247.3 L350.2,247.6 L351.4,247.9 L352.5,248.2 L353.7,248.5 L354.8,248.8 L356.0,249.1 L357.1,249.3 L358.3,249.6 L359.4,249.9 L360.5,250.1 L361.7,250.4 L362.8,250.6 L364.0,250.9 L365.1,251.1 L366.3,251.3 L367.4,251.5 L368.6,251.8 L369.7,252.0 L370.8,252.2 L372.0,252.4 L373.1,252.6 L374.3,252.7 L375.4,252.9 L376.6,253.1 L377.7,253.3 L378.8,253.4 L380.0,253.6 L381.1,253.8 L382.3,253.9 L383.4,254.1 L384.6,254.2 L385.7,254.4 L386.8,254.5 L388.0,254.6 L389.1,254.7 L390.3,254.9 L391.4,255.0 L392.6,255.1 L393.7,255.2 L394.9,255.3 L396.0,255.4"/>
+<path class="s-line-c" d="M30.0,258.0 L31.1,258.0 L32.3,258.0 L33.4,258.0 L34.6,258.0 L35.7,258.0 L36.9,258.0 L38.0,258.0 L39.2,258.0 L40.3,258.0 L41.4,258.0 L42.6,258.0 L43.7,258.0 L44.9,258.0 L46.0,258.0 L47.2,258.0 L48.3,258.0 L49.4,258.0 L50.6,258.0 L51.7,258.0 L52.9,258.0 L54.0,258.0 L55.2,258.0 L56.3,258.0 L57.5,258.0 L58.6,258.0 L59.7,258.0 L60.9,258.0 L62.0,258.0 L63.2,258.0 L64.3,258.0 L65.5,258.0 L66.6,258.0 L67.7,258.0 L68.9,258.0 L70.0,258.0 L71.2,258.0 L72.3,258.0 L73.5,258.0 L74.6,258.0 L75.8,258.0 L76.9,258.0 L78.0,258.0 L79.2,258.0 L80.3,258.0 L81.5,258.0 L82.6,258.0 L83.8,258.0 L84.9,258.0 L86.0,258.0 L87.2,258.0 L88.3,258.0 L89.5,258.0 L90.6,258.0 L91.8,258.0 L92.9,258.0 L94.0,258.0 L95.2,258.0 L96.3,258.0 L97.5,258.0 L98.6,258.0 L99.8,258.0 L100.9,258.0 L102.1,258.0 L103.2,258.0 L104.3,258.0 L105.5,258.0 L106.6,258.0 L107.8,258.0 L108.9,258.0 L110.1,258.0 L111.2,258.0 L112.3,258.0 L113.5,258.0 L114.6,258.0 L115.8,258.0 L116.9,258.0 L118.1,258.0 L119.2,258.0 L120.4,258.0 L121.5,258.0 L122.6,258.0 L123.8,258.0 L124.9,258.0 L126.1,258.0 L127.2,258.0 L128.4,258.0 L129.5,258.0 L130.7,258.0 L131.8,258.0 L132.9,258.0 L134.1,258.0 L135.2,258.0 L136.4,258.0 L137.5,258.0 L138.7,258.0 L139.8,258.0 L140.9,258.0 L142.1,258.0 L143.2,258.0 L144.4,258.0 L145.5,258.0 L146.7,258.0 L147.8,258.0 L148.9,258.0 L150.1,258.0 L151.2,258.0 L152.4,258.0 L153.5,258.0 L154.7,258.0 L155.8,258.0 L157.0,258.0 L158.1,258.0 L159.2,258.0 L160.4,258.0 L161.5,258.0 L162.7,258.0 L163.8,258.0 L165.0,258.0 L166.1,258.0 L167.2,258.0 L168.4,258.0 L169.5,258.0 L170.7,258.0 L171.8,258.0 L173.0,258.0 L174.1,258.0 L175.3,258.0 L176.4,258.0 L177.5,258.0 L178.7,258.0 L179.8,258.0 L181.0,258.0 L182.1,258.0 L183.3,258.0 L184.4,258.0 L185.5,258.0 L186.7,258.0 L187.8,258.0 L189.0,257.9 L190.1,257.9 L191.3,257.9 L192.4,257.9 L193.6,257.9 L194.7,257.9 L195.8,257.8 L197.0,257.8 L198.1,257.7 L199.3,257.7 L200.4,257.6 L201.6,257.6 L202.7,257.5 L203.8,257.4 L205.0,257.3 L206.1,257.1 L207.3,257.0 L208.4,256.8 L209.6,256.6 L210.7,256.4 L211.9,256.1 L213.0,255.8 L214.1,255.4 L215.3,255.0 L216.4,254.6 L217.6,254.0 L218.7,253.5 L219.9,252.8 L221.0,252.0 L222.2,251.2 L223.3,250.3 L224.4,249.2 L225.6,248.1 L226.7,246.8 L227.9,245.4 L229.0,243.8 L230.2,242.1 L231.3,240.3 L232.4,238.2 L233.6,236.0 L234.7,233.6 L235.9,231.0 L237.0,228.2 L238.2,225.2 L239.3,222.0 L240.4,218.5 L241.6,214.9 L242.7,211.0 L243.9,206.9 L245.0,202.5 L246.2,198.0 L247.3,193.2 L248.5,188.3 L249.6,183.1 L250.7,177.8 L251.9,172.3 L253.0,166.7 L254.2,160.9 L255.3,155.0 L256.5,149.1 L257.6,143.1 L258.8,137.0 L259.9,131.0 L261.0,125.0 L262.2,119.0 L263.3,113.2 L264.5,107.4 L265.6,101.9 L266.8,96.5 L267.9,91.4 L269.0,86.5 L270.2,82.0 L271.3,77.7 L272.5,73.9 L273.6,70.4 L274.8,67.3 L275.9,64.7 L277.1,62.5 L278.2,60.8 L279.3,59.5 L280.5,58.8 L281.6,58.5 L282.8,58.8 L283.9,59.5 L285.1,60.8 L286.2,62.5 L287.3,64.7 L288.5,67.3 L289.6,70.4 L290.8,73.9 L291.9,77.7 L293.1,82.0 L294.2,86.5 L295.3,91.4 L296.5,96.5 L297.6,101.9 L298.8,107.4 L299.9,113.2 L301.1,119.0 L302.2,125.0 L303.4,131.0 L304.5,137.0 L305.6,143.1 L306.8,149.1 L307.9,155.0 L309.1,160.9 L310.2,166.7 L311.4,172.3 L312.5,177.8 L313.7,183.1 L314.8,188.3 L315.9,193.2 L317.1,198.0 L318.2,202.5 L319.4,206.9 L320.5,211.0 L321.7,214.9 L322.8,218.5 L323.9,222.0 L325.1,225.2 L326.2,228.2 L327.4,231.0 L328.5,233.6 L329.7,236.0 L330.8,238.2 L331.9,240.3 L333.1,242.1 L334.2,243.8 L335.4,245.4 L336.5,246.8 L337.7,248.1 L338.8,249.2 L340.0,250.3 L341.1,251.2 L342.2,252.0 L343.4,252.8 L344.5,253.5 L345.7,254.0 L346.8,254.6 L348.0,255.0 L349.1,255.4 L350.2,255.8 L351.4,256.1 L352.5,256.4 L353.7,256.6 L354.8,256.8 L356.0,257.0 L357.1,257.1 L358.3,257.3 L359.4,257.4 L360.5,257.5 L361.7,257.6 L362.8,257.6 L364.0,257.7 L365.1,257.7 L366.3,257.8 L367.4,257.8 L368.6,257.9 L369.7,257.9 L370.8,257.9 L372.0,257.9 L373.1,257.9 L374.3,257.9 L375.4,258.0 L376.6,258.0 L377.7,258.0 L378.8,258.0 L380.0,258.0 L381.1,258.0 L382.3,258.0 L383.4,258.0 L384.6,258.0 L385.7,258.0 L386.8,258.0 L388.0,258.0 L389.1,258.0 L390.3,258.0 L391.4,258.0 L392.6,258.0 L393.7,258.0 L394.9,258.0 L396.0,258.0"/>
+<line class="s-line" x1="30" y1="258" x2="396" y2="258"/>
+<line class="s-line" x1="75.8" y1="258" x2="75.8" y2="262"/>
+<text x="75.8" y="276" text-anchor="middle" class="s-small s-muted">-6</text>
+<line class="s-line" x1="144.4" y1="258" x2="144.4" y2="262"/>
+<text x="144.4" y="276" text-anchor="middle" class="s-small s-muted">-3</text>
+<line class="s-line" x1="213.0" y1="258" x2="213.0" y2="262"/>
+<text x="213.0" y="276" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" x1="281.6" y1="258" x2="281.6" y2="262"/>
+<text x="281.6" y="276" text-anchor="middle" class="s-small s-muted">3</text>
+<line class="s-line" x1="350.2" y1="258" x2="350.2" y2="262"/>
+<text x="350.2" y="276" text-anchor="middle" class="s-small s-muted">6</text>
+<rect class="s-box" x="30" y="38" width="22" height="10" rx="2"/>
+<text x="60" y="46" text-anchor="start" class="s-small">teacher p (two modes)</text>
+<line class="s-line-b" x1="30" y1="61" x2="52" y2="61"/>
+<text x="60" y="64" text-anchor="start" class="s-small">forward-KL fit</text>
+<line class="s-line-c" x1="30" y1="79" x2="52" y2="79"/>
+<text x="60" y="82" text-anchor="start" class="s-small">reverse-KL fit</text>
+<text x="420" y="44" text-anchor="start" class="s-bold">Cost of each fit (nats)</text>
+<text x="610" y="66" text-anchor="end" class="s-small s-mono">KL(p‖q)</text>
+<text x="705" y="66" text-anchor="end" class="s-small s-mono">KL(q‖p)</text>
+<line class="s-line" x1="420" y1="72" x2="708" y2="72"/>
+<text x="420" y="92" text-anchor="start" class="s-small s-tb">forward fit N(0, 10)</text>
+<text x="610" y="92" text-anchor="end" class="s-small">0.462</text>
+<text x="705" y="92" text-anchor="end" class="s-small">0.932</text>
+<text x="420" y="114" text-anchor="start" class="s-small s-tc">reverse fit N(3, 1)</text>
+<text x="610" y="114" text-anchor="end" class="s-small">8.311</text>
+<text x="705" y="114" text-anchor="end" class="s-small">0.689</text>
+<text x="420" y="146" text-anchor="start" class="s-small">Forward KL punishes q(x) ≈ 0 where</text>
+<text x="420" y="162" text-anchor="start" class="s-small">p(x) > 0, so q spreads over both modes and</text>
+<text x="420" y="178" text-anchor="start" class="s-small">puts 28 times the target density at x = 0</text>
+<text x="420" y="194" text-anchor="start" class="s-small">(0.126 against 0.0044).</text>
+<text x="420" y="226" text-anchor="start" class="s-small">Reverse KL punishes q(x) > 0 where p(x) ≈ 0,</text>
+<text x="420" y="242" text-anchor="start" class="s-small">so q sits on one mode and pays only</text>
+<text x="420" y="258" text-anchor="start" class="s-small">ln 2 ≈ 0.69 for ignoring the other. Forward</text>
+<text x="420" y="274" text-anchor="start" class="s-small">KL charges that same fit 8.3 nats for the</text>
+<text x="420" y="290" text-anchor="start" class="s-small">mass it dropped.</text>
+<text x="213" y="292" text-anchor="middle" class="s-small s-muted">x (one dimension standing in for the space of continuations)</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Fitting one Gaussian to a teacher with two modes at \(\pm 3\) (unit variance each). The forward-KL fit is moment matching: mean 0, variance \(1 + 3^2 = 10\), so it sits in the valley the teacher avoids. The reverse-KL fit found by a grid search sits on one mode with unit variance. Each fit is optimal for its own divergence and terrible for the other. The numbers are computed by numerical integration.</figcaption>
+  </figure>
+
+  <p>A discrete worked example with four tokens. The teacher is bimodal: \(p_T = (0.48, 0.02, 0.02, 0.48)\), for instance two valid completions and two junk tokens. Compare a student that smears its mass, one that collapses onto one mode, and one with enough capacity:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Student \(p_S\)</th><th class="num">Forward \(\KL(p_T \| p_S)\)</th><th class="num">Reverse \(\KL(p_S \| p_T)\)</th></tr></thead>
+    <tbody>
+      <tr><td>Smeared: \((0.25, 0.25, 0.25, 0.25)\)</td><td class="num">0.525</td><td class="num">0.937</td></tr>
+      <tr><td>Collapsed: \((0.94, 0.02, 0.02, 0.02)\)</td><td class="num">1.203</td><td class="num">0.568</td></tr>
+      <tr><td>Capable: \((0.47, 0.03, 0.03, 0.47)\)</td><td class="num">0.004</td><td class="num">0.005</td></tr>
+    </tbody>
+  </table></div>
+  <p>Arithmetic for the first two rows (natural logs). Smeared, forward: \(0.96 \ln\frac{0.48}{0.25} + 0.04 \ln\frac{0.02}{0.25} = 0.96(0.6523) + 0.04(-2.5257) = 0.5252\). Smeared, reverse: \(0.25\,[\,2\ln\frac{0.25}{0.48} + 2\ln\frac{0.25}{0.02}\,] = 0.25\,(-1.3046 + 5.0515) = 0.9367\). Collapsed, forward: \(0.48 \ln\frac{0.48}{0.94} + 0.48 \ln\frac{0.48}{0.02} = -0.3226 + 1.5255 = 1.2029\) (the two 0.02 entries match and contribute 0). Collapsed, reverse: \(0.94 \ln\frac{0.94}{0.48} + 0.02 \ln\frac{0.02}{0.48} = 0.6318 - 0.0636 = 0.5682\). Forward KL prefers the smeared student (0.525 against 1.203) because the collapsed one gives token 3 a probability of 0.02 against the teacher's 0.48. Reverse KL prefers the collapsed one (0.568 against 0.937) because the smeared one puts 50% of its mass on tokens the teacher considers junk. When the student has the capacity to match, the choice of divergence hardly matters; it matters exactly when the student cannot.</p>
+
+  <p><strong>Practical consequences for language models.</strong> GKD's ablations show the trade-off: moving from forward KL through generalized JSD to reverse KL lowers the diversity of samples (measured by Self-BLEU) and often improves quality at sampling temperature 1, while at low temperatures the divergences converge <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, Fig. 4]</a>. The best choice was task dependent: reverse KL won on task-agnostic instruction tuning (FLAN T5-XL to T5-base, judged on held-out MMLU and BBH), while forward KL was competitive with greedy decoding and on GSM8K. Mode-seeking has its own failure mode. MiniLLM's ablations show degenerate solutions when the reverse-KL optimization is not controlled: without length normalization validation ROUGE-L fell from 27.4 to 17.4 and without teacher-mixed sampling to 22.3, the student learning short or repetitive strings the teacher rates as likely <a href="https://arxiv.org/abs/2306.08543">[Gu et al. 2024, Tab. 4, §3.4]</a>. Diversity loss also matters if you plan to run RL afterwards (<a href="24-rlvr-reasoning.html">page 24</a>): a mode-collapsed student has less to explore.</p>
+
+  <h3 id="estimators">Computing reverse KL on student samples</h3>
+  <p>With reverse KL the expectation is under the student, so it is estimated on the student's own samples. At one prefix there are two ways to evaluate it. <strong>Sampled-token:</strong> draw \(y \sim p_S\) and use \(\hat k = \log p_S(y) - \log p_T(y)\), an unbiased single-sample estimate. <strong>Full-vocabulary:</strong> sum over all \(v\) exactly. In the smeared example the sampled-token estimate is \(-0.652\) or \(+2.526\) with probability one half each: mean 0.937 but standard deviation 1.59, so one sample's noise is 1.7 times the signal (for the collapsed student the values are 0.672, 0, \(-3.178\) with probabilities 0.94, 0.04, 0.02: mean 0.568, standard deviation 0.551). The full-vocabulary sum returns 0.937 with no noise from token sampling. The gradients relate cleanly: since \(\E_{y \sim q}[\nabla \log q(y)] = 0\), we have \(\nabla_\theta \KL(q_\theta \| p) = \E_{y \sim q_\theta}\big[\log\tfrac{q_\theta(y)}{p(y)}\,\nabla_\theta \log q_\theta(y)\big]\). So the RL-style implementation, per-token advantage \(-\operatorname{sg}[\log q - \log p]\) in a policy-gradient loss, is an unbiased estimator of the exact per-position gradient, and the full-vocabulary version removes the sampling variance at that position.</p>
+  <p>Separate from that is what happens <em>across</em> positions. The gradient of the sequence-level \(\KL(q_\theta \| p)\) also includes how a token choice changes the future prefixes, which is what MiniLLM's policy-gradient estimator captures through the return \(R_t = \sum_{t' \ge t} \log \frac{p(y_{t'} \mid y_{\lt t'})}{q_\theta(y_{t'} \mid y_{\lt t'})}\), with a "single-step decomposition" that evaluates the immediate term exactly over the vocabulary <a href="https://arxiv.org/abs/2306.08543">[Gu et al. 2024, §2.2]</a>. GKD does not backpropagate through the student's sampling process, "which makes the training stable and computationally efficient" <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, §3.1]</a>. The Thinking Machines write-up sets the discount factor to zero, "at any given timestep, the student only optimizes the immediate next token" <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">[Lu et al. 2025]</a>. So there are two families: sequence-level reverse KL with returns (unbiased for the sequence objective, higher variance) and per-position divergences on student rollouts (lower variance, ignoring the effect of a token on later prefixes). Modern large-scale systems use the second.</p>
+
+  <h3 id="on-policy">Off-policy versus on-policy distillation</h3>
+  <p>The two axes come apart cleanly. In distillation, <strong>off-policy</strong> means the sequences come from something other than the student: human text, the teacher's samples, a fixed dataset. <strong>On-policy</strong> means the student generates the sequences and the teacher scores them. Agarwal et al. frame it as imitation learning with an interactive expert: training only on fixed sequences causes "train-inference distribution mismatch", because at inference the student conditions on its own earlier mistakes, the exposure bias of <a href="01-big-picture.html#exposure-bias">page 01</a>, and the classic remedy is to collect the learner's own states and query the expert on them (DAgger). Their GKD objective mixes the two with a student-data fraction \(\lambda\):</p>
+  <div class="eq-box">
+  \[ \mathcal L_{\text{GKD}}(\theta) = (1-\lambda)\, \E_{(x,y) \sim (X,Y)}\big[D(p_T \| p_S^\theta)(y \mid x)\big] + \lambda\, \E_{x \sim X}\, \E_{y \sim p_S(\cdot \mid x)}\big[D(p_T \| p_S^\theta)(y \mid x)\big], \quad D(p_T \| p_S)(y \mid x) = \frac{1}{L_y}\sum_{n=1}^{L_y} D\big(p_T(\cdot \mid y_{\lt n}, x)\,\|\,p_S(\cdot \mid y_{\lt n}, x)\big) \]
+  <div class="eq-label">D is any divergence (forward KL, reverse KL, generalized JSD(β)); no gradient flows through the student's sampling; the student starts from an SFT checkpoint. λ = 0 is supervised KD, λ = 1 is on-policy KD. <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, §3.1, Alg. 1]</a></div>
+  </div>
+  <p>Note what this says: <strong>on-policy is not the same as reverse KL.</strong> GKD's "on-policy KD" is the forward KL evaluated on student samples. MiniLLM is on-policy (with the teacher mixed into sampling at strength \(\alpha = 0.2\)) and reverse KL. Results: relative gains over the initial student, averaged across T5 student sizes, of 2.1 times on summarization, 1.7 times on translation and 1.9 times on GSM8K compared with the gains from baseline KD methods <a href="https://arxiv.org/abs/2306.13649">[Agarwal et al. 2024, §1]</a>; and MiniLLM beating sequence-level KD across GPT-2, OPT and LLaMA students from 120M to 13B on instruction following <a href="https://arxiv.org/abs/2306.08543">[Gu et al. 2024, §3]</a>. Both were run on small models and modest datasets, so treat them as mechanism evidence rather than a frontier-scale ranking.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 340" role="img" aria-labelledby="fig-19-3-title">
+<title id="fig-19-3-title">Three ways to distill: logit matching on fixed text, sequence-level training on teacher samples, and on-policy distillation on student samples scored by the teacher</title>
+<defs><marker id="arrow-19-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="120.0" y="20" text-anchor="middle" class="s-bold">Off-policy: logits</text>
+<text x="120.0" y="36" text-anchor="middle" class="s-small s-muted">Hinton 2015; Gemma 2 and 3</text>
+<text x="360.0" y="20" text-anchor="middle" class="s-bold">Off-policy: sequences</text>
+<text x="360.0" y="36" text-anchor="middle" class="s-small s-muted">Kim and Rush; Alpaca; R1-distill</text>
+<text x="600.0" y="20" text-anchor="middle" class="s-bold">On-policy</text>
+<text x="600.0" y="36" text-anchor="middle" class="s-small s-muted">GKD, MiniLLM, Qwen3, V4, MiMo</text>
+<rect class="s-box" x="20" y="52" width="200" height="42" rx="6"/>
+<text x="120.0" y="69.0" text-anchor="middle" class="s-bold">fixed text x</text>
+<text x="120.0" y="84.0" text-anchor="middle" class="s-small">web, human or teacher-written</text>
+<rect class="s-d" x="8" y="132" width="106" height="42" rx="6"/>
+<text x="61.0" y="149.0" text-anchor="middle" class="s-bold">teacher</text>
+<text x="61.0" y="164.0" text-anchor="middle" class="s-small">p_T per prefix</text>
+<rect class="s-a" x="126" y="132" width="106" height="42" rx="6"/>
+<text x="179.0" y="149.0" text-anchor="middle" class="s-bold">student</text>
+<text x="179.0" y="164.0" text-anchor="middle" class="s-small">p_S per prefix</text>
+<path class="s-line" d="M61,94 L61,132" marker-end="url(#arrow-19-3)"/>
+<path class="s-line" d="M179,94 L179,132" marker-end="url(#arrow-19-3)"/>
+<rect class="s-e" x="14" y="212" width="212" height="44" rx="6"/>
+<text x="120.0" y="230.0" text-anchor="middle" class="s-bold">KL(p_T ‖ p_S) per position</text>
+<text x="120.0" y="245.0" text-anchor="middle" class="s-small">times T², forward direction</text>
+<path class="s-line" d="M61,174 L61,212" marker-end="url(#arrow-19-3)"/>
+<path class="s-line" d="M179,174 L179,212" marker-end="url(#arrow-19-3)"/>
+<text x="120.0" y="286" text-anchor="middle" class="s-small">Prefixes are never the student's own:</text>
+<text x="120.0" y="302" text-anchor="middle" class="s-small">exposure bias. The teacher runs on every</text>
+<text x="120.0" y="318" text-anchor="middle" class="s-small">token, so store top-k or sampled logits.</text>
+<rect class="s-box" x="260" y="52" width="200" height="42" rx="6"/>
+<text x="360.0" y="69.0" text-anchor="middle" class="s-bold">prompts x</text>
+<text x="360.0" y="84.0" text-anchor="middle" class="s-small">no answers needed</text>
+<rect class="s-d" x="260" y="132" width="200" height="42" rx="6"/>
+<text x="360.0" y="149.0" text-anchor="middle" class="s-bold">teacher samples y</text>
+<text x="360.0" y="164.0" text-anchor="middle" class="s-small">beam, or T around 0.6 to 1</text>
+<path class="s-line" d="M360.0,94 L360.0,132" marker-end="url(#arrow-19-3)"/>
+<rect class="s-a" x="260" y="212" width="200" height="44" rx="6"/>
+<text x="360.0" y="230.0" text-anchor="middle" class="s-bold">student: SFT on (x, y)</text>
+<text x="360.0" y="245.0" text-anchor="middle" class="s-small">cross-entropy, response only</text>
+<path class="s-line" d="M360.0,174 L360.0,212" marker-end="url(#arrow-19-3)"/>
+<text x="360.0" y="286" text-anchor="middle" class="s-small">Needs only teacher text, so it works</text>
+<text x="360.0" y="302" text-anchor="middle" class="s-small">through an API. R1: about 800K samples,</text>
+<text x="360.0" y="318" text-anchor="middle" class="s-small">SFT only. Still off-policy for the student.</text>
+<rect class="s-box" x="500" y="52" width="200" height="42" rx="6"/>
+<text x="600.0" y="69.0" text-anchor="middle" class="s-bold">prompts x</text>
+<text x="600.0" y="84.0" text-anchor="middle" class="s-small">no answers needed</text>
+<rect class="s-a" x="500" y="110" width="200" height="42" rx="6"/>
+<text x="600.0" y="127.0" text-anchor="middle" class="s-bold">student samples y</text>
+<text x="600.0" y="142.0" text-anchor="middle" class="s-small">y drawn from p_S</text>
+<rect class="s-d" x="500" y="168" width="200" height="42" rx="6"/>
+<text x="600.0" y="185.0" text-anchor="middle" class="s-bold">teacher scores y</text>
+<text x="600.0" y="200.0" text-anchor="middle" class="s-small">logits at every prefix</text>
+<rect class="s-e" x="500" y="226" width="200" height="44" rx="6"/>
+<text x="600.0" y="244.0" text-anchor="middle" class="s-bold">KL per position</text>
+<text x="600.0" y="259.0" text-anchor="middle" class="s-small">reverse KL in V4 and MiMo</text>
+<path class="s-line" d="M600.0,94 L600.0,110" marker-end="url(#arrow-19-3)"/>
+<path class="s-line" d="M600.0,152 L600.0,168" marker-end="url(#arrow-19-3)"/>
+<path class="s-line" d="M600.0,210 L600.0,226" marker-end="url(#arrow-19-3)"/>
+<path class="s-line s-dash" d="M700,248 L710,248 L710,131 L700,131" marker-end="url(#arrow-19-3)"/>
+<text x="600.0" y="292" text-anchor="middle" class="s-small">Update the student, then resample:</text>
+<text x="600.0" y="308" text-anchor="middle" class="s-small">it trains on what it would say.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Where the training sequences come from. Off-policy methods evaluate the loss on text the student may never generate (fixed text, or the teacher's samples). On-policy methods sample from the student and ask the teacher for a per-position verdict on exactly those prefixes, which costs student generation but supplies dense token-level feedback on the student's own mistakes.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Sequences from</th><th>Signal per position</th><th>Divergence</th></tr></thead>
+    <tbody>
+      <tr><td>SFT on human data</td><td>fixed human text</td><td>one-hot next token</td><td>forward KL to the data (cross-entropy)</td></tr>
+      <tr><td>Hinton KD; Gemma 2 and 3 pretraining</td><td>fixed text</td><td>teacher distribution (Gemma 3: 256 sampled logits)</td><td>forward</td></tr>
+      <tr><td>SeqKD; Alpaca; R1-distilled models</td><td>teacher samples</td><td>one-hot next token</td><td>forward, sequence-level, mode approximation</td></tr>
+      <tr><td>GKD, \(\lambda = 1\)</td><td>student samples</td><td>teacher logits</td><td>any: forward, reverse, JSD(β)</td></tr>
+      <tr><td>MiniLLM</td><td>student samples (teacher-mixed)</td><td>teacher log-probabilities</td><td>reverse, sequence-level policy gradient</td></tr>
+      <tr><td>Qwen3 strong-to-weak, phase 2</td><td>student samples</td><td>teacher logits</td><td>"minimize the KL divergence" (direction not stated)</td></tr>
+      <tr><td>DeepSeek-V4 OPD</td><td>student samples</td><td>full-vocabulary teacher logits, over 10 teachers</td><td>reverse</td></tr>
+      <tr><td>MiMo-V2-Flash MOPD</td><td>student samples</td><td>log-ratio at the sampled token, plus an outcome-reward advantage</td><td>reverse, sampled-token form</td></tr>
+      <tr><td>Thinking Machines</td><td>student samples</td><td>log-ratio at the sampled token, discount 0</td><td>reverse</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="decision">
+    <div class="decision-title">On-policy distillation</div>
+    <dl>
+      <dt>Problem</dt><dd>Off-policy distillation trains the student on text it would not generate, and RL gives one scalar reward per long episode (little information per sample).</dd>
+      <dt>Idea</dt><dd>Sample from the student, have the teacher score each position, and minimize a per-position divergence (usually reverse KL) on those samples.</dd>
+      <dt>Why it works</dt><dd>The student is corrected on the prefixes it actually reaches, fixing the train and inference mismatch, and the signal is dense: a full distribution or a log-ratio at every token instead of one outcome reward. Reverse KL is mode-seeking, so a small student spends capacity on the teacher's major modes.</dd>
+      <dt>Evidence</dt><dd>GKD over supervised KD and SeqKD <a href="https://arxiv.org/abs/2306.13649">[GKD]</a>; Qwen3-8B reached AIME'24 74.4 versus 67.6 for RL from the same checkpoint at about a tenth of the GPU hours <a href="https://arxiv.org/abs/2505.09388">[Qwen3, Tab. 21]</a>.</dd>
+      <dt>Cost</dt><dd>Needs teacher logits at inference time for every sampled token (teacher memory and compute, same tokenizer or vocabulary mapping), generation from the student each step, and it cannot exceed the teacher. Mode-seeking reduces diversity.</dd>
+      <dt>Used by</dt><dd>GKD, MiniLLM, Qwen3 small models, MiMo-V2-Flash, DeepSeek-V4, Gemma 2's SFT stage ("distillation from the teacher on the student's distribution", <a href="https://arxiv.org/abs/2408.00118">[Gemma 2, §4]</a>).</dd>
+    </dl>
+  </div>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>If you distilled a large tagger into a small one, you matched softmax outputs over a handful of classes on jets drawn from the same distribution at training and test time, so nothing was on-policy or off-policy. Language models break that: the input at step \(n\) is the model's own previous output, so a student trained on teacher text sees a different state distribution at deployment than in training. That covariate shift, absent from your classification setting, is the reason the on-policy axis exists.</p>
+  </aside>
+</section>
+
+<!-- ============================================================ 7 -->
+<section>
+  <h2 id="reasoning-distill">Distilling reasoning: R1, Qwen3 and DeepSeek-V4</h2>
+
+  <h3 id="r1-distill">DeepSeek-R1 and its distilled models</h3>
+  <p>The R1 report ends with a distillation study. The teacher is R1; the data are the roughly 800K samples used in R1's own second SFT stage (Figure 4); the students are six open models fine-tuned by plain SFT, "we apply only SFT and do not include an RL stage, even though incorporating RL could substantially boost model performance" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. F]</a>. This is sequence-level, off-policy distillation with no logits.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 384" role="img" aria-labelledby="fig-19-4-title">
+<title id="fig-19-4-title">DeepSeek-R1 post-training as stages, and the branch that distills its 800K samples into smaller open models with SFT only</title>
+<defs><marker id="arrow-19-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="8" y="30" width="92" height="56" rx="6"/>
+<text x="54.0" y="54.0" text-anchor="middle" class="s-bold">V3-Base</text>
+<text x="54.0" y="69.0" text-anchor="middle" class="s-small">671B MoE</text>
+<rect class="s-a" x="130" y="30" width="138" height="56" rx="6"/>
+<text x="199.0" y="46.5" text-anchor="middle" class="s-bold">1 · Cold-start SFT</text>
+<text x="199.0" y="61.5" text-anchor="middle" class="s-small">thousands of</text>
+<text x="199.0" y="76.5" text-anchor="middle" class="s-small">long-CoT examples</text>
+<rect class="s-c" x="298" y="30" width="138" height="56" rx="6"/>
+<text x="367.0" y="46.5" text-anchor="middle" class="s-bold">2 · Reasoning RL</text>
+<text x="367.0" y="61.5" text-anchor="middle" class="s-small">GRPO, rule-based</text>
+<text x="367.0" y="76.5" text-anchor="middle" class="s-small">reward + language</text>
+<rect class="s-e" x="466" y="30" width="246" height="56" rx="6"/>
+<text x="589.0" y="46.5" text-anchor="middle" class="s-bold">3 · Rejection sampling</text>
+<text x="589.0" y="61.5" text-anchor="middle" class="s-small">stage-2 checkpoint: about 600K</text>
+<text x="589.0" y="76.5" text-anchor="middle" class="s-small">reasoning + 200K non-reasoning</text>
+<path class="s-line" d="M100,58 L130,58" marker-end="url(#arrow-19-4)"/>
+<path class="s-line" d="M268,58 L298,58" marker-end="url(#arrow-19-4)"/>
+<path class="s-line" d="M436,58 L466,58" marker-end="url(#arrow-19-4)"/>
+<rect class="s-a" x="8" y="158" width="180" height="56" rx="6"/>
+<text x="98.0" y="174.5" text-anchor="middle" class="s-bold">4 · SFT from V3-Base</text>
+<text x="98.0" y="189.5" text-anchor="middle" class="s-small">800K samples, 2 to 3 epochs</text>
+<text x="98.0" y="204.5" text-anchor="middle" class="s-small">LR 5e-5 to 5e-6, 32K ctx</text>
+<rect class="s-c" x="214" y="158" width="150" height="56" rx="6"/>
+<text x="289.0" y="174.5" text-anchor="middle" class="s-bold">5 · RL again</text>
+<text x="289.0" y="189.5" text-anchor="middle" class="s-small">rule-based + preference</text>
+<text x="289.0" y="204.5" text-anchor="middle" class="s-small">reward model</text>
+<rect class="s-box" x="390" y="158" width="116" height="56" rx="6"/>
+<text x="448.0" y="189.5" text-anchor="middle" class="s-bold">DeepSeek-R1</text>
+<path class="s-line" d="M188,186 L214,186" marker-end="url(#arrow-19-4)"/>
+<path class="s-line" d="M364,186 L390,186" marker-end="url(#arrow-19-4)"/>
+<path class="s-line" d="M540,86 L540,122 L98,122 L98,158" marker-end="url(#arrow-19-4)"/>
+<rect class="s-d" x="536" y="158" width="176" height="56" rx="6"/>
+<text x="624.0" y="174.5" text-anchor="middle" class="s-bold">SFT only</text>
+<text x="624.0" y="189.5" text-anchor="middle" class="s-small">2 to 3 epochs, batch 64</text>
+<text x="624.0" y="204.5" text-anchor="middle" class="s-small">no RL stage</text>
+<path class="s-line" d="M624,86 L624,158" marker-end="url(#arrow-19-4)"/>
+<text x="632" y="128" text-anchor="start" class="s-small s-bold">same 800K</text>
+<rect class="s-box" x="410" y="250" width="302" height="64" rx="6"/>
+<text x="561.0" y="270.5" text-anchor="middle" class="s-bold">Distilled students</text>
+<text x="561.0" y="285.5" text-anchor="middle" class="s-small">Qwen2.5-Math-1.5B and 7B, Qwen2.5-14B and 32B,</text>
+<text x="561.0" y="300.5" text-anchor="middle" class="s-small">Llama-3.1-8B, Llama-3.3-70B-Instruct</text>
+<path class="s-line" d="M624,214 L624,250" marker-end="url(#arrow-19-4)"/>
+<text x="8" y="340" text-anchor="start" class="s-small s-muted">Data: 804,745 samples, mean 5,355 tokens each (math 395K, code 211K, general 178K, STEM 10K, logic 10K).</text>
+<text x="8" y="357" text-anchor="start" class="s-small s-muted">Rejection sampling keeps only correct answers and drops mixed-language, long-paragraph and code-block chains.</text>
+<text x="8" y="374" text-anchor="start" class="s-small s-muted">Stage 4 restarts from V3-Base, not from the RL checkpoint. Students see no RL and no logits.</text>
+</svg>
+    <figcaption><b>Figure 4.</b> The DeepSeek-R1 pipeline as documented in the report, and its distillation branch. The 800K samples are generated by rejection sampling from the stage-2 RL checkpoint plus reused V3 SFT data, then used twice: to train R1's own SFT stage from the base model, and to fine-tune the smaller students with no RL. Source: the report's Figure 2, Supp. B.3.3, B.4.2 and B.4.3.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model (pass@1 unless noted)</th><th class="num">AIME 2024</th><th class="num">MATH-500</th><th class="num">GPQA Diamond</th><th class="num">LiveCodeBench</th><th class="num">CodeForces rating</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-4o-0513</td><td class="num">9.3</td><td class="num">74.6</td><td class="num">49.9</td><td class="num">32.9</td><td class="num">759</td></tr>
+      <tr><td>R1-Distill-Qwen-1.5B (from Qwen2.5-Math-1.5B)</td><td class="num">28.9</td><td class="num">83.9</td><td class="num">33.8</td><td class="num">16.9</td><td class="num">954</td></tr>
+      <tr><td>R1-Distill-Qwen-7B (from Qwen2.5-Math-7B)</td><td class="num">55.5</td><td class="num">92.8</td><td class="num">49.1</td><td class="num">37.6</td><td class="num">1189</td></tr>
+      <tr><td>R1-Distill-Qwen-14B</td><td class="num">69.7</td><td class="num">93.9</td><td class="num">59.1</td><td class="num">53.1</td><td class="num">1481</td></tr>
+      <tr class="hl"><td>R1-Distill-Qwen-32B</td><td class="num">72.6</td><td class="num">94.3</td><td class="num">62.1</td><td class="num">57.2</td><td class="num">1691</td></tr>
+      <tr><td>R1-Distill-Llama-8B (from Llama-3.1-8B)</td><td class="num">50.4</td><td class="num">89.1</td><td class="num">49.0</td><td class="num">39.6</td><td class="num">1205</td></tr>
+      <tr><td>R1-Distill-Llama-70B (from Llama-3.3-70B-Instruct)</td><td class="num">70.0</td><td class="num">94.5</td><td class="num">65.2</td><td class="num">57.5</td><td class="num">1633</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek-R1 Supp. F, Tab. 15 (current arXiv version, sampling temperature 0.6, top-p 0.95, up to 32,768 tokens). Students not named in parentheses start from the corresponding Qwen2.5 or Llama base (Tab. 6).</p>
+
+  <h3 id="beats-rl">Why distillation beats RL for small models, and the caveats</h3>
+  <p>The report's control experiment applies large-scale RL (over 10K steps, math, code and STEM data) directly to Qwen2.5-32B:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>32B model</th><th class="num">AIME 2024</th><th class="num">MATH-500</th><th class="num">GPQA Diamond</th><th class="num">LiveCodeBench</th></tr></thead>
+    <tbody>
+      <tr><td>QwQ-32B-Preview</td><td class="num">50.0</td><td class="num">90.6</td><td class="num">54.5</td><td class="num">41.9</td></tr>
+      <tr><td>Qwen2.5-32B-Zero (RL on the base, no SFT)</td><td class="num">47.0</td><td class="num">91.6</td><td class="num">55.0</td><td class="num">40.2</td></tr>
+      <tr class="hl"><td>R1-Distill-Qwen-32B (SFT on 800K samples)</td><td class="num">72.6</td><td class="num">94.3</td><td class="num">62.1</td><td class="num">57.2</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek-R1 Supp. F.1, Tab. 16. The RL model is "on par with QwQ-32B-Preview"; the distilled model is "significantly better ... across all benchmarks."</p>
+  <p>The authors' conclusion: "distilling more powerful models into smaller ones yields excellent results, whereas smaller models relying on the large-scale RL mentioned in this paper require enormous computational power and may not even achieve the performance of distillation" and, second, "advancing beyond the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning." Four mechanisms explain the gap, each with its evidence:</p>
+  <ol>
+    <li><strong>Information per sample.</strong> RL gives one outcome reward per episode of thousands of tokens; distillation gives supervision at every token. The Thinking Machines analysis puts it as \(O(N)\) bits per episode for distillation against \(O(1)\) for RL <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">[Lu et al. 2025]</a>.</li>
+    <li><strong>RL needs a base that can explore.</strong> R1's own early attempts with a 7B dense and a 16B MoE base "consistently failed to yield meaningful improvements" on AIME; the small models fell into repetition and could not exploit long chains of thought, so the team moved to 32B, 230B and 671B bases <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. G.1]</a>. Distillation hands a small model behaviors (verification, backtracking) that it could not have found by sampling.</li>
+    <li><strong>The teacher already paid for the search.</strong> Those behaviors were discovered by RL at 671B scale once, and every student reuses the traces. R1-Zero took about 198 hours on 64 by 8 H800 GPUs (101K GPU-hours) and SFT data creation 5K GPU-hours (Supp. B.4.4).</li>
+    <li><strong>Dense on-policy signal is more efficient still.</strong> Qwen3 compares RL and on-policy distillation from the same off-policy-distilled Qwen3-8B checkpoint on math and code queries (Table 21): AIME'24 55.0 to 67.6 with RL (17,920 GPU-hours) versus 55.0 to 74.4 with on-policy distillation (1,800 GPU-hours), and AIME'25 42.8 to 55.5 versus 65.5. That is a 10-fold difference in GPU-hours and about 15 times more AIME'24 points per GPU-hour (0.70 against 10.8 points per thousand). The students' pass@64 rose with distillation (90.0 to 93.3 on AIME'24) and did not with RL (90.0 to 90.0), which the authors read as expanded exploration <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.7]</a>.</li>
+  </ol>
+  <p><strong>Caveats an interviewer will expect.</strong> The comparison is not compute-matched: the teacher's training and the cost of generating the traces are excluded, so distillation is cheap only because a much larger model already exists and its outputs are reusable. The student is bounded by its teacher, and R1's advice is that frontier capability still requires RL on strong bases. The R1 RL baseline is one recipe on one model (Qwen2.5-32B) from early 2025 and does not show that RL cannot work on small models. Qwen3's comparison used one starting checkpoint and math and code queries only. And the experiments do not separate "which model" from "which data": the distilled students also had 800K carefully filtered samples with a mean length above 5,000 tokens.</p>
+
+  <p><strong>A cost calculation.</strong> The R1 SFT set is 804,745 samples of mean length 5,355 tokens, or \(4.31 \times 10^9\) tokens per epoch. Two to three epochs is 8.6 to 12.9 billion tokens. For a 32B dense student the training compute with the \(6ND\) rule (<a href="13-scaling-laws.html">page 13</a>) is \(6 \times 32\text{B} \times 8.6\text{B} = 1.66 \times 10^{21}\) FLOPs for two epochs and \(2.48 \times 10^{21}\) for three. At an assumed 40% model FLOPs utilization on a chip delivering 989 TFLOP/s in bf16 (an assumption, and attention at long context adds FLOPs), that is about \(1.66 \times 10^{21} / (0.4 \times 989 \times 10^{12}) = 4.2 \times 10^6\) GPU-seconds, or roughly 1,160 GPU-hours for two epochs and 1,740 for three. Compare R1-Zero's 101K GPU-hours: the student run is about 1% of the teacher's RL run, and it is embarrassingly parallel across students. This counts only the student; the shared teacher costs are the caveat above.</p>
+
+  <h3 id="qwen3">Qwen3: strong-to-weak distillation</h3>
+  <p>Qwen3's flagship models use a four-stage pipeline (long-CoT cold start, reasoning RL on 3,995 query-verifier pairs, thinking-mode fusion, general RL). The five small dense models (0.6B, 1.7B, 4B, 8B, 14B) and the 30B-A3B MoE skip it and use strong-to-weak distillation in two phases: <em>off-policy</em>, where outputs of the teacher in both <code>/think</code> and <code>/no_think</code> modes teach basic reasoning and mode switching, then <em>on-policy</em>, where the student samples in either mode and is fine-tuned "by aligning its logits with those of a teacher model (Qwen3-32B or Qwen3-235B-A22B) to minimize the KL divergence". The report says this needs "only 1/10 of the GPU hours compared to the four-stage training method" <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4, §4.5]</a>.</p>
+
+  <h3 id="v4-opd">DeepSeek-V4: multi-teacher on-policy distillation</h3>
+  <p>DeepSeek-V4 (preview, April 2026) changes the last post-training stage. Its pipeline mirrors V3.2's, "a critical methodological substitution was made: the mixed Reinforcement Learning (RL) stage was entirely replaced by On-Policy Distillation" <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1]</a>. First, independent <strong>specialists</strong> are trained per domain (mathematics, coding, agent, instruction following, plus separate specialists for each reasoning-effort mode): SFT, then GRPO RL with domain-specific rewards. Then one unified student is trained on its own samples by minimizing a weighted sum of reverse KLs to \(N\) experts:</p>
+  <div class="eq-box">
+  \[ \mathcal L_{\text{OPD}}(\theta) = \sum_{i=1}^{N} w_i \cdot \KL\big(\pi_\theta \,\|\, \pi_{E_i}\big) \]
+  <div class="eq-label">Trajectories are sampled from the student; each prompt is routed to the relevant domain expert; more than ten teachers are used. <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Eq. 29, §5.1.2]</a></div>
+  </div>
+  <p>Three design points are stated in the report. (1) <strong>Full-vocabulary logits.</strong> "Prior works usually simplify the full-vocabulary KL loss into a token-level KL estimate ... [used] as the per-token advantage estimate in the policy loss," which is "resource-efficient" but "leads to high variance in gradient estimation and often causes training instability"; V4 preserves the complete distribution instead (the variance argument of <a href="#estimators">above</a>). (2) <strong>Why not merge weights or mix RL.</strong> The claim is that logits-level alignment consolidates experts "practically circumventing the performance degradation often encountered in traditional weight-merging or mixed RL techniques". (3) <strong>Systems.</strong> Materializing logits for a vocabulary above 100K for every teacher is prohibitive, so only the teachers' last-layer hidden states are cached and the prediction head reconstructs logits at training time; samples are ordered by teacher index so at most one teacher head is in device memory; teacher weights are offloaded to distributed storage and loaded on demand; the exact KL runs in a specialized TileLang kernel <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.2.2]</a>. By the arithmetic above, reconstructing logits from a cached \(d = 4096\) hidden state costs \(2 \times 4096 \times 128{,}256 \approx 1.05\) GFLOPs per token per teacher, small against a teacher forward pass, and the cache is 31 times smaller than the logits. The report does not present an ablation isolating OPD against mixed RL in the passages I read.</p>
+
+  <h3 id="mopd">MiMo-V2-Flash and the pattern</h3>
+  <p>Xiaomi's MiMo-V2-Flash (309B total, 15B active; January 2026) uses the same three-stage shape, SFT, then domain-specialized teachers (RL or SFT), then <em>multi-teacher on-policy distillation</em>, with a sampled-token formulation: the per-token advantage is \(\operatorname{sg}[\log \pi_{\text{domain}}(y_t \mid \cdot) - \log \pi_\theta(y_t \mid \cdot)]\) plus \(\alpha\) times an outcome-reward advantage, with importance sampling to correct for the gap between training and inference engines <a href="https://arxiv.org/abs/2601.02780">[MiMo-V2-Flash, §4.1, §4.4]</a>. The student matched or beat its best teacher on several benchmarks (AIME 2025: 94.1 against the RL teacher's 93.9) but not on all: SWE-Bench Verified 73.4 against 74.2, Arena-Hard creative writing 86.2 against 90.1, and BrowseComp 45.4 against 51.7 (Tab. 7). Consolidation is close to lossless, not lossless.</p>
+  <p>As of September 2026, among the technical reports I checked, on-policy distillation from a stronger or specialized teacher is a standard component: Qwen3 (May 2025) for small models, MiMo-V2-Flash and DeepSeek-V4 (April 2026) for consolidating specialists, Gemma 2 (2024) in its SFT stage. The recurring reason is the one in the decision card: RL trains specialists efficiently on verifiable domains, and distillation moves and merges their behavior into one model more cheaply and stably than mixing all reward types into a single RL run.</p>
+</section>
+
+<!-- ============================================================ 8 -->
+<section>
+  <h2 id="rft">Rejection-sampling finetuning and STaR</h2>
+
+  <p><strong>Rejection-sampling finetuning</strong> <span class="zh">拒绝采样微调</span> (RFT, also best-of-\(n\) SFT or filtered behavior cloning) uses the model itself as the data source: sample several responses per prompt, keep those that pass a verifier or score highest under a reward model, and fine-tune on the survivors.</p>
+
+<pre><code class="language-python">def rft_round(policy, base_model, prompts, verify, k=16, temperature=0.7):
+    data = []
+    for x in prompts:
+        ys = policy.sample(x, n=k, temperature=temperature)   # k samples from the CURRENT policy
+        good = [y for y in ys if verify(x, y)]                # unit tests, exact answer, or reward-model score
+        data += [(x, y) for y in dedup(good)]                 # keep distinct correct solutions, not k copies of one
+    return sft(base_model, data)                              # STaR restarts from the base model every round
+</code></pre>
+
+  <p><strong>STaR</strong> (Self-Taught Reasoner) is the iterated version for chains of thought: prompt with a few rationale examples, generate rationale and answer, keep those whose final answer is correct, fine-tune, repeat. Each round trains from the <em>original</em> pretrained model "instead of continually training one model to avoid overfitting". Its addition is <em>rationalization</em>: for problems the model gets wrong, give it the correct answer as a hint, generate a rationale, and add it to the training set without the hint, because the loop otherwise "cannot obtain any training signal from failed examples". With GPT-J 6B, STaR reached 72.5% on CommonsenseQA against 73.0% for a fine-tuned model 30 times larger, and +12.5 points over fine-tuning to answer directly <a href="https://arxiv.org/abs/2203.14465">[Zelikman et al. 2022, §1, §3]</a>. A caution the authors report: sampling at higher temperature (0.5 to 0.7) to get more data produced more correct answers with incorrect reasoning and worse models.</p>
+
+  <p><strong>Yuan et al.'s RFT</strong> on GSM8K samples \(k = 100\) paths per training question at temperature 0.7 from an SFT model, keeps correct ones, and deduplicates by the list of equations used, so paths that differ in how they compute count as distinct. For LLaMA-7B: SFT 35.9, RFT with \(k = 100\) from its own samples 41.7, and RFT on the pooled distinct paths of several models 49.3 (+13.4). Their finding is that the number of <em>distinct</em> reasoning paths, not raw sample count, drives the gain; at 33B RFT gave no improvement (54.6 SFT against 54.5) because the larger model had overfit the training questions and produced only 2.78 distinct correct paths per question against 5.25 for 7B <a href="https://arxiv.org/abs/2308.01825">[Yuan et al. 2023, §3, Tab. 1 to 2]</a>. Compute is negligible next to pretraining: about \(10^{-5}\) of pretraining FLOPs for SFT and \(10^{-4}\) for the RFT pipeline (§4.2).</p>
+
+  <p><strong>Frontier use.</strong> Llama 3 samples \(K\) (typically 10 to 30) responses per prompt from the latest policy and keeps the best under the reward model, with system prompts steering tone and formatting; PagedAttention with shared prompt pages more than doubled sampling throughput <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.2.2]</a>. R1's 600K reasoning samples are rejection-sampled from its stage-2 RL checkpoint (Figure 4); Qwen3's cold start samples \(N\) responses per query from QwQ-32B and filters six ways.</p>
+
+  <h3 id="rft-rl">Relation to RL</h3>
+  <p>STaR's authors derive the link. With an indicator reward \(\mathbb 1[\hat y = y]\), the policy gradient of the expected reward is \(\nabla J = \sum_i \E_{\hat r_i, \hat y_i \sim p_M(\cdot \mid x_i)}\big[\mathbb 1(\hat y_i = y_i)\,\nabla \log p_M(\hat y_i, \hat r_i \mid x_i)\big]\): the indicator zeroes the gradient of every wrong sample, which is exactly the filtering step. STaR then approximates this with greedy decoding (lower variance, biased exploration) and several gradient steps per batch. Read this way, RFT is one step of policy improvement from a fixed sampling policy (expert iteration): sample, keep reward-1 samples, maximize their likelihood. Differences from the RL of <a href="22-rl-foundations.html">pages 22</a> to <a href="24-rlvr-reasoning.html">24</a>:</p>
+  <ul>
+    <li><strong>No negative signal.</strong> Failures contribute nothing; GRPO or PPO push probability <em>down</em> on bad samples through negative advantages.</li>
+    <li><strong>No baseline.</strong> Every kept sample gets weight 1, so prompts with many correct samples contribute many examples and easy prompts dominate, which is why RFT deduplicates and why R1 filters (RL methods normalize by prompt).</li>
+    <li><strong>Off-policy after the first update.</strong> Data are sampled from the previous policy and trained on for several epochs, with no importance ratio, clipping or KL penalty. Iterating (STaR, Llama 3's six rounds) re-samples to stay close to on-policy.</li>
+    <li><strong>Different failure mode.</strong> It saturates when the model solves few training prompts (nothing to keep; hence rationalization), and it shrinks diversity as each round trains on the model's own high-probability outputs (RFT's 33B result).</li>
+  </ul>
+  <p>The practical rule: with a reliable verifier and a base that already solves a meaningful fraction of prompts, rejection sampling is a robust, simple way to build SFT data and a strong warm start for RL (R1's stage 3); when prompts are too hard for any sample to succeed, or when negative feedback matters, move to RL.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"SFT teaches the model new knowledge."</strong> It mostly teaches format and behavior. Facts the base model lacks are fit slowly and, once fit, increase hallucination on facts it did know (Gekhman et al.). Long-chain-of-thought SFT does move reasoning scores, but it builds on capability the base model already had.</li>
+    <li><strong>"Loss on the whole sequence is simpler, and the end token is just formatting."</strong> Prompt tokens are inputs: in Llama 3's long-context SFT examples 98% of the tokens are context. The end-of-turn token is the opposite, a target that teaches the model to stop. Masking padding by token id when pad equals EOS, or truncating an example, silently removes it.</li>
+    <li><strong>"Concatenating examples with an EOS token is packing."</strong> With an ordinary causal mask, later examples attend to earlier ones. You need the block-diagonal document mask, per-document position ids for absolute embeddings, and no loss across a document boundary.</li>
+    <li><strong>"The mean loss is the mean loss."</strong> Token mean, sequence mean and mean of micro-batch means are three different objectives (0.44, 0.63 and 0.72 in the examples above). Gradient accumulation changes the weighting unless you divide by the global token count or use a sum loss.</li>
+    <li><strong>"Distillation means matching logits, and on-policy means reverse KL."</strong> SFT on a teacher's samples (R1's distilled models) is distillation too, with no logits. The data source (fixed text, teacher samples, student samples) and the divergence (forward, reverse) are independent choices: GKD's on-policy KD uses forward KL, MiniLLM and DeepSeek-V4 use reverse KL.</li>
+    <li><strong>"Reverse KL is better because it is mode-seeking."</strong> It trades diversity for precision, can collapse onto degenerate high-likelihood outputs without safeguards (MiniLLM's ablations), and the best choice was task dependent in GKD. When the student can match the teacher the two agree.</li>
+    <li><strong>"Distillation beats RL."</strong> It did for a small student with a stronger teacher available, at a fraction of the student-side compute (R1 Qwen-32B, Qwen3-8B). The teacher's cost is excluded, the student is capped by the teacher, and the frontier models themselves are built with RL.</li>
+    <li><strong>"Rejection-sampling finetuning is RL."</strong> It is the positive half of a policy gradient with a binary reward: no negative samples, no baseline, no importance ratio, no KL. That makes it simple and robust, and limits it on prompts the model never solves.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does SFT teach the model that pretraining did not?</summary>
+    <div class="answer">
+      <p>Pretraining teaches knowledge and skills by continuing web text; its objective is misaligned with "follow the instruction and stop". SFT trains the same cross-entropy on (prompt, response) demonstrations, loss on the response, and teaches (1) the task format, answering rather than continuing; (2) the role and turn structure and the end-of-turn token, so the model stops; (3) behavior: tone, refusals, tool-call syntax, reasoning style. It teaches little new knowledge. LIMA reached a competitive assistant with 1,000 curated examples (equal or better than GPT-4 in 43% of comparisons), Flan-PaLM cost 0.2% of pretraining compute, and Gekhman et al. show examples with unknown facts are fit slowly and then raise hallucination. Limits of the "superficial" view: SFT on long verified chains of thought does raise reasoning scores (Qwen2.5-32B-Instruct 26.7 on AIME24, s1-32B 56.7 from 1,000 traces, R1-Distill-32B 72.6 from 800K), though the s1 authors read that as eliciting capability already present after pretraining.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Write the temperature knowledge-distillation loss. Why multiply by \(T^2\), and what temperature do LLM distillation pipelines use?</summary>
+    <div class="answer">
+      <p>\(\mathcal L = (1-\alpha)\,\mathrm{CE}(y, p_S) + \alpha\, T^2\,\KL(p_T^{(T)} \| p_S^{(T)})\) with \(p^{(T)} = \softmax(z/T)\). The gradient of the soft term with respect to a student logit is \((q_i - p_i)/T\), and in the high-temperature limit with zero-meaned logits it is about \((z_i - v_i)/(N T^2)\), so it shrinks like \(1/T^2\). Multiplying by \(T^2\) keeps the soft and hard terms balanced as \(T\) changes. Numerically, teacher logits \((4,2,0,-2)\) against student \((3,3,0,-3)\) give KL 0.324, 0.100, 0.024 at \(T = 1, 2, 4\) but 0.324, 0.402, 0.390 after scaling. For LLMs \(T = 1\) is the norm (Kim and Rush found it best among 1, 1.5, 2; GKD trains at \(T = 1\)): next-token distributions over a large vocabulary are already soft, and the parameter that matters for generation quality is the sampling temperature, not the training one.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate: a packed batch holds three responses with 4, 6 and 90 trained tokens and mean NLL 0.5, 1.0 and 0.4. Give the token-weighted and sequence-weighted loss, and say who dominates each.</summary>
+    <div class="answer">
+      <p>Token-weighted: \((4 \cdot 0.5 + 6 \cdot 1.0 + 90 \cdot 0.4)/100 = (2 + 6 + 36)/100 = 0.440\). Sequence-weighted: \((0.5 + 1.0 + 0.4)/3 = 0.633\). Under the token mean every token weighs 1/100, so the 90-token document carries 90% of the gradient; under the sequence mean each document carries one third, so a token of the 4-token document weighs \(1/12\), which is 8.3 times more. Neither is "right". Token-level weighting matches "minimize total NLL over data" and lets long reasoning chains matter; sequence-level weighting protects short answers from being drowned out. In practice: divide by the <em>global</em> number of trained tokens (or use a sum loss with a retuned LR, as Tulu 3 did), because averaging per micro-batch silently switches to a third weighting (0.72 in the two-micro-batch example on the page).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why mask the prompt tokens in the SFT loss? What about multi-turn conversations?</summary>
+    <div class="answer">
+      <p>The target is \(p(\text{response} \mid \text{prompt})\), and the prompt is supplied at inference. Loss on it optimizes an unrelated objective (modeling user text) and, when prompts are long, swamps the useful one: Llama 3's long-context SFT examples average 37,395 context tokens and 740 response tokens, so 98% of the tokens would be document memorization. Practically you mark which tokens are targets when rendering the template: assistant content <em>and</em> the end-of-turn token are targets; headers, separators after the stop token, BOS, system and user turns, and tool outputs are not.</p>
+      <p>Multi-turn: for a causal model, one forward pass with loss on all assistant turns gives the same per-token losses as one example per turn with its history as context, so it is \(N\) times cheaper, provided the rendering of the first \(k\) turns is a prefix of the first \(k+1\). It breaks when the template rewrites history (Qwen3 drops the reasoning of earlier turns), and some pipelines train only the final turn (Llama 3 uses context plus final response per example). In those cases split conversations into per-turn examples rendered exactly as at inference.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What goes wrong with naive sequence packing, and how do you fix it?</summary>
+    <div class="answer">
+      <p>Naive packing concatenates examples (often with an EOS between them) and applies a plain causal mask. Then example 2's tokens attend to example 1, so the model is trained to condition on an unrelated earlier conversation that never exists at inference; with absolute position embeddings example 2 also sees shifted positions; and the first token of a document is "predicted" from the last token of the previous one. Fixes: (1) a block-diagonal causal mask (query \(i\) sees key \(j\) iff \(j \le i\) and same document), implemented with variable-length attention kernels that take cumulative sequence lengths; (2) position ids that restart per document (a no-op for RoPE in exact arithmetic, since scores depend on offsets, but required for absolute embeddings); (3) drop loss on cross-boundary predictions and on padding; (4) normalize by the global count of trained tokens. Evidence on impact: Flan and Llama 3 mask across documents; Llama 3 found it limited for standard pretraining but important for long-sequence continued pretraining; Ding et al.'s ablation lowered validation perplexity from 9.64 to 9.53. Effects are often small for short SFT examples and cheap to remove.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Forward versus reverse KL for distillation: which is mode-seeking, and why does it matter?</summary>
+    <div class="answer">
+      <p>Forward \(\KL(p_T \| p_S) = \sum p_T \log (p_T/p_S)\) takes its expectation under the teacher, so it explodes wherever the student gives zero mass to something the teacher likes: the student must cover every teacher mode (mode-covering). Reverse \(\KL(p_S \| p_T)\) takes the expectation under the student, so it explodes wherever the student puts mass where the teacher has none: the student may safely ignore modes and settle on major ones (mode-seeking). It only matters when the student cannot match the teacher. Four-token example, teacher \((0.48, 0.02, 0.02, 0.48)\): a uniform student has forward KL 0.525 and reverse 0.937; a student collapsed onto one mode has forward 1.203 and reverse 0.568, so the two divergences rank them oppositely. For a Gaussian fit to two modes at \(\pm 3\), forward gives \(N(0, 10)\) (in the valley), reverse gives \(N(3, 1)\).</p>
+      <p>For LLMs: forward KL spreads a small student's mass over the teacher's tail, so its samples can be unlikely under the teacher (hallucination, low quality at temperature 1); reverse KL gives more precise but less diverse output and can collapse or reward-hack degenerate strings if uncontrolled (MiniLLM's length normalization and teacher-mixed sampling). GKD found the best divergence task dependent. Standard SFT and Hinton KD are forward; on-policy systems such as DeepSeek-V4 use reverse.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A colleague says "on-policy distillation just means reverse KL". Correct them, and explain when you would use each variant.</summary>
+    <div class="answer">
+      <p>Two independent axes. Data source: fixed text (off-policy), teacher samples (off-policy for the student, sequence-level KD), or student samples (on-policy). Divergence at each position: forward KL, reverse KL, or JSD. GKD's "on-policy KD" is the <em>forward</em> KL evaluated on student samples (\(\lambda = 1\)), MiniLLM is on-policy with reverse KL, and Qwen3's report says only "minimize the KL divergence". On-policy fixes the train and inference mismatch (exposure bias): the student is corrected on the prefixes it actually generates, with a dense per-token signal from teacher logits, at the cost of student generation and teacher scoring at every step and a shared vocabulary. Off-policy sequence-level SFT on teacher samples needs only text (so it works through an API), is cheap to scale (R1's 800K samples), and is the right first stage; Qwen3 does exactly that (off-policy phase, then on-policy phase) for its small models. Reverse KL suits a student much smaller than the teacher where precision matters more than diversity; forward KL or JSD is safer when diversity or coverage matters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why does distilling a large reasoning model beat running RL on a small model?</summary>
+    <div class="answer">
+      <p>Evidence: DeepSeek-R1 ran large-scale RL (over 10K steps) on Qwen2.5-32B and got AIME24 47.0, on par with QwQ-32B-Preview (50.0), while SFT on 800K R1 samples gave R1-Distill-Qwen-32B 72.6 (MATH-500 94.3 vs 91.6, GPQA 62.1 vs 55.0, LiveCodeBench 57.2 vs 40.2). Qwen3, from one starting checkpoint, got AIME24 74.4 with on-policy distillation versus 67.6 with RL, using 1,800 versus 17,920 GPU-hours. Mechanisms: (1) information per sample: RL gives one outcome reward per episode, distillation gives supervision at every token (\(O(N)\) versus \(O(1)\) bits); (2) small bases explore poorly: R1's 7B and 16B RL attempts failed to improve AIME and collapsed into repetition; (3) the teacher has already paid for the search (R1-Zero cost about 101K GPU-hours) and the traces contain behaviors like verification that a small model would rarely sample; (4) on-policy distillation adds correction on the student's own prefixes.</p>
+      <p>Caveats: the comparison is not compute-matched (teacher training and trace generation are excluded); the student is capped by the teacher, and R1 states that going beyond needs stronger bases and larger-scale RL; one RL recipe on one model does not prove RL cannot work at small scale; and distillation needs a stronger teacher to exist.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How would you build an SFT dataset for a coding assistant from scratch?</summary>
+    <div class="answer">
+      <p><strong>Prompts:</strong> mix real user requests (with consent and PII scrubbing) and synthetic ones seeded from real code, since seeding gives diversity (Magicoder's OSS-Instruct: 1 to 15 lines of open-source code as the seed for a generated problem), spanning languages and task types (write, explain, debug, refactor, test, review, multi-turn, tool use). <strong>Responses:</strong> from a strong teacher or the best current model, sampled several times, with a system prompt steering style (Llama 3 steered toward documented, well-named code). <strong>Filter with executable signals:</strong> run generated unit tests in a sandbox, plus compile, lint and type checks; use model-as-judge and backtranslation (documentation regenerated into code, scored for fidelity, Llama 3) where tests do not exist; keep distinct correct solutions rather than \(k\) copies. <strong>Curate:</strong> drop items the base model already solves, deduplicate semantically, balance by topic, and weight difficulty (Llama 3, s1). <strong>Decontaminate</strong> against HumanEval, MBPP, LiveCodeBench and internal evals with n-gram matching on prompts (Tulu 3: 8-gram, 50% token and 2% dataset thresholds). <strong>Mix</strong> with general chat, safety and a small slice of long-context data so nothing regresses. <strong>Train</strong> with a response-only mask and the exact deployment template, LR near 1e-5 for 7B to 70B, 2 to 3 epochs, packing with a document mask. <strong>Evaluate</strong> with leave-one-out ablations of each data slice, held-out real prompts, execution benchmarks and regression suites, and choose checkpoints by generation quality, not validation loss. Start at 10K to 100K examples; LIMA shows quality and diversity beat volume for style, and Tulu 3 shows skills need skill-specific data.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does rejection-sampling finetuning relate to RL, and when do you use it?</summary>
+    <div class="answer">
+      <p>RFT samples \(k\) responses per prompt from the current model, keeps those a verifier or reward model accepts, and fine-tunes on them. STaR's derivation shows that with an indicator reward the policy gradient is \(\E[\mathbb 1(\hat y = y)\nabla\log p(\hat y, \hat r \mid x)]\): the indicator zeroes wrong samples, which is the filtering step. So RFT is one step of policy improvement from a fixed sampling policy (expert iteration, filtered behavior cloning). Against PPO or GRPO it has no negative samples, no baseline (prompts with many correct samples dominate, hence deduplication), no importance ratio or KL, and reuses each batch for several epochs, so it is off-policy after the first step. Use it when you have a reliable verifier and a base that solves a fair share of prompts: it is simple, stable and cheap (Yuan et al.: LLaMA-7B GSM8K 35.9 to 41.7 to 49.3 with pooled distinct paths, at roughly \(10^{-4}\) of pretraining FLOPs), and it builds data for SFT and warm starts for RL (Llama 3: \(K = 10\) to 30 samples per prompt, best by reward model; R1: 600K reasoning samples). Move to RL when prompts are too hard for any sample to pass or when negative feedback matters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you must consolidate more than ten domain experts into one student with on-policy distillation. What are the systems problems and how does DeepSeek-V4 address them?</summary>
+    <div class="answer">
+      <p>Loss: \(\sum_i w_i \KL(\pi_\theta \| \pi_{E_i})\), trajectories sampled from the student, each prompt scored by the relevant expert. Problem 1, the estimator: the sampled-token log-ratio used as a per-token advantage is unbiased but high variance (in the four-token example one sample has standard deviation 1.59 against a mean of 0.94), so V4 computes the exact full-vocabulary reverse KL. Problem 2, memory: full logits for \(V = 128{,}256\) in bf16 are 250 KiB per token, 239 GiB per million tokens per teacher, and there are over ten teachers, some with trillions of parameters. V4 caches only the last-layer hidden state (\(d = 4096\) would be 8 KiB per token, 31 times smaller) and rebuilds logits through the teacher's prediction head at training time (about \(2dV \approx 1.05\) GFLOPs per token, small against a teacher forward pass). Problem 3, weights: teacher parameters are offloaded to distributed storage and loaded on demand, samples are ordered by teacher index so at most one prediction head is on device per mini-batch, and loads run asynchronously. Problem 4, throughput: a fused kernel for the exact KL. Design risks to raise: the routing of prompts to teachers and the weights \(w_i\), conflicting experts on mixed prompts, the student's capacity (MiMo's student trailed its teachers on BrowseComp and SWE-Bench), teacher and student sharing a vocabulary, and the lack of an isolating ablation in the report.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Calculate the student-side compute of distilling R1's 800K samples into a 32B model, and say what the number leaves out.</summary>
+    <div class="answer">
+      <p>Tokens: \(804{,}745 \times 5{,}355 = 4.31 \times 10^9\) per epoch, 8.6B for two epochs and 12.9B for three. Training FLOPs \(\approx 6ND\): \(6 \times 32 \times 10^9 \times 8.62 \times 10^9 = 1.66 \times 10^{21}\) (two epochs) to \(2.48 \times 10^{21}\) (three). On hardware with 989 TFLOP/s bf16 and an assumed 40% MFU (395 TFLOP/s effective): \(1.66 \times 10^{21}/3.96 \times 10^{14} = 4.2 \times 10^6\) GPU-seconds, about 1,160 GPU-hours, or 1,740 for three epochs; long-context attention adds to this. R1-Zero used about 101K GPU-hours (64 by 8 H800 for about 198 hours), so the student run is about 1% of it. What it leaves out: the teacher's own training (R1-Zero, R1, and the V3 base), the generation of the 800K traces (5K GPU-hours reported for SFT data creation, and decoding is memory-bound so FLOPs understate it), the data curation and filtering, hyperparameter search, evaluation, and the fact that the six students share the same data. It also says nothing about the RL baseline's cost: the report gives steps (over 10K) but not GPU-hours for Qwen2.5-32B-Zero.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Debugging scenario: after SFT your model never stops, repeats itself, and is worse than the base on long-document tasks. List hypotheses in the order you would test them.</summary>
+    <div class="answer">
+      <p>(1) <strong>Stop token.</strong> Is the end-of-turn token in the labels? Print a decoded example with the mask applied. Check that pad is not the same id as EOS with masking by value, that the stop token the serving stack uses (generation config, <code>eos_token_id</code> list) is the one trained (base versus instruct tokens differ, and Llama 3 has both <code>&lt;|eot_id|&gt;</code> and <code>&lt;|eom_id|&gt;</code>), and that truncation did not cut endings (s1: 74% of samples cut at 4,096 tokens lengthened test-time reasoning from 6,984 to 20,721 tokens). (2) <strong>Template mismatch.</strong> Diff the rendered inference prompt against training strings byte for byte: newlines, system prompt, BOS duplication, generation prompt, reasoning stripping in history. (3) <strong>Packing.</strong> Is there a document mask and boundary loss guard? Compare a run with one example per row on a small subset. (4) <strong>Loss weighting.</strong> Are long examples dominating (token mean) or gradient accumulation changing weights? (5) <strong>Forgetting and data.</strong> Long-context regression is the Llama 3 signature of short-only SFT data; add a small slice (0.1% was best there) and check learning rate and epochs (Gudibande saw MMLU, NQ and HumanEval regress with more imitation data). (6) <strong>Repetition</strong> may come from training on repetitive synthetic data or from decoding settings (page 06). Use generation-based evaluation at each step, not validation loss, to localize.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> LIMA says 1,000 examples suffice, Gekhman says new facts hurt, s1 gets AIME gains from 1,000 traces, and R1 needs 800K. Reconcile them.</summary>
+    <div class="answer">
+      <p>They measure different things. LIMA measures style and format on open-ended prompts judged by humans: the target sub-distribution is narrow, the base has the knowledge, so a thousand diverse, high-quality examples suffice, and quantity beyond that did not help in its ablation. Gekhman shows what happens outside that regime: examples whose facts the model lacks are learned slowly and, once learned, teach guessing, so SFT is a way to <em>elicit</em> knowledge, and example selection (including "maybe known" items) changes how well the model uses it. Gudibande adds that imitation copies style faster than capability. s1 and R1-distill are about eliciting and organizing a latent skill, long verified-style reasoning with backtracking: 1,000 hard, diverse, high-quality traces (s1K) got AIME24 from 26.7 to about 50 to 57, while 800K traces (R1) gave 72.6, and s1's ablations show that data curation (difficulty, diversity, quality) mattered more than volume up to the point where more data buys robustness (59K traces 53.3, at 56 times the compute). The consistent principle: SFT moves what the base can already do, so data volume needed scales with how far the target behavior is from the base's existing distribution, and with how broad the target distribution is. Skills that the base lacks or that must generalize across a broad task set (Tulu 3's math and instruction following) need dedicated data at 10K to 1M scale.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>SFT plumbing and distillation losses.</strong> One module, five functions. <code>build_example</code> renders a conversation through a ChatML-like template spec with a toy tokenizer and returns <code>(input_ids, loss_mask)</code>: assistant content and the end-of-turn token are targets; headers, separators, BOS and other roles are not; it supports <code>train_on="last"</code>. <code>pack</code> does next-fit packing into fixed rows and returns per-row <code>position_ids</code> (restarting per document), <code>doc_ids</code> and the loss mask; <code>document_causal_mask</code> builds the block-diagonal causal mask, and the test checks that packed attention equals attention run on each document alone. <code>packed_lm_loss</code> is the shifted next-token loss with the boundary rule and both normalizations (it reproduces the 0.440 versus 0.633 example above). <code>kd_loss</code> is forward or reverse KL with temperature, \(T^2\) scaling and a position mask; the tests check the four-token example (0.525, 0.937, 1.203, 0.568) and the gradients \((q - p)/N\) and \(q\,(\log(q/p) - \mathrm{KL})/N\). An interviewer would expect the masking and the document mask in about 20 minutes and all five in 40. <span class="ex-path">exercises/drills/sft.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_sft.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2305.11206">Zhou et al. (2023). LIMA: Less Is More for Alignment.</a> <span class="why">Why read it: the superficial alignment hypothesis, a 1,000-example recipe, and clean ablations on quality, diversity and quantity.</span></li>
+    <li><a href="https://arxiv.org/abs/2411.15124">Lambert et al. (2024). Tulu 3: Pushing Frontiers in Open Language Model Post-Training.</a> <span class="why">Why read it: the most detailed open SFT recipe: data sources, decontamination, leave-one-out ablations, loss aggregation and hyperparameters.</span></li>
+    <li><a href="https://arxiv.org/abs/2212.10560">Wang et al. (2022). Self-Instruct: Aligning Language Models with Self-Generated Instructions.</a> <span class="why">Why read it: the seed, generate, filter loop behind Alpaca-style synthetic instruction data.</span></li>
+    <li><a href="https://arxiv.org/abs/1503.02531">Hinton, Vinyals and Dean (2015). Distilling the Knowledge in a Neural Network.</a> <span class="why">Why read it: soft targets, temperature, the \(T^2\) factor and the logit-matching limit.</span></li>
+    <li><a href="https://arxiv.org/abs/1606.07947">Kim and Rush (2016). Sequence-Level Knowledge Distillation.</a> <span class="why">Why read it: the mode approximation behind training on teacher samples, and why students become more peaked.</span></li>
+    <li><a href="https://arxiv.org/abs/2306.13649">Agarwal et al. (2024). On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes (GKD).</a> <span class="why">Why read it: the on-policy versus off-policy framing, the divergence ablations, and the imitation-learning view of exposure bias.</span></li>
+    <li><a href="https://arxiv.org/abs/2306.08543">Gu et al. (2024). MiniLLM: Knowledge Distillation of Large Language Models.</a> <span class="why">Why read it: reverse KL as a policy gradient with single-step decomposition, teacher-mixed sampling and length normalization.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.</a> <span class="why">Why read it: the pipeline, the 800K-sample SFT set, the distilled models and the distillation-versus-RL comparison (Supp. B and F).</span></li>
+    <li><a href="https://arxiv.org/abs/2505.09388">Qwen Team (2025). Qwen3 Technical Report.</a> <span class="why">Why read it: strong-to-weak distillation and the RL versus on-policy distillation table (§4.5, §4.7).</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence.</a> <span class="why">Why read it: multi-teacher on-policy distillation replacing mixed RL, with full-vocabulary reverse KL and its systems design (§5.1.2, §5.2.2).</span></li>
+  </ol>
+  <p class="small muted">Also cited above: <a href="https://arxiv.org/abs/2203.02155">InstructGPT</a>, <a href="https://arxiv.org/abs/2109.01652">FLAN</a> and <a href="https://arxiv.org/abs/2210.11416">Flan-PaLM</a>, <a href="https://arxiv.org/abs/2407.21783">Llama 3</a>, <a href="https://arxiv.org/abs/2405.05904">Gekhman et al.</a>, <a href="https://arxiv.org/abs/2305.15717">Gudibande et al.</a>, <a href="https://arxiv.org/abs/2404.10830">Ding et al.</a>, <a href="https://arxiv.org/abs/2501.19393">s1</a>, <a href="https://arxiv.org/abs/2203.14465">STaR</a>, <a href="https://arxiv.org/abs/2308.01825">RFT</a>, <a href="https://arxiv.org/abs/2601.02780">MiMo-V2-Flash</a>, <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">Thinking Machines</a>.</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>SFT loss = mean NLL over response tokens \(\mathcal R\) (assistant content plus the end-of-turn token). Prompt, headers, separators after the stop token, BOS, tool outputs: masked. Position \(t\) predicts token \(t+1\), so the mask shifts with the labels.</li>
+      <li>Train and inference templates must match byte for byte (newlines, BOS, system prompt, stop token). Base and instruct checkpoints stop on different tokens. Never mask padding by id if pad = EOS. Truncation deletes the ending.</li>
+      <li>Multi-turn: one pass with loss on all assistant turns equals per-turn examples if each history is a prefix of the next; otherwise split per turn (Qwen3 drops old reasoning; Llama 3 trains context plus final response).</li>
+      <li>Packing: block-diagonal causal mask (same document and \(j \le i\)), position ids restart per document (needed for absolute embeddings, a no-op for RoPE), no loss across boundaries, padding never a target.</li>
+      <li>Token mean weighs each token equally (long examples dominate); sequence mean weighs each document equally (short tokens upweighted \(\times\) 8.3 in the 4/6/90 example: 0.440 vs 0.633). Divide by the global trained-token count; per-micro-batch means give a third answer (0.72). Tulu 3: sum loss, LR 5e-6 (8B) and 2e-6 (70B), 2 epochs, batch 128.</li>
+      <li>Recipes: LR about 1/8 to 1/10 of pretraining peak (Llama 3 1e-5 vs 8e-5), smaller for larger models; 2 to 3 epochs at \(10^5\) to \(10^6\) examples, 15 or more at \(10^3\) with dropout; select on generation quality, not validation loss; seed noise is about 1 point at 8B and 2.6 at 70B.</li>
+      <li>Data: quality and diversity beat volume for style (LIMA 1,000); skills need skill data (Tulu 3: no math data, GSM8K 76.2 to 64.1); decontaminate on prompts (8-gram, 50% tokens, 2% of an eval); keep the mix covering everything you want to retain (Llama 3 long context: 0.1%).</li>
+      <li>KD loss \(= (1-\alpha)\mathrm{CE} + \alpha T^2 \KL(p_T^{(T)} \| p_S^{(T)})\); soft-term gradient \((q_i - p_i)/T\); LLMs use \(T = 1\). Full logits cost 250 KiB per token at \(V = 128{,}256\) (bf16).</li>
+      <li>Forward KL \(\KL(p_T \| p_S)\): mode-covering, MLE-like; reverse \(\KL(p_S \| p_T)\): mode-seeking. Four-token example: smeared 0.525 / 0.937, collapsed 1.203 / 0.568 (forward / reverse). They differ only when the student lacks capacity.</li>
+      <li>Two axes: data (fixed, teacher samples, student samples) and divergence. GKD on-policy KD = forward KL on student samples; MiniLLM, V4, MiMo, Thinking Machines = reverse KL. Per-position on rollouts (discount 0) is low variance but ignores effects on later prefixes; MiniLLM adds returns.</li>
+      <li>R1 distillation: 804,745 samples, mean 5,355 tokens, 2 to 3 epochs, SFT only; Qwen-32B 72.6 AIME24 vs 47.0 for RL on the base. Qwen3-8B: on-policy distillation 74.4 vs RL 67.6, 1,800 vs 17,920 GPU-hours. V4: specialists (SFT plus GRPO), then multi-teacher on-policy reverse-KL distillation, full vocabulary, over 10 teachers, cached hidden states.</li>
+      <li>RFT: sample \(k\), keep verified, SFT (STaR restarts from base each round). It is the positive half of a policy gradient with a binary reward: no negatives, no baseline, off-policy after step 1. Distinct paths matter more than count (RFT 7B: 35.9 to 41.7 to 49.3).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

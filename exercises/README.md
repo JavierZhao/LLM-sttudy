@@ -42,4 +42,5 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 14 | Optimizers: AdamW step, LR schedules (cosine/WSD/step), Newton-Schulz, Muon step | `drills/optim.py` |
 | 15 | Distributed training by simulation: ring all-reduce, tensor-parallel MLP and attention, ZeRO memory, pipeline bubble, MFU | `drills/parallel.py` |
 | 18 | Evaluation statistics: unbiased pass@k, Wilson and Wald CIs, paired bootstrap, cloze scoring | `drills/evals.py` |
+| 20 | LoRALinear with merge/unmerge, NF4 block quantization, bits per parameter with double quantization, QLoRA forward | `drills/lora.py` |
 | 21 | Preference losses: masked sequence log-probs, Bradley-Terry with margin, DPO (gradient weight, cDPO), IPO, SimPO, ORPO | `drills/dpo.py` |

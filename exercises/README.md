@@ -51,3 +51,4 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 23 | RLHF in practice: shaped per-token rewards, whitening, EOS penalty, adaptive KL controller | `drills/rlhf.py` |
 | 25 | RL systems primitives: truncated IS weights, agent loss mask, sequence-ratio drift, AReaL staleness rule | `drills/rl_systems.py` |
 | 26 | DeepSeek parameter accounting (MLA + MoE, total vs activated, embedding conventions) and DeepSeek LLM batch-size and learning-rate laws | `drills/deepseek_params.py` |
+| 27 | FP8 fine-grained quantization: E4M3 rounding, per-tensor vs 1x128 tile vs 128x128 block scales, FP32-promoted FP8 GEMM | `drills/fp8.py` |

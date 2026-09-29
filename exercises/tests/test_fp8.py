@@ -55,6 +55,20 @@ def test_round_to_e4m3_matches_torch_float8(impl):
     assert torch.equal(impl.round_to_e4m3(x), ref)
 
 
+def test_round_to_e4m3_ties_match_torch_float8(impl):
+    # Every midpoint of two adjacent E4M3 values is an exact tie (round to the even mantissa), and its two
+    # float32 neighbors are not: this pins round-to-nearest-even across all binades and the subnormals.
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("this torch build has no float8_e4m3fn")
+    vals = torch.arange(0, 127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()   # 0 ... 448, all finite codes
+    mids = (vals[:-1] + vals[1:]) / 2
+    below = torch.nextafter(mids, torch.zeros_like(mids))
+    above = torch.nextafter(mids, torch.full_like(mids, float("inf")))
+    x = torch.cat([mids, below, above])
+    x = torch.cat([x, -x])
+    assert torch.equal(impl.round_to_e4m3(x), x.to(torch.float8_e4m3fn).float())
+
+
 def test_e4m3_has_127_nonnegative_values(impl):
     grid = torch.linspace(0, 460, 400001)
     vals = torch.unique(impl.round_to_e4m3(grid))

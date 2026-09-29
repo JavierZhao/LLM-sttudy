@@ -38,6 +38,9 @@ def build(out: str) -> None:
         shutil.rmtree(out)
     os.makedirs(os.path.join(out, "pages"))
     shutil.copytree(os.path.join(ROOT, "assets"), os.path.join(out, "assets"))
+    # regenerate the question bank from the finished pages so page 36 is never stale
+    import build_bank  # noqa: E402
+    open(os.path.join(out, "assets", "question_bank.js"), "w", encoding="utf-8").write(build_bank.render(build_bank.collect()))
     written = manifest.pages("written")
     total = len(manifest.pages())
     for p in written:

@@ -181,6 +181,7 @@
 
   // ---------- Q&A controls ----------
   function buildQaControls() {
+    if (document.body.hasAttribute("data-own-qa-controls")) return;
     var qs = document.querySelectorAll("details.qa");
     if (!qs.length) return;
     var first = qs[0];
@@ -261,9 +262,9 @@
   }
 
   // ---------- math & code rendering ----------
-  function renderMath() {
+  function renderMath(root) {
     if (!window.renderMathInElement) return;
-    window.renderMathInElement(document.getElementById("content") || document.body, {
+    window.renderMathInElement(root || document.getElementById("content") || document.body, {
       delimiters: [
         { left: "$$", right: "$$", display: true },
         { left: "\\[", right: "\\]", display: true },
@@ -290,13 +291,18 @@
       }
     });
   }
-  function renderCode() {
+  function renderCode(root) {
     if (!window.hljs) return;
-    document.querySelectorAll("pre code").forEach(function (b) {
+    (root || document).querySelectorAll("pre code").forEach(function (b) {
       if (!/\blanguage-/.test(b.className)) b.classList.add("language-python");
       try { window.hljs.highlightElement(b); } catch (e) { /* ignore */ }
     });
   }
+
+  // for content inserted after load (the question bank on page 36 injects answers on open)
+  window.LLMSite = {
+    renderIn: function (root) { renderMath(root); renderCode(root); linkExercisePaths(); }
+  };
 
   buildSidebar();
   setupNavToggle();

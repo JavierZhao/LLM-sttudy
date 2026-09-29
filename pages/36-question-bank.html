@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>36 · Question bank &amp; mock scenarios · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .qb-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: .6rem 0 .4rem; }
+  .qb-controls select, .qb-controls input {
+    font: inherit; font-size: .9rem; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; max-width: 100%;
+  }
+  .qb-controls input { flex: 1 1 180px; min-width: 0; }
+  .qb-count { color: var(--fg-muted); font-size: .9rem; margin: .2rem 0 1rem; }
+  .qb-src { font-size: .85rem; color: var(--fg-muted); margin: .4rem 0 0; }
+  .qb-part[hidden] { display: none; }
+</style>
+</head>
+<body data-page="36" data-root=".." data-own-qa-controls>
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VII · Interview toolkit · Page 36</div>
+  <h1>Question bank &amp; mock scenarios</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~120 min</span>
+    <span>Prereqs: all pages; drills on <a href="35-coding-drills.html">35 Coding drills</a></span>
+  </div>
+  <p class="lede">Every interview question from the finished pages in one place, filterable by part and tier, with a random practice set, plus open-ended mock scenarios of the kind used in research-scientist and research-engineer loops.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">How to use this page</div>
+  <ul>
+    <li><strong>Answer aloud before you open an answer.</strong> Recognizing a correct answer is much easier than producing one under time pressure, and only the second is tested.</li>
+    <li><strong>Practice in short random sets.</strong> "Random 10" draws from whatever the filters currently allow, so you can drill one part, one tier, or everything.</li>
+    <li><strong>Follow the source link.</strong> Each answer links to the page it comes from; if an answer surprises you, reread that section rather than memorizing the answer.</li>
+    <li><strong>The bank is generated from the pages.</strong> It is rebuilt from the source pages on every site build, so a correction to a page reaches this bank automatically.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Answer the core questions of every part of the course without notes, at the depth a frontier-lab interviewer expects.</li>
+    <li>Run a mock interview on yourself or with a partner: pick a scenario, answer for 20 to 40 minutes, and grade against the rubric.</li>
+    <li>Find your weak parts quickly by filtering the bank and sampling random sets.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>The question bank</h2>
+  <p>Questions are grouped by part and keep their tier: <strong>warm-up</strong> (definitions and one-step reasoning), <strong>core</strong> (the questions most loops ask), and <strong>deep-dive</strong> (derivations, design trade-offs, and follow-ups). Answers load when you open them.</p>
+  <div class="qb-controls" role="group" aria-label="Question filters">
+    <select id="qb-part" aria-label="Part"><option value="">All parts</option></select>
+    <select id="qb-tier" aria-label="Tier">
+      <option value="">All tiers</option>
+      <option value="warmup">Warm-up</option>
+      <option value="core">Core</option>
+      <option value="deep">Deep-dive</option>
+    </select>
+    <input id="qb-search" type="search" placeholder="Search questions" aria-label="Search questions">
+  </div>
+  <div class="qb-controls">
+    <button class="icon-btn" type="button" id="qb-random">Random 10</button>
+    <button class="icon-btn" type="button" id="qb-all">Show all matching</button>
+    <button class="icon-btn" type="button" id="qb-collapse">Collapse all</button>
+  </div>
+  <p class="qb-count" id="qb-count" aria-live="polite"></p>
+  <div id="qbank-root"><noscript><p>The question bank needs JavaScript.</p></noscript></div>
+</section>
+
+<!--SCENARIOS-->
+
+<section id="exercises">
+  <h2>Exercises</h2>
+  <p>The coding drills for every page, ranked by how often such problems come up, are on <a href="35-coding-drills.html">page 35</a>. The napkin-math drills are on <a href="34-back-of-envelope.html">page 34</a>.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <p>Every answer cites the papers on its source page. The curated must-read list and the full reading list are on <a href="37-reading-list-glossary.html">page 37</a>.</p>
+</section>
+
+<!--CHEATSHEET-->
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/question_bank.js"></script>
+<script>
+(function () {
+  var Q = window.LLM_QBANK || [];
+  var root = document.getElementById("qbank-root");
+  var partSel = document.getElementById("qb-part");
+  var tierSel = document.getElementById("qb-tier");
+  var search = document.getElementById("qb-search");
+  var count = document.getElementById("qb-count");
+  var TIER = { warmup: "Warm-up", core: "Core", deep: "Deep-dive" };
+  var items = [];   // { q, el, group, text }
+  var groups = {};  // part title -> section element
+
+  function text(html) { var d = document.createElement("div"); d.innerHTML = html; return (d.textContent || "").toLowerCase(); }
+
+  Q.forEach(function (q) {
+    if (!groups[q.part]) {
+      var sec = document.createElement("div");
+      sec.className = "qb-part";
+      var h = document.createElement("h3");
+      h.textContent = q.part;
+      sec.appendChild(h);
+      root.appendChild(sec);
+      groups[q.part] = sec;
+      var o = document.createElement("option");
+      o.value = q.part; o.textContent = q.part;
+      partSel.appendChild(o);
+    }
+    var d = document.createElement("details");
+    d.className = "qa";
+    d.setAttribute("data-tier", q.tier);
+    var s = document.createElement("summary");
+    s.innerHTML = '<span class="tier">' + (TIER[q.tier] || q.tier) + "</span> " + q.q;
+    var a = document.createElement("div");
+    a.className = "answer";
+    d.appendChild(s); d.appendChild(a);
+    d.addEventListener("toggle", function () {
+      if (!d.open || a.getAttribute("data-loaded")) return;
+      a.innerHTML = q.a + '<p class="qb-src">From <a href="' + q.slug + '.html#questions">page ' + q.page + ": " + q.title + "</a></p>";
+      a.setAttribute("data-loaded", "1");
+      if (window.LLMSite) window.LLMSite.renderIn(a);
+    });
+    groups[q.part].appendChild(d);
+    items.push({ q: q, el: d, group: groups[q.part], text: text(q.q) });
+  });
+
+  function matches(it) {
+    var p = partSel.value, t = tierSel.value, s = search.value.trim().toLowerCase();
+    return (!p || it.q.part === p) && (!t || it.q.tier === t) && (!s || it.text.indexOf(s) !== -1);
+  }
+  function show(list, label) {
+    var on = new Set(list);
+    items.forEach(function (it) { it.el.style.display = on.has(it) ? "" : "none"; });
+    Object.keys(groups).forEach(function (k) {
+      groups[k].hidden = !items.some(function (it) { return it.group === groups[k] && on.has(it); });
+    });
+    count.textContent = label.replace("{n}", list.length) + " (" + items.length + " questions in the bank)";
+  }
+  function showMatching() {
+    show(items.filter(matches), "{n} matching");
+  }
+  function randomTen() {
+    var pool = items.filter(matches);
+    for (var i = pool.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+    var pick = pool.slice(0, 10);
+    items.forEach(function (it) { it.el.open = false; });
+    show(pick, "Practice set of {n}");
+  }
+  partSel.addEventListener("change", showMatching);
+  tierSel.addEventListener("change", showMatching);
+  search.addEventListener("input", showMatching);
+  document.getElementById("qb-all").addEventListener("click", showMatching);
+  document.getElementById("qb-random").addEventListener("click", randomTen);
+  document.getElementById("qb-collapse").addEventListener("click", function () { items.forEach(function (it) { it.el.open = false; }); });
+  if (!items.length) count.textContent = "The question bank has not been generated (run python3 tools/build_bank.py).";
+  else showMatching();
+})();
+</script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -62,10 +62,16 @@ VI (26–33) → VII (34–37).
 
 | Batch | Pages | Status |
 |---|---|---|
-| Scaffold + exemplar | 07 | in progress |
-| I | 01–06 | pending |
-| II | 08–11 | pending |
-| III | 12–18 | pending |
-| IV + V | 19–25 | pending |
-| VI | 26–33 | pending |
-| VII | 34–37 | pending |
+| Scaffold + exemplar | 07 | done (updated with DeepSeek-V4, Apr 2026) |
+| I | 01–06 | done: written, fact-checked, audited (RoPE, memory math) |
+| II | 08–11 | briefs ready; waiting for user review of Part I |
+| III | 12–18 | briefs ready |
+| IV + V | 19–25 | briefs ready |
+| VI | 26–33 | briefs ready (28 retitled "R1 to V4") |
+| VII | 34–37 | briefs ready |
+
+Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),
+02 (4 errors: digit grouping, Unigram unk, vocab-extension count, byte-level claim),
+03 (3 errors: misattributed table, MLA projection claim, reversed TP rule),
+04 (initial-loss formula, tying rule of thumb), 05 (figure caption direction, "values can't be
+relative" claim), 06 (CTRL penalty direction, irreproducible simulation claim).

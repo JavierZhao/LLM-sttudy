@@ -9,7 +9,7 @@ window.LLM_MANIFEST = {
       pages: [
         { n: "01", slug: "01-big-picture", title: "The big picture: language modeling", tier: "P0", minutes: 45, status: "written",
           desc: "Autoregressive factorization, cross-entropy and perplexity, the pretrain→SFT→RL pipeline, why decoder-only won." },
-        { n: "02", slug: "02-tokenization", title: "Tokenization", tier: "P0", minutes: 50, status: "planned",
+        { n: "02", slug: "02-tokenization", title: "Tokenization", tier: "P0", minutes: 50, status: "written",
           desc: "BPE from scratch, byte-level BPE, Unigram/SentencePiece, vocab-size trade-offs, chat templates, tokenizer failure modes." },
         { n: "03", slug: "03-attention", title: "Attention from scratch", tier: "P0", minutes: 50, status: "written",
           desc: "QKV, the 1/√d scale, causal masking, multi-head attention, O(n²) cost, a numerically stable implementation." },

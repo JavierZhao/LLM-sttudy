@@ -490,7 +490,7 @@ print(GPT2_PAT.findall("Hello, wörld! 12345"))
       <tr><td>Mistral 7B v0.1</td><td class="num">32,000</td><td class="num">32,000</td><td>official config</td></tr>
       <tr><td>Mistral NeMo (Tekken)</td><td class="num">131,072 (1,000 special slots)</td><td class="num">131,072</td><td><code>tekken.json</code>, config</td></tr>
       <tr><td>Llama 3, 3.1</td><td class="num">128,000 + 256 special</td><td class="num">128,256</td><td><a href="https://arxiv.org/abs/2407.21783">[Table 3, §3.2]</a>: 100K tiktoken + 28K non-English</td></tr>
-      <tr><td>DeepSeek-V3</td><td class="num">128K BPE (128,815 ids)</td><td class="num">129,280</td><td><a href="https://arxiv.org/abs/2412.19437">[§4.1]</a>, tokenizer.json, config</td></tr>
+      <tr><td>DeepSeek-V3, V4</td><td class="num">128K BPE (V3: 128,815 ids; V4: 129,280)</td><td class="num">129,280 (both)</td><td><a href="https://arxiv.org/abs/2412.19437">[V3 §4.1]</a>, tokenizer.json and config of V3 and V4-Pro</td></tr>
       <tr><td>Qwen2.5</td><td class="num">151,665</td><td class="num">151,936 / 152,064</td><td><a href="https://arxiv.org/abs/2412.15115">[§2]</a>, configs (0.5B; 7B, 72B)</td></tr>
       <tr><td>Qwen3</td><td class="num">151,669</td><td class="num">151,936</td><td><a href="https://arxiv.org/abs/2505.09388">[§2]</a>, config (8B)</td></tr>
       <tr><td>Gemma 1</td><td class="num">256k</td><td class="num">256,128 (report), 256,000 (config)</td><td><a href="https://arxiv.org/abs/2403.08295">[Table 1]</a>, config (mirror)</td></tr>
@@ -663,7 +663,7 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
     <li><strong>"Byte-level BPE means the model sees bytes."</strong> It sees ids of variable-length byte strings. Bytes are only the base alphabet that guarantees coverage.</li>
     <li><strong>"A bigger vocabulary is free."</strong> It costs \(2Vd\) LM-head FLOPs per token and \(BTV\) logit memory, adds under-trained rows, and English compression is flat from 50K to 200K in our measurement. In small models it is 20% to 30% of the parameters.</li>
     <li><strong>"LLMs can't count letters because they are not smart enough."</strong> The letters are not in the input, whether the word is one token or three. Byte-level models that see them score near 100% on spelling.</li>
-    <li><strong>"<code>vocab_size</code> in the config is the tokenizer's size."</strong> It is the embedding row count, usually padded to a multiple of 128 (Qwen3.5: 248,070 ids, 248,320 rows).</li>
+    <li><strong>"<code>vocab_size</code> in the config is the tokenizer's size."</strong> It is the embedding row count, which can exceed the tokenizer's size when padded to a multiple of 128 (Qwen3.5: 248,070 ids, 248,320 rows; DeepSeek-V3: 128,815 ids, 129,280 rows).</li>
     <li><strong>"Special tokens are just strings."</strong> They are matched before BPE. Allowing them in user text lets users forge turns, and a missing BOS or wrong end token shifts the distribution silently.</li>
   </ul>
 </section>

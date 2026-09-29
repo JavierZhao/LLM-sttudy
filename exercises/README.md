@@ -25,6 +25,7 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | Page | Drill | File |
 |---|---|---|
 | 01 | Language-modeling loss and metrics (hand-written log-softmax, perplexity, bits per byte) | `drills/lm_loss.py` |
+| 02 | Byte-level BPE from scratch (train, encode, decode) | `drills/bpe.py` |
 | 03 | Attention from scratch: stable softmax, end-aligned causal mask, SDPA, multi-head attention | `drills/attention.py` |
 | 04 | A GPT from scratch: RMSNorm, SwiGLU, GQA block, exact parameter count and FLOPs | `drills/transformer.py` |
 | 05 | RoPE in both layouts (interleaved and rotate-half), sinusoidal, ALiBi | `drills/rope.py` |

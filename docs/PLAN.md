@@ -66,9 +66,10 @@ VI (26–33) → VII (34–37).
 | Scaffold + exemplar | 07 | done (updated with DeepSeek-V4, Apr 2026) |
 | I | 01–06 | done: written, fact-checked, audited (RoPE, memory math) |
 | 2 | 08–15 | done: written, fact-checked; 09, 13, 15 audited by coordinator |
-| 3 | 16–21 | drafts done (writers cut off by a rate limit in their final pass, drafts recovered); fact-checks running |
+| 3 | 16–21 | done: written, fact-checked; 21 (DPO) audited by coordinator |
 | 4 | 22–25 | writers running |
-| VI | 26–33 | briefs ready (28 retitled "R1 to V4") |
+| 5 | 26–28 | DeepSeek writers running |
+| VI | 29–33 | briefs ready |
 | VII | 34–37 | briefs ready |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),

@@ -171,7 +171,7 @@ def moe_forward(x, W_r, bias, experts, shared, k):
 <title id="fig-08-1-title">An MoE layer: the router picks top-k routed experts per token, a shared expert always runs, and the outputs are combined with the gate weights</title>
 <defs><marker id="arrow-08-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
 <rect class="s-box" x="8" y="128" width="84" height="56" rx="6"/>
-<text x="50" y="153" text-anchor="middle" class="s-bold">x<tspan baseline-shift="sub" font-size="9">t</tspan></text>
+<text x="50" y="153" text-anchor="middle" class="s-bold">x</text>
 <text x="50" y="171" text-anchor="middle" class="s-small s-muted">(T, d)</text>
 <rect class="s-b" x="128" y="116" width="150" height="80" rx="6"/>
 <text x="203" y="136" text-anchor="middle" class="s-bold">Router</text>
@@ -211,7 +211,7 @@ def moe_forward(x, W_r, bias, experts, shared, k):
 <text x="572" y="226" text-anchor="middle" class="s-small s-mono">× g<tspan baseline-shift="sub" font-size="9">5</tspan></text>
 <path class="s-line" d="M610,156 L636,156" marker-end="url(#arrow-08-1)"/>
 <rect class="s-box" x="636" y="128" width="76" height="56" rx="6"/>
-<text x="674" y="153" text-anchor="middle" class="s-bold">y<tspan baseline-shift="sub" font-size="9">t</tspan></text>
+<text x="674" y="153" text-anchor="middle" class="s-bold">y</text>
 <text x="674" y="171" text-anchor="middle" class="s-small s-muted">(T, d)</text>
 <text x="626" y="276" text-anchor="middle" class="s-small">each chosen expert runs on</text>
 <text x="626" y="292" text-anchor="middle" class="s-small">its own tokens only:</text>
@@ -697,7 +697,7 @@ def moe_forward(x, W_r, bias, experts, shared, k):
   <p>Two regularities show up in these configs.</p>
   <ul>
     <li><strong>In most of these configs the activated FFN width equals the dense FFN width.</strong> V3: \((8 + 1) \cdot 2048 = 18{,}432\), exactly its dense layers' <code>intermediate_size</code>. V2: \((6+2) \cdot 1536 = 12{,}288\). Kimi K2: \(9 \cdot 2048 = 18{,}432\). Qwen3: \(8 \cdot 1536 = 12{,}288\) (its config's <code>intermediate_size</code>, unused because it has no dense layers). Llama 4 Maverick: \((1+1) \cdot 8192 = 16{,}384\). Each equals its model's dense width. Mixtral and gpt-oss break the pattern (Mixtral's top-2 of full-size experts activates twice a 7B dense FFN). Where it holds, an MoE layer is a dense FFN whose weights are picked per token from a much larger pool, with FLOPs per token held equal to the dense layer it replaces.</li>
-    <li><strong>Early layers.</strong> DeepSeekMoE, V2 and K2 keep the first layer dense, V3 keeps three. The only stated reason we found is DeepSeekMoE's: load balance converges especially slowly in the first layer <a href="https://arxiv.org/abs/2401.06066">[Dai et al. 2024, §5.1.2]</a> (neither the V3 nor the K2 report explains its choice). V4 uses hash-routed MoE there, Qwen3 and gpt-oss use MoE everywhere, and Llama 4 Maverick alternates dense and MoE layers, which halves the MoE parameters at the same expert count.</li>
+    <li><strong>Early layers.</strong> DeepSeekMoE, V2 and K2 keep the first layer dense, V3 keeps three. The only stated reason we found is DeepSeekMoE's: load balance converges especially slowly in the first layer <a href="https://arxiv.org/abs/2401.06066">[Dai et al. 2024, §5.1.2]</a> (we found no explanation in the V3 or K2 reports). V4 uses hash-routed MoE there, Qwen3 and gpt-oss use MoE everywhere, and Llama 4 Maverick alternates dense and MoE layers, which halves the MoE parameters at the same expert count.</li>
   </ul>
 
   <h3 id="upcycling">Sparse upcycling</h3>

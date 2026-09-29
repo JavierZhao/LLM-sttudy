@@ -2,7 +2,7 @@
 
 No real process group is used. "Ranks" are entries of Python lists, and a collective is
 a function that reads all ranks' tensors and returns all ranks' results. Implement the
-seven functions below. Run:
+nine functions below. Run:
     pytest exercises/tests/test_parallel.py
 
 Keep this file self-contained: do not import other drills.

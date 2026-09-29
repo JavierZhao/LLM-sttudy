@@ -33,6 +33,14 @@ def test_rms_norm_eps_and_dtype(impl):
     torch.testing.assert_close(y.float(), _rms_ref(x.float()).float(), atol=3e-2, rtol=3e-2)
 
 
+def test_rms_norm_statistics_in_float32(impl):
+    # 300^2 = 90,000 overflows float16 (max 65,504): the mean-square must be computed in float32
+    x = torch.full((2, 16), 300.0, dtype=torch.float16)
+    y = impl.rms_norm(x)
+    assert y.dtype == torch.float16 and torch.isfinite(y).all()
+    torch.testing.assert_close(y.float(), torch.ones(2, 16), atol=1e-2, rtol=1e-2)
+
+
 # ---------------------------------------------------------- qk_norm_attention
 def _ref_attention(q, k, v, g_q, g_k, causal):
     qh = _rms_ref(q, g_q).to(q.dtype)

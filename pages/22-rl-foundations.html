@@ -208,7 +208,7 @@
 
   <div class="eq-box">
   \[ \nabla_\theta J \;=\; \E\Big[ \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\; G_t \Big] \]
-  <div class="eq-label">Policy gradient theorem, trajectory form. Conditioning \(G_t\) on \((s_t,a_t)\) gives \(Q^\pi(s_t,a_t)\), the form in <a href="https://proceedings.neurips.cc/paper_files/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf">[Sutton et al. 1999]</a></div>
+  <div class="eq-label">Policy gradient theorem, trajectory form. Taking the expectation of the return given the state and action gives the action-value, the form in <a href="https://proceedings.neurips.cc/paper_files/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf">[Sutton et al. 1999]</a></div>
   </div>
 
   <p>Notice what is missing: no term differentiates how often each state is visited, and no term needs the dynamics. Changing \(\theta\) changes which states we reach, but the identity accounts for that through the sampling distribution itself.</p>
@@ -328,7 +328,7 @@ def reinforce_loss(logp, rewards, baseline, mask):
 
   <p><strong>Why the two forms agree.</strong> Substitute \(\hat A^{(k)}_t = \sum_{l&lt;k}\gamma^l\delta_{t+l}\) and collect the coefficient of \(\delta_{t+l}\): it is \(\gamma^l (1-\lambda)\sum_{k &gt; l}\lambda^{k-1} = \gamma^l (1-\lambda)\,\lambda^l/(1-\lambda) = (\gamma\lambda)^l\). The recursion \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\) then gives an \(O(T)\) backward loop.</p>
 
-  <h3 id="gae-knobs">What \(\gamma\) and \(\lambda\) each do</h3>
+  <h3 id="gae-knobs">What the discount and lambda each do</h3>
   <ul>
     <li><strong>\(\lambda = 0\):</strong> \(\hat A_t = \delta_t\). Lowest variance, biased unless \(V_\phi = V^\pi\).</li>
     <li><strong>\(\lambda = 1\):</strong> \(\hat A_t = \sum_l \gamma^l r_{t+l} - V_\phi(s_t)\), the Monte-Carlo return minus a baseline. Unbiased whatever \(V_\phi\) is, highest variance.</li>
@@ -352,7 +352,7 @@ def reinforce_loss(logp, rewards, baseline, mask):
 </code></pre>
   <p class="small muted">This is the drill's <code>gae</code>. The "terminal bootstrap convention" is the two lines that set <code>nxt</code>: EOS means the next value is zero, a truncated row bootstraps from the critic. Many RLHF codebases instead give truncated responses a fixed penalty (Ziegler et al. use \(-1\)), which avoids asking the critic about an unfinished state <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, Detail 23]</a>.</p>
 
-  <h3 id="gae-llm">The LLM setting: \(\gamma = 1\), one reward at the end</h3>
+  <h3 id="gae-llm">The LLM setting: no discount, one reward at the end</h3>
   <p>Set \(\gamma = \lambda = 1\) with only a terminal reward \(R\): GAE collapses to \(\hat A_t = R - V(s_t)\), REINFORCE with a learned per-token baseline, and with \(V \equiv 0\) to the plain bandit gradient. With \(\lambda &lt; 1\) the picture changes. Take \(r_t = 0\) for \(t &lt; T\) and \(\gamma = 1\): the residuals are \(\delta_t = V(s_{t+1}) - V(s_t)\) for \(t &lt; T\) and \(\delta_T = R - V(s_T)\). Suppose the critic is untrained and outputs 0. Then every \(\delta_t\) before the end is zero, and</p>
   \[ \hat A_t = \lambda^{\,T-t}\, R. \]
   <p>The terminal reward decays geometrically as it travels backward. The half-life of the signal is \(\ln 0.5 / \ln\lambda\) tokens: 13.5 for \(\lambda = 0.95\), 69 for 0.99, 693 for 0.999. For a token 1,000 positions before the end, \(0.95^{1000} = 5.3\times10^{-23}\) and even \(0.99^{1000} = 4.3\times10^{-5}\). Such a token receives essentially no direct credit, and its advantage is whatever the critic's bootstrapped predictions imply. That is fine when the critic is good (the worked numbers below) and disastrous when it is not.</p>
@@ -522,7 +522,7 @@ def reinforce_loss(logp, rewards, baseline, mask):
 
   <div class="eq-box">
   \[ L^{\text{CLIP}}(\theta) = \E_t\Big[ \min\big( \rho_t(\theta)\,\hat A_t,\ \ \clip(\rho_t(\theta),\, 1-\epsilon,\, 1+\epsilon)\,\hat A_t \big) \Big], \qquad \epsilon = 0.2 \text{ typically} \]
-  <div class="eq-label">Maximize \(L^{\text{CLIP}}\) (the code minimizes its negative). At \(\rho = 1\) it equals the plain surrogate to first order</div>
+  <div class="eq-label">Maximize the clipped objective (the code minimizes its negative). At ratio 1 it equals the plain surrogate to first order</div>
   </div>
 
   <p>The first term inside the min is the surrogate \(\rho\hat A\). The second removes the incentive to move \(\rho\) outside \([1-\epsilon, 1+\epsilon]\). Taking the <em>minimum</em> makes the whole objective a pessimistic bound on the surrogate. In the paper's words, "we only ignore the change in probability ratio when it would make the objective improve, and we include it when it makes the objective worse". The behavior depends on the sign of \(\hat A\) and on where \(\rho\) is:</p>
@@ -646,22 +646,26 @@ def reinforce_loss(logp, rewards, baseline, mask):
   <h3 id="ppo-full">The full objective and one PPO iteration</h3>
   <p>PPO's objective for a shared actor-critic network adds a value loss and an entropy bonus <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, Eq. 9]</a>: \(L = L^{\text{CLIP}} - c_1 L^{V} + c_2 S[\pi_\theta]\). With separate actor and critic models (the LLM norm) no parameters are shared, and \(c_1\) only rescales the critic's step relative to the actor's. The RLHF recipes cited on this page list no entropy term, because the KL penalty already keeps entropy from collapsing: Ziegler et al. say it "plays the role of an entropy bonus" <a href="https://arxiv.org/abs/1909.08593">[§2]</a>. One iteration, in the order that matters:</p>
 
-<pre><code class="language-python">def ppo_iteration(policy, ref, critic, reward_fn, prompts, K=4, beta=0.05, eps=0.2, gamma=1.0, lam=0.95):
-    resp, mask = policy.generate(prompts)                   # (B, T) tokens and 0/1 response mask
-    with torch.no_grad():                                   # 1) everything below is frozen at rollout time
-        logp_old = policy.logprobs(prompts, resp)           # (B, T) log pi_old(a_t | s_t), recomputed by the trainer
-        logp_ref = ref.logprobs(prompts, resp)              # (B, T)
-        values   = critic.values(prompts, resp)             # (B, T) V_old(s_t)
-        rewards  = -beta * (logp_old - logp_ref) * mask     # 2) KL shaping on every token: -beta * k1
-        last     = mask.sum(1).long() - 1
-        rewards[torch.arange(len(last)), last] += reward_fn(prompts, resp)   # task reward on the last real token
-        adv, ret = gae(rewards, values, gamma, lam, mask)   # 3) advantages and critic targets
-        adv      = masked_whiten(adv, mask)                 #    normalize advantages over the batch
-    for _ in range(K):                                      # 4) K passes over the same batch
-        logp = policy.logprobs(prompts, resp)               #    with grad
+<pre><code class="language-python">def ppo_iteration(policy, ref, critic, reward_fn, prompts,
+                  K=4, beta=0.05, eps=0.2, gamma=1.0, lam=0.95):
+    resp, mask = policy.generate(prompts)            # (B, T) tokens, 0/1 response mask
+    with torch.no_grad():                            # 1) frozen at rollout time
+        logp_old = policy.logprobs(prompts, resp)    # (B, T) log pi_old(a_t | s_t), from the trainer
+        logp_ref = ref.logprobs(prompts, resp)       # (B, T)
+        values = critic.values(prompts, resp)        # (B, T) V_old(s_t)
+        # 2) KL shaping on every token (-beta * k1), task reward on the last real token
+        rewards = -beta * (logp_old - logp_ref) * mask
+        last = mask.sum(1).long() - 1
+        rewards[torch.arange(len(last)), last] += reward_fn(prompts, resp)
+        adv, ret = gae(rewards, values, gamma, lam, mask)   # 3) advantages, critic targets
+        adv = masked_whiten(adv, mask)                       #    whiten over the batch
+    for _ in range(K):                               # 4) K passes over the same batch
+        logp = policy.logprobs(prompts, resp)        #    with grad
         loss_pi = ppo_clip_loss(logp, logp_old, adv, eps, mask)
-        loss_v  = 0.5 * ((critic.values(prompts, resp) - ret).pow(2) * mask).sum() / mask.sum()
-        policy.step(loss_pi); critic.step(loss_v)           #    separate optimizers for actor and critic
+        v = critic.values(prompts, resp)
+        loss_v = 0.5 * ((v - ret).pow(2) * mask).sum() / mask.sum()
+        policy.step(loss_pi)                         #    separate optimizers for actor and critic
+        critic.step(loss_v)
 </code></pre>
   <p class="small muted">Deleting the critic (let <code>values</code> be a per-prompt mean reward and set \(\lambda = 1\)) and using \(K = 1\) turns this loop into REINFORCE or RLOO training with a KL-shaped reward. Real implementations split each pass into minibatches. The drill implements <code>gae</code>, <code>masked_whiten</code> and <code>ppo_clip_loss</code>.</p>
 
@@ -715,7 +719,7 @@ def reinforce_loss(logp, rewards, baseline, mask):
     </dl>
   </div>
 
-  <h3 id="kl-beta">Choosing \(\beta\); and not confusing two KLs</h3>
+  <h3 id="kl-beta">Choosing the KL coefficient, and not confusing two KLs</h3>
   <p>Fixed \(\beta\) values in the literature: 0.1 and 0.03 (Ziegler et al., CNN/DM and TL;DR), 0.02 (InstructGPT), 0.05 (Huang et al.), 0.04 (DeepSeekMath's GRPO), 0 for verifier-reward long-CoT runs. Because different seeds with the same \(\beta\) end at different KLs, Ziegler et al. also use a log-space proportional controller that steers the KL to a target (6 nats for their descriptiveness task, 10 for sentiment):</p>
   \[ e_t = \clip\!\Big(\frac{\KL(\pi_t\|\rho) - \KL_{\text{target}}}{\KL_{\text{target}}},\ -0.2,\ 0.2\Big), \qquad \beta_{t+1} = \beta_t\,(1 + K_\beta\, e_t), \quad K_\beta = 0.1 \]
   <p>so \(\beta\) changes by at most \(0.1 \times 0.2 = 2\%\) per update <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2.2, §3.1.2]</a>.</p>
@@ -729,7 +733,7 @@ def reinforce_loss(logp, rewards, baseline, mask):
 
   <div class="eq-box">
   \[ k_1 = -\log r = \ell_t, \qquad k_2 = \tfrac12 (\log r)^2, \qquad k_3 = (r - 1) - \log r, \qquad r = \frac{\pi_{\text{ref}}(a|s)}{\pi_\theta(a|s)},\ \ a \sim \pi_\theta \]
-  <div class="eq-label">The samples come from \(\pi_\theta\), the target is \(\KL(\pi_\theta\|\pi_{\text{ref}})\). Getting the sampling distribution wrong is the common error</div>
+  <div class="eq-label">Samples come from the policy; the target is the KL from the policy to the reference. Getting the sampling distribution wrong is the common error</div>
   </div>
 
   <ul>

@@ -64,7 +64,7 @@
 
   \[ z_t = f_\theta(x_{\le t}) \in \R^{V}, \qquad p_\theta(x_{t+1} = v \mid x_{\le t}) = \softmax(z_t)_v = \frac{e^{z_{t,v}}}{\sum_{u=1}^{V} e^{z_{t,u}}} \]
 
-  <p>In a transformer, one forward pass over a whole sequence returns all \(T\) logit vectors at once, a tensor of shape \((B, T, V)\), because the <strong>causal mask</strong> (<a href="03-attention.html">page 03</a>) makes row \(t\) a function of \(x_{\le t}\) only. Softmax is over the last axis.</p>
+  <p>In a transformer, one forward pass over a whole sequence returns all \(T\) logit vectors at once, a tensor of shape \((B, T, V)\) (batch, position, vocabulary entry), because the <strong>causal mask</strong> (<a href="03-attention.html">page 03</a>) makes row \(t\) a function of \(x_{\le t}\) only. Softmax is over the last axis, the vocabulary.</p>
 
   <aside class="callout key">
     <div class="callout-title">Key idea</div>
@@ -126,10 +126,10 @@
 <rect class="s-box" x="464" y="30" width="84" height="56" rx="6"/>
 <text x="506" y="54" text-anchor="middle" class="s-bold">LM head</text>
 <text x="506" y="72" text-anchor="middle" class="s-small s-muted">linear, d to V</text>
-<rect class="s-b" x="566" y="30" width="72" height="56" rx="6"/>
+<rect class="s-box" x="566" y="30" width="72" height="56" rx="6"/>
 <text x="602" y="54" text-anchor="middle" class="s-bold">sample</text>
 <text x="602" y="72" text-anchor="middle" class="s-small s-muted">page 06</text>
-<rect class="s-c" x="656" y="30" width="56" height="56" rx="6"/>
+<rect class="s-box" x="656" y="30" width="56" height="56" rx="6"/>
 <text x="684" y="54" text-anchor="middle" class="s-bold">next</text>
 <text x="684" y="72" text-anchor="middle" class="s-small">token</text>
 <path class="s-line" d="M88,58 L106,58" marker-end="url(#arrow-01-1)"/>
@@ -160,10 +160,10 @@
 <text x="380" y="264" class="s-small">A reply of n tokens costs n sequential passes,</text>
 <text x="380" y="280" class="s-small">which is why decoding latency is hard to hide.</text>
 </svg>
-    <figcaption><b>Figure 1.</b> The serving path. The same network runs in two regimes. <em>Prefill</em> processes the prompt in one wide, parallel pass and fills the KV cache. <em>Decode</em> then runs one narrow pass per generated token, because each token must be sampled before the next can be fed in. Shapes are per sequence; a batch adds a leading \(B\).</figcaption>
+    <figcaption><b>Figure 1.</b> The serving path. The same network runs in two regimes, and each pass in either regime runs the whole top row, from embedding to sampling; they differ only in how many positions a pass feeds in. <em>Prefill</em> processes the prompt in one wide, parallel pass and fills the KV cache. <em>Decode</em> then runs one narrow pass per generated token, because each token must be sampled before the next can be fed in. Shapes are per sequence; a batch adds a leading \(B\).</figcaption>
   </figure>
 
-  <p>Two facts about this loop matter for the rest of the course. First, <strong>generation is sequential but training is parallel</strong>: a 2,000-token prompt costs one large pass, while a 500-token answer costs 500 small ones. That asymmetry is why "time to first token" and "inter-token latency" are separate serving metrics, and why decoding is limited by memory bandwidth rather than FLOPs (<a href="06-decoding-kv-cache.html">page 06</a>, <a href="07-kv-efficient-attention.html">page 07</a>, <a href="17-inference-serving.html">page 17</a>). Second, a chat product is the same loop over a text in which the conversation has been serialized with special role tokens; the model's turn ends when it emits an end-of-turn token (<a href="02-tokenization.html">page 02</a> on chat templates, <a href="19-sft-distillation.html">page 19</a> on training with them).</p>
+  <p>Two facts about this loop matter for the rest of the course. First, <strong>processing known tokens is parallel, generating new ones is sequential</strong>: training and prefill run all positions in one pass, while decode needs one pass per new token, because each token must be sampled before it can be fed in. So a 2,000-token prompt costs one large pass, while a 500-token answer costs 500 small ones. That asymmetry is why "time to first token" and "inter-token latency" are separate serving metrics, and why decoding is limited by memory bandwidth rather than FLOPs: every pass streams all the weights from GPU memory (16 GB for Llama-3-8B in bf16), and a prefill pass reuses them for thousands of tokens while a decode pass uses them for one new token per sequence (<a href="06-decoding-kv-cache.html">page 06</a>, <a href="07-kv-efficient-attention.html">page 07</a>, <a href="17-inference-serving.html">page 17</a>). Second, a chat product is the same loop over a text in which the conversation has been serialized with special role tokens; the model's turn ends when it emits an end-of-turn token (<a href="02-tokenization.html">page 02</a> on chat templates, <a href="19-sft-distillation.html">page 19</a> on training with them).</p>
 
 <pre><code class="language-python">@torch.no_grad()
 def generate(model, ids, max_new_tokens, eos_id):

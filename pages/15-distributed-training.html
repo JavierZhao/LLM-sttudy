@@ -359,7 +359,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <rect class="s-d" x="653.0" y="84" width="26.0" height="16" rx="2"/>
 <rect class="s-d" x="680.5" y="84" width="26.0" height="16" rx="2"/>
 <text x="8" y="142" class="s-bold">ZeRO-1</text>
-<text x="8" y="162" class="s-mono">4N + 12N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="162" class="s-mono">4N + 12N/N<tspan baseline-shift="sub" font-size="11">d</tspan></text>
 <text x="8" y="180" class="s-small s-muted">comm 2N</text>
 <rect class="s-plain" x="220" y="116" width="122" height="76" rx="6"/>
 <rect class="s-a" x="226.0" y="124" width="26.0" height="16" rx="2"/>
@@ -414,7 +414,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <rect class="s-plain s-dash" x="653.0" y="168" width="26.0" height="16" rx="2"/>
 <rect class="s-d" x="680.5" y="168" width="26.0" height="16" rx="2"/>
 <text x="8" y="226" class="s-bold">ZeRO-2</text>
-<text x="8" y="246" class="s-mono">2N + 14N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="246" class="s-mono">2N + 14N/N<tspan baseline-shift="sub" font-size="11">d</tspan></text>
 <text x="8" y="264" class="s-small s-muted">comm 2N</text>
 <rect class="s-plain" x="220" y="200" width="122" height="76" rx="6"/>
 <rect class="s-a" x="226.0" y="208" width="26.0" height="16" rx="2"/>
@@ -469,7 +469,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <rect class="s-plain s-dash" x="653.0" y="252" width="26.0" height="16" rx="2"/>
 <rect class="s-d" x="680.5" y="252" width="26.0" height="16" rx="2"/>
 <text x="8" y="310" class="s-bold">ZeRO-3 / FSDP</text>
-<text x="8" y="330" class="s-mono">16N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="330" class="s-mono">16N/N<tspan baseline-shift="sub" font-size="11">d</tspan></text>
 <text x="8" y="348" class="s-small s-muted">comm 3N (1.5×)</text>
 <rect class="s-plain" x="220" y="284" width="122" height="76" rx="6"/>
 <rect class="s-a" x="226.0" y="292" width="26.0" height="16" rx="2"/>
@@ -571,7 +571,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
     </dl>
   </div>
 
-  <p><strong>Rule of thumb.</strong> If ZeRO-1 or ZeRO-2 fits (states plus activations under about 70 GB), use it: communication equals DDP. If parameters alone do not fit, or per-GPU batches are too small to hide gathers, add tensor and pipeline parallelism and use FSDP or ZeRO-1 for what remains. Hybrid-sharded FSDP sits in between when the model fits in a node's aggregate memory.</p>
+  <p><strong>Rule of thumb.</strong> Hybrid-sharded FSDP sits between ZeRO-2 and full sharding when the model fits in a node's aggregate memory; the whiteboard procedure in <a href="#procedure">the layouts section</a> says when to reach for each option.</p>
 </section>
 
 <section>
@@ -597,46 +597,46 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <path class="s-line" d="M121,172 L127,172 L127,86.0 L136,86.0" marker-end="url(#arrow-15-2)"/>
 <path class="s-line" d="M121,172 L127,172 L127,258.0 L136,258.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-a" x="138" y="44" width="132" height="84" rx="6"/>
-<text x="204" y="68.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="10">0</tspan></text>
-<text x="204" y="89.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="10">0</tspan>: d × d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t</text>
+<text x="204" y="68.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="11">0</tspan></text>
+<text x="204" y="89.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="11">0</tspan>: d × d<tspan baseline-shift="sub" font-size="11">ff</tspan>/t</text>
 <text x="204" y="110.0" text-anchor="middle" class="s-small s-muted">column shard</text>
 <path class="s-line" d="M270,86.0 L290,86.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-plain" x="292" y="52" width="56" height="68" rx="6"/>
 <text x="320" y="91.0" text-anchor="middle" class="s-bold">act</text>
 <path class="s-line" d="M348,86.0 L368,86.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-b" x="370" y="44" width="132" height="84" rx="6"/>
-<text x="436" y="68.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="10">0</tspan> B<tspan baseline-shift="sub" font-size="10">0</tspan></text>
-<text x="436" y="89.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="10">0</tspan>: d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t × d</text>
+<text x="436" y="68.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="11">0</tspan> B<tspan baseline-shift="sub" font-size="11">0</tspan></text>
+<text x="436" y="89.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="11">0</tspan>: d<tspan baseline-shift="sub" font-size="11">ff</tspan>/t × d</text>
 <text x="436" y="110.0" text-anchor="middle" class="s-small s-muted">row shard</text>
 <path class="s-line" d="M502,86.0 L522,86.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-d" x="524" y="44" width="78" height="84" rx="6"/>
-<text x="563" y="80.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="10">0</tspan></text>
+<text x="563" y="80.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="11">0</tspan></text>
 <text x="563" y="96.0" text-anchor="middle" class="s-small">partial sum</text>
 <path class="s-line" d="M602,86.0 L616,86.0 L616,158 L630,158" marker-end="url(#arrow-15-2)"/>
 <rect class="s-a" x="138" y="216" width="132" height="84" rx="6"/>
-<text x="204" y="240.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="10">1</tspan></text>
-<text x="204" y="261.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="10">1</tspan>: d × d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t</text>
+<text x="204" y="240.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="11">1</tspan></text>
+<text x="204" y="261.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="11">1</tspan>: d × d<tspan baseline-shift="sub" font-size="11">ff</tspan>/t</text>
 <text x="204" y="282.0" text-anchor="middle" class="s-small s-muted">column shard</text>
 <path class="s-line" d="M270,258.0 L290,258.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-plain" x="292" y="224" width="56" height="68" rx="6"/>
 <text x="320" y="263.0" text-anchor="middle" class="s-bold">act</text>
 <path class="s-line" d="M348,258.0 L368,258.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-b" x="370" y="216" width="132" height="84" rx="6"/>
-<text x="436" y="240.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="10">1</tspan> B<tspan baseline-shift="sub" font-size="10">1</tspan></text>
-<text x="436" y="261.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="10">1</tspan>: d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t × d</text>
+<text x="436" y="240.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="11">1</tspan> B<tspan baseline-shift="sub" font-size="11">1</tspan></text>
+<text x="436" y="261.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="11">1</tspan>: d<tspan baseline-shift="sub" font-size="11">ff</tspan>/t × d</text>
 <text x="436" y="282.0" text-anchor="middle" class="s-small s-muted">row shard</text>
 <path class="s-line" d="M502,258.0 L522,258.0" marker-end="url(#arrow-15-2)"/>
 <rect class="s-d" x="524" y="216" width="78" height="84" rx="6"/>
-<text x="563" y="252.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="563" y="252.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="11">1</tspan></text>
 <text x="563" y="268.0" text-anchor="middle" class="s-small">partial sum</text>
 <path class="s-line" d="M602,258.0 L616,258.0 L616,186 L630,186" marker-end="url(#arrow-15-2)"/>
 <circle class="s-e" cx="650" cy="172" r="20"/><text x="650" y="170" text-anchor="middle" class="s-bold">g</text><text x="650" y="183" text-anchor="middle" class="s-small">Σ</text>
-<text x="670" y="138" text-anchor="middle" class="s-small">Z = Z<tspan baseline-shift="sub" font-size="10">0</tspan> + Z<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="670" y="138" text-anchor="middle" class="s-small">Z = Z<tspan baseline-shift="sub" font-size="11">0</tspan> + Z<tspan baseline-shift="sub" font-size="11">1</tspan></text>
 <path class="s-line" d="M670,172 L700,172" marker-end="url(#arrow-15-2)"/>
 <line class="s-line s-dash" x1="134" y1="172" x2="606" y2="172"/>
 <text x="370" y="166" text-anchor="middle" class="s-small s-muted">no communication between the two GPUs in here</text>
 <text x="8" y="334" class="s-small">f: identity in the forward pass, all-reduce in the backward pass.   g: all-reduce in the forward pass, identity in the backward pass.</text>
-<text x="8" y="354" class="s-small">Shapes: b·T tokens, model width d, FFN width d<tspan baseline-shift="sub" font-size="10">ff</tspan>, t = 2 GPUs here. Llama-3-8B with t = 8: 14,336 / 8 = 1,792 columns per GPU.</text>
+<text x="8" y="354" class="s-small">Shapes: b·T tokens, model width d, FFN width d<tspan baseline-shift="sub" font-size="11">ff</tspan>, t = 2 GPUs here. Llama-3-8B with t = 8: 14,336 / 8 = 1,792 columns per GPU.</text>
 </svg>
     <figcaption><b>Figure 2.</b> A tensor-parallel MLP on two GPUs. The first matrix is split by columns, so the nonlinearity runs on local data; the second is split by rows, so each GPU produces a partial sum of the output; one all-reduce, the operator \(g\), combines them. In the backward pass the roles of \(f\) and \(g\) swap.</figcaption>
   </figure>
@@ -856,7 +856,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <rect class="s-a" x="80" y="220" width="16" height="12" rx="2"/><text x="102" y="231" class="s-small">forward, micro-batch number</text>
 <rect class="s-b" x="280" y="220" width="16" height="12" rx="2"/><text x="302" y="231" class="s-small">backward</text>
 <rect class="s-plain s-dash" x="380" y="220" width="16" height="12" rx="2"/><text x="402" y="231" class="s-small">idle (bubble)</text>
-<text x="80" y="254" class="s-small">Every stage idles (p−1)(t<tspan baseline-shift="sub" font-size="10">f</tspan> + t<tspan baseline-shift="sub" font-size="10">b</tspan>) = 3 × 3 = 9 of 33 units: 27.3% = (p−1)/(m+p−1).</text>
+<text x="80" y="254" class="s-small">Every stage idles (p−1)(t<tspan baseline-shift="sub" font-size="11">f</tspan> + t<tspan baseline-shift="sub" font-size="11">b</tspan>) = 3 × 3 = 9 of 33 units: 27.3% = (p−1)/(m+p−1).</text>
 <text x="80" y="271" class="s-small">Stage 0 keeps up to 4 micro-batches in flight, stage 3 only 1.</text>
 </svg>
     <figcaption><b>Figure 3.</b> A 1F1B schedule for \(p = 4\) stages and \(m = 8\) micro-batches, drawn from the drill's simulator with \(t_b = 2t_f\). Dashed boxes are idle time. Each stage idles for \((p-1)(t_f+t_b) = 9\) of 33 units, and the total is \((m+p-1)\cdot 3 = 33\). Stage 0 has up to 4 micro-batches in flight (its first four forwards complete before its first backward), stage 3 only one.</figcaption>
@@ -923,7 +923,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
   <p>Routing and load balancing are page 08's subject; note that an unbalanced router makes some GPUs' compute and all-to-all volume larger, and every step waits for the slowest.</p>
 
   <h3 id="cp">Context parallelism</h3>
-  <p>At long context the activations dominate: at \(s = 131{,}072\) even the linear \(34\,sbh\) term is \(34 \times 131{,}072 \times 4096 = 18.3\) GB per layer for a Llama-3-8B-shaped model. <strong>Context parallelism</strong> <span class="zh">上下文并行</span> shards the sequence over \(c\) ranks: every rank holds \(s/c\) tokens, norms and MLPs are token-wise so they need no communication, and only attention has to see the other ranks' keys and values. Four ways to do that:</p>
+  <p>At long context the activations dominate: at \(s = 131{,}072\) even the linear \(34\,sbh\) term is \(34 \times 131{,}072 \times 4096 = 18.3\) GB per layer for a Llama-3-8B-shaped model (the long-context recipes themselves are on <a href="10-long-context.html#systems">page 10</a>). <strong>Context parallelism</strong> <span class="zh">上下文并行</span> shards the sequence over \(c\) ranks: every rank holds \(s/c\) tokens, norms and MLPs are token-wise so they need no communication, and only attention has to see the other ranks' keys and values. Four ways to do that:</p>
   <ul>
     <li><strong>Ring attention</strong> <a href="https://arxiv.org/abs/2310.01889">[Liu et al. 2023]</a>. Each rank keeps its query block while key/value blocks rotate around a ring and each rank computes blockwise attention (online-softmax rescaling, <a href="16-gpus-kernels.html">page 16</a>). Communication hides if computing a block takes at least as long as sending it. For block length \(\beta\) and hidden size \(d\), one block pair costs \(4d\beta^2\) FLOPs and the key and value blocks are \(4\beta d\) bytes in bf16, so \(\beta \ge F/B\) (peak FLOP/s over link bandwidth) <a href="https://arxiv.org/abs/2310.01889">[§3]</a>. For an A100 that is 1.0K tokens on NVLink but 24.5K over InfiniBand <a href="https://arxiv.org/abs/2310.01889">[Tab. 2]</a>; my H100 numbers are \(989.4\text{T}/450\text{G} = 2.2\)K on NVLink and \(989.4\text{T}/50\text{G} = 19.8\)K over a 50 GB/s port. GQA shrinks the transferred bytes by \(d/d_{kv}\) (4× for Llama-3-8B, 8× for 70B); a causal mask halves the FLOPs and doubles the requirement.</li>
     <li><strong>All-gather context parallelism</strong> (Llama 3). All-gather \(K\) and \(V\), then attend with the local queries. The latency is exposed, but small: GQA makes \(K\) and \(V\) far smaller than \(Q\), and attention compute is \(O(S^2)\) against \(O(S)\) communication. Any mask works (Llama 3 uses a document mask). The sequence is cut into \(2c\) chunks and rank \(i\) takes chunks \(i\) and \(2c-1-i\), balancing causal work <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</li>
@@ -1088,7 +1088,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
   <p>Config (Llama-3-70B): \(L = 80\), \(d = 8192\), \(\dff = 28{,}672\), \(n_h = 64\), \(n_{kv} = 8\), \(V = 128{,}256\), giving \(N = 70.55\)B parameters (855.65M per layer, my count from the config). Assume the batch of Llama 3's later phases, \(2^{24} = 16.8\)M tokens, which is 2,048 sequences. Cluster: 128 nodes of 8 GPUs.</p>
   <ol>
     <li><strong>States:</strong> \(16N = 1.13\) TB. Impossible to replicate, and about 14 H100s' worth of memory even before activations.</li>
-    <li><strong>TP = 8</strong> inside the node (\(n_{kv} = 8\) divides evenly). Traffic per layer per micro-batch is 939.5 MB: 2.1 ms on NVLink against 13.3 ms of compute (16%), but 18.8 ms over InfiniBand.</li>
+    <li><strong>TP = 8</strong> inside the node (\(n_{kv} = 8\) divides evenly), with sequence parallelism; the traffic is priced in the second table below (16% of layer compute on NVLink, 141% over InfiniBand).</li>
     <li><strong>PP = 4</strong> (20 layers per stage). Then \(N_d = 1024/32 = 32\) and \(m = 2048/32 = 64\) micro-batches of one sequence. Bubble \((p-1)/m = 3/64 = 4.7\%\) of ideal (idle 4.5%); with interleaving \(v = 2\), 2.3%.</li>
     <li><strong>ZeRO-1</strong> over the 32 replicas.</li>
   </ol>
@@ -1306,11 +1306,11 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
       <p>Config (Llama-3-70B): \(L = 80\), \(d = 8192\), 64 heads, 8 KV heads, \(N = 70.55\)B. Batch \(2^{24}\) tokens = 2,048 sequences.</p>
       <ol>
         <li><strong>States:</strong> \(16N = 1.13\) TB, impossible to replicate.</li>
-        <li><strong>TP = 8</strong> in the node: 940 MB per layer per micro-batch, 2.1 ms on NVLink versus 13.3 ms compute (16%); 141% over IB, so never wider than a node.</li>
+        <li><strong>TP = 8</strong> in the node, with sequence parallelism: 940 MB per layer per micro-batch, 2.1 ms on NVLink versus 13.3 ms compute (16%); 141% over IB, so never wider than a node. At 8K context no context parallelism is needed.</li>
         <li><strong>PP = 4</strong> (20 layers per stage): DP \(= 32\), \(m = 2048/32 = 64\), bubble \(3/64 = 4.7\%\) (2.3% with \(v = 2\)); activations cross stage boundaries as 134 MB per micro-batch, 1% of stage compute on IB.</li>
         <li><strong>ZeRO-1</strong> over DP = 32: RS + AG of 4.4 GB each per step, 0.17 s of a 17.5 s step.</li>
       </ol>
-      <p>Memory per GPU: 4.4 (weights) + 4.4 (grads) + 0.8 (ZeRO-1 optimizer) + 22.8 (first-stage activations, \(34\,sbhL/t\) with sequence parallel and selective recompute) = 32.5 GB, plenty of slack. PP = 2 (41 GB) or 1 (59 GB) also fit and remove the bubble, but the DP shard grows 2 to 4× and FSDP-only variants gather 17.6 GB per micro-batch. Estimated time: 17.5 s per step at 40% MFU; 15T tokens would take about 181 days. What I would check on hardware: bubble and stage imbalance (LM-head stage), exposed TP traffic, straggler and restart behavior, and whether MFU is near 40% or the bubble or all-reduce is bigger than modeled.</p>
+      <p>Memory per GPU: 4.4 (weights) + 4.4 (grads) + 0.8 (ZeRO-1 optimizer) + 22.8 (first-stage activations, \(34\,sbhL/t\) with sequence parallel and selective recompute) = 32.5 GB, plenty of slack. PP = 2 (41 GB) or 1 (59 GB) also fit and remove the bubble, but the DP shard grows 2 to 4× and FSDP-only variants gather 17.6 GB per micro-batch. Estimated time: 17.5 s per step at 40% MFU; 15T tokens would take about 181 days. What I would check on hardware: bubble and stage imbalance (the embedding and LM-head stages: move one layer off the first and last stage, as Llama 3 does), exposed TP traffic, straggler and restart behavior, and whether MFU is near 40% or the bubble or all-reduce is bigger than modeled.</p>
     </div>
   </details>
 

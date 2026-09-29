@@ -478,7 +478,7 @@ class MHC(nn.Module):
 <line class="s-line s-dash" x1="545" y1="184" x2="545" y2="156"/>
 <text x="12" y="316" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1</tspan> = H<tspan baseline-shift="sub" font-size="9">res</tspan> x<tspan baseline-shift="sub" font-size="9">l</tspan> + H<tspan baseline-shift="sub" font-size="9">post</tspan><tspan baseline-shift="super" font-size="9">T</tspan> F(H<tspan baseline-shift="sub" font-size="9">pre</tspan> x<tspan baseline-shift="sub" font-size="9">l</tspan>),   x<tspan baseline-shift="sub" font-size="9">l</tspan> ∈ R<tspan baseline-shift="super" font-size="9">n×d</tspan>,   n = 4 in DeepSeek-V4</text>
 <text x="12" y="336" class="s-small">H_res = Sinkhorn-Knopp(exp(raw)): 20 alternating row and column normalizations, approximately doubly stochastic</text>
-<text x="12" y="354" class="s-small s-muted">If exact: ‖H_res‖₂ ≤ 1 and products stay doubly stochastic. Dynamic coefficients: raw = α · (RMSNorm(vec x_l) W) + static bias.</text>
+<text x="12" y="354" class="s-small s-muted">If exact: ‖H_res‖₂ ≤ 1, products stay doubly stochastic. Dynamic: raw = α · (RMSNorm(vec x_l) W) + static bias.</text>
 </svg>
     <figcaption><b>Figure 2.</b> mHC with \(n = 4\) streams. The blue streams carry the residual signal. A small branch (below) reads them with \(H^{\mathrm{pre}}\), runs the layer, and writes back with \(H^{\mathrm{post}}\). The green block mixes streams with a doubly stochastic \(H^{\mathrm{res}}\). Only the mixing block sits on the identity-like path, which is why constraining it restores the stability of plain residuals.</figcaption>
   </figure>

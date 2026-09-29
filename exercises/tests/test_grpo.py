@@ -270,15 +270,17 @@ def test_padding_junk_that_overflows_exp_cannot_reach_the_loss(impl, agg):
     # neutralized BEFORE the exponential, not just multiplied by the mask afterwards
     lp = torch.randn(2, 4, dtype=torch.float64)
     m = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.float64)
-    new, old, ref = lp.clone(), lp.clone(), lp.clone()
-    new[1, 2:], old[1, 2:], ref[1, 2:] = 800.0, -800.0, -800.0
-    new.requires_grad_(True)
-    for a in (f64(1.0, -1.0), f64(-1.0, 1.0)):
-        new.grad = None
-        loss = impl.grpo_loss(new, old, ref, a, m, beta=0.04, agg=agg, max_len=4)
-        loss.backward()
-        assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
-        assert new.grad[1, 2:].abs().sum() == 0
+    # (junk in logp_new, logp_old, logp_ref): the first overflows the ratio, the second overflows the k3 exponent
+    for j_new, j_old, j_ref in ((800.0, -800.0, -800.0), (-800.0, -800.0, 800.0)):
+        new, old, ref = lp.clone(), lp.clone(), lp.clone()
+        new[1, 2:], old[1, 2:], ref[1, 2:] = j_new, j_old, j_ref
+        new.requires_grad_(True)
+        for a in (f64(1.0, -1.0), f64(-1.0, 1.0)):
+            new.grad = None
+            loss = impl.grpo_loss(new, old, ref, a, m, beta=0.04, agg=agg, max_len=4)
+            loss.backward()
+            assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
+            assert new.grad[1, 2:].abs().sum() == 0
 
 
 def test_seq_mean_equals_token_mean_when_lengths_are_equal(impl):

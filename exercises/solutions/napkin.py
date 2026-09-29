@@ -178,8 +178,8 @@ def decode_time(weight_bytes: float, kv_bytes_total: float, bandwidth: float,
 
     Memory time = (weight_bytes + kv_bytes_total) / bandwidth: every step streams all weights once
     (shared by the whole batch) plus every sequence's KV cache. Compute time = n_flops / peak_flops
-    (n_flops and peak_flops are optional; with peak_flops = inf the compute term is zero). Real engines reach about
-    60 to 80% of this bound.
+    (both optional: with the default peak_flops = inf the compute term is zero). Real engines reach
+    a fraction of this bound (80% in one measured H100 NVL point, page 06).
     """
     return max((weight_bytes + kv_bytes_total) / bandwidth, n_flops / peak_flops)
 

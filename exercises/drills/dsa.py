@@ -51,9 +51,10 @@ def dsa_attention(
                  are both the content key and the value.
         kr_cache: (B, S, d_r) cached RoPE keys, one per token, shared by all heads.
         scores: (B, T, S) indexer scores (-inf on keys a query may not use).
-        k_top: number of keys each query attends to. A query with fewer than k_top usable
-               keys attends to all of them (never to a masked key). The selection is made
-               once per query and shared by all n_h heads.
+        k_top: number of keys each query attends to; it may exceed S. A query with fewer
+               than k_top usable keys (always true when k_top > S, and for the first few
+               queries of a prefill) attends to all of them and never to a masked key. The
+               selection is made once per query and shared by all n_h heads.
         scale: softmax scale; logits = (q_lat . c + q_rope . kr) * scale.
     Returns:
         (B, T, n_h, d_c) latent-space outputs sum_s p[b, t, h, s] * c[b, s], with the
@@ -79,6 +80,9 @@ def indexer_kl_loss(
         selected: optional (B, T, S) bool mask of the keys chosen by top-k.
                   None: dense variant (warm-up stage), the sets are all usable keys.
                   Given: sparse variant, both distributions live on the selected keys only.
+                  A key whose index score is -inf is never in the set, even if selected is
+                  True there (a raw top-k over a row with fewer than k usable keys marks
+                  such filler keys).
     Returns:
         A scalar: the sum over t of KL(p_t || q_t), then the mean over the batch.
         - Target p_t: attn_probs summed over heads, restricted to the set (all usable keys,

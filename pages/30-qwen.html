@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>30 · Qwen 1 to 3 and Qwen3-Next · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="30" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VI · Model case studies · Page 30</div>
+  <h1>Qwen 1 to 3 and Qwen3-Next</h1>
+  <div class="meta">
+    <span class="badge p1">P1</span>
+    <span>~45 min</span>
+    <span>Prereqs: <a href="07-kv-efficient-attention.html">07 GQA</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="09-beyond-full-attention.html">09 Hybrid attention</a>, <a href="24-rlvr-reasoning.html">24 RLVR</a></span>
+  </div>
+  <p class="lede">Qwen is the open model family that most research groups fine-tune and run RL on, and its architecture moved further in the last year than in the three before: from a conservative Llama-style decoder (2023), through Qwen3's fine-grained MoE, to Qwen3-Next's 3:1 Gated DeltaNet hybrid with 512 experts, which became the default layout of Qwen3.5 and Qwen3.8. This page follows that lineage and asks of every step what problem it solved, what evidence supports it, and what it cost.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Config fluency:</strong> from Qwen3-235B-A22B's <code>config.json</code>, derive total and activated parameters and the KV cache per token; then do the same for Qwen3-Next, where only one layer in four keeps a cache.</li>
+    <li><strong>Qwen3 versus DeepSeek-V3:</strong> shared experts, gating and normalization, the scope of the balance loss, GQA with QK-norm versus MLA, GSPO versus GRPO. Every difference is a bet, and you should be able to name the evidence for each side.</li>
+    <li><strong>GSPO:</strong> why a token-level importance ratio is a bad estimator, why MoE routing makes it worse, and what the sequence-level ratio changes in the gradient.</li>
+    <li><strong>Gated attention and the hybrid:</strong> what the sigmoid gate fixes, why 3:1, and what a Gated DeltaNet layer gives up compared with a softmax layer.</li>
+    <li><strong>Reading RL papers critically:</strong> why so many RLVR results come from Qwen bases, what random-reward and contamination studies found, and how to design a check.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Trace what changed from Qwen to Qwen2.5 to Qwen3 (tokenizer, QKV bias, GQA, context recipe, MoE initialization) and give one reason for each change.</li>
+    <li>Reproduce the exact parameter count of Qwen3-235B-A22B (235,093,634,560) from its config, and explain why reported "activated" counts follow inconsistent conventions.</li>
+    <li>Write the global-batch load-balancing loss, contrast it with the micro-batch version, and explain why the latter suppresses expert specialization.</li>
+    <li>State GSPO's length-normalized sequence ratio and its clipping range, and argue why MoE routing volatility broke token-level ratios.</li>
+    <li>Draw Qwen3-Next's layer layout, compute its KV cache and recurrent state at 128K tokens, and compare with Qwen3-32B.</li>
+    <li>Describe Qwen3's four-stage post-training, the thinking budget, strong-to-weak distillation, and why the 2507 releases abandoned hybrid thinking.</li>
+    <li>Summarize what Qwen3.5 to Qwen3.8 changed and did not change (as of September 2026), separating primary-source facts from vendor claims.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="lineage">The lineage at a glance</h2>
+  <p>Every Qwen generation reused the previous backbone and moved one or two levers. The table gives what each release changed. Dates come from the Qwen blog posts and Hugging Face release times, and arXiv reports often lag the weights by weeks.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Release</th><th>Scale and data</th><th>Architecture and recipe changes</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen (Aug to Sep 2023)</td><td>1.8B, 7B, 14B; 2.2T to 3.0T tokens; 2K training context</td><td>Llama-style decoder (RoPE, RMSNorm, SwiGLU with FFN \(\tfrac83 d\), untied embeddings) plus QKV bias; ~152K byte-pair vocabulary; context extended at inference only <a href="https://arxiv.org/abs/2309.16609">[Qwen, §2]</a></td></tr>
+      <tr><td>Qwen1.5 (Feb to Apr 2024)</td><td>0.5B to 110B, 32K context at every size; first MoE (A2.7B) in Mar 2024</td><td>GQA only in the 32B and 110B; MoE upcycled from Qwen-1.8B <a href="https://qwenlm.github.io/blog/qwen2/">[Qwen2 blog]</a>, <a href="https://qwenlm.github.io/blog/qwen-moe/">[Qwen1.5-MoE blog]</a></td></tr>
+      <tr><td>Qwen2 (Jun 2024)</td><td>0.5B, 1.5B, 7B, 72B, 57B-A14B; 7T tokens (12T for the 0.5B)</td><td>GQA at every size; RoPE base 10K to 1M in the last stage; YaRN plus DCA to 128K; MoE upcycled from the 7B with 4.5T more tokens <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §2-3]</a></td></tr>
+      <tr><td>Qwen2.5 (Sep 2024), Qwen2.5-1M (Jan 2025)</td><td>0.5B to 72B; 18T tokens</td><td>Same architecture; better filtering, Qwen2.5-Math and -Coder data; five-stage length schedule for the 1M models <a href="https://arxiv.org/abs/2412.15115">[Qwen2.5, §3]</a>, <a href="https://arxiv.org/abs/2501.15383">[Qwen2.5-1M, §3]</a></td></tr>
+      <tr><td>Qwen3 (Apr 2025, report May 2025)</td><td>0.6B to 32B dense; 30B-A3B, 235B-A22B; 36T tokens, 119 languages</td><td>QK-norm replaces QKV bias; MoE with no shared expert and global-batch balancing; thinking and non-thinking modes in one model <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2-4]</a></td></tr>
+      <tr><td>Qwen3-2507 (Jul 2025)</td><td>235B-A22B and 30B-A3B updates</td><td>Hybrid thinking dropped: separate Instruct and Thinking checkpoints, 262,144 context <a href="https://x.com/Alibaba_Qwen/status/1947344511988076547">[Qwen post]</a></td></tr>
+      <tr><td>Qwen3-Next (Sep 2025)</td><td>80B-A3B; 15T-token pretraining</td><td>3:1 Gated DeltaNet to gated attention; 512 experts (10 routed plus 1 shared); multi-token prediction <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">[model card]</a></td></tr>
+      <tr><td>Qwen3.5 (Feb 2026) to Qwen3.8 (Aug 2026)</td><td>0.8B to 2.4T-A95B</td><td>The Qwen3-Next layout becomes the family default; native multimodal from 3.5; Flash-Next previews the "Qwen4" architecture <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next design paper]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout key">
+    <div class="callout-title">Three levers</div>
+    <p>For any Qwen release ask which lever moved: the <strong>data and recipe</strong> (Qwen2.5's 18T tokens, Qwen3's four-stage post-training), the <strong>block</strong> (bias, norms, GQA, expert design), or the <strong>token mixer</strong> (softmax attention versus Gated DeltaNet). Until Qwen3 the answer was almost always the first. Qwen3-Next is the first release where the third lever moved, and the rest of the family followed within five months.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="early">Qwen to Qwen2.5: a conservative backbone and where it bent</h2>
+
+  <h3 id="tokenizer">The tokenizer</h3>
+  <p>Qwen starts from tiktoken's <code>cl100k_base</code> BPE (the GPT-4 vocabulary), adds common Chinese characters and words plus tokens for other languages, and splits numbers into single digits. The result is about 152K entries <a href="https://arxiv.org/abs/2309.16609">[Qwen, §2.2]</a>. The reason is economics: a token is a unit of both training and serving cost, and a Chinese-heavy corpus on an English-centric vocabulary spends far more tokens per sentence (<a href="02-tokenization.html">page 02</a>). From Qwen2 on it is a byte-level BPE <span class="zh">分词器</span> with 151,643 regular tokens and 3 control tokens. Qwen2.5 raises the control tokens to 22, two of them for tools <a href="https://arxiv.org/abs/2412.15115">[Qwen2.5, §2]</a>, and Qwen3's report lists 151,669 <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>. The embedding matrix in <code>config.json</code> has 151,936 rows (\(1{,}187 \times 128\)), padded for tensor-parallel divisibility, and the extra rows are never targets. Qwen3.5 moves to a new vocabulary of about 248K (248,320 padded rows) and advertises 201 languages, though its card does not say the two are linked (see the <a href="02-tokenization.html">page 02</a> table).</p>
+
+  <h3 id="bias">QKV bias in, QK-norm out</h3>
+  <p>Qwen followed the Llama recipe of dropping biases everywhere except one place: it added biases to the Q, K and V projections "to enhance the extrapolation ability of the model", citing a blog post by Jianlin Su <a href="https://arxiv.org/abs/2309.16609">[Qwen, §2.3]</a>. Qwen2 and Qwen2.5 keep it. Qwen3 removes it and adds QK-Norm "to ensure stable training" <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>. Neither report contains an ablation, so the honest summary is a change of priorities. The bias belongs to the era of 2K to 8K training contexts, when extrapolation was the open problem (Qwen was trained at 2,048 tokens). By 2025 the open problem was stability over 36T tokens, and QK-norm attacks it directly by bounding the attention logits (<a href="11-stability-tweaks.html">page 11</a>). Once the logits are bounded, a learned key bias is plausibly less useful, but that is our reasoning, not a tested claim.</p>
+
+  <h3 id="gqa-arrives">GQA arrives</h3>
+  <p>Qwen1.5 used GQA (<a href="07-kv-efficient-attention.html">page 07</a>) only in the 32B and 110B models. The Qwen2 announcement says so explicitly and applies it to every size "so that they can enjoy the benefits of faster speed and less memory usage in model inference" <a href="https://qwenlm.github.io/blog/qwen2/">[Qwen2 blog]</a>, and the config files agree (Qwen1.5-7B and 72B have as many KV heads as query heads). The effect on the cache, in bf16 per token (\(L \cdot 2 \, n_{kv} \, d_h \cdot 2\) bytes):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Layers</th><th class="num">\(n_{kv} \times d_h\)</th><th>Arithmetic</th><th class="num">Per token</th><th class="num">128K tokens</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen1.5-7B (MHA)</td><td class="num">32</td><td class="num">32 × 128</td><td>\(32 \cdot 2 \cdot 32 \cdot 128 \cdot 2\)</td><td class="num">512 KiB</td><td class="num">64 GiB</td></tr>
+      <tr class="hl"><td>Qwen2-7B</td><td class="num">28</td><td class="num">4 × 128</td><td>\(28 \cdot 2 \cdot 4 \cdot 128 \cdot 2 = 57{,}344\)</td><td class="num">56 KiB</td><td class="num">7 GiB</td></tr>
+      <tr><td>Qwen1.5-72B (MHA)</td><td class="num">80</td><td class="num">64 × 128</td><td>\(80 \cdot 2 \cdot 64 \cdot 128 \cdot 2\)</td><td class="num">2.5 MiB</td><td class="num">320 GiB</td></tr>
+      <tr class="hl"><td>Qwen2-72B</td><td class="num">80</td><td class="num">8 × 128</td><td>\(80 \cdot 2 \cdot 8 \cdot 128 \cdot 2 = 327{,}680\)</td><td class="num">320 KiB</td><td class="num">40 GiB</td></tr>
+    </tbody>
+  </table></div>
+  <p>That is 9.1× and 8× smaller. The Qwen2 report lists "substantially lower KV size per token relative to Qwen1.5" as a design result <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §2.2.3]</a>. Small models kept tied embeddings (0.5B and 1.5B in Qwen2, up to 4B in Qwen3) because the embedding matrix is a large share of their parameters.</p>
+
+  <h3 id="ctx-early">Long context: from free tricks to a staged recipe</h3>
+  <p>Qwen (2023) was trained at 2,048 tokens and extended with three training-free tools: dynamic NTK-aware interpolation, LogN-scaling of the attention logits, and layer-wise window attention with shorter windows in lower layers. On arXiv text, Qwen-7B's perplexity at 16,384 tokens fell from 2,645 (no tricks) to 5.71 (dynamic NTK), 4.62 (plus LogN) and 4.32 (plus windows) <a href="https://arxiv.org/abs/2309.16609">[Qwen, Tab. 3]</a>. Qwen2 made length a training stage: 4,096 to 32,768 tokens at the end of pretraining with the RoPE base raised from 10,000 to 1,000,000 (ABF), then YaRN and Dual Chunk Attention (DCA) at inference for 131,072 tokens <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §3.2]</a>. Qwen2.5-1M pushed the same idea to five stages (4K, 32K, 64K, 128K, 256K; bases 10K, 1M, 1M, 5M, 10M) and reaches 1M tokens by extrapolating with DCA plus YaRN, with a 3× to 7× faster prefill from sparse attention <a href="https://arxiv.org/abs/2501.15383">[Qwen2.5-1M, §3, §5]</a>. The mechanics, the RULER-by-stage table and the sparse-prefill trick are on <a href="10-long-context.html">page 10</a>. What matters here is the recipe's shape: <em>raise the base, train a little at the new length, then extrapolate the last factor of four for free</em>. Qwen3 reuses it unchanged (over 30T plus about 5T tokens at 4K, hundreds of billions at 32K, then YaRN plus DCA) <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §3.2]</a>.</p>
+
+  <h3 id="upcycle">Upcycled fine-grained MoE: Qwen1.5-MoE and Qwen2-57B-A14B</h3>
+  <p>Qwen's first MoE models were built from dense ones. Qwen1.5-MoE-A2.7B started from Qwen-1.8B, used 64 fine-grained experts (4 shared and always on, 60 routed of which 4 fire) and, according to the blog, matched 7B dense models with 2.0B non-embedding parameters against Qwen1.5-7B's 6.5B, a 75% cut in training cost and 1.74× faster inference <a href="https://qwenlm.github.io/blog/qwen-moe/">[Qwen1.5-MoE blog]</a>. Qwen2-57B-A14B was upscaled from Qwen2-7B: 64 routed experts of width 2,560 with 8 active, plus 8 shared experts (fused into one FFN of width \(8 \times 2560 = 20{,}480\) in the released config), and 4.5T further tokens <a href="https://arxiv.org/abs/2407.10671">[Qwen2, Tab. 1]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Upcycling with fine-grained experts</div>
+    <dl>
+      <dt>Problem</dt><dd>Training an MoE from scratch is expensive and, in the Qwen team's early experiments, "inefficient and challenging" to bring to peak quality. A dense model already encodes a lot of compute.</dd>
+      <dt>Idea</dt><dd>Initialize the MoE from a dense checkpoint, in the sense of sparse upcycling (<a href="08-mixture-of-experts.html">page 08</a>). Qwen2 replicates the dense FFN \(\lceil n \, h_E / h_{FFN} \rceil\) times, shuffles parameters along the intermediate dimension so copies differ, cuts fine-grained experts out of the copies, and re-initializes 50% of every expert's parameters <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §2.2.2]</a>.</dd>
+      <dt>Why it works</dt><dd>Experts start with useful features instead of noise, and the shuffle plus re-initialization breaks the symmetry that would otherwise keep experts identical. The blog reports that randomness at initialization "significantly expedites convergence" but gives no mechanism.</dd>
+      <dt>Evidence</dt><dd>A2.7B: MMLU 62.5 against 61.0 for Qwen1.5-7B <a href="https://qwenlm.github.io/blog/qwen-moe/">[blog]</a>. 57B-A14B: MMLU 76.5 against 74.3 for Qwen1.5-32B and 77.1 for Yi-1.5-34B <a href="https://arxiv.org/abs/2407.10671">[Qwen2, Tab. 3]</a>. There is no from-scratch control in either source.</dd>
+      <dt>Cost</dt><dd>You need the dense model first, and the MoE inherits its width and tokenizer. Qwen2 itself blames the 57B-A14B's weaker knowledge scores on too few pretraining tokens <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §5.2.2]</a>.</dd>
+      <dt>Used by</dt><dd>Qwen1.5-MoE-A2.7B, Qwen2-57B-A14B. The Qwen3 report does not say how its MoE models were initialized.</dd>
+    </dl>
+  </div>
+
+  <h3 id="data-lever">Qwen2.5: data is the lever</h3>
+  <p>Qwen2.5 kept the Qwen2 architecture and moved the data from 7T to 18T tokens <a href="https://arxiv.org/abs/2412.15115">[Qwen2.5, §3.1]</a>. Qwen2 had already tried a looser quality threshold that produced 12T tokens and found no significant gain over its 7T set <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §3.1]</a>, so the extra tokens in Qwen2.5 came from better filtering, not a lower bar. Qwen2-Instruct models score samples across domains, math and code data come from Qwen2.5-Math and Qwen2.5-Coder, synthetic data is filtered by reward models, and over-represented domains (e-commerce, social media, entertainment) are down-sampled while technology and science are up-sampled. The specialists are themselves data engines. Qwen2.5-Math continues pretraining from Qwen2.5 on a 1T-plus-token math corpus, and its 7B base scores 55.4 on MATH, above Qwen2-72B's 51.1 <a href="https://arxiv.org/abs/2409.12122">[Qwen2.5-Math, §2, §5.1]</a>. Qwen2.5-Coder continues from Qwen2.5 on 5.5T tokens, and a final mix of 70% code, 20% text and 10% math beat both a code-only mix and a more code-heavy one in the authors' 7B ablation <a href="https://arxiv.org/abs/2409.12186">[Qwen2.5-Coder, §3.1.2]</a>. Qwen3 then uses these models to synthesize trillions of pretraining tokens (<a href="12-pretraining-data.html">page 12</a>).</p>
+</section>
+
+<section>
+  <h2 id="rl-default">Why Qwen2.5 became the RL default, and the risk in that</h2>
+  <p>By 2025 a large part of the open RLVR literature (<a href="24-rlvr-reasoning.html">page 24</a>) ran on Qwen bases: DAPO trains Qwen2.5-32B, Oat-Zero and SimpleRL-Zero start from Qwen2.5-Math-7B and other Qwen2.5 models, VAPO uses Qwen2.5-32B, and the DeepSeek-R1 report runs its "RL versus distillation" control experiment on Qwen2.5-32B. Shao et al. call Qwen models "the de facto choice for RLVR research in the open-source community" <a href="https://arxiv.org/abs/2506.10947">[Spurious Rewards, §1]</a>. <span class="unverified" title="No paper we found counts base-model usage across RLVR work; 'most' is an impression supported by the named examples and the Shao et al. quote">That is the sense in which it is "most" of the field</span>, and it is worth knowing why.</p>
+
+  <h3 id="why-qwen">Four reasons</h3>
+  <ol>
+    <li><strong>Availability across scale.</strong> A ladder of open bases from 0.5B to 72B, most under Apache 2.0 <a href="https://arxiv.org/abs/2412.15115">[Qwen2.5, Tab. 1]</a>, lets a lab debug a recipe at 1.5B and report the headline at 32B with one tokenizer and one chat template.</li>
+    <li><strong>Strong math and code in the base.</strong> Qwen2.5 pretraining includes Qwen2.5-Math and Qwen2.5-Coder data (above), so a base already solves problems that RL only has to sharpen.</li>
+    <li><strong>Useful reasoning behaviors already present.</strong> Under identical PPO on the Countdown game, Qwen2.5-3B reached about 60% while Llama-3.2-3B reached about 30%, because Qwen "naturally exhibits" verification, backtracking, subgoal setting and backward chaining and Llama does not. Priming Llama with traces that contain those behaviors, even incorrect ones, made it match Qwen <a href="https://arxiv.org/abs/2503.01307">[Gandhi et al. 2025, §3]</a>. RL amplifies behaviors that occur in successful samples, so a base that already emits them is a better substrate.</li>
+    <li><strong>Convention.</strong> Once DAPO, Dr. GRPO and others published Qwen numbers, comparisons required the same base. This one is our inference, not a documented cause.</li>
+  </ol>
+
+  <h3 id="rl-risk">The risk: results that may be Qwen-specific</h3>
+  <p>Shao et al. ran GRPO for about 300 steps on Qwen2.5-Math-7B with rewards that carry little or no information. On MATH-500 the gain was +29.1 points with ground-truth rewards, +24.1 with rewards for matching incorrect majority-vote labels and +21.4 with rewards assigned at random. Llama3 and OLMo2 gained little or nothing, and on AIME 2025, whose problems postdate the models, the spurious gains largely vanish <a href="https://arxiv.org/abs/2506.10947">[Shao et al. 2025, Abstract, §2-3, App. D]</a>. Their mechanism is a clipping bias in GRPO: without clipping, random rewards give a zero expected gradient, but with it the update raises the probability of tokens the model already favors, amplifying whatever high-prior behavior exists. In Qwen2.5-Math that behavior is "code reasoning" (writing Python-style reasoning without executing it), whose frequency rises from 65% to about 90% under any reward, and answers that use it are correct 60.9% of the time <a href="https://arxiv.org/abs/2506.10947">[§4-5]</a>.</p>
+  <p>Wu et al. offer a second, compatible explanation: memorization. Given the first 60% of a MATH-500 problem, Qwen2.5-Math-7B regenerates the remaining 40% with 54.6% exact match and answers 53.6% of the truncated problems correctly, against 3.8% and 2.4% for Llama3.1-8B. On LiveMathBench (a post-cutoff set) its completion rate is 0.0%. On a freshly generated arithmetic benchmark, only correct rewards produced reliable gains and random ones did not <a href="https://arxiv.org/abs/2507.10532">[Wu et al. 2025, §1, §4]</a>. They also show that the official chat template lowers a Qwen base's starting accuracy, so part of the "RL gain" is adaptation to the format. That paper is a preprint marked work in progress, and it reports similar memorization for Qwen3 in an appendix. The two accounts are not exclusive (a memorized answer is a high-prior behavior), and neither study proves the other wrong.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">A protocol before you trust an RLVR result</div>
+    <p>(1) Repeat on a second model family. (2) Add random-reward and incorrect-label baselines: if they recover most of the gain, the reward is not the cause. (3) Evaluate on problems the base could not have seen (post-cutoff or generated). (4) Match the prompt template to how the base was pretrained. (5) Report pass@\(k\) at large \(k\) as well as pass@1 (<a href="24-rlvr-reasoning.html">page 24</a>). Qwen's own pipelines are Qwen on Qwen: Qwen3's cold-start queries are filtered by Qwen2.5-72B-Instruct, its cold-start responses come from QwQ-32B, and its reference-based judge in general RL is Qwen2.5-72B-Instruct <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.1, §4.4]</a>, so the family's biases can propagate.</p>
+  </aside>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A tagger method validated on a single Monte Carlo generator's tune can be exploiting that generator's quirks. You would check it on a second generator and on data the tune never saw, and you would run a null control such as shuffled labels. Base-model families play the role of generators, post-cutoff problems the unseen data, and random rewards the shuffled-label control.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="qwen3">Qwen3: dense and MoE, one recipe, two modes</h2>
+  <p>Qwen3 (models released April 29, 2025, report May 14, 2025) has six dense models (0.6B to 32B) and two MoE models (30B-A3B and 235B-A22B), all under Apache 2.0. Relative to Qwen2.5 the dense block keeps GQA, SwiGLU, RoPE and pre-norm RMSNorm, drops QKV bias and adds QK-Norm. The MoE block uses 128 fine-grained experts with 8 active, <em>no shared expert</em>, and a global-batch balancing loss <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>. The shapes below come from the released <code>config.json</code> files.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Layers</th><th class="num">\(d\)</th><th class="num">Q / KV heads</th><th class="num">\(d_h\)</th><th class="num">FFN or expert width</th><th class="num">Experts (total / active)</th><th class="num">KV per token (bf16)</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3-8B</td><td class="num">36</td><td class="num">4096</td><td class="num">32 / 8</td><td class="num">128</td><td class="num">12,288</td><td class="num">dense</td><td class="num">144 KiB</td></tr>
+      <tr><td>Qwen3-32B</td><td class="num">64</td><td class="num">5120</td><td class="num">64 / 8</td><td class="num">128</td><td class="num">25,600</td><td class="num">dense</td><td class="num">256 KiB</td></tr>
+      <tr><td>Qwen3-30B-A3B</td><td class="num">48</td><td class="num">2048</td><td class="num">32 / 4</td><td class="num">128</td><td class="num">768</td><td class="num">128 / 8</td><td class="num">96 KiB</td></tr>
+      <tr class="hl"><td>Qwen3-235B-A22B</td><td class="num">94</td><td class="num">4096</td><td class="num">64 / 4</td><td class="num">128</td><td class="num">1,536</td><td class="num">128 / 8</td><td class="num">188 KiB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two things to notice. First, Qwen3 fixes \(d_h = 128\) at every size, so \(n_h d_h\) need not equal \(d\): in the 235B, \(64 \times 128 = 8192 = 2d\), and the attention projections map 4096 to 8192 and back. Second, the flagship's cache is <em>smaller</em> per token than the 32B dense model's (188 versus 256 KiB): it has 4 KV heads instead of 8, and that outweighs its 94 layers against 64 (\(94 \cdot 2 \cdot 4 \cdot 128 \cdot 2 = 192{,}512\) B versus \(64 \cdot 2 \cdot 8 \cdot 128 \cdot 2 = 262{,}144\) B). At 128K tokens (131,072) that is 23.5 GiB against 32 GiB per sequence.</p>
+
+  <h3 id="p235">Worked numbers: Qwen3-235B-A22B from its config</h3>
+  <p>With \(L = 94\), \(d = 4096\), \(n_h = 64\), \(n_{kv} = 4\), \(d_h = 128\), expert width \(m = 1536\), \(E = 128\), \(k = 8\), \(V = 151{,}936\) and untied embeddings, the per-layer pieces are:</p>
+  <ul>
+    <li>Attention: \(4096 \cdot 8192\) (Q) \(+\, 2 \cdot 4096 \cdot 512\) (K, V) \(+\, 8192 \cdot 4096\) (O) \(= 71{,}303{,}168\). QK-norm adds \(2 \cdot 128 = 256\) and the two RMSNorms \(2 \cdot 4096 = 8192\).</li>
+    <li>Router: \(4096 \cdot 128 = 524{,}288\). One expert: \(3 \cdot 4096 \cdot 1536 = 18{,}874{,}368\); all 128: \(2{,}415{,}919{,}104\).</li>
+  </ul>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component (94 layers)</th><th class="num">Parameters</th><th class="num">Share of total</th><th class="num">Active per token</th></tr></thead>
+    <tbody>
+      <tr><td>Routed experts</td><td class="num">227,096,395,776</td><td class="num">96.6%</td><td class="num">14,193,524,736 (8 of 128)</td></tr>
+      <tr><td>Attention projections</td><td class="num">6,702,497,792</td><td class="num">2.85%</td><td class="num">6,702,497,792</td></tr>
+      <tr><td>Routers, QK-norms, RMSNorms (with final norm)</td><td class="num">50,081,280</td><td class="num">0.02%</td><td class="num">50,081,280</td></tr>
+      <tr><td>Embedding plus LM head (\(2 \cdot 151{,}936 \cdot 4096\))</td><td class="num">1,244,659,712</td><td class="num">0.53%</td><td class="num">1,244,659,712</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td class="num">235,093,634,560</td><td class="num">100%</td><td class="num">22,190,763,520</td></tr>
+    </tbody>
+  </table></div>
+  <p>The total equals the Hugging Face safetensors count exactly, so nothing is hiding (the model has no biases and no shared expert). Three lessons. (1) 96.6% of the weights are idle for any one token, but attention is still 32% of the non-embedding active weights (\(6.70 / 20.95\)), which is why long-context cost is dominated by attention and its cache, not by the MoE. (2) The "22B" of the model name is reproduced only when the embedding <em>and</em> the LM head are counted (22.19B). Without embeddings the active count is 20.95B, and with only the LM head 21.57B. (3) Conventions are not consistent across cards: from the released configs (our counts), Qwen3.5-397B-A17B gives 17.35B active on the both-matrices convention (reported 17B) and Qwen3-Next gives 3.25B on the non-embedding convention (reported 3B, but 3.87B with both matrices). Treat "activated parameters" as a rounded label, not a comparable number.</p>
+
+  <h3 id="global-batch">Global-batch load balancing</h3>
+  <p>Qwen3 adopts the loss of Qiu et al. (the Qwen team, January 2025) <a href="https://arxiv.org/abs/2501.11873">[Qiu et al. 2025]</a>. The standard load-balancing loss for \(E\) experts is \(E \sum_i f_i P_i\), where \(f_i\) is the fraction of assignments to expert \(i\) and \(P_i\) the mean router probability. The trouble is <em>where</em> the mean is taken. Frameworks compute \(f_i\) inside each micro-batch (a few sequences, often from one domain) and average across parallel groups, so the constraint is nearly sequence-level: a code-only micro-batch must still be spread over all experts. The fix is to all-reduce only the \(E\)-sized count vector, and keep the probabilities local:</p>
+  <div class="eq-box">
+  \[ \mathcal{L}_{\text{micro}} = \frac{1}{N_P}\sum_{j=1}^{N_P} E \sum_i f^{\,j}_i P^{\,j}_i, \qquad \mathcal{L}_{\text{global}} = \frac{1}{N_P}\sum_{j=1}^{N_P} E \sum_i \bar f_i \, P^{\,j}_i, \quad \bar f_i = \frac{\text{assignments to } i \text{ over all groups}}{\text{tokens} \cdot k} \]
+  <div class="eq-label">\(\bar f\) is a constant (no gradient); gradients still flow through the local \(P^j\)</div>
+  </div>
+  <p>A two-expert example shows the difference. Micro-batch 0 is all code and every token goes to expert 0; micro-batch 1 is all prose and goes to expert 1. Inside each micro-batch \(f = (1,0)\) and \(P = (1,0)\), so \(\mathcal{L}_{\text{micro}} = 2\), the worst possible value. Globally \(\bar f = (\tfrac12, \tfrac12)\) and \(\mathcal{L}_{\text{global}} = \tfrac12(2 \cdot \tfrac12 + 2 \cdot \tfrac12) = 1\), the minimum. The global loss is content with domain-specialized experts as long as the corpus is balanced. This is the first drill (<a href="#exercises">Hands-on</a>).</p>
+  <div class="decision">
+    <div class="decision-title">Global-batch load balancing</div>
+    <dl>
+      <dt>Problem</dt><dd>Micro-batch balancing is a near sequence-level constraint that pushes every sequence, whatever its domain, to spread over all experts, which suppresses specialization.</dd>
+      <dt>Idea</dt><dd>Synchronize expert selection counts across data-parallel groups (or accumulate them over gradient-accumulation steps with a buffer) before forming \(f\).</dd>
+      <dt>Why it works</dt><dd>The constraint moves from "each sequence is balanced" to "the corpus is balanced". A shuffled control that uses a micro-batch-sized random draw of tokens from the global batch recovers almost all of the gain, so what matters is token <em>diversity</em> in the balancing set, not token count.</dd>
+      <dt>Evidence</dt><dd>3.4B-A0.6B on 400B tokens: perplexity 7.347 with balance batch size 4, 7.214 at 128 and 7.198 at 512; shuffled control 7.214 against 7.383 for micro-batch. 15B-A2.54B: 5.778 to 5.603. Experts in the math domain reach selection frequencies above 0.2, against below 0.15 with micro-batch balancing <a href="https://arxiv.org/abs/2501.11873">[Qiu et al. 2025, Tab. 1-2, §4-5]</a>.</dd>
+      <dt>Cost</dt><dd>A lopsided micro-batch means a straggler device: 5.8% slower steps on the 43B-A6.6B model, of which about 1% is communication. A micro-batch term at 1% of the global weight cut that to 2.6% at a small quality cost.</dd>
+      <dt>Used by</dt><dd>Qwen3 MoE <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>, Qwen3-Next (the blog names "global load balancing"). DeepSeek-V3's batch-wise balancing is the same principle (<a href="08-mixture-of-experts.html">page 08</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="qwen3-pretrain">Pretraining: 36T tokens in three stages</h3>
+  <p>Qwen3 doubles Qwen2.5's data to about 36T tokens in 119 languages and dialects (Qwen2.5 covered 29). The additions are PDF-like documents read by Qwen2.5-VL and cleaned by Qwen2.5, and trillions of synthetic tokens (textbooks, Q&amp;A, instructions, code) from Qwen2.5, Qwen2.5-Math and Qwen2.5-Coder. Over 30T tokens are annotated for educational value, domain and safety, and the mixture is optimized per instance with small proxy models rather than per source <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §3.1]</a>. Training has three stages: a general stage of over 30T tokens at 4,096 context; a reasoning stage of about 5T tokens with more STEM, code, reasoning and synthetic data and an accelerated learning-rate decay; and a long-context stage of hundreds of billions of tokens at 32,768 (75% of sequences between 16K and 32K), with ABF, YaRN and DCA as above <a href="https://arxiv.org/abs/2505.09388">[§3.2]</a>. As in Qwen2.5, scaling laws predict the learning-rate schedule and batch size per model and stage. The data mechanics are on <a href="12-pretraining-data.html">page 12</a>. The headline base-model claim is that Qwen3 MoE bases match Qwen3 dense bases "with only 1/5 activated parameters", and that Qwen3-235B-A22B-Base beats DeepSeek-V3-Base on 14 of 15 benchmarks with about 1/3 of its total and 2/3 of its activated parameters (MMLU 87.81 against 87.19, MATH 71.84 against 62.62) <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §3.3, Tab. 3]</a>.</p>
+
+  <h3 id="qwen3-post">Post-training: four stages, one shortcut</h3>
+  <p>The flagship models follow four stages <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4]</a>:</p>
+  <ol>
+    <li><strong>Long-CoT cold start.</strong> Queries are filtered with Qwen2.5-72B-Instruct (drop non-verifiable ones and any it answers correctly without chain of thought), \(N\) responses per query come from QwQ-32B, and six response filters apply (wrong answer, repetition, guesswork, thinking/summary mismatch, language mixing, overlap with validation items). The set is kept deliberately small: "it is preferable to minimize both the number of training samples and the training steps."</li>
+    <li><strong>Reasoning RL.</strong> 3,995 query-verifier pairs that are new, learnable, hard and diverse; GRPO with a large batch, many rollouts per query and off-policy updates, controlling entropy to rise steadily or hold. Qwen3-235B-A22B goes from 70.1 to 85.1 on AIME'24 in 170 steps.</li>
+    <li><strong>Thinking-mode fusion.</strong> Continual SFT on the Stage-2 model. Thinking data is rejection-sampled from that same model so its reasoning does not regress, non-thinking data is curated separately, and one chat template carries a <code>/think</code> or <code>/no_think</code> flag (a non-thinking reply keeps an empty think block).</li>
+    <li><strong>General RL.</strong> Over 20 tasks scored by rule-based rewards, a reference-based judge (Qwen2.5-72B-Instruct) and a preference reward model, including multi-turn agent rollouts with real tool feedback.</li>
+  </ol>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="fig-30-1-title">
+<title id="fig-30-1-title">Qwen3 post-training: four stages for the flagship models, and strong-to-weak distillation for the small models</title>
+<defs><marker id="arrow-30-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="17" y="22" class="s-bold">Flagship models: Qwen3-235B-A22B and Qwen3-32B</text>
+<rect class="s-box" x="17" y="36" width="126" height="72" rx="6"/>
+<text x="80" y="60" text-anchor="middle" class="s-bold">Pretrained base</text>
+<text x="80" y="78" text-anchor="middle" class="s-small">36T tokens</text>
+<text x="80" y="93" text-anchor="middle" class="s-small">3 stages</text>
+<rect class="s-a" x="157" y="36" width="126" height="72" rx="6"/>
+<text x="220" y="60" text-anchor="middle" class="s-bold">1 Cold start</text>
+<text x="220" y="78" text-anchor="middle" class="s-small">long-CoT SFT, small</text>
+<text x="220" y="93" text-anchor="middle" class="s-small">6 response filters</text>
+<rect class="s-b" x="297" y="36" width="126" height="72" rx="6"/>
+<text x="360" y="60" text-anchor="middle" class="s-bold">2 Reasoning RL</text>
+<text x="360" y="78" text-anchor="middle" class="s-small">GRPO, 3,995 pairs</text>
+<text x="360" y="93" text-anchor="middle" class="s-small">AIME'24 70.1 to 85.1</text>
+<rect class="s-c" x="437" y="36" width="126" height="72" rx="6"/>
+<text x="500" y="60" text-anchor="middle" class="s-bold">3 Mode fusion</text>
+<text x="500" y="78" text-anchor="middle" class="s-small">SFT with /think and</text>
+<text x="500" y="93" text-anchor="middle" class="s-small">/no_think flags</text>
+<rect class="s-d" x="577" y="36" width="126" height="72" rx="6"/>
+<text x="640" y="60" text-anchor="middle" class="s-bold">4 General RL</text>
+<text x="640" y="78" text-anchor="middle" class="s-small">20+ tasks, 3 reward</text>
+<text x="640" y="93" text-anchor="middle" class="s-small">types, agents</text>
+<path class="s-line" d="M143,72 L157,72" marker-end="url(#arrow-30-1)"/>
+<path class="s-line" d="M283,72 L297,72" marker-end="url(#arrow-30-1)"/>
+<path class="s-line" d="M423,72 L437,72" marker-end="url(#arrow-30-1)"/>
+<path class="s-line" d="M563,72 L577,72" marker-end="url(#arrow-30-1)"/>
+<text x="17" y="146" class="s-bold">Small models: 0.6B, 1.7B, 4B, 8B, 14B, 30B-A3B</text>
+<rect class="s-box" x="8" y="160" width="120" height="72" rx="6"/>
+<text x="68" y="184" text-anchor="middle" class="s-bold">Small student</text>
+<text x="68" y="202" text-anchor="middle" class="s-small">pretrained base,</text>
+<text x="68" y="217" text-anchor="middle" class="s-small">no stages 1 to 4</text>
+<rect class="s-a" x="152" y="160" width="190" height="72" rx="6"/>
+<text x="247" y="184" text-anchor="middle" class="s-bold">Off-policy phase</text>
+<text x="247" y="202" text-anchor="middle" class="s-small">SFT on teacher outputs</text>
+<text x="247" y="217" text-anchor="middle" class="s-small">in /think and /no_think</text>
+<rect class="s-b" x="366" y="160" width="190" height="72" rx="6"/>
+<text x="461" y="184" text-anchor="middle" class="s-bold">On-policy phase</text>
+<text x="461" y="202" text-anchor="middle" class="s-small">student samples, minimize</text>
+<text x="461" y="217" text-anchor="middle" class="s-small">KL to teacher logits</text>
+<rect class="s-c" x="580" y="160" width="132" height="72" rx="6"/>
+<text x="646" y="184" text-anchor="middle" class="s-bold">Released small</text>
+<text x="646" y="202" text-anchor="middle" class="s-small">models, about 1/10</text>
+<text x="646" y="217" text-anchor="middle" class="s-small">of the GPU hours</text>
+<path class="s-line" d="M128,196 L152,196" marker-end="url(#arrow-30-1)"/>
+<path class="s-line" d="M342,196 L366,196" marker-end="url(#arrow-30-1)"/>
+<path class="s-line" d="M556,196 L580,196" marker-end="url(#arrow-30-1)"/>
+<path class="s-line s-dash" d="M640,108 L640,134 L247,134 L247,160" marker-end="url(#arrow-30-1)"/>
+<path class="s-line s-dash" d="M461,134 L461,160" marker-end="url(#arrow-30-1)"/>
+<text x="600" y="128" text-anchor="end" class="s-small s-muted">teacher: Qwen3-32B or 235B-A22B</text>
+<text x="17" y="262" class="s-small">Distillation versus RL from the same 8B checkpoint (Table 21): AIME'24 74.4 in 1,800 GPU hours</text>
+<text x="17" y="280" class="s-small">against 67.6 in 17,920. Teacher cost is excluded. Page 19 discusses what that comparison leaves out.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Qwen3's post-training. The flagships pass through four stages (top). The six small models skip them and learn from the finished flagships in two phases (bottom, dashed arrows carry teacher outputs and logits). Numbers are from Qwen3 §4.2, §4.5 and Table 21.</figcaption>
+  </figure>
+
+  <p><strong>Thinking budget.</strong> Once a model can answer with or without thinking it can also answer from <em>partial</em> thinking. To cap the thinking length, the serving code halts generation at a user-set threshold and appends the instruction "Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n&lt;/think&gt;.\n\n", after which the model writes its answer. The report stresses that this ability "is not explicitly trained but emerges naturally" from fusion, and shows smooth accuracy gains as the budget grows on four benchmarks <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.3, §4.7]</a>. It is a 思考预算 (thinking budget) enforced outside the model, not a learned length controller.</p>
+
+  <p><strong>Strong-to-weak distillation</strong> (<a href="19-sft-distillation.html">page 19</a>) replaces all four stages for the 0.6B to 14B and 30B-A3B models with two phases: off-policy SFT on teacher outputs in both modes, then on-policy training in which the student samples in either mode and minimizes the KL divergence to the logits of Qwen3-32B or Qwen3-235B-A22B. The report says it needs "only 1/10 of the GPU hours" and improves pass@64, not only pass@1. From one Qwen3-8B checkpoint (AIME'24 55.0, pass@64 90.0), RL reaches 67.6 (pass@64 unchanged at 90.0) with 17,920 GPU hours, and on-policy distillation reaches 74.4 (pass@64 93.3) with 1,800 <a href="https://arxiv.org/abs/2505.09388">[Qwen3, Tab. 21]</a>. The comparison uses one checkpoint and math and code queries only, and it excludes the teacher's cost.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Qwen3-32B</th><th class="num">After reasoning RL (thinking)</th><th class="num">After fusion (thinking)</th><th class="num">After general RL (thinking)</th></tr></thead>
+    <tbody>
+      <tr><td>AIME'24</td><td class="num">83.8</td><td class="num">81.9</td><td class="num">81.4</td></tr>
+      <tr><td>LiveCodeBench v5</td><td class="num">68.4</td><td class="num">67.2</td><td class="num">65.7</td></tr>
+      <tr><td>Arena-Hard</td><td class="num">86.8</td><td class="num">89.4</td><td class="num">93.8</td></tr>
+      <tr><td>ToolUse (in-house)</td><td class="num">63.3</td><td class="num">70.4</td><td class="num">85.5</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: Qwen3 Table 22. The in-house ThinkFollow score (mode switching accuracy) rises from 88.7 after fusion to 98.9 after general RL. The report conjectures that broader training "may compromise" specialized ability and says it chose to accept the trade-off.</p>
+
+  <h3 id="split-2507">2507: undoing the fusion</h3>
+  <p>On July 21, 2025 the Qwen team wrote: "After talking with the community and thinking it through, we decided to stop using hybrid thinking mode. Instead, we'll train Instruct and Thinking models separately so we can get the best quality possible" <a href="https://x.com/Alibaba_Qwen/status/1947344511988076547">[Qwen post]</a>. The new checkpoints, Qwen3-235B-A22B-Instruct-2507 and -Thinking-2507, each state that they support only one mode, and both move to 262,144 native context <a href="https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507">[cards]</a>. Qwen published no ablation of fused against separate training. The strongest in-house evidence is Table 22 above: fusion and general RL lowered AIME and LiveCodeBench in thinking mode while lifting everything general. The underlying tension is that an instruct model is rewarded for short, direct answers and a thinking model for spending tokens, and one set of weights and one RL run must serve both (our reading). DeepSeek went the other way a month later with V3.1's template-switched hybrid (<a href="28-deepseek-3-reasoning.html">page 28</a>). The Qwen3.8-27B card (August 2026) describes a single checkpoint again, with thinking on by default, switchable per request and tunable by a <code>reasoning_effort</code> parameter <a href="https://huggingface.co/Qwen/Qwen3.8-27B">[Qwen3.8-27B card]</a>. The design question was never "fuse or split" but how to control reasoning length without hurting the peak.</p>
+</section>
+
+<section>
+  <h2 id="gspo">GSPO: a sequence-level ratio for MoE reinforcement learning</h2>
+  <p>GRPO (<a href="24-rlvr-reasoning.html">page 24</a>) multiplies each token's advantage by a per-token ratio \(w_{i,t} = \pi_\theta(y_{i,t} \mid x, y_{i,\lt t}) / \pi_{\text{old}}(y_{i,t} \mid x, y_{i,\lt t})\) and clips each token. Group Sequence Policy Optimization (GSPO), from the Qwen team <a href="https://arxiv.org/abs/2507.18071">[Zheng et al. 2025]</a>, changes the unit to the whole response:</p>
+  <div class="eq-box">
+  \[ s_i(\theta) = \left(\frac{\pi_\theta(y_i \mid x)}{\pi_{\text{old}}(y_i \mid x)}\right)^{1/|y_i|} = \exp\!\Big(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|} \log\frac{\pi_\theta(y_{i,t} \mid x, y_{i,\lt t})}{\pi_{\text{old}}(y_{i,t} \mid x, y_{i,\lt t})}\Big), \qquad J = \E\Big[\frac1G \sum_{i=1}^{G} \min\big(s_i \hat A_i,\ \clip(s_i, 1-\varepsilon, 1+\varepsilon)\, \hat A_i\big)\Big] \]
+  <div class="eq-label">\(\hat A_i\) is the group-normalized reward, as in GRPO; \(s_i\) is the geometric mean of the token ratios</div>
+  </div>
+  <p>The argument has four steps.</p>
+  <ol>
+    <li><strong>Token ratios cannot do their job.</strong> Importance sampling corrects a distribution mismatch by averaging a weight over many samples. A token-level ratio uses one sampled token from each next-token distribution, so it corrects nothing and instead injects high-variance noise that "accumulates over long sequences and is exacerbated by the clipping mechanism" <a href="https://arxiv.org/abs/2507.18071">[GSPO, §3]</a>. Their principle: the unit of the objective should match the unit of the reward, and the reward is per sequence.</li>
+    <li><strong>The gradient changes.</strong> GSPO's gradient is \(\frac1G \sum_i s_i \hat A_i \cdot \frac{1}{|y_i|}\sum_t \nabla \log \pi_\theta(y_{i,t} \mid \cdot)\): every token of a response gets the same weight. In GRPO each token is weighted by its own \(w_{i,t}\), which lies in \((0, 1+\varepsilon]\) for positive advantages and \([1-\varepsilon, \infty)\) for negative ones, and those unequal weights compound over training <a href="https://arxiv.org/abs/2507.18071">[§4.2]</a>.</li>
+    <li><strong>MoE makes it worse.</strong> In the 48-layer Qwen3-30B-A3B-Base, "roughly 10% of the experts activated under the new policy are different from those under the old policy" for the same rollout after every gradient update. Routing flips make token likelihoods jump, so token ratios fluctuate wildly. Qwen's earlier fix was <em>Routing Replay</em>: cache the experts chosen under \(\pi_{\text{old}}\) and force them under \(\pi_\theta\), at a cost in memory and communication and a cap on model capacity <a href="https://arxiv.org/abs/2507.18071">[§5.3]</a>. A sequence likelihood is much steadier than any single token's, because the model keeps its language-modeling ability even when individual routes change, so GSPO trains MoE models without replay.</li>
+    <li><strong>The scale of \(\varepsilon\) changes.</strong> The paper uses clipping ranges of \(3 \times 10^{-4}\) (left) and \(4 \times 10^{-4}\) (right) for GSPO against 0.2 and 0.27 for its tuned GRPO baseline, and the average fraction of clipped tokens is 0.0013 for GSPO against 0.15 for GRPO, two orders of magnitude apart. GSPO clips far more tokens (a whole response at a time) and still learns faster per unit of compute, which they read as evidence that token-level gradients were noisy <a href="https://arxiv.org/abs/2507.18071">[§5.1-5.2]</a>.</li>
+  </ol>
+  <p><strong>What \(\varepsilon = 4 \times 10^{-4}\) means.</strong> \(s_i^{|y_i|}\) is the ratio of full-sequence probabilities. For a 1,000-token response, \(s_i = 1 + 4 \times 10^{-4}\) corresponds to \((1 + 4 \times 10^{-4})^{1000} = e^{0.4} \approx 1.49\): the response is clipped once the new policy assigns it about 49% more probability than the old one, which is a mean per-token log-ratio of only 0.0004. Per-token GRPO clipping is loose by comparison: a 0.1% change on every token of the same response compounds to \(1.001^{1000} \approx 2.7\) on the sequence, yet no token comes near the 0.8 to 1.27 clip band.</p>
+  <p>The same paper argues an infrastructure benefit: sequence likelihoods tolerate the numerical gap between training and inference engines, so the engine's log-probabilities could be used without recomputation, which matters for partial rollouts and multi-turn RL <a href="https://arxiv.org/abs/2507.18071">[§5.4]</a> (<a href="25-rl-systems-agentic.html">page 25</a>). A token-level variant, GSPO-token, keeps the same numerical ratio but lets each token have its own advantage for multi-turn credit assignment. The clipping ranges, the ratio computation and the loss are implemented in the <code>grpo</code> drill of <a href="24-rlvr-reasoning.html">page 24</a>, so this page does not repeat them.</p>
+
+  <div class="decision">
+    <div class="decision-title">GSPO</div>
+    <dl>
+      <dt>Problem</dt><dd>Token-level importance ratios are single-sample weights whose noise grows with response length and, in MoE models, is amplified by routing changes after every update.</dd>
+      <dt>Idea</dt><dd>Use the length-normalized sequence likelihood ratio, clip whole responses, and give every token in a response the same weight.</dd>
+      <dt>Why it works</dt><dd>One ratio per reward-bearing unit; sequence likelihood is insensitive to which experts happened to fire for individual tokens.</dd>
+      <dt>Evidence</dt><dd>On a cold-start model from Qwen3-30B-A3B-Base, higher reward and benchmark scores per unit of compute than GRPO with Routing Replay on AIME'24, LiveCodeBench and CodeForces <a href="https://arxiv.org/abs/2507.18071">[GSPO, Fig. 1]</a>. Qwen states that it contributed to the latest Qwen3 models.</dd>
+      <dt>Cost</dt><dd>\(\varepsilon\) must be re-tuned to a new scale; one ratio per response is coarse, and a token-level variant is needed when advantages differ per token. The evidence comes from one lab's runs on one model family, and DeepSeek kept a replay-style fix for its MoE instead (Keep Routing, in <a href="28-deepseek-3-reasoning.html">page 28</a>).</dd>
+      <dt>Used by</dt><dd>Qwen3 RL (per the paper); the Qwen-AgentWorld-35B-A3B card lists RL with GSPO in its training stages <a href="https://huggingface.co/Qwen/Qwen-AgentWorld-35B-A3B">[card]</a>; supported in verl.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="gated-attention">Gated attention: the mechanism Qwen3-Next ships</h2>
+  <p>Softmax attention cannot "do nothing": every row sums to 1, so a head with nothing useful to say parks its mass on a sink token, and the network learns huge activations to make that stable. The Qwen team asked whether a gate fixes this and compared 30 variants on 15B-A2.54B MoE and 1.7B dense models trained on up to 3.5T tokens <a href="https://arxiv.org/abs/2505.06708">[Qiu et al. 2025]</a>. The winner multiplies the attention output of each head, before the output projection \(W_O\), by an elementwise sigmoid gate computed from the layer's own pre-normed hidden state \(X\) (position G1, <a href="11-stability-tweaks.html">page 11</a> has the full study):</p>
+  \[ Y' = Y \odot \sigma(X W_\theta), \qquad Y \in \R^{T \times n_h \times d_h}, \quad W_\theta \in \R^{d \times n_h d_h} \]
+  <p>On the 15B MoE at 400B tokens, perplexity falls from 6.026 to 5.761 and MMLU rises from 58.79 to 60.82, for 201M extra parameters (1.3%) and under 2% wall time; a headwise gate (one scalar per head) costs 1.6M parameters and reaches 5.792. Parameter-matched controls do worse: 8 KV heads (+50M) gives 5.979, 48 query heads (+201M) 5.953 and four more experts (+400M) 5.964. The mean share of attention that the first token receives drops from 46.7% to 4.8%, and after YaRN extension to 128K the RULER score rises from 31.65 to 58.82 <a href="https://arxiv.org/abs/2505.06708">[Tab. 1, Fig. 2, Tab. 5]</a>. The authors' two explanations are non-linearity (per head, \(W_V W_O\) is one low-rank linear map, and the gate puts a non-linearity in between) and sparsity (the gates are small and query-dependent, so a head can silence itself).</p>
+  <p>Qwen3 itself, released two weeks before that paper appeared, uses QK-norm and no gate. Qwen3-Next is the first shipped use. Its checkpoint has a query projection of \(8192 \times 2048\) for 16 heads of 256, that is \(2 \cdot 16 \cdot 256\), and in the Hugging Face implementation that projection is split per head into a query and a gate, and the head outputs are multiplied by \(\sigma(\text{gate})\) before <code>o_proj</code> (<a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py">modeling_qwen3_next.py</a>). The gate's weights are stored fused with the query projection (one matrix of twice the width), which is the same computation as the paper's separate \(W_\theta\) applied to the same pre-normed input. The Gated DeltaNet layers have their own output gate, an RMSNorm gated by SiLU as in the original Gated DeltaNet. The Qwen3.8-Next design paper replaces it with a bounded sigmoid gate, \(o_t = W_o[\sigma(W_z x_t) \odot \RMSNorm(y_t)]\), and reports consistent improvements <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next design paper, Eq. 11]</a>. The Qwen3-Next blog says the output gate removes attention sinks and massive activations; the measurements behind that statement are those of the 2025 paper, not repeated for Qwen3-Next itself.</p>
+  <div class="decision">
+    <div class="decision-title">Gated attention</div>
+    <dl>
+      <dt>Problem</dt><dd>No "no-op" option in softmax attention: attention sinks, massive activations, loss spikes at high learning rates, brittle length extension.</dd>
+      <dt>Idea</dt><dd>Sigmoid gate on each head's output, computed from the current token's hidden state.</dd>
+      <dt>Why it works</dt><dd>Adds non-linearity between \(W_V\) and \(W_O\) and lets each head emit near zero for irrelevant queries.</dd>
+      <dt>Evidence</dt><dd>See the numbers above; the study covers two scales and up to 3.5T tokens, all from one team.</dd>
+      <dt>Cost</dt><dd>+1.3% parameters (elementwise), a wider query projection, under 2% latency. Not compared with learned sink logits (gpt-oss), so the two are unranked.</dd>
+      <dt>Used by</dt><dd>The full-attention layers of Qwen3-Next, Qwen3.5 to Qwen3.8 (<code>attn_output_gate: true</code> in the configs).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="qwen3-next">Qwen3-Next: a hybrid, ultra-sparse design (September 2025)</h2>
+  <p>Qwen3-Next-80B-A3B is billed as the first installment of a series that tests architecture for training and inference efficiency at long context. It combines four ideas: a 3:1 hybrid of Gated DeltaNet and gated softmax attention (<a href="09-beyond-full-attention.html">page 09</a> derives the delta rule and the chunkwise algorithm, which this page does not repeat), a much sparser MoE, stability changes to the normalization and router, and multi-token prediction (MTP, <a href="11-stability-tweaks.html">page 11</a>) <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">[model card]</a>. It was pretrained on 15T tokens, a subset of Qwen3's 36T corpus according to the announcement <a href="https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd">[Qwen3-Next blog]</a>.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th>Qwen3-Next-80B-A3B</th></tr></thead>
+    <tbody>
+      <tr><td>Layout</td><td>48 layers = 12 × (3 × (Gated DeltaNet, MoE) + 1 × (Gated attention, MoE)); width \(d = 2048\)</td></tr>
+      <tr><td>Gated attention (12 layers)</td><td>16 query heads, 2 KV heads, \(d_h = 256\); RoPE on 64 of the 256 dimensions (partial rotary factor 0.25, base \(10^7\)); QK-norm; sigmoid output gate</td></tr>
+      <tr><td>Gated DeltaNet (36 layers)</td><td>16 query/key heads and 32 value heads of dimension 128; causal convolution of width 4; RMSNorm gated by SiLU on the output</td></tr>
+      <tr><td>MoE (every layer)</td><td>512 routed experts of width 512, softmax router over all 512, top-10 weights renormalized (<code>norm_topk_prob</code>); plus 1 shared expert scaled by its own sigmoid scalar gate</td></tr>
+      <tr><td>Other</td><td>Vocabulary rows 151,936; untied embeddings; one MTP module; 262,144 native context, extensible to 1,010,000</td></tr>
+      <tr><td>Size</td><td>"80B total, 3B activated". Our count from the checkpoint: 79.67B without the MTP module (81.32B with it), 3.25B active without embeddings</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 430" role="img" aria-labelledby="fig-30-2-title">
+<title id="fig-30-2-title">Qwen3-Next layer layout: three Gated DeltaNet layers then one gated attention layer, each followed by an MoE block, repeated 12 times, with the shapes of each component and the resulting cache</title>
+<text x="10" y="20" class="s-bold">Layout: 48 layers = 12 blocks of 4</text>
+<rect class="s-plain s-dash" x="10" y="32" width="330" height="238" rx="8"/>
+<rect class="s-c" x="26" y="46" width="160" height="42" rx="6"/>
+<text x="106" y="64" text-anchor="middle" class="s-bold">Gated DeltaNet</text>
+<text x="106" y="80" text-anchor="middle" class="s-small">fixed-size state</text>
+<rect class="s-d" x="214" y="46" width="112" height="42" rx="6"/>
+<text x="270" y="64" text-anchor="middle" class="s-bold">MoE</text>
+<text x="270" y="80" text-anchor="middle" class="s-small">10 + 1 of 512</text>
+<rect class="s-c" x="26" y="100" width="160" height="42" rx="6"/>
+<text x="106" y="118" text-anchor="middle" class="s-bold">Gated DeltaNet</text>
+<text x="106" y="134" text-anchor="middle" class="s-small">fixed-size state</text>
+<rect class="s-d" x="214" y="100" width="112" height="42" rx="6"/>
+<text x="270" y="118" text-anchor="middle" class="s-bold">MoE</text>
+<text x="270" y="134" text-anchor="middle" class="s-small">10 + 1 of 512</text>
+<rect class="s-c" x="26" y="154" width="160" height="42" rx="6"/>
+<text x="106" y="172" text-anchor="middle" class="s-bold">Gated DeltaNet</text>
+<text x="106" y="188" text-anchor="middle" class="s-small">fixed-size state</text>
+<rect class="s-d" x="214" y="154" width="112" height="42" rx="6"/>
+<text x="270" y="172" text-anchor="middle" class="s-bold">MoE</text>
+<text x="270" y="188" text-anchor="middle" class="s-small">10 + 1 of 512</text>
+<rect class="s-a" x="26" y="208" width="160" height="42" rx="6"/>
+<text x="106" y="226" text-anchor="middle" class="s-bold">Gated attention</text>
+<text x="106" y="242" text-anchor="middle" class="s-small">softmax, KV cache</text>
+<rect class="s-d" x="214" y="208" width="112" height="42" rx="6"/>
+<text x="270" y="226" text-anchor="middle" class="s-bold">MoE</text>
+<text x="270" y="242" text-anchor="middle" class="s-small">10 + 1 of 512</text>
+<text x="175" y="264" text-anchor="middle" class="s-small s-muted">repeat this block 12 times</text>
+<rect class="s-c" x="360" y="32" width="350" height="98" rx="8"/>
+<text x="372" y="52" class="s-bold">Gated DeltaNet layer (36 of 48)</text>
+<text x="372" y="70" class="s-small">16 Q/K heads, 32 V heads, dimension 128</text>
+<text x="372" y="86" class="s-small">short causal conv (width 4), L2-normed q and k</text>
+<text x="372" y="102" class="s-small">state: 32 heads of 128 x 128 = 524,288 numbers</text>
+<text x="372" y="118" class="s-small">SiLU-gated output norm; nothing grows with length</text>
+<rect class="s-a" x="360" y="142" width="350" height="98" rx="8"/>
+<text x="372" y="162" class="s-bold">Gated attention layer (12 of 48)</text>
+<text x="372" y="180" class="s-small">16 Q heads, 2 KV heads, d_h = 256, QK-norm</text>
+<text x="372" y="196" class="s-small">RoPE on 64 of 256 dims (25%), sigmoid head gate</text>
+<text x="372" y="212" class="s-small">cache: 2 (K,V) x 2 heads x 256 x 2 B = 2 KiB / token</text>
+<text x="372" y="228" class="s-small">the only layers that can look up an exact token</text>
+<rect class="s-d" x="360" y="252" width="350" height="98" rx="8"/>
+<text x="372" y="272" class="s-bold">MoE block (all 48 layers)</text>
+<text x="372" y="290" class="s-small">512 routed experts of width 512, top-10 + 1 shared</text>
+<text x="372" y="306" class="s-small">softmax router, top-10 renormalized, shared expert gated</text>
+<text x="372" y="322" class="s-small">3.25B active of 79.67B (2 percent of the routed</text>
+<text x="372" y="338" class="s-small">experts run, but every expert must stay in memory)</text>
+<rect class="s-box" x="10" y="366" width="700" height="56" rx="8"/>
+<text x="22" y="386" class="s-small">Per token at 128K tokens: 12 layers x 2 KiB = 24 KiB, so 3.0 GiB, plus a fixed 36 x 2 MiB = 72 MiB state (fp32, assumed).</text>
+<text x="22" y="406" class="s-small">Qwen3-32B for comparison: 64 layers x 4 KiB = 256 KiB per token, 32 GiB, growing with every token.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Qwen3-Next's layout. Colors match between the stack and the cards: three of every four token mixers are Gated DeltaNet layers with a fixed-size state, the fourth is gated softmax attention with 2 KV heads of dimension 256, and every layer ends in an MoE block. Only the amber layers grow a cache, which is where the memory saving comes from.</figcaption>
+  </figure>
+
+  <h3 id="next-why">Why each choice</h3>
+  <div class="decision">
+    <div class="decision-title">3:1 Gated DeltaNet to gated attention</div>
+    <dl>
+      <dt>Problem</dt><dd>Softmax attention costs \(O(T^2)\) FLOPs and a KV cache that grows with \(T\); agentic and long-document workloads made both the binding constraint. Pure linear layers keep a fixed state but cannot retrieve exact tokens.</dd>
+      <dt>Idea</dt><dd>Keep three linear-time Gated DeltaNet layers per softmax layer (75% to 25%), so the model has a compact running memory and periodic exact lookup. The 25% layer gets a wider head (128 to 256), partial RoPE and the output gate.</dd>
+      <dt>Why it works</dt><dd>The delta rule writes a key-value pair by first erasing what the state already predicts for that key, so a fixed matrix state behaves like an associative memory with overwrite, not a running sum (<a href="09-beyond-full-attention.html">page 09</a>). The remaining softmax layers supply what a finite state cannot: exact recall of any earlier token. The blog reports that Gated DeltaNet beats sliding-window attention and Mamba2 in in-context learning.</dd>
+      <dt>Evidence</dt><dd>A later Qwen study trains three 28-layer 25B-A3B MoE models (400B tokens at 4K, then 80B at 32K) and reports averages over nine benchmarks of 49.87 for full attention, 51.15 for a window-128 SWA hybrid and 53.81 for the GDN hybrid. The GDN hybrid beats full attention on 8 of 9 benchmarks and SWA on 7 of 9, and it loses on EvalPlus (49.71 against 51.01 and 52.12) <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next design paper, Tab. 1]</a>. The same paper finds that removing RoPE from the full-attention layers (NoPE) looks identical in pretraining but produces a "substantially higher rate of endless generation after post-training".</dd>
+      <dt>Cost</dt><dd>A fixed state cannot store more than its capacity, so retrieval-heavy tasks must route through the 12 softmax layers. New kernels (chunkwise recurrence), state precision (fp32) and prefix-caching design are needed, and the benefit appears only at long \(T\) (see below). One lab's ablation at 25B-A3B and 480B tokens is not evidence at 1M tokens (<a href="09-beyond-full-attention.html">page 09</a> lists conflicting results from MiniMax and GLM).</dd>
+      <dt>Used by</dt><dd>Qwen3-Next, Qwen3-Coder-Next, Qwen3.5, Qwen3.6, Qwen3.8 (all 3:1). Kimi Linear uses the same ratio with a different linear layer.</dd>
+    </dl>
+  </div>
+
+  <div class="decision">
+    <div class="decision-title">Ultra-sparse MoE, stable normalization, MTP</div>
+    <dl>
+      <dt>Problem</dt><dd>At long context the cost of an MoE model is attention plus the cost of moving weights; the FFN's FLOPs per token can be cut further by activating a smaller fraction of a bigger expert pool.</dd>
+      <dt>Idea</dt><dd>512 routed experts of width 512 with 10 active and 1 shared, that is 2% of routed experts against 6.25% in Qwen3-235B-A22B (8 of 128) and 3.1% in DeepSeek-V3 (8 of 256). The number of possible expert sets grows from \(\binom{128}{8} \approx 10^{12}\) to \(\binom{512}{10} \approx 10^{20.5}\). Unlike Qwen3, it brings back a shared expert.</dd>
+      <dt>Why it works</dt><dd>Same argument as fine-grained experts (<a href="08-mixture-of-experts.html">page 08</a>): finer experts give more specialization per activated FLOP, and global-batch balancing keeps them used. Stability changes follow: RMSNorm gains are applied as \(1 + w\) with \(w\) initialized to zero ("zero-centered", checked in the Hugging Face implementation) and weight-decayed, "to constrain the growth of RMSNorm weights" <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next design paper, §2.1.1]</a>, router weights are normalized at initialization so early expert selection is unbiased, and the output gate removes sinks and massive activations (Qwen blog). MTP is trained in several steps so training matches inference, giving a high acceptance rate for speculative decoding.</dd>
+      <dt>Evidence</dt><dd>The sources we read give <em>no ablation</em> of the expert count, the zero-centered norm or the router initialization, only the end result: the base model "outperforms Qwen3-32B-Base on downstream tasks with 10% of the total training cost", and the instruct model is "on par with Qwen3-235B-A22B-Instruct-2507 on certain benchmarks" (for example AIME25 69.5 against 70.3, LiveCodeBench v6 56.6 against 51.8, MMLU-Pro 80.6 against 83.0) <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">[model card]</a>.</dd>
+      <dt>Cost</dt><dd>All 80B parameters stay resident (about 160 GB in bf16) although about 3B are used per token; each 512-wide expert is a small GEMM; every token fans out to 11 experts, which stresses all-to-all communication and balancing.</dd>
+      <dt>Used by</dt><dd>Qwen3-Next, Qwen3.5-397B-A17B (512 experts, 10 + 1), Qwen3.8-2.4T-A95B (512, 10 + 1). The smaller Qwen3.5 and 3.6 models use 256 experts with 8 + 1.</dd>
+    </dl>
+  </div>
+
+  <h3 id="next-numbers">Worked numbers: parameters, cache and state</h3>
+  <p>From the shapes in the released checkpoint (one row per tensor type):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th class="num">Parameters</th><th class="num">Share</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Routed experts (48 layers)</td><td class="num">77,309,411,328</td><td class="num">97.03%</td><td>\(48 \cdot 512 \cdot 3 \cdot 2048 \cdot 512\); 10 of 512 active</td></tr>
+      <tr><td>Gated DeltaNet layers (36)</td><td class="num">1,213,864,704</td><td class="num">1.52%</td><td>33,718,464 per layer: <code>in_proj_qkvz</code> \(2048 \times 12288\), <code>out_proj</code> \(4096 \times 2048\), convolution, gates</td></tr>
+      <tr><td>Gated attention layers (12)</td><td class="num">327,161,856</td><td class="num">0.41%</td><td>27,263,488 per layer; <code>q_proj</code> is \(8192 \times 2048\) (queries plus gate)</td></tr>
+      <tr><td>Shared experts, routers, gates, norms</td><td class="num">201,623,552</td><td class="num">0.25%</td><td>always active</td></tr>
+      <tr><td>Embedding plus LM head</td><td class="num">622,329,856</td><td class="num">0.78%</td><td>\(2 \cdot 151{,}936 \cdot 2048\)</td></tr>
+      <tr class="hl"><td><strong>Total without MTP</strong></td><td class="num">79,674,391,296</td><td class="num">100%</td><td>the MTP module adds 1,650,471,424</td></tr>
+    </tbody>
+  </table></div>
+  <p>Active without embeddings: \(79{,}674{,}391{,}296 - 622{,}329{,}856 - 77{,}309{,}411{,}328 + \tfrac{10}{512} \cdot 77{,}309{,}411{,}328 = 3{,}252{,}599{,}552\). Attention and Gated DeltaNet layers together are 47% of those active weights, so at any length the token mixers, not the experts, are the largest single cost per token.</p>
+
+  <p>Inference memory for one sequence (bf16 cache; Gated DeltaNet state assumed fp32, which the Qwen3.5 config sets explicitly and the Qwen3-Next config does not state):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Cached layers</th><th class="num">Per layer per token</th><th class="num">Per token</th><th class="num">128K tokens</th><th class="num">Fixed state</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3-32B</td><td class="num">64 of 64</td><td class="num">\(2 \cdot 8 \cdot 128 \cdot 2 = 4096\) B</td><td class="num">256 KiB</td><td class="num">32 GiB</td><td class="num">none</td></tr>
+      <tr><td>Qwen3-235B-A22B</td><td class="num">94 of 94</td><td class="num">\(2 \cdot 4 \cdot 128 \cdot 2 = 2048\) B</td><td class="num">188 KiB</td><td class="num">23.5 GiB</td><td class="num">none</td></tr>
+      <tr class="hl"><td><strong>Qwen3-Next-80B-A3B</strong></td><td class="num">12 of 48</td><td class="num">\(2 \cdot 2 \cdot 256 \cdot 2 = 2048\) B</td><td class="num">24 KiB</td><td class="num">3.0 GiB</td><td class="num">\(36 \cdot 32 \cdot 128^2 \cdot 4\) B = 72 MiB</td></tr>
+      <tr><td>Qwen3.5-397B-A17B</td><td class="num">15 of 60</td><td class="num">\(2 \cdot 2 \cdot 256 \cdot 2 = 2048\) B</td><td class="num">30 KiB</td><td class="num">3.75 GiB</td><td class="num">\(45 \cdot 64 \cdot 128^2 \cdot 4\) B = 180 MiB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Qwen3-Next's KV cache is \(256 / 24 = 10.7\times\) smaller than Qwen3-32B's, from two factors: 5.3× fewer cached layers (12 versus 64) and 2× fewer bytes per cached layer (2 KV heads of 256 versus 8 of 128). With the state included the ratio at 128K is 10.4× (32 GiB against 3.07 GiB). The state is a fixed cost: it equals the KV cache at \(72\text{ MiB} / 24\text{ KiB} = 3{,}072\) tokens (1,536 with a bf16 state), so below a few thousand tokens the hybrid is <em>not</em> smaller per sequence, and the saving is a long-context effect. Decode intensity of a softmax layer (\(n_h / n_{kv}\), <a href="07-kv-efficient-attention.html">page 07</a>) is 8 for Qwen3-Next and Qwen3-32B alike, so the layers that remain are still bandwidth-bound; the gain is that there are fewer of them. The second drill computes exactly this.</p>
+
+  <p><strong>Vendor claims, not independently reproduced.</strong> The announcement (read via Alibaba Cloud's copy of the post, since the qwen.ai page did not render for us) says the base model needs "less than 80% of the GPU hours" of Qwen3-30B-A3B and 9.3% of the compute cost of Qwen3-32B, and that prefill throughput against Qwen3-32B is 7× at 4K context and above 10× beyond 32K, with decode 4× at 4K and above 10× beyond 32K. The cache arithmetic above makes the long-context direction plausible; the exact multiples depend on their kernels and hardware.</p>
+
+  <h3 id="next-trade">Trade-offs to state in an interview</h3>
+  <ul>
+    <li><strong>Recall versus memory.</strong> The 36 linear layers hold \(32 \cdot 128 \cdot 128\) numbers each regardless of length; exact multi-needle retrieval must come from the 12 softmax layers. The design bets that a 25% softmax budget is enough, and the evidence at 1M tokens is mixed (<a href="09-beyond-full-attention.html">page 09</a>).</li>
+    <li><strong>Sparsity versus systems.</strong> 3B active parameters do not mean 3B of memory traffic: a batch of decode tokens touches most experts, so the weights are read from HBM almost in full. Expert parallelism and balance matter more, not less.</li>
+    <li><strong>Infrastructure risk.</strong> Recurrent state complicates prefix caching, speculative decoding and precision. Qwen3-Next ships MTP partly to offset decode cost.</li>
+    <li><strong>Position encoding.</strong> RoPE is kept on 25% of head dimensions in the softmax layers, and the Qwen ablation warns against removing it.</li>
+  </ul>
+  <p><strong>Where it went.</strong> Qwen3-Coder-Next (80B-A3B, released as weights on January 30, 2026 and described in a February 28 report) starts from the Qwen3-Next base, continues pretraining on code and agent data with the context extended from 32,768 to 262,144 tokens, then trains specialist experts (web development, UX, single-turn RL, software engineering) and distills them into one model <a href="https://arxiv.org/abs/2603.00729">[Qwen3-Coder-Next, §3-4]</a>. The rest of the family followed the same layout, as the next section shows.</p>
+</section>
+
+<section>
+  <h2 id="later">After Qwen3-Next: Qwen3.5 to Qwen3.8 (as of September 2026)</h2>
+  <p>The Hugging Face listing of the Qwen organization (checked on September 29, 2026) shows four generations of open language models after Qwen3-Next. It shows no open-weight Qwen3.7 and no Qwen4. Everything below comes from model cards and <code>config.json</code> files unless another source is named. <span class="unverified" title="Absence claim: we searched arXiv through alphaXiv and the Hub listing only, so a report could exist that we did not find">We found no arXiv technical report for the Qwen3.5, Qwen3.6 or Qwen3.8 main models</span>. The design paper for the Qwen3.8-Next architecture is the only Qwen report in this period that documents ablations, and it cites the Qwen3.5 announcement as "Qwen3.5: Towards native multimodal agents" (February 2026).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model (Hub date)</th><th class="num">Total / active</th><th class="num">Layers (3:1)</th><th class="num">Softmax layers: Q / KV heads × \(d_h\)</th><th>FFN</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3-Next-80B-A3B (Sep 9, 2025)</td><td class="num">80B / 3B</td><td class="num">48</td><td class="num">16 / 2 × 256</td><td>512 experts, 10 + 1, width 512</td></tr>
+      <tr><td>Qwen3-Coder-Next (Jan 30, 2026)</td><td class="num">80B / 3B</td><td class="num">48</td><td class="num">16 / 2 × 256</td><td>same as Qwen3-Next</td></tr>
+      <tr class="hl"><td>Qwen3.5-397B-A17B (Feb 16, 2026)</td><td class="num">397B / 17B</td><td class="num">60</td><td class="num">32 / 2 × 256</td><td>512 experts, 10 + 1, width 1024</td></tr>
+      <tr><td>Qwen3.5-122B-A10B (Feb 24, 2026)</td><td class="num">122B / 10B</td><td class="num">48</td><td class="num">32 / 2 × 256</td><td>256 experts, 8 + 1, width 1024</td></tr>
+      <tr><td>Qwen3.5-35B-A3B; Qwen3.6-35B-A3B (Apr 15, 2026)</td><td class="num">35B / 3B</td><td class="num">40</td><td class="num">16 / 2 × 256</td><td>256 experts, 8 + 1, width 512</td></tr>
+      <tr><td>Qwen3.5-27B; Qwen3.6-27B (Apr 21); Qwen3.8-27B (Aug 5)</td><td class="num">27B dense</td><td class="num">64</td><td class="num">24 / 4 × 256</td><td>dense, width 17,408</td></tr>
+      <tr class="hl"><td>Qwen3.8-2.4T-A95B (Aug 8, 2026)</td><td class="num">2.4T / 95B</td><td class="num">92</td><td class="num">64 / 4 × 256</td><td>512 experts, 10 + 1, width 2048</td></tr>
+      <tr><td>Qwen3.8-Flash-Next (Aug 24, 2026)</td><td class="num">125B / 6B (+51B n-gram embeddings)</td><td class="num">48</td><td class="num">24 / 2 × 256 (sparse)</td><td>512 experts, 10 + 1, width 640</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Totals and active counts are as reported on the cards (the conventions differ, see above). Layer counts, heads and widths are from the cards and configs. Every model has one softmax layer in four and 262,144 native context (extensible to about 1M). Smaller Qwen3.5 dense models (0.8B to 9B) also exist.</p>
+
+  <h3 id="later-same">What stayed the same</h3>
+  <ul>
+    <li><strong>The 3:1 layout and the softmax layer's shape</strong> (head dimension 256, 2 to 4 KV heads, partial RoPE with 64 rotary dimensions, output gate on: <code>attn_output_gate: true</code>). The hybrid is not tied to MoE: the 27B models use dense FFNs with the same 3:1 token mixing.</li>
+    <li><strong>The cache stays small.</strong> Qwen3.5-397B caches 15 layers at 2 KiB per token (30 KiB, 3.75 GiB at 128K plus 180 MiB of state); the 27B models cache 16 layers at 4 KiB (64 KiB, 8 GiB at 128K); Qwen3.8-2.4T caches 23 layers at 4 KiB (92 KiB, 11.5 GiB at 128K plus \(69 \cdot 128 \cdot 128^2 \cdot 4\) B = 552 MiB of state).</li>
+    <li><strong>Qwen3.6 changed the recipe, not the shapes.</strong> The Qwen3.6 35B-A3B and 27B configs have the same dimensions as their Qwen3.5 counterparts, and the card describes agentic coding and a "thinking preservation" option (keep reasoning from earlier messages). Qwen3.8-27B likewise has the same dimensions as Qwen3.6-27B, and the Qwen3.8 cards say it is "built on the architectural foundation of Qwen3.5". <span class="unverified" title="The Qwen3.6 and later configs add an output_gate_type field with value swish that the Qwen3.5 configs lack; we found no documentation of whether it changes behavior">Whether a new gate option in the Qwen3.6 configs changes behavior is undocumented in what we read</span>.</li>
+  </ul>
+
+  <h3 id="later-new">What changed</h3>
+  <ul>
+    <li><strong>Native multimodality (3.5).</strong> Early fusion of multimodal tokens with a vision encoder, a vocabulary of about 248K (248,320 padded rows) and 201 languages and dialects. The card claims "near-100% multimodal training efficiency compared to text-only training" and RL "across million-agent environments", both self-reported.</li>
+    <li><strong>Scale and licensing (3.8).</strong> The 2.4T-A95B model is the largest open Qwen release (hidden size 8192, 92 layers) and ships under a custom "qwen3.8-max" license, while the 27B is Apache 2.0 and Flash-Next uses a "qwen-community" license. Check the license before assuming "open" means "Apache".</li>
+    <li><strong>Reasoning control.</strong> Single checkpoints with a <code>reasoning_effort</code> knob and <code>preserve_thinking</code>, after the 2507 split (see above).</li>
+  </ul>
+
+  <h3 id="flash-next">Qwen3.8-Flash-Next: the announced preview of "Qwen4"</h3>
+  <p>The Flash-Next card calls the model an "experimental preview of the architecture that will underpin Qwen4", and the design paper (August 2026) documents its four changes <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next design paper]</a>:</p>
+  <ul>
+    <li><strong>Qwen Sparse Attention (QSA).</strong> The softmax layers become sparse at continued pretraining (256K sequences): a compressed indexer average-pools keys in blocks of \(r = 4\) tokens and each query keeps its top 512 blocks (2,048 tokens). Training has a dense-distillation warm-up (about 2B tokens) and about 200B tokens of sparse training, with loss within about \(10^{-4}\) of full attention. At 1M tokens the kernels are 7.6× faster in prefill and 4.9× in decode (<a href="09-beyond-full-attention.html">page 09</a>).</li>
+    <li><strong>Gated Residual.</strong> The residual stream is widened to four branches, read through an elementwise gate and written through a per-branch scalar gate. An isolated ablation identifies the gate as a key contributor to stability under four times the optimal learning rate.</li>
+    <li><strong>N-gram embeddings.</strong> A single table of 20M bigram and trigram entries, injected at layer 2, adds 51B parameters held in host memory and prefetched, so parameter count grows with negligible FLOPs. The paper finds that loss falls monotonically with table size while downstream accuracy saturates.</li>
+    <li><strong>Optimizer recipe.</strong> Muon (8 Newton-Schulz steps) for 2D linear maps and AdamW for embeddings, output head, router and the low-rank gate projections; a refit hyperparameter scaling law that predicts larger batches and learning rates; no batch-size warmup (it would cost 18.8% more optimizer steps); and a full-scale run reported to have had no loss spike and no need for qk-clip or SwiGLU-clip.</li>
+  </ul>
+  <p>The headline is self-reported: on 14 pretraining benchmarks the base model leads the 397B-A17B model on 8 and trails it by at most 2.6 points on the rest, with one third of the activated parameters, one third of the tokens and roughly one ninth of the training FLOPs <a href="https://arxiv.org/abs/2608.30320">[Abstract]</a>. Treat it as a strong claim from one lab, awaiting independent replication, and note the pattern across the whole page: Qwen's architecture changes since Qwen3-Next were introduced mainly to make long-context and agentic workloads cheaper, and each was justified by the lab's own ablations.</p>
+</section>
+
+<section>
+  <h2 id="vs-deepseek">Qwen versus DeepSeek: same problems, different bets</h2>
+  <p>Both labs build fine-grained MoE models with about 8 active experts, both train with GRPO-family RL, and both moved to long-context efficiency tricks in 2025 and 2026. The table compares the flagship MoE of each at the same point in time (April 2025 to early 2025 for the DeepSeek side), using the reference model of the style guide for V3.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Choice</th><th>Qwen3-235B-A22B</th><th>DeepSeek-V3</th></tr></thead>
+    <tbody>
+      <tr><td>Size, tokens</td><td>235B total, 22B active (9.4%); 36T tokens</td><td>671B total, 37B active (5.5%); 14.8T tokens</td></tr>
+      <tr><td>Depth and width</td><td>94 layers, \(d = 4096\)</td><td>61 layers, \(d = 7168\)</td></tr>
+      <tr><td>Attention</td><td>GQA, 64 Q and 4 KV heads of 128, QK-norm: 188 KiB per token</td><td>MLA, 576 cached elements per layer: 68.6 KiB per token (<a href="07-kv-efficient-attention.html">page 07</a>)</td></tr>
+      <tr><td>Routed experts</td><td>128, width 1536, top-8; no shared expert; MoE in every layer</td><td>256, width 2048, top-8; 1 shared expert; first 3 layers dense</td></tr>
+      <tr><td>Gating</td><td>softmax over all experts, top-8 weights renormalized</td><td>sigmoid scores, normalized, routed scaling factor 2.5</td></tr>
+      <tr><td>Balancing</td><td>global-batch auxiliary loss (Qiu et al.)</td><td>auxiliary-loss-free bias, batch-wise, plus a small sequence-wise loss (<a href="08-mixture-of-experts.html">page 08</a>)</td></tr>
+      <tr><td>Long context</td><td>ABF base 1M in a 32K stage; YaRN plus DCA at inference</td><td>YaRN (factor 40) on the decoupled RoPE key only</td></tr>
+      <tr><td>Multi-token prediction</td><td>not in the Qwen3 report or config; added in Qwen3-Next</td><td>one MTP module in training</td></tr>
+      <tr><td>RL algorithm</td><td>GRPO in the Qwen3 report; GSPO in later Qwen RL, with no Routing Replay</td><td>GRPO; V3.2 adds Keep Routing (replay-style), an unbiased KL estimate and sequence masking (<a href="28-deepseek-3-reasoning.html">page 28</a>)</td></tr>
+      <tr><td>Post-training shape</td><td>four stages, strong-to-weak distillation, split in 2507, single checkpoint with effort control by 2026</td><td>R1's four stages, V3.1 template-switched hybrid, later specialists merged by on-policy distillation</td></tr>
+      <tr><td>Next attention step</td><td>Gated DeltaNet hybrids at 3:1, then QSA</td><td>DSA sparse attention (V3.2), then compressed CSA/HCA (V4)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Read the rows as bets. <strong>Qwen keeps components standard</strong> so that stock kernels and frameworks work (GQA, softmax routing, plain top-k, no MLA), and spends its novelty on data volume, RL recipes and, later, the token mixer. <strong>DeepSeek co-designs with the hardware</strong> (MLA for cache bytes, sigmoid routing with bias balancing, node-limited routing, FP8) and pays in implementation complexity. The evidence on the two most debated rows is thin on both sides:</p>
+  <ul>
+    <li><strong>Shared experts.</strong> DeepSeekMoE's 2B-parameter ablation raised loss from 1.808 to 2.414 without the shared expert, while Qwen3 dropped it with no ablation in its report, and Qwen3-Next brought one back, scaled by a learned scalar gate (<a href="08-mixture-of-experts.html">page 08</a>). One shared expert out of 11 active is a different regime from 1 of 9, so the two results do not conflict directly.</li>
+    <li><strong>Attention.</strong> MLA caches 2.7× fewer bytes per token than Qwen3-235B's GQA (68.6 versus 188 KiB), but at the cost of decoupled RoPE and two execution modes. The Qwen route to the same end is not a smaller per-layer cache but fewer cached layers: Qwen3-Next caches 24 KiB per token, 2.9× less than MLA at V3's shape, and that comparison mixes model sizes and is only indicative.</li>
+  </ul>
+  <p>The convergence is the more useful fact: both labs ended up with fine-grained sparse FFNs of about 8 to 10 active experts, batch-level balancing, and long-context attention that reads or stores less than full softmax attention does. The two paths differ in what they keep exact: DeepSeek keeps every token but selects or compresses, while Qwen replaces most layers with a lossy fixed-size memory and keeps a few exact layers.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Qwen3 is a hybrid-attention model."</strong> Qwen3 (April 2025) is a standard GQA plus QK-norm Transformer with an MoE variant. The Gated DeltaNet hybrid arrived with Qwen3-Next in September 2025 and became the family default only from Qwen3.5.</li>
+    <li><strong>"Qwen3 uses gated attention."</strong> It uses QK-norm. Gated attention (a sigmoid gate on each head's output) first ships in Qwen3-Next. It is also not the Gated DeltaNet gates, which control decay and writes of the recurrent state.</li>
+    <li><strong>"Activated parameters are comparable across model cards."</strong> The 22B of Qwen3-235B-A22B counts the embedding and the LM head (22.19B), while Qwen3-Next's 3B matches the non-embedding count (3.25B; 3.87B with both). Recompute from the config.</li>
+    <li><strong>"Global-batch balancing is one global auxiliary loss."</strong> Only the expert counts are synchronized (an \(E\)-sized all-reduce). The probabilities stay local and are the only path for gradients.</li>
+    <li><strong>"GSPO is GRPO with a sequence-level advantage."</strong> GRPO's advantage is already per sequence. GSPO changes the importance ratio and the clipping unit to the length-normalized sequence ratio, at a different scale of \(\varepsilon\).</li>
+    <li><strong>"The thinking budget is a trained length controller."</strong> It is a forced stop: the serving code inserts a fixed sentence and the closing think tag at a threshold. The ability emerges from fusing the two modes, and Qwen's 2507 models then dropped the fusion.</li>
+    <li><strong>"Large RL gains on Qwen bases show that RL teaches reasoning."</strong> Random and incorrect rewards give most of the MATH-500 gain on Qwen2.5-Math-7B, and the base shows signs of memorizing the benchmark. Test on another family and on post-cutoff problems.</li>
+    <li><strong>"A 3:1 hybrid cuts memory 4×."</strong> The KV cache shrinks with the share of softmax layers, and Qwen3-Next's cache is 10.7× smaller than Qwen3-32B's because it also uses fewer, wider-headed KV heads. The recurrent state is a fixed cost that equals the cache at about 3K tokens, so short sequences see no saving.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What changed in the attention block between Qwen2.5 and Qwen3, and why?</summary>
+    <div class="answer">
+      <p>GQA, RoPE, pre-norm RMSNorm and SwiGLU stay. Qwen3 removes the QKV bias that Qwen introduced in 2023 "to enhance extrapolation", and adds QK-norm (an RMSNorm on each head's query and key over \(d_h = 128\), before RoPE) "to ensure stable training". The reports give no ablation. The plausible story is a change of priorities: extrapolation mattered when training contexts were 2K to 8K, and by 2025 the risk was logit growth and loss spikes over 36T tokens, which QK-norm bounds directly (<a href="11-stability-tweaks.html">page 11</a>). Qwen3 also fixes \(d_h = 128\) at every size, so \(n_h d_h\) can exceed \(d\) (64 × 128 = 8192 = 2\(d\) in the 235B).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Compute the KV cache per token of Qwen3-32B, and for one 128K-token sequence. How does Qwen3-235B-A22B compare?</summary>
+    <div class="answer">
+      <p>Qwen3-32B has 64 layers, 8 KV heads and \(d_h = 128\): \(64 \cdot 2 \cdot 8 \cdot 128 \cdot 2\ \text{B} = 262{,}144\) B = 256 KiB per token, so \(256\text{ KiB} \times 131{,}072 = 32\) GiB. Qwen3-235B-A22B has 94 layers but 4 KV heads: \(94 \cdot 2 \cdot 4 \cdot 128 \cdot 2 = 192{,}512\) B = 188 KiB, or 23.5 GiB. The bigger model has the smaller cache, because its KV heads are half as many and that outweighs 30 more layers.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is Qwen3's thinking budget, and how is it enforced?</summary>
+    <div class="answer">
+      <p>One checkpoint answers in thinking mode (<code>&lt;think&gt;...&lt;/think&gt;</code> then the reply) or non-thinking mode (an empty think block), switched by <code>/think</code> and <code>/no_think</code> flags or a template option. For a budget, the serving code stops generation when the thinking reaches the threshold, appends "Considering the limited time by the user, I have to give the solution based on the thinking directly now." plus the closing tag, and lets the model write its answer from the partial reasoning. Qwen says this ability "is not explicitly trained but emerges naturally" from thinking-mode fusion, and accuracy rises smoothly with the budget on four benchmarks. It is external control, not a learned length policy.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What architectural choices distinguish Qwen3's MoE from DeepSeek-V3's?</summary>
+    <div class="answer">
+      <p>Qwen3-235B-A22B: 128 routed experts of width 1536, top-8, <strong>no shared expert</strong>, MoE in every layer, softmax routing with top-8 weights renormalized, a <strong>global-batch auxiliary loss</strong>, and GQA (4 KV heads) with QK-norm. DeepSeek-V3: 256 routed experts of width 2048 plus 1 shared expert, top-8, first 3 layers dense, sigmoid scores with a routed scaling factor of 2.5, <strong>bias-based auxiliary-loss-free balancing</strong> (plus a small sequence-wise loss), and MLA. Beyond the MoE: V3 has an MTP module, Qwen3 does not.</p>
+      <p>Why they differ: Qwen favors standard components that run on stock kernels and puts its novelty into data (36T tokens) and RL. DeepSeek co-designs with hardware. What they share: fine-grained top-8 experts and balancing over the whole batch, not per sequence. Evidence is thin on shared experts: DeepSeekMoE's 2B ablation raised loss from 1.808 to 2.414 without one, Qwen3 dropped it with no ablation, and Qwen3-Next brought one back. Cache: 188 KiB per token for Qwen3-235B against 68.6 KiB for V3's MLA.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did Qwen introduce GSPO?</summary>
+    <div class="answer">
+      <p>GRPO's per-token ratio \(\pi_\theta/\pi_{\text{old}}\) is computed from one sampled token per position, so it cannot do the distribution correction that importance sampling needs. It adds variance that grows with length and is amplified by clipping, and it weights the tokens of one response unequally. In MoE models it is worse: after each gradient update roughly 10% of the activated experts change for the same rollout (Qwen3-30B-A3B-Base), so token likelihoods jump. GRPO then needed Routing Replay, which costs memory and communication and constrains capacity.</p>
+      <p>GSPO uses \(s_i = (\pi_\theta(y_i)/\pi_{\text{old}}(y_i))^{1/|y_i|}\), clips whole responses at about \(3\text{-}4 \times 10^{-4}\) and weights every token equally in the gradient. Sequence likelihood is stable under route flips, so no replay is needed. Reported: about 0.13% of tokens clipped against 15% for GRPO, yet better reward per unit of compute. Caveats: evidence from Qwen's own runs, coarser credit assignment (GSPO-token restores per-token advantages), and a new \(\varepsilon\) scale to tune.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is gated attention and what does it fix?</summary>
+    <div class="answer">
+      <p>A sigmoid gate multiplies each head's attention output before \(W_O\): \(Y' = Y \odot \sigma(X W_\theta)\) with \(X\) the layer's pre-normed input (elementwise, head-specific in the best variant). Softmax cannot output "nothing", so heads dump mass on a sink token and the network builds massive activations to support it. The gate lets a head emit near zero for an irrelevant query. On a 15B-A2.54B MoE at 400B tokens: perplexity 6.026 to 5.761, MMLU +2.0, with 201M added parameters (1.3%) and under 2% latency; first-token attention 46.7% to 4.8%; stable at larger learning rates; RULER at 128K after YaRN 31.65 to 58.82. Parameter-matched controls (more KV heads, more query heads, more experts) did worse. Two explanations: non-linearity between the low-rank \(W_V W_O\), and query-dependent sparsity. It is used in Qwen3-Next's softmax layers. Caveat: one team's study, not compared with learned sink logits.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Describe Qwen3-Next's hybrid design and its trade-offs.</summary>
+    <div class="answer">
+      <p>48 layers in 12 blocks of three Gated DeltaNet layers and one gated softmax layer, each followed by an MoE block of 512 experts (10 routed plus 1 shared, width 512). Softmax layers have 16 Q heads, 2 KV heads, \(d_h = 256\), partial RoPE on 25% of dimensions. Delta-rule layers keep a fixed state (32 heads of 128 × 128 per layer) that erases what it already predicts before writing, so it acts as an overwriting associative memory.</p>
+      <p>Numbers: KV cache \(12 \cdot 2 \cdot 2 \cdot 256 \cdot 2 = 24{,}576\) B = 24 KiB per token, so 3 GiB at 128K against 32 GiB for Qwen3-32B (10.7×), plus a 72 MiB fp32 state that equals the cache at 3,072 tokens. Trade-offs: a finite state cannot recall arbitrary tokens, so exact retrieval depends on the 12 softmax layers; new kernels, state precision and prefix-caching needs; the saving is a long-context effect; and with only 2 KV heads, tensor parallelism above 2 replicates the cache (<a href="07-kv-efficient-attention.html">page 07</a>). Evidence: a 25B-A3B ablation averaging 53.81 for the GDN hybrid against 49.87 (full) and 51.15 (SWA hybrid) but worse on EvalPlus; throughput multiples (7× prefill at 4K, over 10× beyond 32K) are vendor claims.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why are Qwen bases so common in RL research, and what is the risk in that?</summary>
+    <div class="answer">
+      <p>Reasons: open weights across 0.5B to 72B (mostly Apache 2.0) with one tokenizer; strong math and code from pretraining data built with Qwen2.5-Math and -Coder; and pre-existing reasoning behaviors. Under identical PPO on Countdown, Qwen2.5-3B reached about 60% and Llama-3.2-3B about 30%, because Qwen already shows verification and backtracking and RL amplifies behaviors that appear in successful samples. Convention then locks it in.</p>
+      <p>Risk: findings may be Qwen-specific. On Qwen2.5-Math-7B, GRPO with random rewards raised MATH-500 by 21.4 points against 29.1 for ground truth, and with incorrect labels by 24.1; Llama3 and OLMo2 did not gain. One account is clipping bias amplifying high-prior behavior (code reasoning 65% to 90%); another is memorization (54.6% exact-match completion of MATH-500 from a 60% prefix). Response: replicate on a second family, include random-reward baselines, use post-cutoff or generated problems, match templates, report pass@\(k\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain the global-batch load-balancing loss. What does it change and what does it cost?</summary>
+    <div class="answer">
+      <p>Standard loss: \(E \sum_i f_i P_i\), with \(f_i\) the assignment fraction and \(P_i\) the mean router probability. Frameworks compute it per micro-batch and average, which acts almost at the sequence level and forces even a code-only micro-batch to use all experts. Qiu et al. all-reduce the \(E\)-sized count vector so \(\bar f\) reflects the global batch, keep \(P^j\) local, and average \(E\sum_i \bar f_i P^j_i\) over groups (gradient only through \(P^j\); a buffer over gradient-accumulation steps approximates the global batch). Example: two domain-specific micro-batches, each collapsed onto one of two experts, give a micro loss of 2 and a global loss of 1.</p>
+      <p>Evidence: perplexity 7.347 to 7.198 (3.4B-A0.6B, 400B tokens) and 5.778 to 5.603 (15B-A2.54B); a shuffled control shows token diversity, not token count, matters. Cost: stragglers, 5.8% slower steps in one setting, reduced to 2.6% by a small micro-batch term.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate the total and activated parameters of Qwen3-235B-A22B from its config.</summary>
+    <div class="answer">
+      <p>Config: \(L = 94\), \(d = 4096\), 64 Q and 4 KV heads of 128, expert width 1536, 128 experts, top-8, \(V = 151{,}936\), untied. Per layer: attention \(4096 \cdot 8192 + 2 \cdot 4096 \cdot 512 + 8192 \cdot 4096 = 71{,}303{,}168\); router \(4096 \cdot 128 = 524{,}288\); experts \(128 \cdot 3 \cdot 4096 \cdot 1536 = 2{,}415{,}919{,}104\); plus small norms. Times 94, plus \(2 \cdot 151{,}936 \cdot 4096 = 1{,}244{,}659{,}712\) for embedding and head, gives 235,093,634,560 (equal to the checkpoint). Active: replace 128 experts by 8, giving 22.19B with embedding and head, 21.57B with only the head, 20.95B without either. The name's "22B" matches the first. Attention is 2.85% of the total but 32% of the non-embedding active weights.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you want one model that can both answer instantly and think for a long time. What did Qwen3 do, what went wrong, and what would you do?</summary>
+    <div class="answer">
+      <p>Qwen3 trained a long-CoT cold start, then reasoning RL (3,995 pairs, GRPO), then fused non-thinking data into the RL model by SFT (thinking data rejection-sampled from the same model, one template with <code>/think</code> and <code>/no_think</code>), then general RL over 20+ tasks. Mode switching improved (ThinkFollow 88.7 to 98.9) and general scores rose (Arena-Hard 86.8 to 93.8), but Qwen3-32B's thinking-mode AIME'24 fell from 83.8 to 81.4 and LiveCodeBench from 68.4 to 65.7, and Qwen accepted the trade. In July 2025 it stopped fusing and shipped Instruct and Thinking checkpoints, then in 2026 cards returned to one checkpoint with <code>reasoning_effort</code>.</p>
+      <p>My plan: treat it as a routing or control problem, not a weights problem. Options: separate checkpoints and a router (best peak, double serving cost); fusion with effort control (one model, some regression); or specialists plus on-policy distillation (DeepSeek-V4 style, <a href="19-sft-distillation.html">page 19</a>). Measure the regression on your hardest reasoning benchmarks, the length distribution and instruction following, and keep an in-mode compliance metric like ThinkFollow.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Random rewards raise Qwen2.5-Math-7B's MATH-500 accuracy by about 21 points. What do you conclude, and which experiments would you run?</summary>
+    <div class="answer">
+      <p>Conclude nothing about the reward. Separate four hypotheses. (1) Format or template adaptation: compare with the base's best greedy score without the chat template, since the template lowers Qwen base accuracy and the "gain" may only return to it. (2) Clipping bias amplifying priors: repeat with clipping disabled (one gradient step per rollout); the expected update is then zero, so gains should vanish. Track the frequency of the high-prior behavior (code reasoning). (3) Memorization: partial-prompt completion on MATH-500 and on a post-cutoff set, and training on freshly generated problems, where only correct rewards should help. (4) Model specificity: repeat on Llama and OLMo. Add pass@\(k\) at large \(k\) to see whether the model sharpens or expands. Report all with error bars over seeds, since 300-step GRPO runs are noisy. Only if random rewards fail on clean data and on other families can you say the ground-truth reward is what teaches the skill.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Trade-off: you must run stable RL on a 30B-A3B MoE. Compare token-level GRPO with Routing Replay, engine-routing replay, and GSPO.</summary>
+    <div class="answer">
+      <p>Problem size: ~10% of activated experts change after one update in Qwen3-30B-A3B-Base, and between an inference engine and a trainer about 10% of router decisions and 94% of tokens (at least one layer) differ (<a href="25-rl-systems-agentic.html">page 25</a>). <strong>Routing Replay (train-side)</strong> fixes update-induced flips, costs memory and communication for cached routes, caps capacity and does not fix engine mismatch. <strong>Engine-routing replay</strong> also fixes mismatch, at a small logging cost, but biases the target policy and did not help on-policy in that study. <strong>GSPO</strong> needs no replay because sequence likelihood is stable, tolerates numeric mismatch, and uses engine log-probs directly, but gives one ratio per response, requires re-tuning \(\varepsilon\) near \(10^{-4}\) and has evidence mostly from Qwen. I would start with GSPO (or its token variant if multi-turn credit matters), monitor the clipped fraction (order 0.1% in the paper), the train-inference KL and the expert-flip rate, and add a replay method only if the flip rate still correlates with instability.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Qwen3-Next activates 10 of 512 experts and caches 24 KiB per token. What limits going sparser, and how do the two choices interact at serving time?</summary>
+    <div class="answer">
+      <p>Limits on sparsity: all 80B parameters stay resident (about 160 GB in bf16); each 512-wide expert is a small GEMM; a token fans out to 11 experts, so all-to-all traffic and balance dominate; and the sources give no ablation of expert count. At decode, a batch touches most experts, so weight reads approach the full model.</p>
+      <p>Interaction: the small cache lets more sequences share a node, and a bigger batch amortizes expert reads, which is exactly what sparse MoE needs. Idealized 8 × 80 GB and 128K contexts, ignoring activations: Qwen3-Next has about 481 GB free after ~159 GB of weights, and at 3.07 GiB per sequence that is about 145 sequences; Qwen3-32B has about 574 GB free after 65.5 GB of weights, and at 32 GiB per sequence about 16. Caveat: with 2 KV heads, 8-way tensor parallelism replicates each KV head 4×, so real deployments use small attention TP or data-parallel attention (<a href="07-kv-efficient-attention.html">page 07</a>), which shrinks the advantage.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Gated attention output.</strong> Implement <code>gated_attention_output</code>: multiply the per-head attention output by \(\sigma(x W_\text{gate})\), elementwise (\(W_\text{gate}\) with \(n_h d_h\) columns) or headwise (\(n_h\) columns). Tests check that a gate driven to \(+\infty\) recovers the ungated output, that the gate is token-local, and that gradients flow. An interviewer expects this in about 10 minutes. <span class="ex-path">exercises/drills/qwen_bits.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Micro-batch versus global-batch balance loss.</strong> Implement <code>micro_batch_balance_loss</code> and <code>global_batch_balance_loss</code> for a list of micro-batches with different sizes. Tests check that the two agree when every micro-batch has the same statistics, that they differ for domain-specific micro-batches (2.0 against 1.0), that \(\bar f\) is token-weighted, and that gradients reach only the local probabilities. Budget 20 minutes. <span class="ex-path">exercises/drills/qwen_bits.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Two calculators.</strong> <code>qwen3_moe_param_counts</code> reproduces the exact totals of Qwen3-235B-A22B (235,093,634,560) and Qwen3-30B-A3B (30,532,122,624). <code>hybrid_cache_bytes</code> returns KV per token, total KV and recurrent state for a Gated DeltaNet hybrid, and reduces to the ordinary formula when every layer is full attention. Budget 10 minutes each. <span class="ex-path">exercises/drills/qwen_bits.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_qwen_bits.py</code>; add <code>--solutions</code> to check the reference implementations. The GSPO ratio and loss are in the <code>grpo</code> drill of <a href="24-rlvr-reasoning.html">page 24</a>.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2505.09388">Qwen Team (2025). Qwen3 Technical Report.</a> <span class="why">Why read it: architecture (§2), three-stage pretraining (§3), the four post-training stages, thinking budget, strong-to-weak distillation and Tables 21 and 22 (§4).</span></li>
+    <li><a href="https://arxiv.org/abs/2507.18071">Zheng et al. (2025). Group Sequence Policy Optimization.</a> <span class="why">Why read it: the sequence ratio, gradient comparison, and the MoE routing-volatility argument (§3-5). Short.</span></li>
+    <li><a href="https://arxiv.org/abs/2505.06708">Qiu et al. (2025). Gated Attention for Large Language Models.</a> <span class="why">Why read it: 30 gating variants with parameter-matched controls, and the sink and massive-activation analysis.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.11873">Qiu et al. (2025). Demons in the Detail: On Implementing Load Balancing Loss for Training Specialized MoE Models.</a> <span class="why">Why read it: the micro-versus-global formulas, the shuffle control and the straggler cost.</span></li>
+    <li><a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">Qwen (2025). Qwen3-Next-80B-A3B model card and blog.</a> <span class="why">Why read it: the layout, the claimed cost and throughput, and the config to compute cache and parameters from.</span></li>
+    <li><a href="https://arxiv.org/abs/2608.30320">Qwen Team (2026). On the Design of Qwen3.8-Next Architecture.</a> <span class="why">Why read it: the only Qwen ablation of GDN hybrid versus full and SWA attention, plus QSA, Gated Residual, n-gram embeddings and Muon.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.10671">Qwen Team (2024). Qwen2 Technical Report.</a> <span class="why">Why read it: GQA everywhere, upcycled MoE recipe (§2.2.2), and the long-context recipe with DCA and YaRN.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.15115">Qwen Team (2024). Qwen2.5 Technical Report</a> and <a href="https://arxiv.org/abs/2501.15383">Qwen2.5-1M</a>. <span class="why">Why read them: the 18T-token data pipeline, and the five-stage length schedule with per-stage RULER.</span></li>
+    <li><a href="https://arxiv.org/abs/2506.10947">Shao et al. (2025). Spurious Rewards: Rethinking Training Signals in RLVR.</a> <span class="why">Why read it: the case for validating RL claims on more than one base model. Pair it with <a href="https://arxiv.org/abs/2507.10532">Wu et al. (2025)</a> on contamination and <a href="https://arxiv.org/abs/2503.01307">Gandhi et al. (2025)</a> on why Qwen bases work.</span></li>
+    <li><a href="https://arxiv.org/abs/2309.16609">Bai et al. (2023). Qwen Technical Report.</a> <span class="why">Why read it: the origin of the tokenizer, the QKV bias and the training-free context extension.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>Lineage: Qwen (2023, 3T tokens, QKV bias) → Qwen1.5 (GQA only in 32B and 110B) → Qwen2 (GQA everywhere, base 1M, YaRN plus DCA, upcycled 57B-A14B) → Qwen2.5 (18T tokens) → Qwen3 (36T, 119 languages, QK-norm) → Qwen3-Next (Sep 2025) → Qwen3.5 to 3.8 (3:1 hybrid default).</li>
+      <li>Qwen3 MoE: 128 experts, top-8, no shared expert, global-batch balance loss, GQA with 4 KV heads. 235B-A22B: 94 layers, \(d = 4096\), expert width 1536, total 235,093,634,560, active 22.19B (with embedding and head), 188 KiB KV per token. 30B-A3B: 48 layers, 768-wide experts, total 30,532,122,624.</li>
+      <li>Global-batch loss: \(\frac{1}{N_P}\sum_j E \sum_i \bar f_i P^j_i\), \(\bar f\) synchronized (no gradient), \(P^j\) local. Micro-batch version uses \(f^j\). Domain-specific micro-batches: micro 2, global 1.</li>
+      <li>Qwen3 post-training: cold start → reasoning RL (3,995 pairs, GRPO) → fusion (<code>/think</code>, <code>/no_think</code>) → general RL (20+ tasks). Small models: off- then on-policy distillation from 32B or 235B, about 1/10 of the GPU hours (8B: 74.4 against 67.6 AIME'24, 1,800 against 17,920 GPU hours). Fusion cost 32B about 2.4 AIME points and 2.7 LiveCodeBench points. 2507: split into Instruct and Thinking.</li>
+      <li>GSPO: \(s_i = (\pi_\theta/\pi_{\text{old}})^{1/|y_i|}\), clip whole responses at \(3\text{-}4 \times 10^{-4}\), all tokens weighted equally, no Routing Replay; about 10% of experts flip per update in 30B-A3B; clipped fraction 0.0013 against 0.15.</li>
+      <li>Gated attention: \(Y' = Y \odot \sigma(X W_\theta)\) before \(W_O\); PPL 6.026 to 5.761, first-token attention 46.7% to 4.8%, RULER 128K 31.65 to 58.82; +1.3% parameters.</li>
+      <li>Qwen3-Next: 48 layers = 12 × (3 GDN + 1 gated attention), each followed by MoE (512 experts, 10 + 1, width 512); softmax layers 16 Q / 2 KV × 256, RoPE on 25%. 80B total, 3B active (ours 79.67B, 3.25B non-embedding). KV 24 KiB per token (3 GiB at 128K) plus 72 MiB fp32 state, against 256 KiB (32 GiB) for Qwen3-32B; equal at 3,072 tokens.</li>
+      <li>Qwen3.5 to 3.8 keep 3:1: 397B-A17B (60 layers, 512 experts), 27B dense (64 layers), 2.4T-A95B (92 layers). Flash-Next previews Qwen4: QSA, Gated Residual, n-gram embeddings, Muon.</li>
+      <li>RL on Qwen bases: random rewards +21.4 against +29.1 (ground truth) MATH-500 on Qwen2.5-Math-7B; 54.6% exact-match completion of MATH-500 from a 60% prefix. Validate on a second family and post-cutoff problems.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

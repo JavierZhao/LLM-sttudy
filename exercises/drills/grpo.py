@@ -29,13 +29,15 @@ def group_advantages(rewards: Tensor, group_size: int, kind: str = "grpo", eps: 
         group_size: G >= 2 responses per prompt.
         kind:
             "grpo":    (r - mean) / (std + eps), with std the SAMPLE standard deviation of the group
-                       (divide by G - 1, the torch.std default), as in DeepSeekMath / verl.
+                       (divide by G - 1, the torch.std default), as in verl (DeepSeekMath does not say
+                       which). eps is added to the std, not to the variance.
             "dr_grpo": r - mean (Dr. GRPO: no std normalization).
             "rloo":    r_i minus the mean of the OTHER G - 1 rewards of the group (leave-one-out).
         eps: added to the std in the denominator ("grpo" only).
     Returns:
         (N,) advantages with the dtype of `rewards`. A group whose rewards are all equal gets
-        advantage exactly 0 for every kind (no NaN or inf). Raise ValueError for an unknown kind
+        advantage exactly 0 for every kind (no NaN or inf), also for rewards such as 0.1 that are
+        not exact in floating point and also when eps=0. Raise ValueError for an unknown kind
         or if N is not divisible by group_size.
     """
     raise NotImplementedError

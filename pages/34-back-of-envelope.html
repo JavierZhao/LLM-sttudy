@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>34 · Back-of-envelope calculations · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="34" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VII · Interview toolkit · Page 34</div>
+  <h1>Back-of-envelope calculations</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~45 min, plus the drills</span>
+    <span>Prereqs: <a href="04-transformer-block.html">04 Params &amp; FLOPs</a>, <a href="06-decoding-kv-cache.html">06 KV cache</a>, <a href="07-kv-efficient-attention.html">07 MLA</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="13-scaling-laws.html">13 Scaling laws</a>, <a href="15-distributed-training.html">15 Parallelism</a></span>
+  </div>
+  <p class="lede">Frontier-lab interviews ask you to size things on the spot: how many parameters, how many GPU-hours, how much memory, how fast does it decode. This page collects the constants to memorize, one formula card for every quantity, and 34 worked drills whose numbers agree with every earlier page, so that each answer is a short chain of multiplications you can do aloud.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Sizing with no notes:</strong> "How long does it take to train a 70B model on 15T tokens on 2,048 GPUs?", "How many GPUs to serve 32 users at 32K context?", "How fast does an 8B model decode?" The score is on the process (assumptions, units, arithmetic, a sanity check) more than on the last digit.</li>
+    <li><strong>Which constant, exactly:</strong> dense versus sparse peak, bf16 versus fp8, GB versus GiB, bidirectional versus one-way bandwidth, and which \(N\) (total, non-embedding, activated). Each of these is a factor of 1.07 to 2 that a careless answer silently absorbs.</li>
+    <li><strong>Which resource binds:</strong> compute, HBM bandwidth, HBM capacity, or the network. A strong answer computes all of them and takes the largest time.</li>
+    <li><strong>Cross-checks against public numbers:</strong> Llama 3 405B's \(3.8 \times 10^{25}\) FLOPs, DeepSeek-V3's 2.788M GPU-hours, MFU in the 30% to 45% band. A number that contradicts them is a bug in your assumptions.</li>
+    <li><strong>Sensitivity:</strong> "What changes if we double the batch, the context, or the MFU?" You should answer with a ratio before touching the arithmetic.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Recite the hardware constants: H100 SXM at 989.4 dense bf16 TFLOP/s and 1,979 fp8, 80 GB at 3.35 TB/s (ridge 295 FLOPs per byte), NVLink at 450 GB/s per direction, InfiniBand at 50 GB/s, with the A100, H200, B200 and GB200 counterparts.</li>
+    <li>Write, with its assumptions, the formula for each of: parameters (dense, MLA, MoE total and activated), FLOPs per token, training time and cost, training and inference memory, KV bytes per token, decode and prefill time, ring all-reduce, pipeline bubble, MoE all-to-all bytes, and the Chinchilla optimum.</li>
+    <li>Pick the binding resource for training, prefill, decode, gradient sync and MoE dispatch, and say what efficiency (MFU or fraction of roofline) to expect.</li>
+    <li>Reproduce the headline numbers of the earlier pages from scratch: 8,030,261,248 parameters, 128 KiB of KV per token, 208 tokens/s at batch 1, 507K GPU-hours for Llama-3-8B, 67.7 days for 405B on 16K GPUs at 40% MFU.</li>
+    <li>Run a five-step protocol (assume, bound, compute, check, sensitivity) and cross-check any answer against a public number.</li>
+    <li>Implement the formulas as code, with tests that reproduce the worked answers.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="method">The method: assume, bound, compute, check</h2>
+
+  <p>A sizing question is a product of a few quantities that you can look up or state: a config, a token count, a hardware peak, an efficiency, a price. What an interviewer scores is whether you choose the right quantities, keep the units straight, and notice when the result is implausible. Use the same five steps every time:</p>
+
+  <ol>
+    <li><strong>Restate</strong> the quantity and the unit you will report (GPU-days, GB, tokens/s, dollars).</li>
+    <li><strong>Assume out loud, as numbers.</strong> The architecture (\(L, d, n_{kv}\), ...), bytes per element, the hardware peak (dense, in the number format you compute in), MFU or the fraction of the roofline, and the price. Where two conventions exist, name yours (for example which \(N\)).</li>
+    <li><strong>Bound.</strong> Decide which resource sets the time: FLOPs over achieved FLOP/s (compute), bytes over bandwidth (memory), bytes over link speed (network), or bytes over capacity (does it fit at all?). When unsure, compute all of them and report the largest time. That is the roofline (<a href="16-gpus-kernels.html#roofline">page 16</a>).</li>
+    <li><strong>Compute</strong> in scientific notation with two or three significant digits, and write each intermediate result so that a slip is easy to find.</li>
+    <li><strong>Check</strong> against an anchor you know (a public number, an earlier answer), against the units, and for sensitivity: "at 30% MFU instead of 40% this grows by 1.33×".</li>
+  </ol>
+
+  <p>One or two significant digits is the right precision for most answers. What matters is the exponent and the biggest factor of two, and the factors of two hide in a short list of conventions: dense versus sparse peak (2×), bidirectional versus one-way bandwidth (2×), bits versus bytes (8×), GB versus GiB (1.074×), forward versus training FLOPs (3×), total versus activated parameters (18× for DeepSeek-V3).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Anchor</th><th>Value</th><th>Why it pays for itself</th></tr></thead>
+    <tbody>
+      <tr><td>One day, one year</td><td>86,400 s; \(3.15 \times 10^{7}\) s</td><td>Every wall-clock answer ends with a conversion.</td></tr>
+      <tr><td>H100 SXM at 40% MFU</td><td>396 TFLOP/s, so \(1.42 \times 10^{18}\) FLOPs per GPU-hour</td><td>\(10^{24}\) FLOPs is \(7.0 \times 10^{5}\) GPU-hours, about $1.4M at $2 per GPU-hour.</td></tr>
+      <tr><td>Llama-3-8B</td><td>8.03B parameters, 16.06 GB in bf16, 128 KiB of KV per token, \(7.2 \times 10^{23}\) FLOPs for 15T tokens</td><td>The reference model of the whole course (<a href="04-transformer-block.html#param-count">page 04</a>).</td></tr>
+      <tr><td>H100 ridge point</td><td>295 FLOPs per byte</td><td>The batch size at which a bf16 weight matmul stops being bandwidth-bound.</td></tr>
+      <tr><td>Initial loss</td><td>\(\ln V = 11.76\) for \(V = 128{,}256\) (about 12.6 with the 0.02-std initialization)</td><td>A run that starts far above this has a scale bug (<a href="04-transformer-block.html#init">page 04</a>).</td></tr>
+      <tr><td>One GiB</td><td>1.074 GB</td><td>A 16.06 GB model is 14.96 GiB. State which one you use.</td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Calibrate the scale. Suppose a 2M-parameter tagger sees \(10^8\) jets of 30 particles for 10 epochs (assumed numbers, close to a typical study). That is \(D = 3 \times 10^{10}\) particle-tokens and \(C = 6ND = 3.6 \times 10^{17}\) FLOPs, about 15 minutes of one H100 at 40% MFU. Llama 3 405B used \(3.8 \times 10^{25}\) FLOPs, about \(10^{8}\) times more. The formulas below are the same ones you would use for your tagger. What changes is that the answer decides a cluster, a schedule and a budget, so the assumptions must be stated.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="constants">Constants to memorize</h2>
+
+  <p>Every hardware number below comes from NVIDIA's own pages, checked in September 2026: <a href="https://www.nvidia.com/en-us/data-center/a100/">A100</a>, <a href="https://www.nvidia.com/en-us/data-center/h100/">H100</a>, <a href="https://www.nvidia.com/en-us/data-center/h200/">H200</a>, <a href="https://www.nvidia.com/en-us/data-center/hgx/">HGX B200</a> and <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200 NVL72</a>. NVIDIA's headline tensor-core numbers are "with sparsity" (2:4 structured sparsity that training and inference almost never use), so <strong>every dense number is half of the listed one</strong>. For the H100 SXM the listing says 1,979 bf16 and 3,958 fp8 TFLOP/s, and the architecture whitepaper gives the exact dense bf16 value, 989.4 (<a href="06-decoding-kv-cache.html#performance">page 06</a>). The B200 and GB200 tables list a whole 8-GPU board or a 2-GPU superchip, so divide by the GPU count as well. Compare with the bf16 dense column, not the fp8 one, unless the run computes in fp8.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>GPU (per GPU, dense)</th><th class="num">bf16 TFLOP/s</th><th class="num">fp8 TFLOP/s</th><th class="num">HBM</th><th class="num">HBM bandwidth</th><th class="num">Ridge, bf16 (FLOPs/B)</th><th class="num">NVLink, one way</th></tr></thead>
+    <tbody>
+      <tr><td>A100 80GB SXM</td><td class="num">312</td><td class="num">none</td><td class="num">80 GB HBM2e</td><td class="num">2.04 TB/s</td><td class="num">153</td><td class="num">300 GB/s</td></tr>
+      <tr class="hl"><td><strong>H100 SXM</strong> (H800: same compute and HBM)</td><td class="num">989.4</td><td class="num">1,979</td><td class="num">80 GB HBM3</td><td class="num">3.35 TB/s</td><td class="num">295</td><td class="num">450 GB/s</td></tr>
+      <tr><td>H200 SXM</td><td class="num">989.4</td><td class="num">1,979</td><td class="num">141 GB HBM3e</td><td class="num">4.8 TB/s</td><td class="num">206</td><td class="num">450 GB/s</td></tr>
+      <tr><td>B200 (HGX / DGX)</td><td class="num">2,250</td><td class="num">4,500</td><td class="num">180 GB HBM3e</td><td class="num">8 TB/s</td><td class="num">281</td><td class="num">900 GB/s</td></tr>
+      <tr><td>GB200 (per GPU of an NVL72)</td><td class="num">2,500</td><td class="num">5,000</td><td class="num">186 GB HBM3e</td><td class="num">8 TB/s</td><td class="num">313</td><td class="num">900 GB/s</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Derivations from the datasheets. A100: 312 dense of 624 with sparsity; 2,039 GB/s; NVLink 600 GB/s bidirectional. H100/H200: 1,979 bf16 and 3,958 fp8 with sparsity, NVLink 900 GB/s bidirectional; H200 has 141 GB at 4.8 TB/s and the same compute. HGX B200 (8 GPUs): 36 PFLOP/s bf16 and 72 fp8 with sparsity, so \(36/8/2 = 2.25\) and \(72/8/2 = 4.5\) PFLOP/s dense per GPU; DGX B200 lists 1,440 GB and 64 TB/s in total, so 180 GB and 8 TB/s per GPU; NVLink 1.8 TB/s per GPU. GB200 NVL72, per two-GPU superchip: 10 PFLOP/s bf16 and 20 fp8 with sparsity, 372 GB, 16 TB/s, so \(10/2/2 = 2.5\) and \(20/2/2 = 5\) PFLOP/s, 186 GB and 8 TB/s per GPU. Ridge = bf16 / bandwidth (page 16 also lists B200 at 281). NVIDIA also lists Blackwell Ultra and Rubin parts as of this writing; this page stops at the parts the earlier pages use, and the method is the same for newer ones.</p>
+
+  <p>Read the table as ratios. From the A100 to the H100, compute grew 3.2× and bandwidth 1.6×, so the ridge doubled from 153 to 295: more of an inference workload became memory-bound. From the H100 to the B200 compute grew 2.3× and bandwidth 2.4×, so the ridge barely moved. From the H100 to the H200 only bandwidth changed (1.43×), and that alone gives batch-1 decode 43% more tokens per second. FP8 doubles the FLOP rate, so the ridge doubles to 591 FLOPs per byte, but a 1-byte fp8 weight also does twice the FLOPs per token as a 2-byte bf16 weight does per byte, so the batch at which a weight matmul turns compute-bound stays at about 295 tokens.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Link</th><th class="num">Listed</th><th class="num">One way (use this)</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>HBM3, H100</td><td class="num">3.35 TB/s</td><td class="num">3.35 TB/s</td><td>H100 datasheet</td></tr>
+      <tr><td>NVLink 4, H100 and H200</td><td class="num">900 GB/s bidirectional</td><td class="num">450 GB/s</td><td>H100 datasheet</td></tr>
+      <tr><td>NVLink 3, A100</td><td class="num">600 GB/s bidirectional</td><td class="num">300 GB/s</td><td>A100 datasheet</td></tr>
+      <tr><td>NVLink 5, B200 and GB200</td><td class="num">1.8 TB/s bidirectional</td><td class="num">900 GB/s</td><td>HGX B200, GB200 NVL72 pages</td></tr>
+      <tr><td>NVLink on DeepSeek's H800 cluster</td><td class="num">160 GB/s effective</td><td class="num">160 GB/s</td><td><a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.2.2]</a></td></tr>
+      <tr><td>InfiniBand or RoCE, 400 Gb/s per GPU</td><td class="num">400 Gb/s</td><td class="num">50 GB/s</td><td><a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.1]</a>, DeepSeek-V3 §3.2.2</td></tr>
+      <tr><td>PCIe Gen5 x16</td><td class="num">128 GB/s bidirectional</td><td class="num">64 GB/s (about 50 effective, an assumption)</td><td>H100 datasheet</td></tr>
+    </tbody>
+  </table></div>
+  <p>The hierarchy to remember is HBM : NVLink : network, about 3,350 : 450 : 50, or 67 : 9 : 1 per direction. It is why tensor parallelism stays inside a node and data parallelism spans nodes (<a href="15-distributed-training.html#layouts">page 15</a>). The H800 is the export variant of the H100: same tensor cores and HBM (the assumption on <a href="27-deepseek-2-v3.html#cost">page 27</a>), reduced NVLink. Third-party listings give it 400 GB/s bidirectional, which NVIDIA does not publish, so use DeepSeek's measured 160 GB/s.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Format</th><th class="num">Bytes per element</th><th>Where it appears</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td class="num">4</td><td>Master weights, Adam moments, gradient accumulation, logits for the loss</td></tr>
+      <tr><td>bf16, fp16</td><td class="num">2</td><td>Working weights and gradients, activations, default KV cache</td></tr>
+      <tr><td>fp8, int8</td><td class="num">1</td><td>DeepSeek-V3 released weights, KV quantization, MoE dispatch (V3 combines in bf16)</td></tr>
+      <tr><td>int4 with group-128 fp16 scales</td><td class="num">0.516 (4.125 bits)</td><td>W4A16 serving (<a href="17-inference-serving.html#quant-arith">page 17</a>)</td></tr>
+      <tr><td>NF4 with double quantization</td><td class="num">0.516 (4.127 bits)</td><td>QLoRA base weights (<a href="20-peft-lora.html">page 20</a>)</td></tr>
+      <tr><td>Adam with mixed precision</td><td class="num">16 per parameter</td><td>2 weights + 2 gradients + 12 optimizer (<a href="15-distributed-training.html#states">page 15</a>); 18 if gradients accumulate in fp32 (Llama 3)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Reference model</th><th class="num">Parameters</th><th class="num">KV per token, bf16</th><th class="num">Training tokens</th><th>Reported cost</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3-8B</td><td class="num">8,030,261,248</td><td class="num">128 KiB</td><td class="num">about 15T</td><td>1.46M H100-hours (Llama 3.1 card; 1.3M on the Llama 3 card)</td></tr>
+      <tr><td>Llama-3-70B</td><td class="num">70,553,706,496</td><td class="num">320 KiB</td><td class="num">about 15T</td><td>7.0M H100-hours (3.1 card)</td></tr>
+      <tr><td>Llama-3-405B</td><td class="num">405,853,388,800</td><td class="num">504 KiB</td><td class="num">15.6T</td><td>30.84M H100-hours (3.1 card); \(3.8 \times 10^{25}\) FLOPs</td></tr>
+      <tr class="hl"><td>DeepSeek-V3 (MoE, MLA)</td><td class="num">671,026,404,352 total; 37.55B activated</td><td class="num">68.6 KiB (70,272 B)</td><td class="num">14.8T</td><td>2.788M H800-hours, $5.576M at $2 per GPU-hour</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: parameter counts from the configs (<a href="04-transformer-block.html#param-count">page 04</a>, <a href="15-distributed-training.html#plan-b">page 15</a> for 70B, <a href="08-mixture-of-experts.html#numbers">page 08</a> for V3), verified against Llama 3 Table 3 and the V3 report. GPU-hours from the Llama 3 and 3.1 model cards and <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 1]</a>. KV per token: \(2 \cdot L \cdot n_{kv} \cdot d_h \cdot 2\) B, for 405B \(2 \cdot 126 \cdot 8 \cdot 128 \cdot 2 = 516{,}096\) B. The headline "405B" is the round name; the config gives 405.85B.</p>
+
+  <p>Finally, the efficiency constants that turn a peak into a prediction. <strong>Training:</strong> 38% to 43% MFU for Llama 3 405B on H100 (<a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 4]</a>: 430, 400 and 380 TFLOP/s per GPU), 34.6% implied for DeepSeek-V3 on its bf16 basis; plan with 40% for a large dense run and expect less for small models. <strong>Prefill:</strong> plan 50% MFU (PaLM reached 43% to 76%, <a href="06-decoding-kv-cache.html#prefill-time">page 06</a>). <strong>Decode:</strong> real engines reach a fraction of the bandwidth roofline (80% in one measured H100 NVL point, <a href="06-decoding-kv-cache.html#decode-time">page 06</a>; page 25 plans with 64%). <strong>RL rollouts:</strong> about 4% MFU during decode (<a href="25-rl-systems-agentic.html#rollout-numbers">page 25</a>). Prices are assumptions: this course uses $2 per GPU-hour, the H800 lease price of DeepSeek's own accounting, and real prices vary.</p>
+</section>
+
+<section>
+  <h2 id="formulas">The formula card</h2>
+
+  <p>One row per quantity you can be asked for. Each row states the assumption that makes it true, and an anchor number from an earlier page so you can test your memory of the formula against a result you already trust. Derivations live on the linked pages: parameters and FLOPs on <a href="04-transformer-block.html#param-count">04</a>, KV bytes on <a href="06-decoding-kv-cache.html#kv-size">06</a> and <a href="07-kv-efficient-attention.html#mla-numbers">07</a>, MoE on <a href="08-mixture-of-experts.html#numbers">08</a>, scaling laws on <a href="13-scaling-laws.html#derivation">13</a>, memory and parallelism on <a href="15-distributed-training.html#states">15</a>.</p>
+
+  <figure class="fig">
+    <div class="table-wrap"><table class="data">
+      <thead><tr><th>Quantity</th><th>Formula</th><th>Assumptions and anchor</th></tr></thead>
+      <tbody>
+        <tr><th colspan="3">Parameters</th></tr>
+        <tr><td>Dense decoder, GQA + SwiGLU</td><td>\(N = 2Vd + L\,[\,2d\,n_h d_h + 2d\,n_{kv} d_h + 3d\,d_{ff} + 2d\,] + d\)</td><td>Untied embeddings, RMSNorm, no biases, RoPE. Llama-3-8B: 8,030,261,248. Shortcut \(N \approx c\,Ld^2 + 2Vd\) with \(c = 13,\ 12.75,\ 11.875\) for 8B, 70B, 405B (12 for GPT-style MHA with a 4d MLP).</td></tr>
+        <tr><td>MoE, total and activated</td><td>\(N_{\text{tot}} = N_{\text{sh}} + L_{\text{moe}}(n_r + n_s)\,3d\,d_e\)<br>\(N_{\text{act}} = N_{\text{sh}} + L_{\text{moe}}(k + n_s)\,3d\,d_e\)</td><td>\(N_{\text{sh}}\): attention (MLA layer of V3: 187,107,328), dense FFNs, routers, norms, and for \(N_{\text{act}}\) both vocabulary matrices. V3: 671.03B and 37.55B (35.70B without embeddings).</td></tr>
+        <tr><th colspan="3">FLOPs</th></tr>
+        <tr><td>Forward, per token</td><td>\(2N_{mm} + 4LTd\), or \(2N_{mm} + 2LTd\) causal</td><td>\(N_{mm}\): matmul weights (no embedding table). A multiply-add is 2 FLOPs. Attention matches the linear layers at \(T \approx 6d\) (full) to \(12d\) (causal).</td></tr>
+        <tr><td>Training</td><td>\(C = 6ND\); with recomputation \(8ND\)</td><td>Forward 2 + input gradient 2 + weight gradient 2. MoE: use \(N_{\text{act}}\). Llama 3 405B: \(6 \times 405\text{B} \times 15.6\text{T} = 3.79 \times 10^{25}\).</td></tr>
+        <tr><th colspan="3">Time</th></tr>
+        <tr><td>Training time, GPU-hours</td><td>\(t = \dfrac{C}{G\,P\,\text{MFU}}\), \(\quad\text{GPU-h} = \dfrac{C}{3600\,P\,\text{MFU}}\)</td><td>\(P\): dense peak in the format you compute in. Perfect scaling, no downtime. Large dense runs: MFU 0.38 to 0.43.</td></tr>
+        <tr><td>Prefill</td><td>\(t \approx \dfrac{2NT}{P \cdot \text{MFU}}\)</td><td>Compute-bound. Plan MFU 0.5. Add \(2LT^2d\) at long context. 8B, 2,048 tokens: 33 ms at peak, 66 ms at 50%.</td></tr>
+        <tr><td>Decode, one step</td><td>\(t \ge \max\!\Big(\dfrac{W + B\,T\,\kappa}{\text{BW}},\ \dfrac{2N_{mm}B + 4Ln_hd_h\,BT}{P}\Big)\)</td><td>\(W\): weight bytes, \(\kappa\): KV bytes per token, \(B\): batch, \(T\): context. Tokens per second \(= B/t\). A lower bound: engines reach a fraction of it.</td></tr>
+        <tr><th colspan="3">Memory</th></tr>
+        <tr><td>Training states</td><td>\(16N\) B; ZeRO-1/2/3 per GPU: \(4N + \tfrac{12N}{N_d}\), \(2N + \tfrac{14N}{N_d}\), \(\tfrac{16N}{N_d}\)</td><td>bf16 weights and gradients + fp32 master, \(m\), \(v\). Llama-3-8B: 128.5 GB (does not fit in 80 GB).</td></tr>
+        <tr><td>Activations, per layer</td><td>\(sbh\,(34 + 5as/h)\); fused or selective: \(34\,sbh\); full recompute: \(2\,sbh\)</td><td>GPT-style constants, \(s = T\), \(b\) micro-batch, \(h = d\), \(a = n_h\); divide by \(t\) with TP and sequence parallelism. Llama-3-8B, \(s = 8192\): 11.9, 1.14 and 0.07 GB per layer.</td></tr>
+        <tr><td>Inference</td><td>\(\text{bytes per parameter} \times N + B\,T\,\kappa\)</td><td>Plus activations; use 90% of HBM. Batch capacity \(= (0.9\,\text{HBM} - W)/(T\kappa)\).</td></tr>
+        <tr><td>KV bytes per token</td><td>\(\kappa = L \cdot 2\,n_{kv}\,d_h \cdot b\); MLA: \(L\,(d_c + d_h^R)\,b\)</td><td>\(b\): bytes per element. Llama-3-8B: 131,072 B (128 KiB). DeepSeek-V3 MLA: \(61 \times 576 \times 2 = 70{,}272\) B.</td></tr>
+        <tr><th colspan="3">Communication</th></tr>
+        <tr><td>Ring all-reduce</td><td>\(t = 2\,\dfrac{n-1}{n}\,\dfrac{S}{\text{BW}}\)</td><td>\(S\): message bytes; BW one way per GPU. Reduce-scatter, all-gather and all-to-all move half as much. Latency ignored (fine for GB-sized messages).</td></tr>
+        <tr><td>Traffic per optimizer step</td><td>DDP, ZeRO-1, ZeRO-2: \(2N\); ZeRO-3: \(3N\) elements</td><td>Multiply by bytes per element and \((n-1)/n\). Per micro-batch for ZeRO-2 and -3 if states stay sharded.</td></tr>
+        <tr><td>Tensor parallelism</td><td>\(16\,bsh\,\tfrac{t-1}{t}\) B per layer</td><td>Four all-reduces of a \(b \times s \times h\) bf16 tensor (two forward, two backward). Stays on NVLink.</td></tr>
+        <tr><td>Pipeline bubble</td><td>\(\dfrac{p-1}{v\,m}\) of ideal; idle fraction \(\dfrac{p-1}{v\,m + p - 1}\)</td><td>\(p\) stages, \(m\) micro-batches, \(v\) interleaved chunks. \(p = 16\), \(m = 64\): 23.4% and 19.0%.</td></tr>
+        <tr><td>MoE all-to-all</td><td>\(d\,(b_{\text{disp}} + b_{\text{comb}})\) per token, layer, destination</td><td>DeepSeek-V3: fp8 dispatch, bf16 combine, so \(3d = 21{,}504\) B; at most 4 destination nodes.</td></tr>
+        <tr><th colspan="3">Scaling laws and money</th></tr>
+        <tr><td>Chinchilla optimum</td><td>\(N^{\star} = (C/120)^{1/2}\), \(D^{\star} = 20N^{\star}\); or \(N = G\,(C/6)^{a}\)</td><td>\(G = (\alpha A/\beta B)^{1/(\alpha+\beta)}\), \(a = \beta/(\alpha+\beta)\); constants on <a href="13-scaling-laws.html#derivation">page 13</a>. At \(10^{24}\): 91B (rule) or 95.9B (Epoch fit).</td></tr>
+        <tr><td>Over-training</td><td>\(D/N\), and \((D/N)/20\)</td><td>Llama-3-8B: 1,868 tokens per parameter, 93× the compute-optimal ratio; V3: 400 per activated parameter.</td></tr>
+        <tr><td>Dollars</td><td>\(\$ = \text{GPU-h} \times p\); \(\ \$/\text{M tokens} = \dfrac{p\,G}{3600 \cdot \text{tokens/s}} \times 10^{6}\)</td><td>\(p\): price per GPU-hour ($2 here); tokens/s counts only tokens within the latency SLO (<a href="17-inference-serving.html#cost-model">page 17</a>).</td></tr>
+      </tbody>
+    </table></div>
+    <figcaption><b>Figure 1.</b> The formula card. Every row is one multiplication chain over the constants of the previous section. Notation as on the linked pages: \(N\) parameters, \(D\) tokens, \(C\) FLOPs, \(G\) GPUs, \(P\) dense peak FLOP/s, BW bytes/s, \(W\) weight bytes, \(\kappa\) KV bytes per token, \(B\) batch, \(T\) context.</figcaption>
+  </figure>
+
+  <h3 id="f-params">Parameters and FLOPs: count shapes, name your \(N\)</h3>
+  <p>Only weight matrices matter: the norm gains of Llama-3-8B are 266,240 parameters, and biases do not exist. The one real ambiguity is <strong>which \(N\)</strong>. For Llama-3-8B there are three defensible values: the total (8.03B), the count without the input table (7.50B), and the non-embedding count without either vocabulary matrix (6.98B). At 15T tokens, \(6ND\) is 7.23, 6.75 or \(6.28 \times 10^{23}\) FLOPs, a 7% to 13% spread. The FLOP-correct choice is the matmul weights plus attention (<a href="04-transformer-block.html#which-n">page 04</a>). The shortcut \(13Ld^2 + 2Vd\) is exact only for a model whose attention is \(2.5d^2\) and whose FFN is \(10.5d^2\), which is Llama-3-8B; rederive the coefficient for any other config (12.75 for 70B, 11.875 for 405B).</p>
+  <p>For MoE, memory follows the total and compute follows the activated count. DeepSeek-V3's 37.55B activated parameters give \(6 \times 37\text{B} \times 14.8\text{T} = 3.29 \times 10^{24}\) FLOPs, 11.5 times less than Llama 3 405B, and the GPU-hour ratio of the two runs is 11.6 (<a href="27-deepseek-2-v3.html#cost">page 27</a>).</p>
+
+  <h3 id="f-memory">Memory: states, activations, then the KV cache</h3>
+  <p>Training memory is model states (16 bytes per parameter for bf16 plus Adam) plus activations plus the fp32 logits (4.2 GB for one 8K sequence of Llama-3-8B) plus 10% for buffers and fragmentation. States dominate small clusters and activations dominate long sequences: at \(s = 8192\) the quadratic score-matrix term is 90% of the stored-everything total, which is why every serious run uses a fused attention kernel (<a href="16-gpus-kernels.html#flash">page 16</a>) and selective or full recomputation. Inference memory is weights plus KV cache. Use 90% of HBM as usable, so the number of sequences that fit is \((72\text{ GB} - W)/(T\kappa)\) on an 80 GB GPU, and remember that capacity, not bandwidth, is what caps the batch in long-context serving.</p>
+
+  <h3 id="f-time">Time: one division, and the largest of several</h3>
+  <p>Training and prefill are single divisions of FLOPs by achieved FLOP/s. Decode is the maximum of a memory term and a compute term, and for a dense model at ordinary batch sizes the memory term wins: the weights are read once per step whatever the batch, while each sequence adds its own KV cache. For Llama-3-8B at 4K context one sequence costs \(0.537\text{ GB}/3.35\text{ TB/s} = 0.160\) ms per step, the weights cost 4.79 ms, and as \(B \to \infty\) throughput approaches \(\text{BW}/(T\kappa) = 6{,}240\) tokens/s per GPU. Compute overtakes memory only when \(B\) exceeds the ridge (about 295) <em>and</em> the context is short: with GQA-8 the attention part has intensity 4 FLOPs per byte, so above roughly 390 tokens of context the whole step stays memory-bound at any batch (<a href="06-decoding-kv-cache.html#batching">page 06</a>).</p>
+
+  <h3 id="f-comm">Communication: per-direction bandwidth, and which link</h3>
+  <p>A ring all-reduce sends \(2(n-1)/n\) times the message from each GPU, so its time tends to \(2S/\text{BW}\) and does not grow with \(n\). Three things go wrong in practice: using NVLink's 900 GB/s bidirectional figure as a one-way rate (a factor of 2), forgetting the factor 2 of all-reduce itself, and forgetting which link a collective crosses (450 GB/s inside a node, 50 GB/s between nodes). Tensor parallelism's traffic relative to compute is \(\tfrac29 (t-1)\,C_{\text{eff}}/(\text{BW}\,h)\), which for Llama-3-70B at \(t = 8\) is 16% of layer compute on NVLink and 141% over InfiniBand (<a href="15-distributed-training.html#tp-cost">page 15</a>): that ratio is the whole argument for keeping it inside a node.</p>
+
+  <h3 id="f-scaling">Scaling laws and money</h3>
+  <p>At 20 tokens per parameter, \(C = 6N \cdot 20N = 120N^2\), so \(N = \sqrt{C/120}\). This agrees with the Epoch AI refit of the parametric law within 10% from \(10^{22}\) to \(4 \times 10^{25}\) FLOPs, and the IsoFLOP valley is so flat that a factor of two in \(N\) costs only about 0.004 nats at \(10^{24}\) (<a href="13-scaling-laws.html#worked">page 13</a>). Do not use the rounded constants printed in the Chinchilla paper for Approach 3: they imply 60 to 140 tokens per parameter, an artifact of rounding. Money is a product: GPU-hours times a price, or for serving, price times GPUs over tokens per second. Report the price you assumed.</p>
+</section>
+
+<section>
+  <h2 id="regimes">Which resource binds: chaining the formulas</h2>
+
+  <p>The card tells you how much of something a formula gives. The harder question in an interview is which formula applies. The answer is almost always determined by one resource, and the table lists it for the workloads you will be asked about, with the efficiency to plan with.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Workload</th><th>Binding resource</th><th>Time</th><th>Plan with</th></tr></thead>
+    <tbody>
+      <tr><td>Pretraining, fine-tuning</td><td>Compute</td><td>\(6ND/(G\,P\,\text{MFU})\)</td><td>MFU 0.40 (0.38 to 0.43 for Llama 3 405B)</td></tr>
+      <tr><td>Prefill</td><td>Compute</td><td>\(2NT/(P\,\text{MFU})\)</td><td>MFU 0.5</td></tr>
+      <tr><td>Decode, dense model</td><td>HBM bandwidth: weights at small batch, KV cache at large batch or long context</td><td>\((W + B\,T\,\kappa)/\text{BW}\)</td><td>A fraction of the roofline (0.64 on page 25, 0.80 measured on page 06)</td></tr>
+      <tr><td>Decode, MoE</td><td>HBM bandwidth of nearly all experts once \(B \gtrsim 64\)</td><td>\(W_{\text{tot}}/\text{BW}\)</td><td>Memory follows the total, not the activated count</td></tr>
+      <tr><td>Gradient sync, tensor parallelism</td><td>Network, per-direction link bandwidth</td><td>\(2\tfrac{n-1}{n}S/\text{BW}\)</td><td>Data-parallel sync overlaps the backward pass; TP does not</td></tr>
+      <tr><td>RL rollouts</td><td>HBM bandwidth (decode)</td><td>tokens over tokens/s per GPU</td><td>2,500 tokens/s per GPU for an 8B model, about 4% MFU (page 25)</td></tr>
+      <tr><td>Does it fit?</td><td>HBM capacity</td><td>bytes versus 0.9 × HBM</td><td>Leave room for logits, buffers, fragmentation</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Real answers chain several rows. Figure 2 follows the most common chain, from a token budget to a bill, with the numbers for Llama 3 405B on 16,384 H100s at 40% MFU: \(C = 6 \times 405\text{B} \times 15.6\text{T} = 3.79 \times 10^{25}\) FLOPs; one GPU sustains \(0.40 \times 989.4 = 395.8\) TFLOP/s; \(3.79 \times 10^{25}/3.958 \times 10^{14} = 9.58 \times 10^{10}\) GPU-seconds, which is 26.6M GPU-hours; divided over 16,384 GPUs that is \(5.85 \times 10^{6}\) s or 67.7 days; at $2 per GPU-hour it costs $53M.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 320" role="img" aria-labelledby="fig-34-2-title">
+<title id="fig-34-2-title">The napkin chain from tokens and parameters to compute, GPU-hours, wall-clock time and dollars, with Llama 3 405B numbers and the assumption each step hides</title>
+<defs><marker id="arrow-34-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-a" x="6" y="30" width="132" height="70" rx="6"/>
+<text x="72" y="52" text-anchor="middle" class="s-bold">Inputs</text>
+<text x="72" y="70" text-anchor="middle" class="s-small">D = 15.6T tokens</text>
+<text x="72" y="86" text-anchor="middle" class="s-small">N = 405B parameters</text>
+<rect class="s-box" x="198" y="30" width="132" height="70" rx="6"/>
+<text x="264" y="52" text-anchor="middle" class="s-bold">Compute C</text>
+<text x="264" y="72" text-anchor="middle" class="s-small">3.79e25 FLOPs</text>
+<rect class="s-box" x="390" y="30" width="132" height="70" rx="6"/>
+<text x="456" y="52" text-anchor="middle" class="s-bold">GPU-hours</text>
+<text x="456" y="70" text-anchor="middle" class="s-small">26.6M GPU-h</text>
+<text x="456" y="86" text-anchor="middle" class="s-small s-muted">(9.58e10 GPU-s)</text>
+<rect class="s-c" x="582" y="30" width="132" height="70" rx="6"/>
+<text x="648" y="52" text-anchor="middle" class="s-bold">Wall-clock</text>
+<text x="648" y="70" text-anchor="middle" class="s-small">67.7 days</text>
+<text x="648" y="86" text-anchor="middle" class="s-small s-muted">G = 16,384 GPUs</text>
+<path class="s-line" d="M138,65 L198,65" marker-end="url(#arrow-34-2)"/>
+<text x="168" y="57" text-anchor="middle" class="s-small s-mono">× 6N</text>
+<path class="s-line" d="M330,65 L390,65" marker-end="url(#arrow-34-2)"/>
+<text x="360" y="57" text-anchor="middle" class="s-small s-mono">÷ P·MFU</text>
+<path class="s-line" d="M522,65 L582,65" marker-end="url(#arrow-34-2)"/>
+<text x="552" y="57" text-anchor="middle" class="s-small s-mono">÷ G</text>
+<text x="360" y="84" text-anchor="middle" class="s-small s-muted">396T/s</text>
+<path class="s-line" d="M456,100 L456,120" marker-end="url(#arrow-34-2)"/>
+<text x="464" y="115" text-anchor="start" class="s-small s-mono">× price</text>
+<rect class="s-e" x="390" y="120" width="132" height="60" rx="6"/>
+<text x="456" y="142" text-anchor="middle" class="s-bold">Dollars</text>
+<text x="456" y="160" text-anchor="middle" class="s-small">$53M at $2/GPU-h</text>
+<rect class="s-box" x="6" y="120" width="370" height="60" rx="6"/>
+<text x="16" y="140" text-anchor="start" class="s-small s-bold">Cross-check with public numbers</text>
+<text x="16" y="157" text-anchor="start" class="s-small">6ND = 3.79e25 matches the paper's 3.8e25 FLOPs.</text>
+<text x="16" y="172" text-anchor="start" class="s-small">Model card: 30.84M GPU-h implies 34.5% MFU.</text>
+<text x="6" y="204" text-anchor="start" class="s-small s-bold">What each step hides</text>
+<rect class="s-plain s-dash" x="6" y="212" width="224" height="88" rx="6"/>
+<text x="16" y="231" text-anchor="start" class="s-small s-bold">× 6N: which N?</text>
+<text x="16" y="249" text-anchor="start" class="s-small">8B: 7% to 13% on C</text>
+<text x="16" y="265" text-anchor="start" class="s-small">MoE: 18× (671B vs 37.55B)</text>
+<text x="16" y="281" text-anchor="start" class="s-small">6N leaves out attention</text>
+<rect class="s-plain s-dash" x="248" y="212" width="224" height="88" rx="6"/>
+<text x="258" y="231" text-anchor="start" class="s-small s-bold">÷ P·MFU: which peak?</text>
+<text x="258" y="249" text-anchor="start" class="s-small">dense 989.4T, not sparse 1,979T</text>
+<text x="258" y="265" text-anchor="start" class="s-small">MFU 0.38 to 0.43 is a 13% span</text>
+<text x="258" y="281" text-anchor="start" class="s-small">fp8 run: use the fp8 peak</text>
+<rect class="s-plain s-dash" x="490" y="212" width="224" height="88" rx="6"/>
+<text x="500" y="231" text-anchor="start" class="s-small s-bold">÷ G: perfect scaling?</text>
+<text x="500" y="249" text-anchor="start" class="s-small">assumes no restarts or idle time</text>
+<text x="500" y="265" text-anchor="start" class="s-small">Llama 3: over 90% effective time</text>
+<text x="500" y="281" text-anchor="start" class="s-small">small models: lower MFU</text>
+</svg>
+    <figcaption><b>Figure 2.</b> From a token budget to a bill: two multiplications and two divisions, each with an assumption that an interviewer may probe. Blue is given, green and yellow are answers. The cross-check box is what turns a calculation into an estimate you can defend: 6ND reproduces the paper's compute, and the model card's GPU-hours imply an MFU (34.5%) a little below the 38% to 43% of Table 4, because they average over the whole run, which plausibly includes restarts and the lower-MFU long-context stage (our reading; the card does not say).</figcaption>
+  </figure>
+
+  <p>Where the error hides differs by question. In a training-time answer, the achieved MFU is the least certain input (a 13% span within one paper, and about 0.16 versus 0.40 between Llama-3-8B and a large dense run), then the peak (a factor of 2 if you pick the sparse number), then which \(N\). In an inference answer the bandwidth is exact but the achieved fraction is not, and the distribution of context lengths matters as much as the mean. When you must give one number, give the roofline and say it is a bound.</p>
+</section>
+
+<section>
+  <h2 id="habits">Sanity checks, and how to say them out loud</h2>
+
+  <ul>
+    <li><strong>Order of magnitude before arithmetic.</strong> \(10^{24}\) FLOPs is about \(7 \times 10^{5}\) GPU-hours. If your answer for a \(10^{24}\)-FLOP run is \(7 \times 10^{3}\) or \(7 \times 10^{8}\), stop and find the slip (usually a factor of 3600, or bits versus bytes).</li>
+    <li><strong>Ratios before absolutes.</strong> "Doubling the context doubles the KV term, so throughput at large batch halves." "Going from an H100 to an H200 changes only bandwidth, so batch-1 decode speeds up 1.43×." An interviewer often wants the ratio, and you can state it in seconds.</li>
+    <li><strong>Compute every bound and report the largest time.</strong> A decode answer that shows the memory time and the compute time (4.95 ms against 0.017 ms at batch 1) is more convincing than one that asserts "it is memory-bound".</li>
+    <li><strong>Cross-check against a published number</strong> you can quote (table below). If your formula misses a public number by more than 30%, one of your assumptions is wrong, and finding which one is the answer.</li>
+    <li><strong>Units at every step.</strong> GB or GiB, Gb or GB, FLOPs or FLOP/s, tokens or sequences, one-way or bidirectional. Say the unit next to each number as you write it.</li>
+    <li><strong>State what you neglected and its size:</strong> "I ignore attention FLOPs (about 7% of \(6N\) at 8K for an 8B model), norms (0.01%), and communication that overlaps (1% to 8% of a step in page 15's plans)". Say the direction of the error: a roofline is a lower bound on time.</li>
+    <li><strong>Give a range, not a point.</strong> Three MFU values (0.30, 0.40, 0.50) turn "507K GPU-hours" into "405K to 677K", which is what a planner needs.</li>
+  </ul>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Public number</th><th>Formula</th><th class="num">Result</th></tr></thead>
+    <tbody>
+      <tr><td>Llama 3 405B: \(3.8 \times 10^{25}\) FLOPs <a href="https://arxiv.org/abs/2407.21783">[§1]</a></td><td>\(6 \times 405\text{B} \times 15.6\text{T}\)</td><td class="num">\(3.79 \times 10^{25}\) (0.24% low)</td></tr>
+      <tr><td>Llama 1 65B: about 21 days on 2,048 A100 at 380 tokens/s/GPU</td><td>\(1.4\text{T}/(380 \times 2048)\)</td><td class="num">20.8 days (<a href="04-transformer-block.html#gpu-hours">page 04</a>)</td></tr>
+      <tr><td>DeepSeek-V3: 180K GPU-hours per trillion tokens, 2.664M for 14.8T <a href="https://arxiv.org/abs/2412.19437">[§1]</a></td><td>\(180\text{K} \times 14.8\); \(180\text{K}/2048\)</td><td class="num">2.664M exactly; 87.9 h = 3.7 days</td></tr>
+      <tr><td>DeepSeek-V3 implied efficiency</td><td>\(6 \times 37\text{B} \times 10^{12}/(180\text{K} \times 3600)\)</td><td class="num">343 TFLOP/s: 34.6% of bf16, 17.3% of fp8 peak</td></tr>
+      <tr><td>Llama 3.1 405B model card: 30.84M H100-hours</td><td>\(3.79 \times 10^{25}/(30.84\text{M} \times 3600)\)</td><td class="num">341 TFLOP/s: 34.5% (Table 4: 38% to 43% in steady state)</td></tr>
+      <tr><td>Llama 2 7B and 70B: 184,320 and 1,720,320 A100-80GB hours for 2.0T tokens <a href="https://arxiv.org/abs/2307.09288">[Tab. 1-2]</a></td><td>\(6ND/(\text{GPU-h} \times 3600)\), with \(N = 6.74\text{B}\) and \(68.98\text{B}\) from the configs</td><td class="num">122 and 134 TFLOP/s: 39% and 43% of the A100's 312</td></tr>
+      <tr><td>Llama 3 8B model card: 1.3M H100-hours</td><td>\(7.23 \times 10^{23}/(1.3\text{M} \times 3600)\)</td><td class="num">154 TFLOP/s: 15.6%, small models run at lower MFU</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="sensitivity">Sensitivities to state before you compute</h3>
+  <p>Interviewers often follow an answer with "and if we change X?" Have the ratio ready; it is one line and it shows you understand which term moves.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>If you change</th><th>The answer changes by</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>MFU from 0.40 to 0.30</td><td>Training time and GPU-hours ×1.33</td><td>\(t \propto 1/\text{MFU}\)</td></tr>
+      <tr><td>Tokens ×2, or parameters ×2</td><td>Compute and time ×2</td><td>\(C = 6ND\). A compute-optimal run at 4× the budget has 2× the parameters and 2× the tokens.</td></tr>
+      <tr><td>Cluster size ×2 at a fixed batch</td><td>Time ÷ slightly under 2</td><td>MFU falls at scale: Llama 3 went from 43% on 8,192 GPUs to 41% on 16,384 (Table 4)</td></tr>
+      <tr><td>Decode batch ×2 with weights dominating</td><td>Tokens/s up to ×2, with the step time nearly flat</td><td>One weight read is shared; the KV term grows, capping throughput at \(\text{BW}/(T\kappa)\)</td></tr>
+      <tr><td>Context ×2 in decode</td><td>KV bytes and its read time ×2; ceiling throughput ÷2</td><td>KV is linear in \(T\); weights do not change</td></tr>
+      <tr><td>GQA-8 to MHA on Llama-3-8B</td><td>KV per token ×4</td><td>32 KV heads instead of 8</td></tr>
+      <tr><td>bf16 to fp8 weights (and cache)</td><td>Weight-read time and cache bytes ÷2</td><td>Bytes per element; the ridge in tokens stays about 295</td></tr>
+      <tr><td>H100 to H200 for decode</td><td>Tokens/s ×1.43</td><td>Same FLOP/s, HBM 4.8 versus 3.35 TB/s</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="script">One question, spoken through</h3>
+  <p><em>"How many H100s would you need to train a 7B model on 2T tokens in two weeks?"</em> Here is a complete answer, in the order you would say it.</p>
+  <ol>
+    <li><strong>Restate.</strong> GPUs \(G\) such that \(6ND\) FLOPs finish in 14 days.</li>
+    <li><strong>Assume.</strong> \(N = 7\text{B}\), \(D = 2\text{T}\), bf16 dense peak 989.4 TFLOP/s, MFU 40%, so 396 TFLOP/s per GPU. Fourteen days is \(1.21 \times 10^{6}\) s. Price $2 per GPU-hour.</li>
+    <li><strong>Compute.</strong> \(C = 6 \times 7 \times 10^{9} \times 2 \times 10^{12} = 8.4 \times 10^{22}\) FLOPs. One GPU delivers \(3.96 \times 10^{14} \times 1.21 \times 10^{6} = 4.8 \times 10^{20}\) in that time, so \(G = 8.4 \times 10^{22}/4.8 \times 10^{20} = 175\), about 22 nodes (176 GPUs). That is \(8.4 \times 10^{22}/(3.96 \times 10^{14} \times 3600) = 59\text{K}\) GPU-hours, $118K.</li>
+    <li><strong>Does it fit?</strong> States are \(16 \times 7\text{B} = 112\) GB, more than 80 GB, so shard: ZeRO-1 over 176 GPUs leaves \(4N + 12N/176 = 28.5\) GB. Activations at 4K context with a fused kernel are \(34\,sbhL = 18\) GB for one sequence, plus 0.5 GB of logits. It fits.</li>
+    <li><strong>Network.</strong> bf16 gradients are 14 GB; a ring over 50 GB/s InfiniBand sends \(2 \times 175/176 \times 14 = 28\) GB, 0.56 s. With a 4M-token batch each GPU does 22,700 tokens, \(6N \times 22{,}700 = 9.5 \times 10^{14}\) FLOPs, 2.4 s per step, so the sync is 23% if exposed. It must overlap with the backward pass, which it can.</li>
+    <li><strong>Check and range.</strong> Llama 2 7B needed 184,320 A100-hours for 2.0T tokens, which is 39% of the A100's peak, so 40% is consistent; the same FLOPs on H100 at 40% are 59K GPU-hours. At MFU 30% I would need 234 GPUs, and the cost is $118K plus restarts, ablations and the runs that chose the recipe.</li>
+  </ol>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"An H100 does 1,979 TFLOP/s in bf16."</strong> That is NVIDIA's headline with 2:4 structured sparsity. Dense bf16 is 989.4, and dense fp8 is 1,979. Using the sparse number halves every MFU you compute and understates every training time by 2×.</li>
+    <li><strong>"NVLink is 900 GB/s, so a gradient all-reduce runs at 900."</strong> 900 GB/s is bidirectional per GPU. A ring uses one direction, 450 GB/s, and the all-reduce sends \(2(n-1)/n\) times the message. Both slips are factors of about 2.</li>
+    <li><strong>"6ND uses the parameter count on the model card."</strong> Which \(N\)? Total, without the input table, without both vocabulary matrices, or (for MoE) activated. For Llama-3-8B the choices span 7% to 13% of \(C\); for DeepSeek-V3 the gap between 671B and 37.55B is 18×.</li>
+    <li><strong>"Decode speed follows FLOPs."</strong> It follows bytes over bandwidth. An H200 has the same tensor cores as an H100 and decodes 1.43× faster because its HBM is 1.43× faster, and at batch 1 an H100 uses 0.35% of its FLOP/s.</li>
+    <li><strong>"Activated parameters set the memory and the GPU count."</strong> They set the FLOPs. DeepSeek-V3 needs 671 GB in fp8 even though a token touches 37.55B parameters, and by a batch of 64 a decode step already reads 87% of the routed experts.</li>
+    <li><strong>"GB versus GiB does not matter."</strong> It is a 7.4% gap. Llama-3-8B in bf16 is 16.06 GB or 14.96 GiB, and the 32-user, 32K-context KV cache of a 70B model is 343.6 GB or 320 GiB. State the unit.</li>
+    <li><strong>"40% MFU means the GPU is 40% busy."</strong> MFU counts only the FLOPs the model needs, against the dense peak of the format you compute in. Recomputation lowers it, and DeepSeek-V3's 34.6% on a bf16 basis is 17.3% of the fp8 peak it actually uses.</li>
+    <li><strong>"The roofline is what I will measure."</strong> It is a lower bound on time. One measured H100 NVL decode point reaches 80% of its roofline, and page 25's engine is assumed at 64%. Quote the bound and say so.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions: 34 worked drills</h2>
+
+  <p>Eight groups, and within each group the drills run from warm-up to deep-dive. Try each one on a blank page with a timer (2 to 4 minutes for warm-up and core, 5 to 8 for deep-dive), then open the answer, which shows the arithmetic and names the assumption that matters. Unless a drill says otherwise, the constants are those of the <a href="#constants">constants section</a>: 989.4 TFLOP/s dense bf16, 3.35 TB/s HBM, 450 GB/s NVLink and 50 GB/s network per direction, $2 per GPU-hour, GB = \(10^9\) bytes. The tests of the <a href="#exercises">napkin drill</a> reproduce these answers.</p>
+
+  <h3 id="q-params">Parameters and FLOPs</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D1. How many parameters does Llama-3-8B have? Go from the config: \(L = 32\), \(d = 4096\), \(n_h = 32\), \(n_{kv} = 8\), \(d_h = 128\), \(d_{ff} = 14{,}336\), \(V = 128{,}256\), untied embeddings, no biases.</summary>
+    <div class="answer">
+      <p>Count matrices. Embedding \(V d = 128{,}256 \times 4096 = 525{,}336{,}576\), and the LM head is the same size. Per layer, attention is \(2 d\, n_h d_h + 2 d\, n_{kv} d_h = 2 \cdot 4096 \cdot 4096 + 2 \cdot 4096 \cdot 1024 = 33{,}554{,}432 + 8{,}388{,}608 = 41{,}943{,}040\); the SwiGLU FFN is \(3 \cdot 4096 \cdot 14{,}336 = 176{,}160{,}768\); two norm gains add 8,192. That is 218,112,000 per layer, and \(\times 32 = 6{,}979{,}584{,}000\). Total: \(2 \times 525{,}336{,}576 + 6{,}979{,}584{,}000 + 4{,}096\) (final norm) \(= \mathbf{8{,}030{,}261{,}248}\).</p>
+      <p>The shortcut \(13Ld^2 + 2Vd = 6{,}979{,}321{,}856 + 1{,}050{,}673{,}152 = 8{,}029{,}995{,}008\) is within 0.003%. Say which terms scale how: the MLPs are 70% of the model (\(d^2\) scaling), the two vocabulary matrices 13.1% (\(Vd\) scaling), norms are invisible. Derivation on <a href="04-transformer-block.html#param-count">page 04</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D2. Llama-3-8B: forward FLOPs per token, training FLOPs per token, and total training FLOPs for 15T tokens. Which \(N\) do you use?</summary>
+    <div class="answer">
+      <p>Forward is \(2N = 2 \times 8.03 \times 10^{9} = 16.1\) GFLOPs per token (two FLOPs per weight). Training is \(6N = 48.2\) GFLOPs: forward 2, input gradient 2, weight gradient 2. Over 15T tokens, \(C = 6ND = 6 \times 8.03 \times 10^{9} \times 15 \times 10^{12} = \mathbf{7.23 \times 10^{23}}\) FLOPs.</p>
+      <p>Then state the convention. The embedding lookup costs no FLOPs, so the matmul weights are 7.505B (blocks plus LM head), giving \(2N_{mm} = 15.01\) GFLOPs. Attention scores add \(4LTd = 4.29\) GFLOPs at \(T = 8192\) (full count; 2.15 causal). With causal attention, training costs \(6 \times 7.505 \times 10^{9} + 6 \cdot 32 \cdot 8192 \cdot 4096 = 45.03 + 6.44 = 51.47\) GFLOPs per token, 6.8% above \(6N\). Choosing total, non-embedding (6.98B) or matmul-only \(N\) moves \(C\) between \(6.28\) and \(7.23 \times 10^{23}\), a 7% to 13% spread (<a href="04-transformer-block.html#which-n">page 04</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D3. Estimate Llama-3-70B's parameter count from its config (\(L = 80\), \(d = 8192\), \(n_h = 64\), \(n_{kv} = 8\), \(d_{ff} = 28{,}672\), \(V = 128{,}256\)), then say why "\(13Ld^2 + 2Vd\)" is off for it.</summary>
+    <div class="answer">
+      <p>Per layer: attention \(2 \cdot 8192 \cdot 8192 + 2 \cdot 8192 \cdot 1024 = 134{,}217{,}728 + 16{,}777{,}216 = 150{,}994{,}944\); FFN \(3 \cdot 8192 \cdot 28{,}672 = 704{,}643{,}072\); norms 16,384. That is 855,654,400 (page 15's 855.65M), and \(\times 80 = 68{,}452{,}352{,}000\). Embedding and head \(2 \times 128{,}256 \times 8192 = 2{,}101{,}346{,}304\), final norm 8,192. Total \(\mathbf{70{,}553{,}706{,}496}\), or 70.55B.</p>
+      <p>The rule \(13Ld^2 + 2Vd\) gives 71.89B, 1.9% too high, because the coefficient is not universal. It is (attention + FFN)/\(d^2\): for Llama-3-8B, \(n_{kv}d_h = d/4\) so attention is \(2.5d^2\) and the FFN is \(3 \times 3.5 = 10.5d^2\), total 13. For 70B, \(n_{kv}d_h = d/8\) gives \(2.25d^2\), so \(2.25 + 10.5 = 12.75\). For 405B (\(d_{ff} = 3.25d\), \(n_{kv}d_h = d/16\)): \(2.125 + 9.75 = 11.875\). Rederive it per config.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D4. How many parameters does DeepSeek-V3 activate per token? Config: 61 layers (3 dense with \(d_{ff} = 18{,}432\), 58 MoE), \(d = 7168\), MLA attention of 187,107,328 parameters per layer, 256 routed and 1 shared expert of width 2,048, top-8, \(V = 129{,}280\). The report says 37B.</summary>
+    <div class="answer">
+      <p>One SwiGLU expert has \(3 \cdot 7168 \cdot 2048 = 44{,}040{,}192\) parameters. An MoE layer activates \(8 + 1 = 9\) experts, \(396{,}361{,}728\), plus the router \(7168 \times 256 = 1{,}835{,}008\): 398,196,736 per layer, so 58 layers give 23,095,410,688. Add the three dense FFNs \(3 \times 3 \cdot 7168 \cdot 18{,}432 = 1{,}189{,}085{,}184\), attention \(61 \times 187{,}107{,}328 = 11{,}413{,}547{,}008\), and norms \(881{,}664\):</p>
+      <p>non-embedding \(= 35{,}698{,}924{,}544\) (35.70B). Adding the LM head (\(129{,}280 \times 7168 = 926{,}679{,}040\)) gives 36.63B, and adding the input table too gives 37,552,282,624 (37.55B). The reported 37B sits inside that range: which vocabulary matrices count is a 5% choice, so say which.</p>
+      <p>The total is \(58 \times (257 \times 44{,}040{,}192 + 1{,}835{,}008) + 1{,}189{,}085{,}184 + 11{,}413{,}547{,}008 + 1{,}853{,}358{,}080 + 881{,}664 = 671{,}026{,}404{,}352\). Experts are 97.8% of the parameters but only \(9/257 = 3.5\%\) of them are active, so activated over total is 5.6%: the 14.6B of always-on parameters is why the ratio exceeds the expert ratio. See <a href="08-mixture-of-experts.html#numbers">page 08</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D5. At what context length do attention scores cost as much as the linear layers in Llama-3-8B, and what share of the forward FLOPs are they at 8K and at 128K?</summary>
+    <div class="answer">
+      <p>The linear layers cost \(2N_{mm} = 15.01\) GFLOPs per token (\(N_{mm} = 7{,}504{,}658{,}432\)). Attention per token is \(4LTd = 524{,}288\,T\) FLOPs counting every score, half that if causal. At \(T = 8192\): 4.29 GFLOPs, 22.2% of the forward pass (2.15 GFLOPs and 12.5% causal). At \(T = 131{,}072\): 68.7 GFLOPs, 82.1% (34.4 and 69.6% causal).</p>
+      <p>They are equal when \(4LTd = 2N_{mm}\), i.e. \(T^{*} = N_{mm}/(2Ld) = 28{,}628\) (full count) or 57,256 (causal), close to the rule of thumb \(6d = 24{,}576\) and \(12d = 49{,}152\). Roughly 20K to 60K tokens, depending on the convention. That is why Llama 3 pretrains at 8K and adds context at the end (about 800B tokens, 5% of the 405B run; <a href="04-transformer-block.html#attn-flops">page 04</a>).</p>
+    </div>
+  </details>
+
+  <h3 id="q-memory">Memory</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D6. How much memory do the model states of a 70B dense model take with mixed-precision Adam, and how many 80 GB GPUs is that?</summary>
+    <div class="answer">
+      <p>Sixteen bytes per parameter: 2 (bf16 weights) + 2 (bf16 gradients) + 4 (fp32 master) + 4 + 4 (Adam \(m\) and \(v\)). With \(N = 70.55\)B: \(16 \times 70.55 \times 10^{9} = 1{,}129\) GB, 1.13 TB. Divided by 80 GB that is 14.1 GPUs (15.7 at 90% usable) before a single activation is stored, so at least 16 GPUs just to hold them. Sharding, not fitting, is the issue: ZeRO-3 over 64 GPUs leaves \(1{,}129/64 = 17.6\) GB per GPU. The recipe is specific: Llama 3 accumulates gradients in fp32 (18 bytes), and DeepSeek-V3 keeps bf16 Adam moments (about 14). See <a href="15-distributed-training.html#states">page 15</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D7. You want to fine-tune Llama-3-8B on one 80 GB GPU. Compare training-state memory for full fine-tuning, LoRA rank 16 on all linear layers, and QLoRA.</summary>
+    <div class="answer">
+      <p><strong>Full:</strong> \(16 \times 8.03\text{B} = 128.5\) GB, which does not fit. <strong>LoRA:</strong> an adapter on a \(d_{in} \times d_{out}\) matrix has \(r(d_{in} + d_{out})\) parameters. Per layer the seven matrices (q, k, v, o, gate, up, down) sum to \(8192 + 5120 + 5120 + 8192 + 3 \times 18{,}432 = 81{,}920\), so \(16 \times 81{,}920 = 1{,}310{,}720\) per layer and 41,943,040 in total (0.52% of the model). Their states cost \(41.9\text{M} \times 16\) B \(= 0.67\) GB. The frozen bf16 base is 16.06 GB, so the total is 16.73 GB, 7.7× less than full.</p>
+      <p><strong>QLoRA:</strong> the 6.98B linear parameters go to NF4 with double quantization at 4.127 bits: \(6.98 \times 10^{9} \times 4.127/8 = 3.60\) GB, plus 2.10 GB for the bf16 embedding and head (\(2 \times 525{,}336{,}576 \times 2\) B), plus 0.67 GB of adapter states: 6.37 GB, 20× less than full. The adapters are a rounding error; the frozen base is what QLoRA shrinks. Activations come on top and do not shrink (<a href="20-peft-lora.html#lora-numbers">page 20</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D8. Activation memory for one 8,192-token sequence through Llama-3-8B: store everything, use a fused attention kernel, or recompute fully. Use Korthikanti's per-layer formula.</summary>
+    <div class="answer">
+      <p>Per layer, storing everything costs \(sbh(34 + 5as/h)\) bytes. Here \(sbh = 8192 \cdot 1 \cdot 4096 = 33.55\)M and \(5as/h = 5 \cdot 32 \cdot 8192/4096 = 320\), so the factor is 354: \(354 \times 33.55\text{M} = 11.88\) GB per layer and \(\mathbf{380}\) GB for 32 layers (354 GiB). The \(T^2\) score term is 90% of it. A fused kernel (FlashAttention) never stores the scores, leaving \(34\,sbh\) = 1.14 GB per layer and 36.5 GB in total. Full recomputation keeps only each layer's input, \(2\,sbh = 67\) MB per layer and 2.15 GB in total, at the price of a third forward pass (\(8N\) instead of \(6N\) FLOPs per token, +33%).</p>
+      <p>Add the fp32 logits, \(8192 \times 128{,}256 \times 4\) B \(= 4.2\) GB. The constants are GPT-style (dropout, GeLU, MHA); Llama's differ, but the scaling in \(s\), \(b\) and \(L\) is what an interviewer wants (<a href="15-distributed-training.html#activations">page 15</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D9. Llama 3 405B's training states are 6.48 TB. How many GPUs does memory force, and why did Meta use 16,384?</summary>
+    <div class="answer">
+      <p>States are \(16 \times 405\text{B} = 6.48\) TB (6.49 TB with the exact 405.85B). At 80 GB per GPU that is 81 GPUs; at 90% usable, 90. Activations, logits and buffers push the practical minimum to the low hundreds: Llama 3's \(\text{TP}8 \times \text{PP}16 = 128\) GPUs hold one replica at \(6.48\text{ TB}/128 = 50.6\) GB of states per GPU (<a href="15-distributed-training.html#plan-c">page 15</a>).</p>
+      <p>Memory sets the size of a replica; <strong>time</strong> sets how many replicas. One 128-GPU replica at 40% MFU needs \(3.79 \times 10^{25}/(128 \times 3.958 \times 10^{14}) = 7.5 \times 10^{8}\) s, about 24 years. To finish in 60 days you need \(G = C/(t\,P\,\text{MFU}) = 3.79 \times 10^{25}/(5.18 \times 10^{6} \times 3.958 \times 10^{14}) = 18{,}500\) GPUs, the same order as Meta's 16K. Data parallelism (DP 128) exists for speed, not for memory.</p>
+    </div>
+  </details>
+
+  <h3 id="q-training">Training time and cost</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D10. Estimate the GPU-hours and dollar cost of pretraining Llama-3-8B on 15T tokens on H100s at 40% MFU, and the days on 1,024 GPUs. How does that compare with the model card?</summary>
+    <div class="answer">
+      <p>\(C = 6ND = 7.23 \times 10^{23}\) FLOPs (D2). One GPU sustains \(0.40 \times 989.4 = 395.8\) TFLOP/s, so GPU-seconds \(= 7.23 \times 10^{23}/3.958 \times 10^{14} = 1.83 \times 10^{9}\), which is \(\mathbf{507\text{K}}\) GPU-hours (507,268; page 04 gets 507,474 using a 989 TFLOP/s peak). On 1,024 GPUs: \(507{,}268/1024/24 = 20.6\) days. At $2 per GPU-hour: $1.01M. As a range, MFU 0.30 to 0.50 gives 676K to 406K GPU-hours.</p>
+      <p>The model cards list 1.3M (Llama 3) and 1.46M (Llama 3.1) H100-hours, 2.6× and 2.9× more. Inverted, that is an MFU of 15.6% and 13.9%: small models run far below the 40% of large dense runs, and the cards may include overheads. This is the case to raise in an interview: a formula that misses a public number by that much needs a stated reason (<a href="04-transformer-block.html#gpu-hours">page 04</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D11. How long does Llama 3 405B take to pretrain on 16,384 H100s at 40% MFU, and how does that compare with what the paper says?</summary>
+    <div class="answer">
+      <p>\(C = 6 \times 405 \times 10^{9} \times 15.6 \times 10^{12} = 3.79 \times 10^{25}\) FLOPs, matching the paper's \(3.8 \times 10^{25}\). The cluster sustains \(16{,}384 \times 3.958 \times 10^{14} = 6.485 \times 10^{18}\) FLOP/s, so \(t = 3.79 \times 10^{25}/6.485 \times 10^{18} = 5.85 \times 10^{6}\) s \(= \mathbf{67.7}\) days, or 26.6M GPU-hours. With the MFU of Table 4 (38% to 43%) it is 71.2 to 62.9 days.</p>
+      <p>The paper gives no wall-clock time for the run. It reports MFU and, for its failure statistics, a 54-day snapshot of pre-training with 466 interruptions and over 90% effective training time <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2, §3.3.4]</a>. The Llama 3.1 model card lists 30.84M H100-hours; on 16,384 GPUs that is 1,882 hours, 78.4 days, an implied MFU of 34.5%. Table 4 lists three stages, one of them on 8,192 GPUs, so wall-clock is not simply GPU-hours over 16,384. Read the napkin as a lower bound: 68 days at a steady 40%, and more with restarts, evaluation and the lower-MFU long-context stage.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D12. DeepSeek-V3 reports 2.788M H800 GPU-hours. Check the cost, and compute the MFU it implies.</summary>
+    <div class="answer">
+      <p>The report's Table 1 lists 2,664K (pretraining) + 119K (context extension) + 5K (post-training) = 2,788K GPU-hours, and at an assumed $2 per hour \(\$5.576\)M. Pretraining is 180K GPU-hours per trillion tokens times 14.8T \(= 2{,}664\)K exactly, which is 87.9 hours (3.7 days) per trillion tokens on 2,048 GPUs and 54.2 days in total.</p>
+      <p>Implied efficiency: \(10^{12}/(180{,}000 \times 3600) = 1{,}543\) tokens/s per GPU, and \(6N_{\text{act}} = 6 \times 37\text{B} = 222\) GFLOPs per token, so 343 TFLOP/s, which is \(\mathbf{34.6\%}\) of the 989.4 bf16 peak but only 17.3% of the 1,979 TFLOP/s fp8 peak the run computes in. It is a lower bound (attention and the MTP module are not counted). The same method on Llama 3 405B gives 34.5%, so the 11× cost gap is the ratio of \(N_{\text{act}} D\) (\(3.29 \times 10^{24}\) versus \(3.79 \times 10^{25}\) FLOPs), not better hardware efficiency. And $5.576M is the rental value of the final run only: it excludes research, ablations, data and staff (<a href="27-deepseek-2-v3.html#cost">page 27</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D13. What does 1T tokens of RL rollouts from Llama-3-8B cost, if one H100 sustains 2,500 output tokens/s?</summary>
+    <div class="answer">
+      <p>\(10^{12}/2500 = 4 \times 10^{8}\) GPU-seconds \(= 111{,}111\) GPU-hours \(= \$222\)K at $2 per hour. On 64 GPUs that is \(4 \times 10^{8}/64 = 6.25 \times 10^{6}\) s, 72 days; on 1,024 GPUs, 4.5 days. Sanity-check the rate: 2,500 tokens/s is 64% of the 3,919 tokens/s roofline of a 64-sequence decode batch with a 4.6K average context (each step reads 16.06 GB of weights plus 38.7 GB of KV, 16.3 ms), and it is \(2N \times 2500 = 40\) TFLOP/s, about 4% MFU.</p>
+      <p>The same tokens cost half as much to train on: \(10N\) FLOPs per trained token (forward, backward, two log-prob passes) at 40% MFU is 0.20 ms per token, against 0.40 ms per generated token. So generation is about two thirds of the GPU-seconds of an RL step, despite five times fewer FLOPs (<a href="25-rl-systems-agentic.html#rollout-numbers">page 25</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D14. Design question. You must pretrain a 70B dense model (Llama-3-70B shape) on 15T tokens in 30 days on H100s. How many GPUs, what does it cost, and what else must you check?</summary>
+    <div class="answer">
+      <p><strong>Size.</strong> \(C = 6 \times 70.55 \times 10^{9} \times 15 \times 10^{12} = 6.35 \times 10^{24}\) FLOPs. At 40% MFU one GPU delivers \(3.958 \times 10^{14}\) FLOP/s, so \(C/3.958 \times 10^{14} = 1.60 \times 10^{10}\) GPU-seconds, 4.46M GPU-hours. Over 30 days (720 h), \(G = 4.457\text{M}/720 = \mathbf{6{,}190}\) GPUs, about 775 nodes of 8. That is 6.0× the 1,024 GPUs of page 15's 181-day plan, as it should be. The bill is \(4.457\text{M} \times \$2 = \$8.9\)M. Range: MFU 0.35 needs 7,070 GPUs and 0.45 needs 5,500.</p>
+      <p><strong>Check the layout, which is a second problem.</strong> Memory is fine (states \(16N = 1.13\) TB shard over thousands of GPUs). But with TP8 × PP4, 6,144 GPUs give \(N_d = 192\) replicas, and a 16.8M-token batch (2,048 sequences) leaves only \(2048/192 = 10.7\) micro-batches per replica, so the pipeline bubble \((p-1)/m = 3/10.7 = 28\%\), against 4.7% in page 15's 1,024-GPU plan. Options: interleave (\(v = 4\) gives 7%), drop pipeline parallelism for FSDP with TP8, or grow the batch. The MFU you assumed depends on this choice.</p>
+      <p><strong>State the risks:</strong> restarts (Llama 3 lost under 10% to interruptions), whether 6,190 contiguous GPUs are available, and that the 30 days exclude ablations and the scaling-law runs that chose the recipe.</p>
+    </div>
+  </details>
+
+  <h3 id="q-inference">Inference latency and throughput</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D15. How fast can an H100 decode Llama-3-8B at batch 1? What would an A100, H200 and B200 do?</summary>
+    <div class="answer">
+      <p>Decode is bandwidth-bound: every step streams all weights once. In bf16 they are \(2 \times 8.03\text{B} = 16.06\) GB, so a step takes at least \(16.06/3350 = 4.79\) ms, at most 208 tokens/s. With a 4K-token KV cache (\(4096 \times 128\) KiB \(= 0.537\) GB) it is 16.60 GB, 4.95 ms, 202 tokens/s. The compute time is \(2N_{mm}/P = 15.0\text{ GFLOPs}/989.4\text{ TFLOP/s} = 0.015\) ms, 0.3% of the step: the tensor cores idle. Real engines reach a fraction; expect roughly 130 to 180 tokens/s on an SXM part (<a href="06-decoding-kv-cache.html#decode-time">page 06</a>).</p>
+      <p>Same formula, other HBM: A100 80GB (2.04 TB/s) 7.88 ms, 127 tokens/s; H200 (4.8 TB/s) 3.35 ms, 299; B200 (8 TB/s) 2.01 ms, 498. Only bandwidth matters at batch 1, so the H200 is 1.43× the H100 with identical FLOP/s.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D16. Llama-3-8B decoding with batch 64 at 4K context on one H100: step time, per-user speed, total throughput, and is it compute-bound? How many sequences fit?</summary>
+    <div class="answer">
+      <p>KV per sequence 0.537 GB, so 64 sequences hold 34.36 GB. A step reads \(16.06 + 34.36 = 50.42\) GB, taking \(50.42/3350 = \mathbf{15.05}\) ms. Per user that is 66.4 tokens/s; in total \(64/0.01505 = 4{,}252\) tokens/s, 21× the batch-1 throughput for 3.0× the step time. Compute per step is \(64 \times (15.0 + 2.15)\) GFLOPs (linear layers plus attention over a 4K cache) \(\approx 1.1\) TFLOPs, 1.1 ms, 7% of the step: still memory-bound.</p>
+      <p>Capacity: at 90% of 80 GB, \((72 - 16.06)/0.537 = 104\) sequences. The ceiling as \(B \to \infty\) is \(\text{BW}/(T\kappa) = 3.35\text{ TB/s}/0.537\text{ GB} = 6{,}240\) tokens/s per GPU, which no batching can beat: it is Shazeer's point that the cache is not shared across a batch (<a href="06-decoding-kv-cache.html#batching">page 06</a>). \(B = 64\) reaches 68% of it.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D17. Prefill a 2,048-token prompt on Llama-3-8B on one H100. What is the time to first token, and how does the prompt rate compare with decode?</summary>
+    <div class="answer">
+      <p>Prefill is compute-bound. FLOPs \(= 2NT = 2 \times 8.03 \times 10^{9} \times 2048 = 3.29 \times 10^{13}\). At peak that is \(3.29 \times 10^{13}/989.4 \times 10^{12} = 33.2\) ms; at a planning MFU of 50%, 66.5 ms, which is 30,800 prompt tokens/s, about 150× the 202 tokens/s of one decode stream. The weights are read once (4.8 ms), small next to 33 ms, so the pass is compute-bound. TTFT on an idle GPU is about 70 ms, plus queueing and network.</p>
+      <p>\(2NT\) is a slight overestimate at 2K (exact counting, with no FLOPs for the embedding lookup, causal attention and the LM head on the last position only, gives \(2.97 \times 10^{13}\), 10% less), and a big underestimate at long context: at \(T = 32{,}768\), attention is 38% of the FLOPs and the pass takes 1.5 s at 50% MFU (<a href="06-decoding-kv-cache.html#prefill-time">page 06</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D18. Design question. A service promises a time per output token (TPOT) of at most 20 ms for Llama-3-8B at 4K context on one H100. What is the largest batch, and what throughput does that give? What if the target is 10 ms?</summary>
+    <div class="answer">
+      <p>Step time is \((16.06 + 0.537\,B)/3350\) GB per ms, which must be at most 20 ms: \(16.06 + 0.537B \le 67.0\), so \(B \le 94.9\), i.e. \(B = 94\). The step is then \((16.06 + 50.47)/3350 = 19.86\) ms and throughput is \(94/0.01986 = \mathbf{4{,}733}\) tokens/s, or $0.117 per million tokens at $2 per hour. Capacity would allow 104, so the latency target binds first.</p>
+      <p>At 10 ms: \(0.010 \times 3350 = 33.5\) GB, so \(B \le (33.5 - 16.06)/0.537 = 32.5\), i.e. 32, giving 3,225 tokens/s. Halving TPOT costs 32% of throughput, and per-user speed doubles from 50 to 101 tokens/s. That trade curve (throughput up with \(B\), each user slower) is what a serving team tunes (<a href="17-inference-serving.html#cost-model">page 17</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D19. Price per million output tokens for Llama-3-8B on one H100 at $2 per GPU-hour, at batch 1 and at the 4K-context capacity limit (\(B = 104\)). Why the difference?</summary>
+    <div class="answer">
+      <p>\(\$/\text{M tokens} = p\,G/(3600 \cdot \text{tokens/s}) \times 10^{6}\). At batch 1 the rate is 202 tokens/s: \(2/(3600 \times 202) \times 10^{6} = \$2.75\). At \(B = 104\) a step reads \(16.06 + 55.83 = 71.9\) GB, 21.46 ms, so 4,846 tokens/s: \(\$0.115\). Batching made a token 24× cheaper because one 16 GB weight read is shared by 104 sequences.</p>
+      <p>Context reverses it: at 128K context the KV cache is 17.2 GB per sequence, only 3 fit, and the cost at capacity is $3.74 per million tokens, 32× the 4K figure, because the KV read is per sequence and cannot be shared (<a href="17-inference-serving.html#cost-numbers">page 17</a>). These are roofline bounds, so real costs are higher. For scale, DeepSeek's published accounting works out to about $0.30 per million output tokens on its decode nodes at $16 per node-hour, within 3× of the 8B roofline despite a 671B model.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D20. At what batch size does decode of an 8B model become compute-bound on an H100 in bf16, in fp8, and with 4-bit weights? Does it ever, once the KV cache is counted?</summary>
+    <div class="answer">
+      <p>A weight matmul with \(m\) tokens sharing each weight read does \(2m\) FLOPs per weight. <strong>bf16:</strong> a weight is 2 bytes, so intensity is \(m\) FLOPs/byte against a ridge of \(989.4/3.35 = 295\): \(m^{*} = 295\). <strong>fp8 (W8A8):</strong> 1 byte per weight, so intensity \(2m\), against a ridge that doubled to 591: \(m^{*} = 295\) again, at twice the FLOP rate. <strong>W4A16</strong> (4.125 bits, 0.516 bytes per weight, computed on bf16 tensor cores after dequantization): intensity \(2m/0.516 = 3.88m\), so \(m^{*} = 295/3.88 = 76\). Four-bit weights hit the compute wall at a 4× smaller batch, which is why the measured speedup of 4-bit kernels fades beyond batch 32 to 128 (<a href="17-inference-serving.html#quant-arith">page 17</a>).</p>
+      <p>The KV cache changes the answer. Attention has intensity \(n_h/n_{kv} = 4\) FLOPs per byte at any batch, so the whole step's intensity at large \(B\) is \(4 + 2N_{mm}/(\kappa T)\). That reaches 295 only if \(T \le 2 \times 7.5\text{B}/(131{,}072 \times 291) \approx 390\) tokens. Above that, GQA-8 decode stays memory-bound however large the batch.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D21. Speculative decoding with per-token acceptance \(\alpha = 0.8\) and \(\gamma = 4\) draft tokens: expected tokens per target pass, and the wall-clock speedup if a draft pass costs 5% of a target pass? When does it stop helping?</summary>
+    <div class="answer">
+      <p>Assuming independent acceptance, a step emits the accepted drafts plus one token: \(\mathbb{E}[\text{tokens}] = (1 - \alpha^{\gamma+1})/(1 - \alpha) = (1 - 0.8^5)/0.2 = (1 - 0.32768)/0.2 = \mathbf{3.36}\). The step costs one target pass plus \(\gamma\) draft passes, \(1 + \gamma c = 1 + 4 \times 0.05 = 1.2\) target-pass units, so the speedup is \(3.36/1.2 = \mathbf{2.80\times}\). The ceiling at \(\alpha = 0.8\) is \(1/(1-\alpha) = 5\) tokens. At \(\alpha = 0.9\): 4.10 tokens and 3.41×.</p>
+      <p>It works because verifying \(\gamma + 1\) tokens reads the weights once, and decode is bandwidth-bound, so extra tokens are nearly free. It stops when \(B(\gamma + 1)\) nears the ridge (about 295), which is \(B \approx 59\) at \(\gamma = 4\), and it is worse for MoE, where 5 verified tokens touch about 37.6 distinct experts instead of 8 (<a href="17-inference-serving.html#spec-math">page 17</a>).</p>
+    </div>
+  </details>
+
+  <h3 id="q-kv">KV cache</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D22. What is Llama-3-8B's KV cache per token, and for one 128K-token sequence? What would plain multi-head attention cost?</summary>
+    <div class="answer">
+      <p>Per token: \(2 \cdot L \cdot n_{kv} \cdot d_h \cdot b = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes \(= 128\) KiB (2 for K and V, 2 bytes for bf16). One 128K-token sequence (131,072 tokens) is \(128\text{ KiB} \times 131{,}072 = 16\) GiB (17.2 GB), more than the weights (16.06 GB). With MHA (32 KV heads) it would be 4× larger, 64 GiB; with an fp8 cache, 8 GiB. Note the unit: 16 GiB is 17.2 GB, and a careless mix of the two is a 7% error (<a href="06-decoding-kv-cache.html#kv-size">page 06</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D23. Design question. How much KV cache do 32 concurrent users at 32K context need on a 70B GQA model (80 layers, 8 KV heads of 128, bf16), and how many H100s do you need to serve them?</summary>
+    <div class="answer">
+      <p>Per token \(2 \cdot 80 \cdot 8 \cdot 128 \cdot 2 = 327{,}680\) B \(= 320\) KiB. Tokens: \(32 \times 32{,}768 = 1{,}048{,}576\). KV \(= 320\text{ KiB} \times 2^{20} = \mathbf{320\text{ GiB}} = 343.6\) GB, which is 10.7 GB per user. Weights in bf16 are \(2 \times 70.55\text{B} = 141.1\) GB. Total 484.7 GB.</p>
+      <p>At 72 GB usable per GPU (90% of 80) that is 6.7, so 7 GPUs. Tensor parallelism wants a power of two that divides 64 query heads and 8 KV heads, so use one 8-GPU node: 576 GB usable, 434.9 GB left after weights, room for 40 sequences of 32K (32 fit with 8 to spare). With an fp8 KV cache the cache halves to 171.8 GB and the node fits 81 sequences.</p>
+      <p>Then check speed: each decode step reads all 484.7 GB, over 8 GPUs at 26.8 TB/s aggregate: 18.1 ms, so 55 tokens/s per user and 1,770 tokens/s in total. The KV cache is 71% of the bytes read, so KV quantization or an MLA-style cache speeds up decode as well as adding capacity.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D24. Compare DeepSeek-V3's MLA cache with a GQA-8 cache of the same shape per token and for a 128K sequence, and count how many 128K sequences fit next to the fp8 weights on 8 H200s.</summary>
+    <div class="answer">
+      <p>MLA caches \(d_c + d_h^R = 512 + 64 = 576\) numbers per layer: \(61 \times 576 \times 2 = 70{,}272\) B \(= 68.6\) KiB per token, and for 131,072 tokens 9.21 GB (8.58 GiB). GQA-8 with 128-dim heads is \(2 \cdot 61 \cdot 8 \cdot 128 \cdot 2 = 249{,}856\) B \(= 244\) KiB per token, 32.7 GB (30.5 GiB) at 128K, 3.56× larger. MHA with 128 heads would be 3.81 MiB per token, 488 GiB at 128K (<a href="07-kv-efficient-attention.html#mla-numbers">page 07</a>).</p>
+      <p>Eight H200s hold \(8 \times 141 = 1{,}128\) GB. The fp8 weights take 671 GB, leaving 457 GB: \(457/9.21 = 49\) sequences of 128K with MLA, against \(457/32.7 = 13\) with GQA-8. A 671B model has a smaller cache per token than the 8B Llama (68.6 versus 128 KiB).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D25. Disaggregated serving moves the KV cache from a prefill GPU to a decode GPU. How long does the transfer take for a 2,048-token prompt on Llama-3-70B over 400 Gb/s InfiniBand, over 25 Gb/s Ethernet, and with DeepSeek-V3's MLA cache? Compare with the prefill compute.</summary>
+    <div class="answer">
+      <p>Llama-3-70B: \(320\text{ KiB} \times 2048 = 671\) MB. Over one 400 Gb/s link (50 GB/s) that is \(671/50{,}000 = 13.4\) ms; over 25 Gb/s Ethernet (3.125 GB/s), 215 ms. DeepSeek-V3: \(70{,}272 \times 2048 = 144\) MB, 2.9 ms on InfiniBand, 4.7× smaller than the GQA cache for the same prompt.</p>
+      <p>Prefill compute for the 70B model is \(2NT = 2 \times 70.55 \times 10^{9} \times 2048 = 2.89 \times 10^{14}\) FLOPs, which on 8 H100s at 50% MFU takes \(2.89 \times 10^{14}/(8 \times 0.5 \times 989.4 \times 10^{12}) = 73\) ms. So on InfiniBand the transfer is 18% of prefill if it is not overlapped, and on slow Ethernet it is 3× the prefill and dominates. Systems stream the cache layer by layer while the next layer computes; Splitwise reports about 5 ms of visible overhead on H100 (<a href="17-inference-serving.html#kv-transfer">page 17</a>). This is one more reason to shrink the cache per token.</p>
+    </div>
+  </details>
+
+  <h3 id="q-comm">Communication</h3>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> D26. How long does a gradient all-reduce take for an 8B-parameter model over 8 GPUs connected by NVLink (H100)?</summary>
+    <div class="answer">
+      <p>The bf16 gradients are \(S = 2 \times 8.03\text{B} = 16.06\) GB. A ring all-reduce sends \(2(n-1)/n \times S = 2 \times 7/8 \times 16.06 = 28.1\) GB from each GPU. The usable bandwidth is one direction of NVLink 4, 450 GB/s (900 GB/s is bidirectional), so \(t = 28.1/450 = \mathbf{62.5}\) ms. Using 900 by mistake gives 31 ms. If gradients are accumulated and reduced in fp32, as Llama 3 does, the message is 32.1 GB and the time 125 ms.</p>
+      <p>Put it in context: at 65,536 tokens per GPU per step the compute is \(6 \times 8.03 \times 10^{9} \times 65{,}536 = 3.16 \times 10^{15}\) FLOPs, 8.0 s at 40% MFU, so the all-reduce is 0.8% of the step even with no overlap. Real collectives reach a fraction of the link peak, so treat 62 ms as a floor. (Plain DDP would not fit an 8B model anyway, D6: real setups shard the states.)</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D27. The same gradient sync, now across 64 GPUs on 8 nodes over 400 Gb/s InfiniBand. What fraction of a 4M-token step does it take, and what happens with ZeRO-2 or full FSDP?</summary>
+    <div class="answer">
+      <p>Each GPU sends \(2 \times 63/64 \times 16.06 = 31.6\) GB. On the 50 GB/s network that is \(0.632\) s (a flat ring on the slowest link; a hierarchical collective would use NVLink inside nodes and do better). A 4M-token step is 65,536 tokens per GPU, 8.0 s at 40% MFU (D26), so the sync is 7.9% of the step if exposed. It overlaps with the backward pass, which is two thirds of the compute, so most of it hides.</p>
+      <p>Sharding costs traffic. ZeRO-2 must reduce-scatter after each of the 8 micro-batches: \(8 \times 15.8 + 15.8 = 142\) GB, 2.8 s, still overlappable with backward. Full FSDP re-gathers parameters for every micro-batch, 2 all-gathers and a reduce-scatter of 47.4 GB each, \(8 \times 47.4 = 379\) GB and 7.6 s, as long as the whole step unless parameters stay resident, which is why Llama 3 does not reshard after the forward pass (<a href="15-distributed-training.html#plan-a">page 15</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D28. A pipeline has \(p = 16\) stages and \(m = 64\) micro-batches. What is the bubble? How many micro-batches for under 5%, and what does interleaving buy?</summary>
+    <div class="answer">
+      <p>State which ratio you mean. Relative to the ideal compute time the bubble is \((p-1)/m = 15/64 = \mathbf{23.4\%}\). As the fraction of wall-clock time a GPU sits idle it is \((p-1)/(m + p - 1) = 15/79 = 19.0\%\). GPipe and 1F1B have the same bubble (1F1B only saves activation memory).</p>
+      <p>Under 5% relative needs \(m > 15/0.05 = 300\) micro-batches, which usually means a global batch that hurts optimization. Interleaving with \(v\) model chunks per GPU divides the bubble by \(v\): \(v = 2\) gives 11.7% (idle 10.5%), \(v = 4\) gives 5.9% (idle 5.5%), at the price of \(v\) times more point-to-point messages. Since \(m = \text{sequences}/(N_d \times \text{micro-batch})\), the bubble grows as you add data-parallel replicas at a fixed batch: 2,048 sequences over 32 replicas gives \(m = 64\) (page 15's 70B plan), over 192 replicas only 10.7 (D14).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D29. MoE all-to-all for DeepSeek-V3 (\(d = 7168\)): bytes per token per layer and per forward pass, and the InfiniBand bandwidth this needs at the training throughput of 180K GPU-hours per trillion tokens.</summary>
+    <div class="answer">
+      <p>V3 dispatches in fp8 (1 byte per element) and combines in bf16 (2 bytes), so one destination costs \(7168 \times (1 + 2) = 21{,}504\) B per token per layer. Routing is limited to 4 nodes, so at most \(4 \times 21{,}504 = 86{,}016\) B per token per MoE layer (an upper bound: one target may be the token's own node, and NVLink forwards to further GPUs inside a node). Over 58 MoE layers: 4.99 MB per token, forward.</p>
+      <p>Throughput is 1,543 tokens/s per GPU (D12), so the forward pass generates \(1543 \times 4.99\text{ MB} = 7.7\) GB/s per GPU, and the backward pass mirrors it (fp8 gradient dispatch, bf16 combine), about 15.4 GB/s in all, 31% of the 50 GB/s InfiniBand link, as a time average. It is an upper bound and ignores recomputation and the MTP module. With no node limit (8 nodes per token) it would be 62%. That is why the all-to-all must overlap with compute (DualPipe) and why the limit of 4 nodes matters (<a href="08-mixture-of-experts.html#node-limited">page 08</a>).</p>
+    </div>
+  </details>
+
+  <h3 id="q-scaling">Scaling laws</h3>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D30. What is the compute-optimal model at \(10^{23}\) FLOPs, and what does training it cost?</summary>
+    <div class="answer">
+      <p>With the 20 tokens per parameter rule, \(C = 6N \cdot 20N = 120N^2\), so \(N = \sqrt{10^{23}/120} = \sqrt{8.33 \times 10^{20}} = 2.89 \times 10^{10}\), about <strong>28.9B parameters</strong>, and \(D = 20N = 577\)B tokens. Check: \(6 \times 28.9 \times 10^{9} \times 577 \times 10^{9} = 1.0 \times 10^{23}\).</p>
+      <p>The closed form with the Epoch AI refit (\(A = 482.01\), \(B = 2085.43\), \(\alpha = 0.3478\), \(\beta = 0.3658\)) gives 29.4B parameters and 566B tokens (19.2 per parameter), about 2% from the rule; the two allocations differ in predicted loss by about \(5 \times 10^{-6}\) nats, so the valley is flat. Do not use the rounded constants printed for Chinchilla's Approach 3: they give 14.6B and 1.14T tokens, 78 tokens per parameter, an artifact (<a href="13-scaling-laws.html#worked">page 13</a>). Cost: an H100-hour at 40% MFU delivers \(1.42 \times 10^{18}\) FLOPs, so \(10^{23}/1.42 \times 10^{18} = 70\text{K}\) H100-hours, about $140K at $2.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D31. Llama-3-8B saw 15T tokens. How many tokens per parameter is that, how far is it from Chinchilla, and what model would be compute-optimal for the same compute? Why do labs do this?</summary>
+    <div class="answer">
+      <p>\(15 \times 10^{12}/8.03 \times 10^{9} = 1{,}868\) tokens per parameter, 93× the compute-optimal 20. Its compute is \(7.23 \times 10^{23}\) FLOPs (D2), for which the rule gives \(N = \sqrt{7.23 \times 10^{23}/120} = 77.6\)B on 1.55T tokens: a model 9.7× larger trained on 9.7× fewer tokens. For comparison, Llama 3 405B is at 38.5 tokens per parameter, and DeepSeek-V3 at 400 per activated parameter (22 per total).</p>
+      <p>The reason is inference. Serving costs \(2N\) FLOPs per token, so total cost is \(6ND + 2N\,T_{\text{served}}\), and a model that will serve trillions of tokens should be smaller and trained longer than the training-optimal point. That is over-training, a cost decision and not a mistake (<a href="13-scaling-laws.html#overtraining">page 13</a>). Caveat: the fitted law is extrapolated far outside the range where it was fitted, so quote the ratio, not a predicted loss.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D32. (a) With the Epoch fit, by what factor does the reducible loss fall each time compute doubles? (b) A 60B model trained on 3T tokens reaches the loss of a 96B compute-optimal model. When does the smaller model win?</summary>
+    <div class="answer">
+      <p><strong>(a)</strong> At the optimum \(L^{*} = E + K C^{-\gamma}\) with \(\gamma = \alpha\beta/(\alpha + \beta) = 0.3478 \times 0.3658/0.7136 = 0.178\). Doubling compute multiplies the reducible part by \(2^{-0.178} = 0.884\). From \(10^{24}\) FLOPs (\(L^{*} = 1.9597\), reducible part \(1.9597 - 1.8172 = 0.1425\)) to \(2 \times 10^{24}\): \(0.1425 \times 0.884 = 0.1260\), so \(L^{*} = 1.9431\), a gain of 0.017 nats for twice the compute.</p>
+      <p><strong>(b)</strong> The 96B model is trained on 1.74T tokens (\(C = 1.0 \times 10^{24}\)). To reach the same loss the 60B model needs 3.05T tokens (\(6 \times 60\text{B} \times 3.05\text{T} = 1.10 \times 10^{24}\), 10% more compute). Serving costs \(2N\) per token, so total FLOPs are \(6ND + 2N\,T_s\). Setting the two equal gives \(T^{*} = 3(N_2 D_2 - N_1 D_1)/(N_1 - N_2) = 3 \times (1.832 - 1.667) \times 10^{23}/(35.9 \times 10^{9}) = 1.4 \times 10^{12}\) tokens. If you expect to serve more than about 1.4T tokens, the 60B model is cheaper overall, and since decode is bandwidth-bound in practice, the real threshold is lower. The unknown is the demand forecast, not the arithmetic (<a href="13-scaling-laws.html#overtrain-cost">page 13</a>).</p>
+    </div>
+  </details>
+
+  <h3 id="q-moe">Mixture of experts</h3>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> D33. Serve DeepSeek-V3 (671B parameters in fp8). What is the minimum number of 80 GB GPUs, what fits on 8 H200s, and what is the floor on step time and tokens/s per user at large batch?</summary>
+    <div class="answer">
+      <p>At one byte per parameter the weights are 671 GB: \(671/80 = 8.4\), so at least 9 GPUs for weights alone, and more once KV cache and activations count (DeepSeek's real units are 32 GPUs for prefill and 320 for decode). Eight H200s hold \(8 \times 141 = 1{,}128\) GB, leaving 457 GB for KV and activations.</p>
+      <p>Bandwidth: \(8 \times 4.8 = 38.4\) TB/s. Past a batch of about 64 nearly every expert is read each step, so a step streams about the whole 671 GB: \(671/38{,}400 = 17.5\) ms, at most 57 tokens/s per user (page 17's 17.2 ms and about 58 are the batch-128 figures, where 98% of the experts are touched). At batch 1 only the activated 37.55 GB is read: 0.98 ms per step. So a 128× larger batch costs 18× the step time, and the 37B "active" advantage has largely gone (idealized: perfect sharding, no communication; <a href="17-inference-serving.html#moe-memory">page 17</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> D34. Why does MoE decode need a far larger batch than a dense model to become compute-bound? For DeepSeek-V3 (256 routed experts, top-8) compute the fraction of experts read at batch 64, the tokens per expert, and the batch at which each expert's matmul reaches the ridge.</summary>
+    <div class="answer">
+      <p>With \(b\) tokens in flight and uniform independent routing, the expected number of distinct experts read in a layer is \(E\,[1 - (1 - k/E)^b]\) with \(k/E = 1/32\): \(b = 1\) reads 8 experts (3%), \(b = 8\) reads 57 (22%), \(b = 64\) reads 222 (87%), and \(b = 512\) all 256. Each expert receives \(bk/E = b/32\) tokens, so 2 tokens per expert at \(b = 64\). Real routing is correlated, which lowers the touched count at small \(b\).</p>
+      <p>An expert matmul with \(n\) tokens reads \(P\) bytes (fp8) and does \(2nP\) FLOPs: intensity \(2n\) against the fp8 ridge of 591, so it is compute-bound at \(n \approx 295\) (the same threshold as bf16). With \(n = b/32\) that needs \(b = 295 \times 32 = 9{,}440\) tokens in flight, 32× the batch of 295 that a dense model needs. DeepSeek reports decode batches per expert usually within 256 tokens, so the MoE part is memory-bound, which is why serving pools tokens from many replicas (DP80) into a wide expert-parallel group (EP320): 9,440 tokens is about 118 sequences per replica (<a href="08-mixture-of-experts.html#serving">page 08</a>, <a href="17-inference-serving.html#moe-batch">page 17</a>).</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>The napkin module.</strong> Implement the formulas of Figure 1 as 19 small pure-Python functions: <code>params</code>, <code>mla_attn_params</code>, <code>moe_params</code>, <code>flops</code>, <code>train_flops</code>, <code>train_time</code>, <code>gpu_hours</code>, <code>dollar_cost</code>, <code>cost_per_million_tokens</code>, <code>train_memory</code> (with the ZeRO stages), <code>activation_memory</code>, <code>kv_bytes</code> (MHA, GQA, MQA and MLA), <code>decode_time</code> (the roofline maximum), <code>prefill_time</code>, <code>allreduce_time</code>, <code>pipeline_bubble</code>, <code>moe_alltoall_bytes</code>, <code>experts_touched</code> and <code>chinchilla_opt</code> (rule of thumb and closed form). Each docstring states the assumptions that the page insists on: dense peak, one-way bandwidth, which \(N\), which unit. The 37 tests reproduce the worked answers of D1 to D34, from Llama-3-8B's 8,030,261,248 parameters and DeepSeek-V3's (671,026,404,352 total, 37,552,282,624 activated) to the 67.7 days of D11, the 62.5 ms all-reduce of D26 and the 28.9B model of D30. Budget 20 to 40 minutes: the parameter and memory functions are the ones an interviewer will ask you to write on a whiteboard, and the value of the exercise is the habit of stating each assumption before you type. <span class="ex-path">exercises/drills/napkin.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_napkin.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2001.08361">Kaplan et al. (2020). Scaling Laws for Neural Language Models.</a> <span class="why">Why read it: §2.1 is the origin of \(N \approx 12Ld^2\), the forward count \(2N + 2Ln_{\text{ctx}}d\) and \(C \approx 6N\) per token.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.15556">Hoffmann et al. (2022). Training Compute-Optimal Large Language Models.</a> <span class="why">Why read it: §3 for the three approaches and the 20 tokens per parameter rule; read it with the Epoch replication on <a href="13-scaling-laws.html">page 13</a> before trusting the printed constants.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">Why read it: Table 3 (configs), Table 4 (MFU per configuration), §3.3.4 (54-day failure statistics). The best public data for calibrating a training-time estimate.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: Table 1 (the cost accounting used in D12), §3.2.2 (NVLink and IB bandwidths, node-limited routing), §3.3.3 (fp8 dispatch, bf16 combine).</span></li>
+    <li><a href="https://arxiv.org/abs/2204.02311">Chowdhery et al. (2022). PaLM: Scaling Language Modeling with Pathways.</a> <span class="why">Why read it: the definition of MFU versus HFU (§4.1, App. B) and the \(6N + 12LHQT\) count that the formula card uses.</span></li>
+    <li><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al. (2022). Reducing Activation Recomputation in Large Transformer Models.</a> <span class="why">Why read it: the \(sbh(34 + 5as/h)\) derivation and the memory-versus-FLOPs trade of selective recomputation.</span></li>
+    <li><a href="https://arxiv.org/abs/1910.02054">Rajbhandari et al. (2020). ZeRO: Memory Optimizations Toward Training Trillion Parameter Models.</a> <span class="why">Why read it: the \(2N + 2N + KN\) accounting and Table 1, which D6 and the napkin drill's ZeRO test reproduce.</span></li>
+    <li><a href="https://arxiv.org/abs/2104.04473">Narayanan et al. (2021). Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM.</a> <span class="why">Why read it: the pipeline bubble \((p-1)/m\), the interleaved schedule, and the tensor-versus-pipeline traffic analysis behind D28.</span></li>
+    <li><a href="https://arxiv.org/abs/2211.05102">Pope et al. (2022). Efficiently Scaling Transformer Inference.</a> <span class="why">Why read it: the prefill and decode cost model and measured MFU for both phases on PaLM.</span></li>
+    <li><a href="https://www.nvidia.com/en-us/data-center/h100/">NVIDIA H100 Tensor Core GPU datasheet.</a> <span class="why">Why read it: the source of the constants table. Halve every "with sparsity" number, and read the A100, H200, HGX B200 and GB200 NVL72 pages linked in the constants section the same way.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>H100 SXM (dense):</strong> 989.4 TFLOP/s bf16, 1,979 fp8, 80 GB, 3.35 TB/s, ridge 295 FLOPs/B; NVLink 450 GB/s and InfiniBand 50 GB/s per direction. A100: 312 TFLOP/s, 2.04 TB/s. H200: 141 GB, 4.8 TB/s. B200: 2,250 / 4,500 TFLOP/s, 180 GB, 8 TB/s. GB200: 2,500 per GPU. Headline numbers include 2:4 sparsity: halve them.</li>
+      <li><strong>Bytes:</strong> bf16 2, fp8 1, fp32 4, int4 with scales 0.516. Mixed-precision Adam 16 B per parameter. GB = \(10^9\) B; GiB = 1.074 GB.</li>
+      <li><strong>Parameters:</strong> \(N = 2Vd + L(2d\,n_hd_h + 2d\,n_{kv}d_h + 3d\,d_{ff} + 2d) + d\). Llama-3-8B 8,030,261,248; 70B 70.55B; 405B 405.85B. DeepSeek-V3 671.03B total, 37.55B activated (35.70B non-embedding). Shortcut coefficient \(c\) in \(cLd^2 + 2Vd\): 13, 12.75, 11.875.</li>
+      <li><strong>FLOPs:</strong> forward \(2N\) per token (+ \(4LTd\) attention), training \(6N\), \(C = 6ND\). Llama-3-8B on 15T: \(7.23 \times 10^{23}\); 405B on 15.6T: \(3.79 \times 10^{25}\); V3 (37B, 14.8T): \(3.29 \times 10^{24}\).</li>
+      <li><strong>Time and money:</strong> \(t = C/(G\,P\,\text{MFU})\). At 40% MFU an H100-hour is \(1.42 \times 10^{18}\) FLOPs, so \(10^{24}\) FLOPs is 0.7M GPU-hours, about $1.4M at $2. Llama-3-8B 507K GPU-hours (20.6 days on 1,024); 405B on 16,384 GPUs 67.7 days; V3 2.788M H800-hours, $5.576M, 34.6% MFU; 70B on 15T in 30 days needs about 6,190 GPUs.</li>
+      <li><strong>Training memory:</strong> \(16N\); ZeRO-1/2/3 \(4N + 12N/N_d\), \(2N + 14N/N_d\), \(16N/N_d\). Llama-3-8B 128.5 GB. Activations per layer \(sbh(34 + 5as/h)\): 380 GB stored, 36.5 GB fused, 2.1 GB recomputed at \(s = 8192\); fp32 logits 4.2 GB.</li>
+      <li><strong>KV per token:</strong> \(L \cdot 2n_{kv}d_h \cdot b\). Llama-3-8B 128 KiB (16 GiB at 128K), 70B 320 KiB (32 users at 32K: 320 GiB), 405B 504 KiB, DeepSeek-V3 MLA 70,272 B (68.6 KiB).</li>
+      <li><strong>Decode:</strong> \(t \ge (W + BT\kappa)/\text{BW}\). 8B on H100: 4.79 ms, 208 tokens/s at \(B = 1\); \(B = 64\) at 4K: 15.05 ms, 4,252 tokens/s; ceiling \(\text{BW}/(T\kappa) = 6{,}240\). Prefill 2,048 tokens: 33 ms at peak, 66 ms at 50%. Compute-bound batch about 295 (bf16 and fp8), 76 for W4A16; attention intensity is \(n_h/n_{kv}\).</li>
+      <li><strong>Communication:</strong> all-reduce \(2\frac{n-1}{n}S/\text{BW}\) with one-way BW. 8B bf16 gradients (16.06 GB): 62.5 ms over 8 GPUs on NVLink, 0.63 s over 64 GPUs on IB. Bubble \((p-1)/(vm)\): 23.4% at \(p = 16\), \(m = 64\). MoE all-to-all \(3d\) = 21,504 B per destination for V3.</li>
+      <li><strong>Scaling laws:</strong> \(N = \sqrt{C/120}\), \(D = 20N\): \(10^{23}\) gives 28.9B and 577B tokens. Llama-3-8B is at 1,868 tokens per parameter (93× Chinchilla). Doubling compute multiplies the reducible loss by 0.884.</li>
+      <li><strong>Serving cost:</strong> \(\$/\text{M tokens} = pG/(3600 \cdot \text{tokens/s}) \times 10^6\). Llama-3-8B decode $2.75 at \(B = 1\), $0.115 at \(B = 104\), $3.74 at 128K context at capacity. 1T RL rollout tokens at 2,500 tokens/s per GPU: 111K GPU-hours, $222K.</li>
+      <li><strong>Habits:</strong> assume out loud; compute every bound and take the largest time; hunt the factors of 2 (sparse, bidirectional, bits versus bytes, GB versus GiB, forward versus training, total versus activated); cross-check against a public number; give a range and say which side of the truth a roofline is on.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -217,7 +217,7 @@ def format_reward(response):               # R1-style structure check
 <path class="s-line" d="M524,103 L548,103" marker-end="url(#arrow-24-1)"/>
 <text x="548" y="182" class="s-small s-muted">All right or all wrong:</text>
 <text x="548" y="198" class="s-small s-muted">std = 0, every A_i = 0,</text>
-<text x="548" y="214" class="s-small s-muted">no gradient (see DAPO)</text>
+<text x="548" y="214" class="s-small s-muted">no policy gradient (see DAPO)</text>
 <rect class="s-e" x="172" y="252" width="540" height="76" rx="6"/>
 <text x="442" y="272" text-anchor="middle" class="s-bold">4 Update: clipped policy gradient over all G × tokens</text>
 <text x="442" y="292" text-anchor="middle" class="s-small">min( ρ A_i , clip(ρ, 1 − ε_low, 1 + ε_high) A_i ) − β · k3(π_θ, π_ref)</text>
@@ -286,7 +286,7 @@ def grpo_loss(logp_new, logp_old, logp_ref, adv, mask, eps_low=0.2, eps_high=0.2
       <tr><td>Updates per rollout</td><td class="num">1</td><td class="num">16 minibatches, one epoch</td><td class="num">16</td><td class="num">4</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Sources: <a href="https://arxiv.org/abs/2402.03300">DeepSeekMath §4.2</a>; <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1 §2.1, §3.2.1</a> (ε is stated only for R1's first RL stage; 10 makes the clip nearly inactive, reported as printed; R1 states 32 questions per training step and 8,192 outputs per rollout in 16 minibatches, so 512 prompts per rollout is our arithmetic, 8,192 ÷ 16); <a href="https://arxiv.org/abs/2503.14476">DAPO §4.1</a>; <a href="https://arxiv.org/abs/2505.24864">ProRL §3.2</a>. Note that GRPO was born with a <em>learned</em> reward model and R1 paired it with rule-based rewards, and that every later recipe replaced one update per rollout with 4 to 16, which is what makes the clip and off-policy issues below matter.</p>
+  <p class="small muted">Sources: <a href="https://arxiv.org/abs/2402.03300">DeepSeekMath §4.2</a>; <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1 §2.1, §3.2.1</a> (ε is stated only for R1's first RL stage; 10 makes the clip nearly inactive, reported as printed; R1 states 32 questions per training step and 8,192 outputs per rollout in 16 minibatches, so 512 prompts per rollout is our arithmetic, 8,192 ÷ 16); <a href="https://arxiv.org/abs/2503.14476">DAPO §4.1</a>; <a href="https://arxiv.org/abs/2505.24864">ProRL §3.2</a>. Note that GRPO was born with a <em>learned</em> reward model and R1 paired it with rule-based rewards, and that every later recipe in this table replaced one update per rollout with 4 to 16, which is what makes the clip and off-policy issues below matter.</p>
   <p>The scale of the original effect: from DeepSeekMath-Instruct 7B, training on about 144K chain-of-thought questions from the GSM8K and MATH SFT data, GRPO raised GSM8K from 82.9% to 88.2%, MATH from 46.8% to 51.7%, and out-of-domain CMATH from 84.6% to 88.8% <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §1, §4.2]</a>.</p>
 </section>
 
@@ -593,7 +593,7 @@ loss = (ppo_loss * mask).sum(-1) / MAX_TOKENS        # Dr. GRPO: constant, no le
       <tr><td>CISPO, illustrative cap \(c=1.28\): \(\min(\rho,c)\)</td><td class="num">0.5</td><td class="num">1</td><td class="num">1.2</td><td class="num">1.28</td><td class="num">1.28</td><td class="num">1.28</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">The paper does not state the cap used in its ablation, so \(c=1.28\) is only illustrative.</p>
+  <p class="small muted">The paper does not state the cap used in its ablation, so \(c=1.28\) is only illustrative; an independent study found caps from 4 to 8 equally good (see the side-by-side section).</p>
   <p>When M1 extended its output limit from 40K to 80K tokens, negative samples grew longer faster and hit the window first, so large negative gradients piled up in sequence tails and produced garbled endings. Remedies: early stopping on repetition, sample-level loss combined with token-level normalization, and lower gradient-clip and \(\varepsilon^{IS}_{\text{high}}\) values (§5).</p>
 
   <div class="decision">
@@ -640,7 +640,9 @@ loss = (ppo_loss * mask).sum(-1) / MAX_TOKENS        # Dr. GRPO: constant, no le
       <tr><td><strong>DeepSeek-V3.2</strong></td><td>\(r-\bar r\)</td><td>\(\frac1G\sum_i\frac1{|o_i|}\sum_t\)</td><td>token \(\rho\) + masking negatives</td><td>importance-corrected k3, weak or none for math</td><td>Keep Routing, Keep Sampling Mask, length penalty</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">DeepSeek-V4's specialists reuse V3.2's GRPO with "hyper-parameters closely aligned with our prior research" <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1]</a>: the successors are absorbed into GRPO as modifications rather than replacing it.</p>
+  <p class="small muted">DeepSeek-V4's specialists reuse V3.2's GRPO with "hyper-parameters closely aligned with our prior research" <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1]</a>: the successors are absorbed into GRPO as modifications rather than replacing it. Library defaults show the same drift: Hugging Face TRL's <code>GRPOTrainer</code> now defaults to <code>loss_type="dapo"</code> (token-level normalization; its docs list the original \(1/|o_i|\) form as "Not recommended due to length bias") and \(\beta=0\), while still scaling rewards by the group std <a href="https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_config.py">[TRL, grpo_config.py, main branch, September 2026]</a>.</p>
+
+  <p><strong>An independent large-scale check.</strong> ScaleRL (Meta and collaborators) ran over 400K GPU-hours of ablations, mostly on an 8B dense model, and fit sigmoidal compute-performance curves. Prompt-level std, batch-level std and no std gave similar results (they chose batch-level). Prompt-level loss averaging reached the highest asymptote among sample, prompt and token averaging. CISPO and GSPO beat DAPO's loss in asymptotic reward, CISPO was insensitive to its cap between 4 and 8, GSPO's \(10^{-4}\) clip scale was not the best there (\(10^{-3}\) was) and some GSPO runs diverged, so they chose CISPO. Dropping zero-variance prompts, and permanently removing prompts with pass rate 0.9 or more, raised the asymptote. Read the bias and clipping arguments above with this in mind: their size is recipe-dependent <a href="https://arxiv.org/abs/2510.13786">[ScaleRL, §3.2, App. A.17]</a>.</p>
 </section>
 
 <section>
@@ -952,7 +954,7 @@ loss = (ppo_loss * mask).sum(-1) / MAX_TOKENS        # Dr. GRPO: constant, no le
     <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2</a> and <a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read it: V3.2 §3.1 lists the stabilizers used to scale GRPO (unbiased KL, off-policy masking, Keep Routing); V4 §5 shows specialists plus on-policy distillation and the three reasoning-effort modes.</span></li>
     <li><a href="https://arxiv.org/abs/2501.12599">Kimi Team (2025). Kimi k1.5: Scaling Reinforcement Learning with LLMs.</a> <span class="why">Why read it: the argument against value functions for long CoT, the length penalty, curriculum and prioritized sampling, partial rollouts and long2short.</span></li>
   </ol>
-  <p class="small muted">Cited in the text and worth knowing: Tülu 3 (2411.15124, origin of the term RLVR), RLOO (2402.14740), REINFORCE++ (2501.03262), SAPO (2511.20347), s1 (2501.19393), Qwen3 (2505.09388), ProRL (2505.24864), Spurious Rewards (2506.10947), and Li et al. on combining on-policy distillation with RLVR (2609.04108).</p>
+  <p class="small muted">Cited in the text and worth knowing: Tülu 3 (2411.15124, origin of the term RLVR), RLOO (2402.14740), REINFORCE++ (2501.03262), SAPO (2511.20347), s1 (2501.19393), Qwen3 (2505.09388), ProRL (2505.24864), Spurious Rewards (2506.10947), Li et al. on combining on-policy distillation with RLVR (2609.04108), and ScaleRL (2510.13786).</p>
 </section>
 
 <section id="cheatsheet">

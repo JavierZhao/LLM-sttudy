@@ -133,3 +133,41 @@ def test_kv_cache_hybrid_local_global(impl):
     assert kv(48, 8, 128, T) == 4 * per * 12 * T       # all-global would be 4x the global part
     # shorter than the window: local layers hold everything, so nothing is saved
     assert kv(48, 8, 128, 1000, n_global_layers=12, local_window=8192) == kv(48, 8, 128, 1000)
+
+
+def test_breakdown_llama3_405b_matches_worked_example(impl):
+    # The worked example on the page: one layer is 3,187,703,808 parameters, the whole model 405,853,388,800.
+    cfg = _cfg(impl, 16384, 126, 128, 8, 128256, 4096, 1.2)
+    assert cfg.ffn_hidden == 53248
+    b = impl.param_breakdown(cfg)
+    per_layer = (2 * 16384 * 16384 + 2 * 16384 * 1024) + 3 * 16384 * 53248 + 2 * 16384
+    assert per_layer == 3_187_703_808
+    assert b["attention"] == 126 * (2 * 16384 * 16384 + 2 * 16384 * 1024)
+    assert b["ffn"] == 126 * 3 * 16384 * 53248
+    assert b["norm"] == (2 * 126 + 1) * 16384
+    assert b["embedding"] == b["lm_head"] == 128256 * 16384
+    assert b["total"] == impl.llama_params(cfg) == 126 * per_layer + 2 * 128256 * 16384 + 16384 == 405_853_388_800
+
+
+def test_llama4_tied_embeddings(impl):
+    cfg = _l4(impl, range(1, 48, 2), 128)
+    tied = impl.Llama4Config(**{**cfg.__dict__, "tie_embeddings": True})
+    (t0, a0), (t1, a1) = impl.llama4_params(cfg), impl.llama4_params(tied)
+    assert t0 - t1 == a0 - a1 == 202048 * 5120        # the output head is shared with the embedding
+
+
+def test_kv_cache_edge_cases(impl):
+    kv = impl.kv_cache_bytes
+    per = 2 * 8 * 128 * 2
+    # no global layers: every layer is local, so nothing grows past the window
+    assert kv(48, 8, 128, 100_000, n_global_layers=0, local_window=8192) == 48 * per * 8192
+    # every layer global: the window is irrelevant
+    assert kv(48, 8, 128, 100_000, n_global_layers=48, local_window=8192) == kv(48, 8, 128, 100_000)
+    # a window exactly as long as the sequence saves nothing; an empty sequence costs nothing
+    assert kv(48, 8, 128, 8192, n_global_layers=12, local_window=8192) == kv(48, 8, 128, 8192)
+    assert kv(48, 8, 128, 0, n_global_layers=12, local_window=8192) == 0
+    # element size scales every term, local and global
+    assert kv(48, 8, 128, 20_000, n_global_layers=12, local_window=8192, bytes_per_el=1) * 2 == \
+        kv(48, 8, 128, 20_000, n_global_layers=12, local_window=8192, bytes_per_el=2)
+    # per-token cost is exactly 2 * n_kv * d_h * bytes per layer, independent of the model width
+    assert kv(1, 3, 5, 7, bytes_per_el=4) == 2 * 3 * 5 * 4 * 7

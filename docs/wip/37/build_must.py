@@ -52,7 +52,7 @@ open("/tmp/w37/must.html", "w", encoding="utf-8").write("\n".join(out) + "\n")
 
 # reading budgets table
 TIERDESC = {1: ("Tier 1", "Read before any interview loop", "The 12 papers whose content is asked about most directly: attention, kernels, scaling, the reference recipe, memory accounting, the RLHF and RL objectives, MLA and the DeepSeek-V3 design, and DeepSeek-V4 for long-context efficiency."),
-            2: ("Tier 2", "Read for depth", "Papers that sharpen an answer you already have: position encoding, GQA, tensor parallelism, MoE design, RL at scale, sparse attention and context extension."),
+            2: ("Tier 2", "Read for depth", "Papers that sharpen an answer you already have: position encoding, GQA, the original scaling laws, tensor parallelism, MoE design, RL at scale, sparse attention and context extension."),
             3: ("Tier 3", "Read when it is your target or your research", "The newest KV-compression design, the linear-attention layer used in hybrids, and two open model families that made different choices from DeepSeek.")}
 rows = []
 tot = 0

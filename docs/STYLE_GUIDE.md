@@ -161,7 +161,11 @@ This is interview prep: a confidently wrong fact is worse than no fact.
   them where relevant, and still verify any detail you cite): Gemma 4 technical report
   (arXiv 2607.02770, 2026), DiffusionGemma (2608.00146, Jul 2026; diffusion LM fine-tuned from
   Gemma 4 26B A4B), LLaDA 2.0 (2512.15745), FlashAttention-4 (Zadouri et al., MLSys 2026),
-  EAGLE-3, Gemma 4 multi-token-prediction drafters (Google blog, 2026). Search for others.
+  EAGLE-3, Gemma 4 multi-token-prediction drafters (Google blog, 2026), **DeepSeek-V4**
+  (arXiv 2606.19348, April 2026 preview: V4-Pro 1.6T/49B and V4-Flash 284B/13B, 1M context,
+  CSA/HCA compressed attention replacing MLA, mHC residuals, Muon, FP4 QAT experts, on-policy
+  distillation instead of mixed RL), mHC (Xie et al. 2026). Other models referenced in 2026
+  reports: GPT-5.4, Gemini 3.1 Pro, Claude Opus 4.6, Kimi K2.6, GLM-5.1. Search for others.
 - Today is late September 2026. For fast-moving topics (latest model releases, newest RL
   variants), search for developments after your training data and say "as of <month
   year>". Do not present a model as the latest without checking.

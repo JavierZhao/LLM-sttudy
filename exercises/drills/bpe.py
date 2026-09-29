@@ -93,6 +93,6 @@ def bytes_to_unicode() -> dict[int, str]:
 
     Returns:
         dict with 256 entries, byte value -> one-character str, all distinct.
-        For example b2u[ord("A")] == "A" and b2u[32] == "Ġ" ("Ġ").
+        For example b2u[ord("A")] == "A" and b2u[32] == "Ġ" (U+0120).
     """
     raise NotImplementedError

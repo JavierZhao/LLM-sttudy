@@ -571,9 +571,26 @@ def gqa_attention(q, k, v):
       <dt>Why it works</dt><dd>K/V information per token is highly compressible. Heads stay distinct because each has its own up-projection. Absorption turns decode into MQA over the latent, so each cached byte is reused by all heads. Decoupled RoPE keeps position out of the absorbable path.</dd>
       <dt>Evidence</dt><dd>Beats MHA at 16B and 250B MoE scale with 4 to 14% of the cache [V2, Tab. 9]. Kept through V3, R1, V3.2, and adopted by Kimi K2.</dd>
       <dt>Cost</dt><dd>More complex kernels and two execution modes. 3.4× more attention FLOPs per cached token when absorbed, which matters at long context. The latent is shared by all heads, so head-sharded tensor parallelism cannot split the cache. RoPE covers only 64 of each head's 192 query-key dimensions.</dd>
-      <dt>Used by</dt><dd>DeepSeek-V2, V2.5, V3, R1, V3.1, V3.2 (with DSA sparse attention on top, <a href="09-beyond-full-attention.html">page 09</a>); Kimi K2 (64 heads instead of 128) <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.3]</a>.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V2, V2.5, V3, R1, V3.1, V3.2 (with DSA sparse attention on top, <a href="09-beyond-full-attention.html">page 09</a>); Kimi K2 (64 heads instead of 128) <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.3]</a>. DeepSeek-V4 (2026) moved on to compressed shared-KV attention, described next.</dd>
     </dl>
   </div>
+
+  <h3 id="after-mla">What came next: DeepSeek-V3.2 and V4</h3>
+  <p>MLA shrank the cache along the <em>feature</em> axis: 576 numbers per token per layer instead of 40,960. DeepSeek's next two steps attack the <em>sequence</em> axis.</p>
+  <ul>
+    <li><strong>DeepSeek-V3.2</strong> (December 2025) keeps MLA unchanged and adds DeepSeek Sparse Attention on top of its MQA mode. A small "lightning indexer" scores every previous token, and each query attends to only the top 2,048 cached latents <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.1]</a>. The cache itself is the same size. What shrinks is the bytes read and the attention FLOPs per step.</li>
+    <li><strong>DeepSeek-V4</strong> (preview, April 2026: V4-Pro with 1.6T total and 49B activated parameters, V4-Flash with 284B and 13B, both with 1M-token context) replaces MLA with interleaved layers of Compressed Sparse Attention (CSA) and Heavily Compressed Attention (HCA) <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §2.3]</a>. Three details are worth knowing:
+      <ol>
+        <li><strong>It keeps the MQA view and drops the up-projections.</strong> Each token produces one 512-dim KV entry per layer that serves as both key and value for all query heads ("shared key-value MQA"). That is the same shape that absorbed MLA attends over at decode time. Because the values now carry RoPE on their last 64 dimensions, V4 also rotates those dimensions of each attention output by the query's negative position, so the position signal becomes relative again (<a href="05-positional-encoding.html">page 05</a>).</li>
+        <li><strong>It compresses along the sequence.</strong> CSA merges the entries of every 4 consecutive tokens into one, using learned softmax weights over overlapping windows, and then runs DSA-style top-k selection over the compressed entries (top 1,024 in V4-Pro). HCA merges every 128 tokens and attends densely over the result. A 128-token uncompressed sliding window keeps local detail, and learned attention sinks let a head attend to "nothing".</li>
+        <li><strong>It lowers precision.</strong> KV entries are stored in FP8 except the RoPE dimensions (BF16), and the indexer runs in FP4.</li>
+      </ol>
+      DeepSeek reports that at 1M tokens V4-Pro needs 27% of V3.2's single-token inference FLOPs and 10% of its KV cache, and about 2% of the cache of a BF16 GQA-8 baseline with 128-dim heads <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Abstract, §2.3.4]</a>.</li>
+  </ul>
+  <aside class="callout key">
+    <div class="callout-title">The pattern to remember</div>
+    <p>KV bytes = layers × tokens × features per token × bytes per feature, and each generation attacked a different factor. MQA and GQA cut the number of distinct K/V heads (features). MLA compressed every token's K/V into one shared latent (features). DSA reads only a subset of tokens per step (bandwidth, not capacity). CSA/HCA merge the tokens themselves (tokens), and FP8/FP4 storage cuts the last factor.</p>
+  </aside>
 </section>
 
 <section>
@@ -779,6 +796,7 @@ def gqa_attention(q, k, v):
     <li><a href="https://arxiv.org/abs/2307.09288">Touvron et al. (2023). Llama 2.</a> <span class="why">App. A.2.1: the GQA vs MQA vs MHA ablation and the tensor-parallel sharding argument.</span></li>
     <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">§2.1.1 (MLA at V3 scale), §3.4 (deployment layout), §4.3 (YaRN applied only to the RoPE key).</span></li>
     <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2.</a> <span class="why">App. A names MLA's MHA and MQA modes, and §2.1 shows DSA built on the MQA mode.</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence.</a> <span class="why">§2.3: what replaced MLA (shared-KV MQA with sequence compression, CSA/HCA).</span></li>
     <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">§2.3: why an MLA model might want fewer heads.</span></li>
     <li><a href="https://arxiv.org/abs/2502.07864">Meng et al. (2025). TransMLA: MLA Is All You Need.</a> <span class="why">Expressiveness proof (GQA ⊂ MLA at equal cache) and converting GQA models to MLA.</span></li>
     <li><a href="https://arxiv.org/abs/2405.12981">Brandon et al. (2024). Reducing Transformer Key-Value Cache Size with Cross-Layer Attention.</a> <span class="why">An orthogonal axis (sharing across layers) and a clean cache-vs-perplexity Pareto study.</span></li>
@@ -799,6 +817,7 @@ def gqa_attention(q, k, v):
       <li>Absorbed mode: 3.4× attention FLOPs, 71× fewer bytes. Decode uses MQA mode, training and prefill use MHA mode.</li>
       <li>Evidence: MLA ≥ MHA with 4 to 14% of the cache (DeepSeek-V2 App. D). Treat single-lab ablations with care.</li>
       <li>Head count is a cost knob for absorbed MLA: Kimi K2 uses 64 heads vs V3's 128 (+83% inference FLOPs at 128K for 128 heads).</li>
+      <li>After MLA: V3.2 adds top-2,048 sparse reads (DSA). V4 (2026) uses one shared 512-dim KV entry per token (MQA-style), merged 4× (CSA, plus top-k) or 128× (HCA): about 10% of V3.2's KV cache at 1M tokens.</li>
     </ul>
   </div>
 </section>

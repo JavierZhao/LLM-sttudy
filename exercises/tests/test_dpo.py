@@ -257,11 +257,17 @@ def test_simpo_is_length_normalized_and_reference_free(impl):
 def test_orpo_values_and_stability(impl):
     loss = impl.orpo_odds_ratio_loss(t(-0.65), t(-1.10))
     assert abs(loss.item() - 0.3762551923) < 1e-8
-    # a model that is nearly certain of both responses: average log-prob ~ -1e-9
-    tiny = impl.orpo_odds_ratio_loss(t(-1e-9), t(-2e-9))
-    assert torch.isfinite(tiny)
     # equal probabilities -> odds ratio 1 -> loss log 2
-    torch.testing.assert_close(impl.orpo_odds_ratio_loss(t(-0.4), t(-0.4)), torch.tensor([math.log(2)], dtype=torch.float64)[0])
+    torch.testing.assert_close(impl.orpo_odds_ratio_loss(t(-0.4), t(-0.4)),
+                               torch.tensor([math.log(2)], dtype=torch.float64))
+    # A model that is nearly certain of both responses: mean log-prob ~ -1e-9 in float32, where
+    # exp(-1e-9) rounds to exactly 1.0 and a naive log(1 - exp(lp)) becomes log(0) = -inf.
+    lw = torch.tensor([-1e-9])
+    ll = torch.tensor([-2e-9])
+    tiny = impl.orpo_odds_ratio_loss(lw, ll)
+    assert torch.isfinite(tiny).all()
+    # odds ~ 1/|lp|, so the log odds ratio is log(2) and the loss is log(1 + 1/2)
+    assert abs(tiny.item() - math.log(1.5)) < 1e-3
 
 
 def test_orpo_gradient_signs(impl):

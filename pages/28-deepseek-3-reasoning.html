@@ -1012,8 +1012,8 @@ def indexer_kl(attn, scores, selected=None):
   <p>Higher requested effort thus makes tokens cheaper, and one checkpoint can trade cost for accuracy at deployment, including interpolated values. The public API's three tiers map to \(b = 100\) (max), 75 (high) and 50 (low) <a href="https://arxiv.org/abs/2609.19969">[V4.1 report, §5.1.4]</a>. Compare V3.2, one length penalty and one operating point; V4, three separately trained modes; V4.1, a smooth dial.</p>
 
   <div class="table-wrap"><table class="data">
-    <caption>Table 21. Selected V4.1-Flash results, max effort, as reported by DeepSeek <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">[V4.1-Flash model card]</a> (self-reported; agent benchmarks use DeepSeek Harness minimal mode and up to 1M context). Opus-5.0 is the top closed model on these rows except GPQA Diamond, where GPT-5.6 Sol scores 94.1 (DeepSeek reports no closed model on Codeforces).</caption>
-    <thead><tr><th>Benchmark</th><th class="num">V4-Flash</th><th class="num">V4-Pro</th><th class="num">V4.1-Flash</th><th class="num">Opus-5.0</th></tr></thead>
+    <caption>Table 21. Selected V4.1-Flash results, max effort, as reported by DeepSeek <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">[V4.1-Flash model card]</a> (self-reported; agent benchmarks use DeepSeek Harness minimal mode and up to 1M context). Opus-5 is the top closed model on these rows except GPQA Diamond, where GPT-5.6 Sol scores 94.1 (DeepSeek reports no closed model on Codeforces).</caption>
+    <thead><tr><th>Benchmark</th><th class="num">V4-Flash</th><th class="num">V4-Pro</th><th class="num">V4.1-Flash</th><th class="num">Opus-5</th></tr></thead>
     <tbody>
       <tr><td>Terminal-Bench 2.1</td><td class="num">82.7</td><td class="num">87.9</td><td class="num">90.6</td><td class="num">89.1</td></tr>
       <tr><td>DeepSWE v1.1</td><td class="num">54.4</td><td class="num">62.7</td><td class="num">74.2</td><td class="num">74.0</td></tr>

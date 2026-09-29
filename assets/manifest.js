@@ -88,7 +88,7 @@ window.LLM_MANIFEST = {
           desc: "DeepSeek LLM hyperparameter scaling, DeepSeekMoE, DeepSeekMath and GRPO, DeepSeek-V2." },
         { n: "27", drills: ["fp8"], slug: "27-deepseek-2-v3", title: "DeepSeek II: V3 end to end", tier: "P0", minutes: 75, status: "written",
           desc: "V3 architecture, aux-loss-free MoE, MTP, FP8 training, DualPipe, the cost accounting." },
-        { n: "28", drills: ["dsa"], slug: "28-deepseek-3-reasoning", title: "DeepSeek III: R1 to V4", tier: "P0", minutes: 65, status: "planned",
+        { n: "28", drills: ["dsa"], slug: "28-deepseek-3-reasoning", title: "DeepSeek III: R1 to V4", tier: "P0", minutes: 65, status: "written",
           desc: "R1-Zero and R1, V3.1 hybrid thinking, V3.2 sparse attention and agentic RL, V4's compressed attention, mHC, Muon and 1M context." },
         { n: "29", drills: ["llama_config"], slug: "29-llama", title: "Llama 1 to 4", tier: "P1", minutes: 45, status: "planned",
           desc: "The Llama recipe, GQA, 15T-token overtraining, Llama 3 long context, Llama 4 MoE and iRoPE." },

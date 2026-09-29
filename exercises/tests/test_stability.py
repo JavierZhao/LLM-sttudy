@@ -33,6 +33,12 @@ def test_rms_norm_eps_and_dtype(impl):
     torch.testing.assert_close(y.float(), _rms_ref(x.float()).float(), atol=3e-2, rtol=3e-2)
 
 
+def test_rms_norm_eps_inside_sqrt(impl):
+    # mean-square ~ 1e-6, the same size as eps: eps added outside the square root gives a visibly different answer
+    x = torch.randn(4, 16) * 1e-3
+    torch.testing.assert_close(impl.rms_norm(x, eps=1e-6).double(), _rms_ref(x, eps=1e-6), atol=1e-5, rtol=1e-4)
+
+
 def test_rms_norm_statistics_in_float32(impl):
     # 300^2 = 90,000 overflows float16 (max 65,504): the mean-square must be computed in float32
     x = torch.full((2, 16), 300.0, dtype=torch.float16)

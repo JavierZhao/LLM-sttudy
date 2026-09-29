@@ -126,14 +126,14 @@
     rms = lambda x, g: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * g
     q, k = rms(q, g_q), rms(k, g_k)                    # unit RMS per head and position, then a learned gain
     scores = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5
-    causal = torch.ones(q.shape[-2], k.shape[-2], dtype=torch.bool).tril()
+    causal = torch.ones(q.shape[-2], k.shape[-2], dtype=torch.bool, device=q.device).tril()
     return scores.masked_fill(~causal, float("-inf")).softmax(-1) @ v
 </code></pre>
 
   <h3 id="qk-history">Origin and adopters</h3>
   <p>Henry et al. (2020) proposed \(\ell_2\)-normalized queries and keys with a learnable scalar in place of \(1/\sqrt d\) for low-resource translation <a href="https://arxiv.org/abs/2010.04245">[Henry et al. 2020]</a>. The stability case came from ViT-22B: at about 8B parameters and Adam \(10^{-3}\) the loss diverged within a few thousand steps as attention logits passed 50,000. LayerNorm on \(q\) and \(k\) (a fix they credit to unpublished work of Gilmer et al.) removed it and kept LR \(10^{-3}\) usable at larger sizes <a href="https://arxiv.org/abs/2302.05442">[Dehghani et al. 2023, §2, App. B]</a>. Adopters:</p>
   <ul>
-    <li><strong>Chameleon</strong> 7B and 34B: essential; the 7B diverged after about 20% of an epoch without it <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. <strong>OLMo 2</strong>, <strong>Gemma 3</strong> (it "replaced the soft-capping of Gemma 2 with QK-norm") and <strong>Qwen3</strong> (removed QKV bias, added QK-Norm "to ensure stable training") <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.1]</a>, <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>, <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>.</li>
+    <li><strong>Chameleon</strong> 7B and 34B: essential; the 7B diverged after about 20% of an epoch without it <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. <strong>OLMo 2</strong>, <strong>Gemma 3</strong> ("we replace the soft-capping of Gemma 2 with QK-norm") and <strong>Qwen3</strong> (removed QKV bias, added QK-Norm "to ensure stable training") <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.1]</a>, <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>, <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>.</li>
     <li><strong>DeepSeek-V4</strong> normalizes each query head and the single compressed KV entry just before core attention, which "avoids exploding attention logits", so it does not use QK-Clip <a href="https://arxiv.org/abs/2606.19348">[V4, §2.3.3, §2.4]</a>.</li>
   </ul>
 
@@ -330,7 +330,7 @@
   \[ h = x + \RMSNorm\big(\mathrm{Attn}(x)\big), \qquad x_{\text{out}} = h + \RMSNorm\big(\mathrm{MLP}(h)\big) \]
 
   <p>The reordering comes from Swin Transformer V2's "residual-post-norm" <a href="https://arxiv.org/abs/2111.09883">[Liu et al. 2021]</a> via Chameleon. OLMo 2 found that neither reordering nor QK-norm alone gave good results, but together they cut the gradient-norm spike score (percentage of values at least 7 standard deviations above a rolling 1,000-step average) from 0.108 to 0.069 <a href="https://arxiv.org/abs/2501.00656">[§3.3.2, Fig. 7]</a>. Chameleon-34B still diverged with the Llama-2 ordering plus QK-norm and dropout, and needed the reordering, which "bounds the norm growth of the feedforward block, which can become additionally problematic given the multiplicative nature of the SwiGLU activation" <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. One typo to know: OLMo 2's Eq. 2 in §2.1 prints \(\mathrm{MLP}(x)\), while its §3.3.2 table and the Hugging Face implementation apply the MLP to \(h\), as above.</p>
-  <p><strong>Why bounding the write helps.</strong> In pre-norm, \(F(\mathrm{LN}(x))\) has no ceiling: a gated FFN can write a huge vector, and every later LayerNorm divides by a norm dominated by it. LLaMA2-7B's massive activations reach 2,622 against a median of 0.2 <a href="https://arxiv.org/abs/2402.17762">[Sun et al. 2024, Table 1]</a>, and the Qwen gating study traces them to early-layer FFN outputs carried by the residual stream, consistent with normalizing FFN outputs first <a href="https://arxiv.org/abs/2505.06708">[Qiu et al. 2025, §4.3]</a>. One consequence (our reasoning): the branch can no longer start near zero, since \(\RMSNorm\) of a tiny vector still has unit RMS, which fits OLMo 2 dropping depth-scaled initialization (<a href="04-transformer-block.html#init">page 04</a>).</p>
+  <p><strong>Why bounding the write helps.</strong> In pre-norm, \(F(\mathrm{LN}(x))\) has no ceiling: a gated FFN can write a huge vector, and every later LayerNorm divides by a norm dominated by it. The Qwen gating study traces massive activations (<a href="#why-sinks">below</a>) to early-layer FFN outputs carried by the residual stream, consistent with normalizing FFN outputs first <a href="https://arxiv.org/abs/2505.06708">[Qiu et al. 2025, §4.3]</a>. One consequence (our reasoning): the branch can no longer start near zero, since \(\RMSNorm\) of a tiny vector still has unit RMS, <span class="unverified" title="OLMo 2 does not give this as its reason for dropping depth-scaled initialization; the link is our inference.">which would fit OLMo 2 dropping depth-scaled initialization</span> (<a href="04-transformer-block.html#init">page 04</a>).</p>
 
   <div class="decision">
     <div class="decision-title">Output-norm (sandwich and OLMo 2 style)</div>
@@ -340,7 +340,7 @@
       <dt>Why it works</dt><dd>The write's RMS is set by a learned gain, not by the sublayer's internal scale.</dd>
       <dt>Evidence</dt><dd>Chameleon-34B stable only after reordering <a href="https://arxiv.org/abs/2405.09818">[Fig. 6c]</a>; OLMo 2 spike score 0.108 to 0.069 with QK-norm <a href="https://arxiv.org/abs/2501.00656">[§3.3.2]</a>.</dd>
       <dt>Cost</dt><dd>One or two extra norms per sublayer; changes how initialization should scale writes; did not work well with dropout in Chameleon.</dd>
-      <dt>Used by</dt><dd>Gemma 2 and 3, OLMo 2, Chameleon-34B. Llama, Qwen, gpt-oss and DeepSeek keep plain pre-norm.</dd>
+      <dt>Used by</dt><dd>Gemma 2 and 3, OLMo 2, Chameleon-34B. Llama, Qwen, gpt-oss and DeepSeek-V3 keep plain pre-norm.</dd>
     </dl>
   </div>
 
@@ -381,7 +381,7 @@
   <ol>
     <li><strong>Non-expansive.</strong> The max row sum \(\lVert B\rVert_\infty\) and max column sum \(\lVert B\rVert_1\) both equal 1, so \(\lVert B\rVert_2 \le \sqrt{\lVert B\rVert_1 \lVert B\rVert_\infty} = 1\).</li>
     <li><strong>Closed under products.</strong> \((B_1 B_2)\mathbf 1 = \mathbf 1\), likewise for columns, so any depth of composition stays doubly stochastic.</li>
-    <li><strong>Mean-preserving.</strong> \(\mathbf 1^\top (BX) = \mathbf 1^\top X\): mixing moves signal between streams but conserves the total, the multi-stream identity mapping <a href="https://arxiv.org/abs/2512.24880">[mHC, §4.1]</a>.</li>
+    <li><strong>Mean-preserving.</strong> \(\mathbf 1^\top (BX) = \mathbf 1^\top X\): mixing moves signal between streams but conserves the total, the multi-stream identity mapping <a href="https://arxiv.org/abs/2512.24880">[mHC, §1, §4.1]</a>.</li>
   </ol>
   <p>To produce such a matrix from a raw output \(\tilde H\), mHC runs <strong>Sinkhorn-Knopp</strong>: \(M^{(0)} = \exp(\tilde H)\), then alternate row and column normalization, \(t_{\max} = 20\) iterations <a href="https://arxiv.org/abs/2512.24880">[mHC, §4.2]</a>, as in V4 <a href="https://arxiv.org/abs/2606.19348">[§2.2]</a>. Twenty iterations only approximate the projection, so gains are near 1, not exactly 1.</p>
 
@@ -488,8 +488,7 @@ class MHC(nn.Module):
   <h3 id="mhc-cost">Cost, evidence and use</h3>
   <ul>
     <li><strong>Memory traffic is the real cost.</strong> Per token and layer a residual merge reads \(2C\) and writes \(C\) elements; HC reads \((5n+1)C + n^2 + 2n\) and writes \((3n+1)C + n^2 + 2n\), about \(21C\) and \(13C\) at \(n = 4\), that is 10.5x and 13x more, plus an \(n\)-times wider stream to store and send between pipeline stages <a href="https://arxiv.org/abs/2512.24880">[mHC, §3.2, Tab. 2]</a>. Fused kernels, recomputation and a DualPipe overlap bring it to 6.7% overhead at \(n = 4\) <a href="https://arxiv.org/abs/2512.24880">[§1, §4.3]</a>.</li>
-    <li><strong>Parameters are negligible.</strong> At V4-Flash's \(d = 4096\) a module holds \(W^{\mathrm{pre}}, W^{\mathrm{post}} \in \R^{nd\times n}\) and \(W^{\mathrm{res}} \in \R^{nd\times n^2}\), \(65{,}536 + 65{,}536 + 262{,}144\) plus 27 small parameters, about 393K. One module per sublayer over 43 layers gives 33.8M, 0.012% of 284B (our arithmetic).</li>
-    <li><strong>Evidence is modest and internal.</strong> On 27B MoE models mHC finished 0.021 below baseline loss <a href="https://arxiv.org/abs/2512.24880">[§5.2, Fig. 5]</a>. In the paper's preliminary ablation of plain HC, \(H^{\mathrm{res}}\) alone gave \(-0.022\) against \(-0.027\) for all three mappings, so most of the gain is residual mixing <a href="https://arxiv.org/abs/2512.24880">[§3, Tab. 1]</a>. These are the authors' own runs. V4 uses mHC at 284B and 1.6T parameters, with AdamW for the mHC static biases and gates and Muon for most matrices <a href="https://arxiv.org/abs/2606.19348">[§2.4]</a> (<a href="28-deepseek-3-reasoning.html">page 28</a>).</li>
+    <li><strong>Parameters are negligible.</strong> At V4-Flash's \(d = 4096\) a module holds \(W^{\mathrm{pre}}, W^{\mathrm{post}} \in \R^{nd\times n}\) and \(W^{\mathrm{res}} \in \R^{nd\times n^2}\), \(65{,}536 + 65{,}536 + 262{,}144\) plus 27 small parameters, about 393K. One module per sublayer over 43 layers gives 33.8M, 0.012% of 284B (our arithmetic).</li>ow baseline loss <a href="https://arxiv.org/abs/2512.24880">[§5.2, Fig. 5]</a>. In the paper's preliminary ablation of plain HC, \(H^{\mathrm{res}}\) alone gave \(-0.022\) against \(-0.027\) for all three mappings, so most of the gain is residual mixing <a href="https://arxiv.org/abs/2512.24880">[§3, Tab. 1]</a>. These are the authors' own runs. V4 uses mHC at 284B and 1.6T parameters, with AdamW for the mHC static biases and gates and Muon for most matrices <a href="https://arxiv.org/abs/2606.19348">[§2.4]</a> (<a href="28-deepseek-3-reasoning.html">page 28</a>).</li>
   </ul>
 
   <div class="decision">

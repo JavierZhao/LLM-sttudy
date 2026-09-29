@@ -45,8 +45,10 @@ def test_mask_limits(impl):
 
 def test_sliding_window_attention_matches_sdpa(impl):
     q, k, v = _rand(T=11, dk=8, dv=8)
+    i = torch.arange(11)[:, None]
+    j = torch.arange(11)[None, :]
     for w in (1, 3, 5, 11, 20):
-        mask = impl.sliding_window_mask(11, w)  # checked above; reused to build the SDPA reference
+        mask = (j <= i) & (j > i - w)  # independent reference mask
         ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         torch.testing.assert_close(impl.sliding_window_attention(q, k, v, w), ref, atol=1e-5, rtol=1e-5)
 

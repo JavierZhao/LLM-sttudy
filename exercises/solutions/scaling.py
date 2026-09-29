@@ -60,8 +60,8 @@ def isoflop_optimum(sizes: Sequence[float], losses: Sequence[float]) -> Tuple[fl
     """Vertex of the least-squares parabola in ln N through one IsoFLOP curve."""
     N = np.asarray(sizes, dtype=np.float64)
     L = np.asarray(losses, dtype=np.float64)
-    if N.shape != L.shape or N.ndim != 1 or N.size < 3:
-        raise ValueError("need at least 3 (size, loss) pairs of equal length")
+    if N.shape != L.shape or N.ndim != 1 or np.unique(N).size < 3:
+        raise ValueError("need at least 3 distinct sizes, with one loss per size")
     lx = np.log(N)
     x0 = lx.mean()
     c2, c1, c0 = np.polyfit(lx - x0, L, 2)
@@ -77,6 +77,8 @@ def effective_tokens(unique_tokens: float, total_tokens: float,
     U, D = float(unique_tokens), float(total_tokens)
     if U <= 0:
         raise ValueError("unique_tokens must be positive")
+    if not r_star > 0:
+        raise ValueError("r_star must be positive (math.inf is allowed)")
     if D <= U or math.isinf(r_star):                 # no repeats, or repeats as good as fresh data
         return D
     R = D / U - 1.0

@@ -207,6 +207,8 @@ def test_isoflop_optimum_validation(impl):
         impl.isoflop_optimum([1e8, 1e9, 1e10], [2.5, 2.4])                 # length mismatch
     with pytest.raises(ValueError):                                         # concave data: no minimum
         impl.isoflop_optimum([1e8, 1e9, 1e10, 1e11], [2.0, 2.4, 2.5, 2.1])
+    with pytest.raises(ValueError):                                         # only 2 distinct sizes
+        impl.isoflop_optimum([1e8, 1e8, 1e9, 1e9], [2.5, 2.5, 2.4, 2.4])
 
 
 # ------------------------------------------------------------------ effective_tokens
@@ -224,6 +226,15 @@ def test_effective_tokens_known_values(impl):
     assert impl.effective_tokens(1.0, 1e6) == pytest.approx(1 + 15.387756, rel=1e-6)
     # a different decay constant
     assert impl.effective_tokens(1.0, 4.0, r_star=3.0) == pytest.approx(1 + 3 * (1 - math.exp(-1.0)), rel=1e-9)
+
+
+def test_effective_tokens_validation(impl):
+    with pytest.raises(ValueError):
+        impl.effective_tokens(0.0, 10.0)
+    with pytest.raises(ValueError):
+        impl.effective_tokens(1.0, 4.0, r_star=0.0)
+    with pytest.raises(ValueError):
+        impl.effective_tokens(1.0, 4.0, r_star=-3.0)
 
 
 def test_effective_tokens_shape_and_scaling(impl):
@@ -302,3 +313,7 @@ def test_inference_aware_validation(impl):
         impl.inference_aware_optimum(1.5, 1e12, **EPOCH)        # target below the irreducible loss E
     with pytest.raises(ValueError):
         impl.inference_aware_optimum(EPOCH["E"], 1e12, **EPOCH)
+    with pytest.raises(ValueError):
+        impl.inference_aware_optimum(2.0, -1.0, **EPOCH)          # negative served tokens
+    with pytest.raises(ValueError):
+        impl.inference_aware_optimum(2.0, 1e12, **dict(EPOCH, A=0.0))

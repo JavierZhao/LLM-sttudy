@@ -33,3 +33,4 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 06 | KV cache, incremental attention, greedy decoding | `drills/kv_cache.py` |
 | 07 | GQA with a KV cache; MHA→GQA mean-pool conversion | `drills/gqa.py` |
 | 07 | MLA: decompressed forward and absorbed decode; KV bytes per token | `drills/mla.py` |
+| 13 | Scaling laws: fit, optimum, inference-aware sizing | `drills/scaling.py` |

@@ -79,8 +79,8 @@ def isoflop_optimum(sizes: Sequence[float], losses: Sequence[float]) -> Tuple[fl
         (N_opt, L_min): N_opt = exp(-c1 / (2 * c2)) and L_min = the parabola's value at its vertex,
         both Python floats.
     Raises:
-        ValueError if fewer than 3 points are given, the lengths differ, or the fitted
-        parabola has no minimum (c2 <= 0).
+        ValueError if fewer than 3 distinct sizes are given, the lengths differ, or the
+        fitted parabola has no minimum (c2 <= 0).
     """
     raise NotImplementedError
 
@@ -97,6 +97,8 @@ def effective_tokens(unique_tokens: float, total_tokens: float,
         r_star: the fitted decay constant R*_D (> 0); math.inf means repeated tokens are worth as much as fresh ones.
     Returns:
         D' as a float. If total_tokens <= unique_tokens there is no repetition and D' = total_tokens.
+    Raises:
+        ValueError if unique_tokens <= 0 or r_star <= 0.
     """
     raise NotImplementedError
 
@@ -117,7 +119,8 @@ def inference_aware_optimum(loss: float, d_inf: float, E: float, A: float, B: fl
         (N, D_train) as floats. With d_inf = 0 this is the compute-optimal model for that loss.
         Larger d_inf must give a smaller N and a larger D_train.
     Raises:
-        ValueError if loss <= E or any constant is not positive.
+        ValueError if loss <= E, d_inf < 0, or A, B, alpha or beta is not positive (E may be any
+        value below loss).
     Notes:
         There is no closed form for d_inf > 0; a robust 1-D search over ln N is expected.
         Only sizes with A / N**alpha < loss - E can reach the target at all.

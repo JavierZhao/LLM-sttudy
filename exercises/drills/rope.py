@@ -41,8 +41,10 @@ def apply_rope_interleaved(x: Tensor, pos: Tensor, base: float = 10000.0) -> Ten
         pos: (T,) integer position ids.
         base: RoPE base b.
     Returns:
-        Same shape and dtype as x. Compute the angles in float64 (or at least float32) and
-        cast cos/sin to x.dtype: angles like 100_000 rad are unrepresentable in bfloat16.
+        Same shape and dtype as x. Compute the angles pos * theta_i in float64 and cast cos/sin
+        to x.dtype only after the trig: angles like 100_000 rad are unrepresentable in bfloat16,
+        and the float64 tests compare against a float64 reference to about 1e-7, which float32
+        angles miss.
     """
     raise NotImplementedError
 
@@ -93,7 +95,7 @@ def sinusoidal_embedding(T: int, d: int, base: float = 10000.0) -> Tensor:
     PE[pos, 2i] = sin(pos / base ** (2i / d)),  PE[pos, 2i + 1] = cos(pos / base ** (2i / d)).
 
     Args:
-        T: number of positions (pos = 0 .. T-1). d: even embedding width.
+        T: number of positions (pos = 0 .. T-1). d: even embedding width. base: the 10000 of Vaswani et al.
     Returns:
         (T, d) float32 tensor.
     """
@@ -110,7 +112,8 @@ def alibi_slopes(n_heads: int) -> Tensor:
     by 2^-0.5, 2^-1.5, 2^-2.5, 2^-3.5).
 
     Returns:
-        (n_heads,) float32 tensor, decreasing.
+        (n_heads,) float32 tensor. Decreasing when n_heads is a power of two; otherwise the borrowed
+        slopes restart at a larger value (12 heads: ..., 2^-8, then 2^-0.5, ...), so it is not monotone.
     """
     raise NotImplementedError
 

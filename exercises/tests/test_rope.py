@@ -83,6 +83,16 @@ def test_position_zero_is_identity_and_dtype_preserved(impl):
         assert fn(x.double(), torch.arange(3)).dtype == torch.float64
 
 
+def test_angles_are_computed_before_casting_to_low_precision(impl):
+    """Angles near 100_000 rad are meaningless in bfloat16: do the trig in high precision, cast cos/sin after."""
+    x = torch.randn(1, 4, 2, 16).to(torch.bfloat16)
+    pos = torch.tensor([0, 1, 100_000, 100_001])
+    for fn, ref in ((impl.apply_rope_interleaved, _ref_interleaved), (impl.apply_rope_half, _ref_half)):
+        got = fn(x, pos, 10000.0).float()
+        want = ref(x.double(), pos, 10000.0).float()
+        torch.testing.assert_close(got, want, atol=6e-2, rtol=0.0)
+
+
 def test_rotation_preserves_norms(impl):
     x = torch.randn(3, 11, 4, 32, dtype=torch.float64)
     pos = torch.arange(11) * 137                                           # large, irregular positions

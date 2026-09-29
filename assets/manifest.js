@@ -15,7 +15,7 @@ window.LLM_MANIFEST = {
           desc: "QKV, the 1/√d scale, causal masking, multi-head attention, O(n²) cost, a numerically stable implementation." },
         { n: "04", slug: "04-transformer-block", title: "The Transformer block, params & FLOPs", tier: "P0", minutes: 70, status: "written",
           desc: "Residual stream, pre-norm, RMSNorm, SwiGLU, weight tying, exact parameter and FLOP counting, a ~150-line GPT." },
-        { n: "05", slug: "05-positional-encoding", title: "Positional encoding & RoPE", tier: "P0", minutes: 55, status: "planned",
+        { n: "05", slug: "05-positional-encoding", title: "Positional encoding & RoPE", tier: "P0", minutes: 55, status: "written",
           desc: "Sinusoidal, learned, relative bias, ALiBi, full RoPE derivation, partial RoPE, NoPE, length generalization." },
         { n: "06", slug: "06-decoding-kv-cache", title: "Decoding & the KV cache", tier: "P0", minutes: 55, status: "written",
           desc: "Sampling (temperature, top-k, top-p, min-p), beam search, KV cache memory, prefill vs decode, arithmetic intensity." }

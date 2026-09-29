@@ -165,10 +165,10 @@ def format_reward(response):               # R1-style structure check, added wit
 <text x="68" y="198" text-anchor="middle" class="s-small s-muted">no critic</text>
 <path class="s-line" d="M68,104 L68,128" marker-end="url(#arrow-24-1)"/>
 <path class="s-line" d="M128,169 L168,169" marker-end="url(#arrow-24-1)"/>
-<text x="176" y="40" class="s-small s-muted">response</text>
-<text x="252" y="40" class="s-small s-muted">tokens |o_i| (illustrative)</text>
-<text x="404" y="40" class="s-small s-muted">reward r_i</text>
-<text x="472" y="40" class="s-small s-muted">A_i</text>
+<text x="180" y="40" class="s-small s-muted">response</text>
+<text x="236" y="40" class="s-small s-muted">tokens |o_i| (illustrative)</text>
+<text x="420" y="40" text-anchor="middle" class="s-small s-muted">reward r_i</text>
+<text x="498" y="40" text-anchor="middle" class="s-small s-muted">A_i</text>
 <rect class="s-c" x="172" y="47" width="352" height="20" rx="3"/>
 <rect class="s-c" x="172" y="69" width="352" height="20" rx="3"/>
 <rect class="s-c" x="172" y="91" width="352" height="20" rx="3"/>
@@ -185,14 +185,14 @@ def format_reward(response):               # R1-style structure check, added wit
 <text x="180" y="172" class="s-small">o6</text>
 <text x="180" y="194" class="s-small">o7</text>
 <text x="180" y="216" class="s-small">o8</text>
-<rect class="s-fill-muted" x="206" y="53" width="102" height="8" rx="2"/><text x="316" y="61" class="s-small s-muted">1,020</text>
-<rect class="s-fill-muted" x="206" y="75" width="76" height="8" rx="2"/><text x="290" y="83" class="s-small s-muted">760</text>
-<rect class="s-fill-muted" x="206" y="97" width="134" height="8" rx="2"/><text x="348" y="105" class="s-small s-muted">1,340</text>
-<rect class="s-fill-muted" x="206" y="119" width="210" height="8" rx="2"/>
-<rect class="s-fill-muted" x="206" y="141" width="165" height="8" rx="2"/>
-<rect class="s-fill-muted" x="206" y="163" width="90" height="8" rx="2"/>
-<rect class="s-fill-muted" x="206" y="185" width="240" height="8" rx="2"/>
-<rect class="s-fill-muted" x="206" y="207" width="180" height="8" rx="2"/>
+<rect class="s-fill-muted" x="206" y="53" width="51" height="8" rx="2"/><text x="264" y="61" class="s-small s-muted">1,020</text>
+<rect class="s-fill-muted" x="206" y="75" width="38" height="8" rx="2"/><text x="251" y="83" class="s-small s-muted">760</text>
+<rect class="s-fill-muted" x="206" y="97" width="67" height="8" rx="2"/><text x="280" y="105" class="s-small s-muted">1,340</text>
+<rect class="s-fill-muted" x="206" y="119" width="105" height="8" rx="2"/><text x="318" y="127" class="s-small s-muted">2,100</text>
+<rect class="s-fill-muted" x="206" y="141" width="83" height="8" rx="2"/><text x="296" y="149" class="s-small s-muted">1,650</text>
+<rect class="s-fill-muted" x="206" y="163" width="45" height="8" rx="2"/><text x="258" y="171" class="s-small s-muted">900</text>
+<rect class="s-fill-muted" x="206" y="185" width="120" height="8" rx="2"/><text x="333" y="193" class="s-small s-muted">2,400</text>
+<rect class="s-fill-muted" x="206" y="207" width="90" height="8" rx="2"/><text x="303" y="215" class="s-small s-muted">1,800</text>
 <text x="420" y="62" text-anchor="middle" class="s-mono">1</text>
 <text x="420" y="84" text-anchor="middle" class="s-mono">1</text>
 <text x="420" y="106" text-anchor="middle" class="s-mono">1</text>
@@ -216,13 +216,14 @@ def format_reward(response):               # R1-style structure check, added wit
 <text x="630" y="130" text-anchor="middle" class="s-small s-muted">one scalar per response,</text>
 <text x="630" y="146" text-anchor="middle" class="s-small s-muted">shared by all its tokens</text>
 <path class="s-line" d="M524,103 L548,103" marker-end="url(#arrow-24-1)"/>
-<text x="548" y="182" class="s-small s-muted">All-correct or all-wrong group:</text>
+<text x="548" y="182" class="s-small s-muted">All right or all wrong:</text>
 <text x="548" y="198" class="s-small s-muted">std = 0, every A_i = 0,</text>
-<text x="548" y="214" class="s-small s-muted">no gradient (dynamic sampling)</text>
+<text x="548" y="214" class="s-small s-muted">no gradient (see DAPO)</text>
 <rect class="s-e" x="172" y="252" width="540" height="76" rx="6"/>
-<text x="442" y="272" text-anchor="middle" class="s-bold">4 Update: clipped policy gradient, one loss over G × tokens</text>
-<text x="442" y="292" text-anchor="middle" class="s-small">min( ρ A_i , clip(ρ, 1 − ε_low, 1 + ε_high) A_i ) − β · k3( π_θ , π_ref ), averaged per response then over the group</text>
-<text x="442" y="310" text-anchor="middle" class="s-small s-muted">ρ = π_θ(token) / π_old(token); the KL to the reference sits in the loss, not in the reward</text>
+<text x="442" y="272" text-anchor="middle" class="s-bold">4 Update: clipped policy gradient over all G × tokens</text>
+<text x="442" y="292" text-anchor="middle" class="s-small">min( ρ A_i , clip(ρ, 1 − ε_low, 1 + ε_high) A_i ) − β · k3(π_θ, π_ref)</text>
+<text x="442" y="308" text-anchor="middle" class="s-small">averaged over tokens per response, then over the group</text>
+<text x="442" y="323" text-anchor="middle" class="s-small s-muted">ρ = π_θ(token) / π_old(token); the KL sits in the loss, not the reward</text>
 <path class="s-line" d="M172,290 L68,290 L68,210" marker-end="url(#arrow-24-1)"/>
 <text x="12" y="240" class="s-small s-muted">π_old ← π_θ</text>
 <path class="s-line" d="M442,221 L442,252" marker-end="url(#arrow-24-1)"/>
@@ -334,7 +335,7 @@ def format_reward(response):               # R1-style structure check, added wit
   </ol>
 
   <figure class="fig">
-<svg viewBox="0 0 720 352" role="img" aria-labelledby="fig-24-2-title">
+<svg viewBox="0 0 720 360" role="img" aria-labelledby="fig-24-2-title">
 <title id="fig-24-2-title">The DeepSeek-R1 training pipeline: R1-Zero as data source, four stages from V3-Base to R1 with AIME 2024 scores after each stage, and the distillation branch</title>
 <defs><marker id="arrow-24-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
 <rect class="s-box" x="8" y="10" width="140" height="56" rx="6"/>
@@ -342,7 +343,7 @@ def format_reward(response):               # R1-style structure check, added wit
 <text x="78" y="50" text-anchor="middle" class="s-small s-muted">671B MoE, 37B active</text>
 <rect class="s-a" x="176" y="10" width="220" height="56" rx="6"/>
 <text x="286" y="32" text-anchor="middle" class="s-bold">Pure RL with GRPO</text>
-<text x="286" y="50" text-anchor="middle" class="s-small">accuracy + format rewards, 10,400 steps</text>
+<text x="286" y="50" text-anchor="middle" class="s-small">accuracy + format, 10,400 steps</text>
 <rect class="s-box" x="424" y="10" width="160" height="56" rx="6"/>
 <text x="504" y="32" text-anchor="middle" class="s-bold">R1-Zero</text>
 <text x="504" y="50" text-anchor="middle" class="s-small s-muted">AIME 77.9, hard to read</text>
@@ -350,44 +351,47 @@ def format_reward(response):               # R1-style structure check, added wit
 <path class="s-line" d="M396,38 L424,38" marker-end="url(#arrow-24-2)"/>
 <path class="s-line s-dash" d="M504,66 L504,96 L72,96 L72,118" marker-end="url(#arrow-24-2)"/>
 <text x="84" y="90" class="s-small s-muted">filtered, rewritten R1-Zero samples seed the cold-start data</text>
-<rect class="s-e" x="8" y="118" width="128" height="98" rx="6"/>
-<text x="72" y="140" text-anchor="middle" class="s-bold">1 Cold-start SFT</text>
-<text x="72" y="159" text-anchor="middle" class="s-small">V3-Base + thousands</text>
-<text x="72" y="174" text-anchor="middle" class="s-small">of long-CoT examples,</text>
-<text x="72" y="189" text-anchor="middle" class="s-small">readable, first person</text>
-<rect class="s-a" x="152" y="118" width="128" height="98" rx="6"/>
-<text x="216" y="140" text-anchor="middle" class="s-bold">2 Reasoning RL</text>
-<text x="216" y="159" text-anchor="middle" class="s-small">GRPO, rule-based</text>
-<text x="216" y="174" text-anchor="middle" class="s-small">accuracy + format</text>
-<text x="216" y="189" text-anchor="middle" class="s-small">+ language reward</text>
-<rect class="s-e" x="296" y="118" width="128" height="98" rx="6"/>
-<text x="360" y="140" text-anchor="middle" class="s-bold">3 Rejection + SFT</text>
-<text x="360" y="159" text-anchor="middle" class="s-small">sample from stage 2:</text>
-<text x="360" y="174" text-anchor="middle" class="s-small">~600K reasoning +</text>
-<text x="360" y="189" text-anchor="middle" class="s-small">~200K other, SFT V3-Base</text>
-<rect class="s-a" x="440" y="118" width="128" height="98" rx="6"/>
-<text x="504" y="140" text-anchor="middle" class="s-bold">4 Final RL</text>
-<text x="504" y="159" text-anchor="middle" class="s-small">rules + reward models</text>
-<text x="504" y="174" text-anchor="middle" class="s-small">(helpful, harmless)</text>
-<text x="504" y="189" text-anchor="middle" class="s-small">1,700 steps, T = 0.7</text>
-<rect class="s-c" x="584" y="118" width="128" height="98" rx="6"/>
-<text x="648" y="140" text-anchor="middle" class="s-bold">DeepSeek-R1</text>
-<text x="648" y="159" text-anchor="middle" class="s-small">AIME 79.8</text>
-<text x="648" y="174" text-anchor="middle" class="s-small">Codeforces 2029</text>
-<text x="648" y="189" text-anchor="middle" class="s-small">IF-Eval 83.3</text>
-<path class="s-line" d="M136,167 L152,167" marker-end="url(#arrow-24-2)"/>
-<path class="s-line" d="M280,167 L296,167" marker-end="url(#arrow-24-2)"/>
-<path class="s-line" d="M424,167 L440,167" marker-end="url(#arrow-24-2)"/>
-<path class="s-line" d="M568,167 L584,167" marker-end="url(#arrow-24-2)"/>
-<text x="12" y="234" class="s-small s-mono">after 1: AIME 59.0</text>
-<text x="156" y="234" class="s-small s-mono">after 2: AIME 74.0</text>
-<text x="300" y="234" class="s-small s-mono">after 3: AIME 78.1</text>
-<text x="444" y="234" class="s-small s-mono">after 4: AIME 79.8</text>
-<path class="s-line s-dash" d="M410,216 L410,262" marker-end="url(#arrow-24-2)"/>
-<rect class="s-d" x="200" y="262" width="330" height="48" rx="6"/>
-<text x="365" y="283" text-anchor="middle" class="s-bold">Distilled students: SFT only, no RL</text>
-<text x="365" y="300" text-anchor="middle" class="s-small">Qwen2.5 1.5B, 7B, 14B, 32B and Llama 8B, 70B on the ~800K samples</text>
-<text x="8" y="334" class="s-small s-muted">Stage 3 restarts from V3-Base: the stage-2 checkpoint only generates the data. Scores are AIME 2024 pass@1 from Table 3 of the v2 paper.</text>
+<rect class="s-e" x="8" y="118" width="128" height="112" rx="6"/>
+<text x="72" y="138" text-anchor="middle" class="s-bold">1 Cold-start SFT</text>
+<text x="72" y="157" text-anchor="middle" class="s-small">V3-Base + thousands</text>
+<text x="72" y="171" text-anchor="middle" class="s-small">of long-CoT examples,</text>
+<text x="72" y="185" text-anchor="middle" class="s-small">first-person style</text>
+<text x="72" y="219" text-anchor="middle" class="s-small s-bold">AIME 59.0</text>
+<rect class="s-a" x="152" y="118" width="128" height="112" rx="6"/>
+<text x="216" y="138" text-anchor="middle" class="s-bold">2 Reasoning RL</text>
+<text x="216" y="157" text-anchor="middle" class="s-small">GRPO, rule-based</text>
+<text x="216" y="171" text-anchor="middle" class="s-small">accuracy + format</text>
+<text x="216" y="185" text-anchor="middle" class="s-small">+ language reward</text>
+<text x="216" y="219" text-anchor="middle" class="s-small s-bold">AIME 74.0</text>
+<rect class="s-e" x="296" y="118" width="128" height="112" rx="6"/>
+<text x="360" y="138" text-anchor="middle" class="s-bold">3 Sample + SFT</text>
+<text x="360" y="157" text-anchor="middle" class="s-small">from stage 2: ~600K</text>
+<text x="360" y="171" text-anchor="middle" class="s-small">reasoning + ~200K</text>
+<text x="360" y="185" text-anchor="middle" class="s-small">other; SFT restarts</text>
+<text x="360" y="199" text-anchor="middle" class="s-small">from V3-Base</text>
+<text x="360" y="219" text-anchor="middle" class="s-small s-bold">AIME 78.1</text>
+<rect class="s-a" x="440" y="118" width="128" height="112" rx="6"/>
+<text x="504" y="138" text-anchor="middle" class="s-bold">4 Final RL</text>
+<text x="504" y="157" text-anchor="middle" class="s-small">rules + reward models</text>
+<text x="504" y="171" text-anchor="middle" class="s-small">(helpful, harmless),</text>
+<text x="504" y="185" text-anchor="middle" class="s-small">1,700 steps, T = 0.7</text>
+<text x="504" y="219" text-anchor="middle" class="s-small s-bold">AIME 79.8</text>
+<rect class="s-c" x="584" y="118" width="128" height="112" rx="6"/>
+<text x="648" y="138" text-anchor="middle" class="s-bold">DeepSeek-R1</text>
+<text x="648" y="157" text-anchor="middle" class="s-small">Codeforces 2029</text>
+<text x="648" y="171" text-anchor="middle" class="s-small">IF-Eval 83.3</text>
+<text x="648" y="185" text-anchor="middle" class="s-small">Arena-Hard 92.3</text>
+<text x="648" y="219" text-anchor="middle" class="s-small s-bold">AIME 79.8</text>
+<path class="s-line" d="M136,174 L152,174" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M280,174 L296,174" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M424,174 L440,174" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M568,174 L584,174" marker-end="url(#arrow-24-2)"/>
+<path class="s-line s-dash" d="M360,230 L360,262" marker-end="url(#arrow-24-2)"/>
+<rect class="s-d" x="195" y="262" width="330" height="48" rx="6"/>
+<text x="360" y="283" text-anchor="middle" class="s-bold">Distilled students: SFT only, no RL</text>
+<text x="360" y="300" text-anchor="middle" class="s-small">Qwen2.5 1.5B to 32B and Llama 8B, 70B on the ~800K samples</text>
+<text x="8" y="334" class="s-small s-muted">Bold scores are AIME 2024 pass@1 after each stage (R1 paper v2, Table 3). The stage-2 checkpoint only</text>
+<text x="8" y="350" class="s-small s-muted">generates the stage-3 data; stage-3 SFT starts again from DeepSeek-V3-Base.</text>
 </svg>
     <figcaption><b>Figure 2.</b> The R1 pipeline (colors: yellow SFT, blue RL, green final model). Reasoning strength is already high in R1-Zero and after stage 2, and the cold-start stage lowers it (59.0) before RL restores it: the stages mostly buy readability and general ability, as the table below quantifies.</figcaption>
   </figure>
@@ -533,16 +537,18 @@ loss = (ppo_loss * mask).sum(-1) / MAX_TOKENS        # Dr. GRPO: constant, no le
 <text x="550" y="258" text-anchor="middle" class="s-small s-muted">ratio ρ = π_θ / π_old</text>
 <text x="34" y="213" text-anchor="end" class="s-small">0.5</text><text x="34" y="138" text-anchor="end" class="s-small">1.0</text><text x="34" y="63" text-anchor="end" class="s-small">1.5</text>
 <text x="394" y="63" text-anchor="end" class="s-small">−0.5</text><text x="394" y="138" text-anchor="end" class="s-small">−1.0</text><text x="394" y="213" text-anchor="end" class="s-small">−1.5</text>
-<text x="52" y="72" class="s-small s-tb">solid orange: ε_high = 0.28 (cap 1.28)</text>
-<text x="52" y="88" class="s-small s-muted">dashed grey: symmetric ε = 0.2 (cap 1.2)</text>
-<text x="338" y="150" text-anchor="end" class="s-small">no gradient above</text>
-<text x="338" y="166" text-anchor="end" class="s-small">the cap</text>
+<text x="200" y="186" class="s-small s-tb">orange: ε_high = 0.28</text>
+<text x="200" y="202" class="s-small s-muted">grey dashed: ε = 0.2</text>
+<text x="338" y="130" text-anchor="end" class="s-small">no gradient above</text>
+<text x="338" y="146" text-anchor="end" class="s-small">the cap</text>
 <text x="408" y="150" class="s-small">clipped below 0.8:</text>
 <text x="408" y="166" class="s-small">no gradient</text>
-<text x="698" y="70" text-anchor="end" class="s-small">not clipped above: a token made</text>
-<text x="698" y="86" text-anchor="end" class="s-small">MORE likely still gets full penalty;</text>
-<text x="698" y="102" text-anchor="end" class="s-small s-muted">ε_low stays 0.2 (raising it would</text>
-<text x="698" y="118" text-anchor="end" class="s-small s-muted">drive rare tokens toward 0)</text>
+<text x="698" y="74" text-anchor="end" class="s-small">not clipped above:</text>
+<text x="698" y="90" text-anchor="end" class="s-small">a raised token still</text>
+<text x="698" y="106" text-anchor="end" class="s-small">gets the full penalty</text>
+<text x="698" y="124" text-anchor="end" class="s-small s-muted">ε_low stays 0.2:</text>
+<text x="698" y="140" text-anchor="end" class="s-small s-muted">raising it drives</text>
+<text x="698" y="156" text-anchor="end" class="s-small s-muted">rare tokens to 0</text>
 <text x="8" y="284" class="s-small">A rare token with π_old = 0.01 can rise to at most 0.012 under ε = 0.2 and 0.0128 under ε_high = 0.28.</text>
 <text x="8" y="300" class="s-small">A likely token with π_old = 0.9 is capped only by probability 1, so the upper clip mostly binds rare "exploration" tokens.</text>
 <text x="8" y="316" class="s-small s-muted">Dots mark the on-policy point ρ = 1. Curves are the per-token objective; a flat piece means zero gradient.</text>

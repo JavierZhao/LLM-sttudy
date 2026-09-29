@@ -70,7 +70,7 @@
       <tr><td>Apr 2026 (report Jun 2026)</td><td>Gemma 4</td><td>Shared K=V global layers, p-RoPE, a 26B-A4B MoE, encoder-free 12B, thinking mode, Apache 2.0</td><td><a href="https://arxiv.org/abs/2607.02770">[Gemma 4, §2]</a></td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">As of September 2026 I found no later Mistral, Gemma or OpenAI open-weight release with primary technical detail (Mistral said in July 2026 that a new open-weight MoE family was in early access, without published specifications). DiffusionGemma (arXiv 31 Jul 2026), a Gemma 4 derivative, appears in the Gemma 4 section.</p>
+  <p class="small muted">As of September 2026 I found no later Mistral, Gemma or OpenAI open-weight release with primary technical detail (<span class="unverified" title="Press reports (July 2026) only; I found no primary source with specifications">Mistral said in July 2026 that a new open-weight MoE family was in early access</span>, without published specifications). DiffusionGemma (arXiv 31 Jul 2026), a Gemma 4 derivative, appears in the Gemma 4 section.</p>
 
   <aside class="callout note">
     <div class="callout-title">How to read this page</div>
@@ -165,7 +165,7 @@
 <section>
   <h2 id="gemma">Gemma: Gemini's recipe, distilled into small open models</h2>
 
-  <p>Gemma is Google DeepMind's line of open models "built from the research and technology used to create Gemini" <a href="https://arxiv.org/abs/2403.08295">[Gemma, abstract]</a>. Habits that recur: a large Gemini vocabulary (256K, 262K from Gemma 3), a head dimension of 256 or 128 decoupled from \(d/n_h\), and tied embeddings (in the configs I checked: Gemma 1, 2, 4) scaled by \(\sqrt{d}\) at input. The scaling is in the code (<code>embed_scale = hidden_size ** 0.5</code>): the "keep the shortcut large" trick of <a href="11-stability-tweaks.html#embeddings-stability">page 11</a>, since <span class="unverified" title="My reading; the reports do not state the reason for the scaling">a tied table is trained at the scale the output logits need</span>. What changed between generations is mostly attention.</p>
+  <p>Gemma is Google DeepMind's line of open models "built from the research and technology used to create Gemini" <a href="https://arxiv.org/abs/2403.08295">[Gemma, abstract]</a>. Habits that recur: a large Gemini vocabulary (256K, 262K from Gemma 3), a head dimension of 256 or 128 decoupled from \(d/n_h\), and tied embeddings (stated for Gemma 1 and 2, configured for 4) with the input scaled by \(\sqrt{d}\). The scaling is in the Hugging Face code of Gemma 1, 2 and 3 (<code>embed_scale = hidden_size ** 0.5</code>): the "keep the shortcut large" trick of <a href="11-stability-tweaks.html#embeddings-stability">page 11</a>, since <span class="unverified" title="My reading; the reports do not state the reason for the scaling">a tied table is trained at the scale the output logits need</span>. What changed between generations is mostly attention.</p>
 
   <h3 id="gemma1">Gemma 1 (February 2024): MQA for the 2B, wide heads, a huge vocabulary</h3>
 
@@ -569,14 +569,14 @@ kv_bytes(10, 52, e, 131072, 1024) / 2**30              # 10.41 GiB (5:1, window 
   </figure>
 
   <h3 id="sinks">Learned attention sinks</h3>
-  <p>The card: "Each attention head has a learned bias in the denominator of the softmax, similar to off-by-one attention and attention sinks, which enables the attention mechanism to pay no attention to any tokens" <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>. Each head in each layer owns one scalar \(z\), and</p>
+  <p>The card: "Each attention head has a learned bias in the denominator of the softmax, similar to off-by-one attention and attention sinks, which enables the attention mechanism to pay no attention to any tokens" <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>. Each head in each layer owns one scalar \(z\), an <em>attention sink</em> <span class="zh">注意力汇聚</span> in learned-logit form, and</p>
   \[ p_{t,j} = \frac{\exp(s_{t,j})}{\sum_{k \le t} \exp(s_{t,k}) + \exp(z)}, \qquad o_t = \sum_{j \le t} p_{t,j}\, v_j \]
-  <p>The sink is only in the denominator: a fictitious key with a zero value vector. The real weights sum to \(1 - p_{\text{sink}} < 1\), and a head with nothing to read can send its mass there and output almost nothing. In the released Hugging Face code the sink is an <code>nn.Parameter</code> of shape <code>(num_attention_heads,)</code> per attention module, so <strong>64 scalars per layer, 2,304 in the 120b</strong>, and the eager path is:</p>
+  <p>The sink is only in the denominator: a fictitious key with a zero value vector. The real weights sum to \(1 - p_{\text{sink}} &lt; 1\), and a head with nothing to read can send its mass there and output almost nothing. In the released Hugging Face code the sink is an <code>nn.Parameter</code> of shape <code>(num_attention_heads,)</code> per attention module, so <strong>64 scalars per layer, 2,304 in the 120b</strong>, and the eager path is:</p>
 
 <pre><code class="language-python">sinks = module.sinks.reshape(1, -1, 1, 1).expand(B, n_h, T, 1)      # one logit per head
 logits = torch.cat([attn_weights, sinks], dim=-1)                   # (B, n_h, T, S + 1)
 probs = torch.softmax(logits - logits.max(-1, keepdim=True).values, dim=-1)
-scores = probs[..., :-1]                                            # drop the sink column: rows now sum to < 1
+scores = probs[..., :-1]                                            # drop the sink column: rows now sum to &lt; 1
 out = scores @ v
 </code></pre>
 
@@ -951,7 +951,7 @@ weight_bytes_mxfp4(114.71e9, 0.96e9 + 1.16e9) / 2**30     # 60.70 GiB (card: 60.
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> Local:global ratio: how would you choose it?</summary>
     <div class="answer">
-      <p>Start from the budget. Relative to all-global the KV cache (and decode read, and roughly prefill attention FLOPs) is \(f = \frac{1}{r+1} + \frac{r}{r+1}\min(1, W/T)\) for \(r\) local per global layer. At 128K and \(W = 1024\): 1:1 is 0.50, 3:1 0.26, 5:1 0.17, 7:1 0.13, 11:1 0.09. Diminishing returns: 5:1 to 11:1 saves 8 points of cache and halves the layers able to do exact lookup. Per-layer cache size matters too: gpt-oss at 1:1 with a 128 window caches 2 KiB per token-layer, Gemma 3 27B 8 KiB, so gpt-oss ends at 4.5 GiB and Gemma 3 at 10.4 GiB despite the worse ratio.</p>
+      <p>Start from the budget. Relative to all-global the KV cache (and decode read, and roughly prefill attention FLOPs) is \(f = \frac{1}{r+1} + \frac{r}{r+1}\min(1, W/T)\) for \(r\) local per global layer. At 128K and \(W = 1024\): 1:1 is 0.50, 3:1 0.26, 5:1 0.17, 7:1 0.13, 11:1 0.09. Diminishing returns: 5:1 to 11:1 saves 8 points of cache and halves the layers able to do exact lookup. Per-layer cache size matters too: gpt-oss at 1:1 with a 128 window caches 2 KiB per token-layer, Gemma 3 27B 8 KiB, so with also fewer layers (36 against 62) gpt-oss ends at 4.5 GiB and Gemma 3 at 10.4 GiB despite the worse ratio.</p>
       <p>Then quality. Perplexity is nearly flat from 1:1 to 7:1 and windows to 512 (Gemma 3 §5.2), but it mostly measures local prediction. I would pick the smallest global fraction and window that keep RULER, NoLiMa and multi-hop tasks intact <em>after</em> context extension, at 32K and 128K, as per-length curves. MiMo's ablation is the warning: 512 collapsed after extension while 128 did not; MiniMax saw hybrids degrade past 32K. Also ablate sinks (a small window needs them), place a global layer last (Gemma 4), give global layers a higher RoPE base (Gemma 3), and check that the serving stack supports window-sized paged-KV blocks and prefix caching. Default: 5:1 to 7:1, a 512 to 1,024 window, sinks, then revise from the curves.</p>
     </div>
   </details>

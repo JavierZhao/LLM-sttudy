@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · The big picture: language modeling · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="01" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part I · Foundations · Page 01</div>
+  <h1>The big picture: language modeling</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~45 min</span>
+    <span>Prereqs: none. Next: <a href="02-tokenization.html">02 Tokenization</a></span>
+  </div>
+  <p class="lede">A language model is a function from a token prefix to a probability distribution over the next token. Everything else in this course (tokenizers, attention, scaling laws, RLHF, KV caches) refines that one sentence. This page gives you the whole picture first: what the model computes, how it generates, how it is trained and scored, why almost every frontier model is decoder-only, and the three-stage pipeline (pretrain, SFT, RL) that turns a next-token predictor into an assistant.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Derivations from first principles:</strong> why next-token cross-entropy is maximum likelihood, the one-position shift between inputs and labels, why all \(T\) positions train in a single forward pass, and what the causal mask guarantees.</li>
+    <li><strong>Metric fluency:</strong> converting between nats per token, perplexity and bits per byte with the arithmetic shown, why perplexity breaks across tokenizers, and "is a 0.05 drop in loss a big deal?"</li>
+    <li><strong>The architecture question:</strong> "why is everything decoder-only?" answered with evidence (training-signal density, Wang et al. 2022, caching) and with the honest counter-evidence.</li>
+    <li><strong>Pipeline literacy:</strong> what pretraining, SFT and preference/RL each add, what each costs, and real numbers for GPT-3/InstructGPT, Llama 3 and DeepSeek-V3/R1.</li>
+    <li><strong>Conceptual traps and debugging reflexes:</strong> exposure bias, in-context learning, emergent abilities versus metric artifacts, and "the loss looks too good" (label leakage).</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Write the autoregressive factorization, name the tensor shapes from tokens to logits to probabilities, and explain why the factorization is exact rather than an approximation.</li>
+    <li>Derive next-token cross-entropy as maximum likelihood (and as KL divergence to the data plus a constant), implement the shift and padding mask, and state the loss a randomly initialized model should show (\(\ln V\)).</li>
+    <li>Convert between loss, perplexity and bits per byte with shown arithmetic, and explain why only bits per byte is comparable across tokenizers.</li>
+    <li>Contrast encoder-only, encoder-decoder and decoder-only models by mask and objective, and argue why decoder-only became the default, including the counter-evidence from Wang et al.</li>
+    <li>Describe the pretrain, SFT and preference/RL stages: data, objective, capability added and reported cost, with Llama 3 and DeepSeek-V3/R1 as concrete examples.</li>
+    <li>Sketch the generation loop (prefill, then decode) and tell base, instruct and reasoning models apart by how you prompt them.</li>
+    <li>State what in-context learning is and summarize both sides of the emergent-abilities debate.</li>
+  </ul>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="lm-defn">What a language model computes</h2>
+
+  <p>A <strong>language model</strong> <span class="zh">语言模型</span> is a probability distribution over sequences of <strong>tokens</strong> <span class="zh">词元</span>. A token is a subword unit from a fixed vocabulary of \(V\) entries (typically 32K to 256K; how the vocabulary is built is the subject of <a href="02-tokenization.html">page 02</a>). For a sequence \(x_{1:T}\), the chain rule of probability gives an identity that holds for <em>any</em> distribution:</p>
+
+  <div class="eq-box">
+  \[ p(x_{1:T}) = \prod_{t=1}^{T} p(x_t \mid x_{&lt;t}) \]
+  <div class="eq-label">Autoregressive factorization: exact, no independence assumption</div>
+  </div>
+
+  <p>A model is <strong>autoregressive</strong> <span class="zh">自回归</span> when it represents every factor with one shared network \(f_\theta\) that reads a prefix and returns a score (a <em>logit</em>) for each vocabulary entry. We index so that position \(t\) reads \(x_{\le t}\) and predicts \(x_{t+1}\), with a start token \(x_0\) (BOS) so that the very first token also has a prefix:</p>
+
+  \[ z_t = f_\theta(x_{\le t}) \in \R^{V}, \qquad p_\theta(x_{t+1} = v \mid x_{\le t}) = \softmax(z_t)_v = \frac{e^{z_{t,v}}}{\sum_{u=1}^{V} e^{z_{t,u}}} \]
+
+  <p>In a transformer, one forward pass over a whole sequence returns all \(T\) logit vectors at once, a tensor of shape \((B, T, V)\), because the <strong>causal mask</strong> (<a href="03-attention.html">page 03</a>) makes row \(t\) a function of \(x_{\le t}\) only. Softmax is over the last axis.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p>The factorization is a theorem; the network is the modeling assumption. All modeling content sits in how well \(f_\theta\) represents the conditionals. Because \(z_t\) never depends on \(x_{&gt;t}\), the product is a properly normalized distribution over sequences. Two consequences drive everything below: you can <em>sample</em> exactly by drawing one token at a time (<a href="#serving">next section</a>), and you can <em>score</em> any text exactly, since \(\log p(x_{1:T})\) is a sum of log-probabilities read off the softmax. That exact likelihood is what makes perplexity and bits per byte well defined.</p>
+  </aside>
+
+<pre><code class="language-python">def sequence_logprob(logits, ids):
+    # logits: (T, V) from one forward pass, row t predicts ids[t]; ids: (T,) target token ids
+    logp = logits.log_softmax(-1)                          # (T, V) log p(. | prefix)
+    return logp.gather(-1, ids[:, None]).sum()             # sum_t log p(x_t | x_&lt;t), a scalar
+</code></pre>
+
+  <p><strong>Worked numbers.</strong> Suppose the four true tokens of a short text received probabilities \(1/2,\ 1/4,\ 4/5,\ 1/10\). Then \(p(x) = 0.5 \cdot 0.25 \cdot 0.8 \cdot 0.1 = 0.01\), so \(\log p(x) = -0.693 - 1.386 - 0.223 - 2.303 = -4.605\) nats. The mean per token is \(4.605/4 = 1.151\) nats. We reuse this example in <a href="#metrics">the metrics section</a>.</p>
+
+  <h3 id="other-objectives">Two other ways to train a transformer on text</h3>
+  <p>In 2018 and 2019 the leading transfer-learning results used <em>denoising</em> objectives, which T5's authors say "have quickly become standard" <a href="https://arxiv.org/abs/1910.10683">[Raffel et al. 2019, §3.1.4]</a>. <strong>Masked language modeling</strong> <span class="zh">掩码语言模型</span> (BERT) hides some tokens and predicts them from both sides. <strong>Span corruption</strong> (T5) drops spans of tokens and asks a decoder to regenerate them.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Objective</th><th>Model input</th><th>Prediction target</th><th class="num">Positions with a loss</th><th>Architecture</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>Causal LM (GPT)</td><td>prefix \(x_{\le t}\)</td><td>\(x_{t+1}\), for every \(t\)</td><td class="num">100%</td><td>decoder-only</td></tr>
+      <tr><td>Masked LM (BERT)</td><td>full sequence; 15% of tokens chosen, of which 80% become [MASK], 10% a random token, 10% stay unchanged</td><td>original token at each chosen position</td><td class="num">15%</td><td>encoder-only</td></tr>
+      <tr><td>Span corruption (T5)</td><td>15% of tokens dropped in spans (mean length 3), each span replaced by one sentinel</td><td>the dropped spans, delimited by sentinels</td><td class="num">about 18% (114 targets per 626 tokens)</td><td>encoder-decoder</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: BERT <a href="https://arxiv.org/abs/1810.04805">[Devlin et al. 2018, §3.1]</a>; T5 <a href="https://arxiv.org/abs/1910.10683">[Raffel et al. 2019, §3.1.4 and §3.7]</a>; the 18% figure is from the token accounting in <a href="https://arxiv.org/abs/2204.05832">[Wang et al. 2022, §3.2]</a>.</p>
+
+  <p>Denoising objectives train conditionals \(p(x_{\text{masked}} \mid x_{\text{visible}})\) that do not multiply into a joint distribution you can sample left to right, and most of the sequence is input rather than target. BERT itself notes that masked LM "does converge slightly slower" than a left-to-right model, which it attributes to predicting only 15% of tokens per batch <a href="https://arxiv.org/abs/1810.04805">[Devlin et al. 2018, App. A.1 and C.1]</a>. The consequences for architecture are in <a href="#families">the families section</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger mapped an unordered set of particles to one label with a permutation-invariant encoder: no positional encoding, full bidirectional attention, one output per jet. A language model differs in three ways. Order is the signal, so positions must be injected (<a href="05-positional-encoding.html">page 05</a>). Attention is causal, so row \(t\) sees only \(x_{\le t}\). And there is one output <em>per token</em>, a softmax over \(V \sim 10^5\) classes instead of a handful. In effect the LM is a classifier applied at every position whose labels the data provides for free, by shifting.</p>
+  </aside>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="serving">How an LLM is used: the generation loop</h2>
+
+  <p>Before the details of training, look at the trained artifact in use. Generating text is a loop around the forward pass (Figure 1): <strong>tokenize</strong> the text into ids of shape \((T,)\) (<a href="02-tokenization.html">page 02</a>); <strong>embed</strong> them to \((T, d)\); run \(L\) <strong>transformer blocks</strong> (<a href="03-attention.html">pages 03</a> to <a href="05-positional-encoding.html">05</a>); apply the <strong>LM head</strong>, a linear map \(d \to V\), to get logits of shape \((T, V)\); <strong>sample</strong> a token from the last row (greedy, temperature, top-\(p\); <a href="06-decoding-kv-cache.html">page 06</a>); <strong>append</strong> it and repeat until an end-of-sequence token or a length limit.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="fig-01-1-title">
+<title id="fig-01-1-title">The generation loop: text becomes token ids, embeddings, L transformer blocks and logits; a token is sampled, appended and fed back. Prefill processes the prompt in one parallel pass, decode adds one token per pass.</title>
+<defs><marker id="arrow-01-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="8" y="30" width="80" height="56" rx="6"/>
+<text x="48" y="54" text-anchor="middle" class="s-bold">text</text>
+<text x="48" y="72" text-anchor="middle" class="s-small s-muted">the prompt</text>
+<rect class="s-box" x="106" y="30" width="88" height="56" rx="6"/>
+<text x="150" y="54" text-anchor="middle" class="s-bold">tokenizer</text>
+<text x="150" y="72" text-anchor="middle" class="s-small s-muted">page 02</text>
+<rect class="s-box" x="212" y="30" width="84" height="56" rx="6"/>
+<text x="254" y="54" text-anchor="middle" class="s-bold">embed</text>
+<text x="254" y="72" text-anchor="middle" class="s-small s-muted">id to vector</text>
+<rect class="s-a" x="314" y="30" width="132" height="56" rx="6"/>
+<text x="380" y="50" text-anchor="middle" class="s-bold">L × block</text>
+<text x="380" y="65" text-anchor="middle" class="s-small">attention + FFN</text>
+<text x="380" y="79" text-anchor="middle" class="s-small s-muted">pages 03 to 05</text>
+<rect class="s-box" x="464" y="30" width="84" height="56" rx="6"/>
+<text x="506" y="54" text-anchor="middle" class="s-bold">LM head</text>
+<text x="506" y="72" text-anchor="middle" class="s-small s-muted">linear, d to V</text>
+<rect class="s-b" x="566" y="30" width="72" height="56" rx="6"/>
+<text x="602" y="54" text-anchor="middle" class="s-bold">sample</text>
+<text x="602" y="72" text-anchor="middle" class="s-small s-muted">page 06</text>
+<rect class="s-c" x="656" y="30" width="56" height="56" rx="6"/>
+<text x="684" y="54" text-anchor="middle" class="s-bold">next</text>
+<text x="684" y="72" text-anchor="middle" class="s-small">token</text>
+<path class="s-line" d="M88,58 L106,58" marker-end="url(#arrow-01-1)"/>
+<path class="s-line" d="M194,58 L212,58" marker-end="url(#arrow-01-1)"/>
+<path class="s-line" d="M296,58 L314,58" marker-end="url(#arrow-01-1)"/>
+<path class="s-line" d="M446,58 L464,58" marker-end="url(#arrow-01-1)"/>
+<path class="s-line" d="M548,58 L566,58" marker-end="url(#arrow-01-1)"/>
+<path class="s-line" d="M638,58 L656,58" marker-end="url(#arrow-01-1)"/>
+<text x="150" y="104" text-anchor="middle" class="s-small s-muted">ids (T,)</text>
+<text x="254" y="104" text-anchor="middle" class="s-small s-muted">(T, d)</text>
+<text x="380" y="104" text-anchor="middle" class="s-small s-muted">(T, d) per layer</text>
+<text x="506" y="104" text-anchor="middle" class="s-small s-muted">(T, V), row T used</text>
+<text x="602" y="104" text-anchor="middle" class="s-small s-muted">(V,) to 1 id</text>
+<path class="s-line s-dash" d="M684,88 L684,134 L282,134 L282,90" marker-end="url(#arrow-01-1)"/>
+<text x="483" y="152" text-anchor="middle" class="s-small">append the new id and repeat; stop at EOS or the length limit</text>
+<rect class="s-b" x="8" y="172" width="346" height="118" rx="8"/>
+<text x="22" y="196" class="s-bold">Prefill: the prompt, all T tokens at once</text>
+<text x="22" y="216" class="s-small">One parallel pass over all T prompt positions.</text>
+<text x="22" y="232" class="s-small">Compute-bound: large matrix multiplies.</text>
+<text x="22" y="248" class="s-small">Writes K and V of every layer into the KV cache.</text>
+<text x="22" y="264" class="s-small">Logits exist for all T rows; only row T is used,</text>
+<text x="22" y="280" class="s-small">to sample the first new token.</text>
+<rect class="s-c" x="366" y="172" width="346" height="118" rx="8"/>
+<text x="380" y="196" class="s-bold">Decode: one new token per pass</text>
+<text x="380" y="216" class="s-small">Feeds only token T+1, then T+2, and so on.</text>
+<text x="380" y="232" class="s-small">Reads the whole KV cache and appends one entry.</text>
+<text x="380" y="248" class="s-small">Memory-bandwidth-bound (pages 06 and 07).</text>
+<text x="380" y="264" class="s-small">A reply of n tokens costs n sequential passes,</text>
+<text x="380" y="280" class="s-small">which is why decoding latency is hard to hide.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> The serving path. The same network runs in two regimes. <em>Prefill</em> processes the prompt in one wide, parallel pass and fills the KV cache. <em>Decode</em> then runs one narrow pass per generated token, because each token must be sampled before the next can be fed in. Shapes are per sequence; a batch adds a leading \(B\).</figcaption>
+  </figure>
+
+  <p>Two facts about this loop matter for the rest of the course. First, <strong>generation is sequential but training is parallel</strong>: a 2,000-token prompt costs one large pass, while a 500-token answer costs 500 small ones. That asymmetry is why "time to first token" and "inter-token latency" are separate serving metrics, and why decoding is limited by memory bandwidth rather than FLOPs (<a href="06-decoding-kv-cache.html">page 06</a>, <a href="07-kv-efficient-attention.html">page 07</a>, <a href="17-inference-serving.html">page 17</a>). Second, a chat product is the same loop over a text in which the conversation has been serialized with special role tokens; the model's turn ends when it emits an end-of-turn token (<a href="02-tokenization.html">page 02</a> on chat templates, <a href="19-sft-distillation.html">page 19</a> on training with them).</p>
+
+<pre><code class="language-python">@torch.no_grad()
+def generate(model, ids, max_new_tokens, eos_id):
+    # ids: (1, T) prompt token ids; model(ids) returns logits (1, T_cur, V)
+    for _ in range(max_new_tokens):
+        logits = model(ids)                                   # recomputes every position: O(T) work per step without a KV cache
+        next_id = logits[:, -1].argmax(-1, keepdim=True)      # (1, 1) greedy; sampling variants are page 06
+        ids = torch.cat([ids, next_id], dim=1)                # append and repeat
+        if next_id.item() == eos_id:
+            break
+    return ids
+</code></pre>
+  <p class="small muted">This version re-runs the whole sequence at every step. A KV cache stores each layer's keys and values so a step processes only the new token; it is the subject of <a href="06-decoding-kv-cache.html">page 06</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger ran one forward pass per jet, so serving it meant batching jets to keep the GPU busy. An LLM reply is hundreds of dependent forward passes, each of which must wait for the previous token. Batching still helps for the weight matmuls, but the sequential dependency is intrinsic to autoregression, and it shapes nearly every serving optimization in <a href="17-inference-serving.html">page 17</a>.</p>
+  </aside>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="training">Training: next-token cross-entropy is maximum likelihood</h2>
+
+  <h3 id="mle">From maximum likelihood to the loss</h3>
+  <p>Training data is a set of sequences drawn from an unknown distribution \(p_{\text{data}}\). <strong>Maximum likelihood estimation</strong> <span class="zh">最大似然估计</span> picks the parameters that make the data most probable. Taking logs, negating and averaging over the \(N\) supervised token positions turns it into a minimization:</p>
+
+  <div class="eq-box">
+  \[ \hat\theta = \argmax_\theta \sum_{i} \log p_\theta(x^{(i)}) = \argmin_\theta \; \underbrace{-\frac{1}{N} \sum_{i} \sum_{t} \log p_\theta\big(x^{(i)}_{t+1} \mid x^{(i)}_{\le t}\big)}_{\mathcal{L}(\theta)\ \text{, mean cross-entropy in nats per token}} \]
+  <div class="eq-label">Next-token cross-entropy = mean negative log-likelihood = maximum likelihood</div>
+  </div>
+
+  <p>Two identities are worth having ready. First, the loss at one position is the cross-entropy between the one-hot label \(e_y\) and the softmax, and it simplifies to</p>
+  \[ \ell_t = -\log \softmax(z_t)_y = \operatorname{logsumexp}(z_t) - z_{t,y}, \qquad \frac{\partial \ell_t}{\partial z_t} = \softmax(z_t) - e_y . \]
+  <p>The gradient is "prediction minus target", exactly as in logistic regression, applied at every position. Second, in expectation the loss decomposes as</p>
+  \[ \E_{p_{\text{data}}}[\mathcal{L}] = H(p_{\text{data}}, p_\theta) = H(p_{\text{data}}) + \KL(p_{\text{data}} \,\|\, p_\theta), \]
+  <p>so minimizing cross-entropy minimizes the KL divergence to the data distribution, and the entropy term \(H(p_{\text{data}})\) is a floor on the expected loss on fresh data (Chinchilla's fitted constant \(E\) estimates it for one dataset and tokenizer; see <a href="#reading-loss">below</a>). Language modeling is also lossless compression: a model with loss \(\ell\) nats per token, used with an arithmetic coder, encodes each token in about \(\ell/\ln 2\) bits, so "current language model training protocols use a maximum-compression objective" <a href="https://arxiv.org/abs/2309.10668">[Delétang et al. 2023, §2]</a>.</p>
+
+  <h3 id="teacher-forcing">Teacher forcing, the shift, and why every position is an example</h3>
+  <p>During training the input at position \(t\) is the <em>ground-truth</em> token \(x_t\), never the model's own earlier sample. This is <strong>teacher forcing</strong> <span class="zh">教师强制</span>. It makes all \(T\) conditional terms computable in parallel from the data, in one forward pass with a causal mask. The consequence for the data pipeline is the <strong>one-position shift</strong>: the model reads \(x_{0:T-1}\) (BOS first) and the labels are \(x_{1:T}\), so the label at position \(t\) is the input at position \(t+1\). No human labeling is needed, because the text is its own supervision.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="fig-01-2-title">
+<title id="fig-01-2-title">Teacher forcing: inputs, logits, and labels shifted left by one position for the sequence BOS The cat sat EOS PAD, with the last position and the padding target ignored, next to the 6 by 6 causal mask</title>
+<defs><marker id="arrow-01-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="40" class="s-small">input</text>
+<text x="8" y="54" class="s-small s-muted">(what it reads)</text>
+<rect class="s-box" x="100" y="26" width="56" height="32" rx="5"/><text x="128" y="47" text-anchor="middle">&lt;bos&gt;</text>
+<rect class="s-box" x="162" y="26" width="56" height="32" rx="5"/><text x="190" y="47" text-anchor="middle">The</text>
+<rect class="s-box" x="224" y="26" width="56" height="32" rx="5"/><text x="252" y="47" text-anchor="middle">cat</text>
+<rect class="s-box" x="286" y="26" width="56" height="32" rx="5"/><text x="314" y="47" text-anchor="middle">sat</text>
+<rect class="s-box" x="348" y="26" width="56" height="32" rx="5"/><text x="376" y="47" text-anchor="middle">&lt;eos&gt;</text>
+<rect class="s-box" x="410" y="26" width="56" height="32" rx="5"/><text x="438" y="47" text-anchor="middle">&lt;pad&gt;</text>
+<path class="s-line" d="M128,58 L128,70" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M190,58 L190,70" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M252,58 L252,70" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M314,58 L314,70" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M376,58 L376,70" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M438,58 L438,70" marker-end="url(#arrow-01-2)"/>
+<rect class="s-d" x="100" y="72" width="366" height="24" rx="5"/>
+<text x="283" y="88" text-anchor="middle" class="s-small">causal transformer: position t sees only positions up to t</text>
+<path class="s-line" d="M128,96 L128,108" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M190,96 L190,108" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M252,96 L252,108" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M314,96 L314,108" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M376,96 L376,108" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M438,96 L438,108" marker-end="url(#arrow-01-2)"/>
+<text x="8" y="124" class="s-small">logits</text>
+<text x="8" y="138" class="s-small s-muted">(T, V)</text>
+<rect class="s-plain" x="100" y="110" width="56" height="32" rx="5"/><text x="128" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">0</tspan></text>
+<rect class="s-plain" x="162" y="110" width="56" height="32" rx="5"/><text x="190" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<rect class="s-plain" x="224" y="110" width="56" height="32" rx="5"/><text x="252" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">2</tspan></text>
+<rect class="s-plain" x="286" y="110" width="56" height="32" rx="5"/><text x="314" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">3</tspan></text>
+<rect class="s-plain" x="348" y="110" width="56" height="32" rx="5"/><text x="376" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">4</tspan></text>
+<rect class="s-plain" x="410" y="110" width="56" height="32" rx="5"/><text x="438" y="131" text-anchor="middle">z<tspan baseline-shift="sub" font-size="10">5</tspan></text>
+<text x="8" y="160" class="s-small">cross-entropy</text>
+<text x="8" y="174" class="s-small">at each t</text>
+<path class="s-line" d="M128,142 L128,182" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M190,142 L190,182" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M252,142 L252,182" marker-end="url(#arrow-01-2)"/>
+<path class="s-line" d="M314,142 L314,182" marker-end="url(#arrow-01-2)"/>
+<path class="s-line s-dash" d="M376,142 L376,182" marker-end="url(#arrow-01-2)"/>
+<path class="s-line s-dash" d="M438,142 L438,182" marker-end="url(#arrow-01-2)"/>
+<text x="8" y="200" class="s-small">label</text>
+<text x="8" y="214" class="s-small s-muted">(next token)</text>
+<rect class="s-b" x="100" y="184" width="56" height="32" rx="5"/><text x="128" y="205" text-anchor="middle">The</text>
+<rect class="s-b" x="162" y="184" width="56" height="32" rx="5"/><text x="190" y="205" text-anchor="middle">cat</text>
+<rect class="s-b" x="224" y="184" width="56" height="32" rx="5"/><text x="252" y="205" text-anchor="middle">sat</text>
+<rect class="s-b" x="286" y="184" width="56" height="32" rx="5"/><text x="314" y="205" text-anchor="middle">&lt;eos&gt;</text>
+<rect class="s-plain s-dash" x="348" y="184" width="56" height="32" rx="5"/><text x="376" y="205" text-anchor="middle" class="s-muted">-100</text>
+<rect class="s-plain s-dash" x="410" y="184" width="56" height="32" rx="5"/><text x="438" y="205" text-anchor="middle" class="s-muted">-100</text>
+<text x="8" y="240" class="s-small">in the loss?</text>
+<rect class="s-a" x="100" y="226" width="56" height="24" rx="5"/><text x="128" y="243" text-anchor="middle" class="s-small">counted</text>
+<rect class="s-a" x="162" y="226" width="56" height="24" rx="5"/><text x="190" y="243" text-anchor="middle" class="s-small">counted</text>
+<rect class="s-a" x="224" y="226" width="56" height="24" rx="5"/><text x="252" y="243" text-anchor="middle" class="s-small">counted</text>
+<rect class="s-a" x="286" y="226" width="56" height="24" rx="5"/><text x="314" y="243" text-anchor="middle" class="s-small">counted</text>
+<rect class="s-plain s-dash" x="348" y="226" width="56" height="24" rx="5"/><text x="376" y="243" text-anchor="middle" class="s-small s-muted">ignored</text>
+<rect class="s-plain s-dash" x="410" y="226" width="56" height="24" rx="5"/><text x="438" y="243" text-anchor="middle" class="s-small s-muted">ignored</text>
+<text x="516" y="22" class="s-bold s-small">causal mask</text>
+<text x="516" y="38" class="s-small s-muted">row t (query) sees columns j ≤ t</text>
+<text x="531" y="56" text-anchor="middle" class="s-small s-muted">0</text>
+<text x="561" y="56" text-anchor="middle" class="s-small s-muted">1</text>
+<text x="591" y="56" text-anchor="middle" class="s-small s-muted">2</text>
+<text x="621" y="56" text-anchor="middle" class="s-small s-muted">3</text>
+<text x="651" y="56" text-anchor="middle" class="s-small s-muted">4</text>
+<text x="681" y="56" text-anchor="middle" class="s-small s-muted">5</text>
+<text x="508" y="82" text-anchor="end" class="s-small s-muted">0</text>
+<rect class="s-a" x="516" y="62" width="30" height="30"/>
+<rect class="s-box" x="546" y="62" width="30" height="30"/>
+<rect class="s-box" x="576" y="62" width="30" height="30"/>
+<rect class="s-box" x="606" y="62" width="30" height="30"/>
+<rect class="s-box" x="636" y="62" width="30" height="30"/>
+<rect class="s-box" x="666" y="62" width="30" height="30"/>
+<text x="508" y="112" text-anchor="end" class="s-small s-muted">1</text>
+<rect class="s-a" x="516" y="92" width="30" height="30"/>
+<rect class="s-a" x="546" y="92" width="30" height="30"/>
+<rect class="s-box" x="576" y="92" width="30" height="30"/>
+<rect class="s-box" x="606" y="92" width="30" height="30"/>
+<rect class="s-box" x="636" y="92" width="30" height="30"/>
+<rect class="s-box" x="666" y="92" width="30" height="30"/>
+<text x="508" y="142" text-anchor="end" class="s-small s-muted">2</text>
+<rect class="s-a" x="516" y="122" width="30" height="30"/>
+<rect class="s-a" x="546" y="122" width="30" height="30"/>
+<rect class="s-a" x="576" y="122" width="30" height="30"/>
+<rect class="s-box" x="606" y="122" width="30" height="30"/>
+<rect class="s-box" x="636" y="122" width="30" height="30"/>
+<rect class="s-box" x="666" y="122" width="30" height="30"/>
+<text x="508" y="172" text-anchor="end" class="s-small s-muted">3</text>
+<rect class="s-a" x="516" y="152" width="30" height="30"/>
+<rect class="s-a" x="546" y="152" width="30" height="30"/>
+<rect class="s-a" x="576" y="152" width="30" height="30"/>
+<rect class="s-a" x="606" y="152" width="30" height="30"/>
+<rect class="s-box" x="636" y="152" width="30" height="30"/>
+<rect class="s-box" x="666" y="152" width="30" height="30"/>
+<text x="508" y="202" text-anchor="end" class="s-small s-muted">4</text>
+<rect class="s-a" x="516" y="182" width="30" height="30"/>
+<rect class="s-a" x="546" y="182" width="30" height="30"/>
+<rect class="s-a" x="576" y="182" width="30" height="30"/>
+<rect class="s-a" x="606" y="182" width="30" height="30"/>
+<rect class="s-a" x="636" y="182" width="30" height="30"/>
+<rect class="s-box" x="666" y="182" width="30" height="30"/>
+<text x="508" y="232" text-anchor="end" class="s-small s-muted">5</text>
+<rect class="s-a" x="516" y="212" width="30" height="30"/>
+<rect class="s-a" x="546" y="212" width="30" height="30"/>
+<rect class="s-a" x="576" y="212" width="30" height="30"/>
+<rect class="s-a" x="606" y="212" width="30" height="30"/>
+<rect class="s-a" x="636" y="212" width="30" height="30"/>
+<rect class="s-a" x="666" y="212" width="30" height="30"/>
+<text x="516" y="258" class="s-small s-muted">shaded = visible, blank = masked</text>
+<text x="8" y="278" class="s-small">labels[t] = tokens[t+1]. The last position has no next token, and a target equal to &lt;pad&gt; becomes -100.</text>
+<text x="8" y="294" class="s-small">The mean runs over the 4 counted positions only. One forward pass yields all T predictions.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Teacher forcing with the causal mask. Each position reads the ground-truth prefix and predicts the next token, so the labels are the inputs shifted left by one. The final position has no target and padding targets are replaced by \(-100\) (PyTorch's <code>ignore_index</code>), so they contribute neither loss nor gradient. The lower-triangular mask on the right is what lets all six predictions come from a single pass without leaking future tokens.</figcaption>
+  </figure>
+
+  <p><strong>Every position is a training example.</strong> A causal LM has a loss at all \(T\) positions of each sequence, versus 15% for BERT-style masking and about 18% for span corruption (table above). Wang et al. give the accounting at equal tokens processed: full LM trains on 100% of tokens, a prefix LM on about 50%, span corruption on 18% <a href="https://arxiv.org/abs/2204.05832">[Wang et al. 2022, §3.2]</a>. ELECTRA makes the same point about masked LM, which "only learns from 15% of the tokens per example" and so pays a compute cost <a href="https://arxiv.org/abs/2003.10555">[Clark et al. 2020, §1]</a>. Two caveats: supervision density is not downstream quality per FLOP (T5 found denoising better than LM objectives for <em>fine-tuned</em> transfer at equal cost, <a href="https://arxiv.org/abs/1910.10683">[Raffel et al. 2019, Tab. 2]</a>), and the case for causal LMs rests on generality and scale (<a href="#families">below</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Teacher-forced next-token cross-entropy</div>
+    <dl>
+      <dt>Problem</dt><dd>A self-supervised objective that scales to trillions of tokens, yields a generative model, and gives a training signal at every position.</dd>
+      <dt>Idea</dt><dd>Maximize the log-likelihood of the data with ground-truth prefixes as inputs and the next token as label, for all positions in parallel under a causal mask.</dd>
+      <dt>Why it works</dt><dd>The chain rule makes it exactly the sequence log-likelihood, the gradient is simply softmax minus one-hot, and to predict text well the model must learn syntax, facts and task structure (GPT-2's "unsupervised multitask learning" argument, <a href="#icl">below</a>).</dd>
+      <dt>Evidence</dt><dd>Loss falls as a smooth power law in parameters, data and compute over many orders of magnitude <a href="https://arxiv.org/abs/2001.08361">[Kaplan et al. 2020, §1.2]</a>; causal LMs show the strongest zero-shot generalization straight after pretraining <a href="https://arxiv.org/abs/2204.05832">[Wang et al. 2022, Tab. 3]</a>.</dd>
+      <dt>Cost</dt><dd>Exposure bias; likelihood is only a proxy for the quality of sampled text; each token is predicted from its past only, and generation is sequential.</dd>
+      <dt>Used by</dt><dd>GPT-2 and GPT-3, Llama 3, DeepSeek-V3 (which adds a multi-token-prediction auxiliary loss, <a href="11-stability-tweaks.html">page 11</a>), and the other decoder-only models in Part VI.</dd>
+    </dl>
+  </div>
+
+  <h3 id="loss-code">Masking, normalization and numerics</h3>
+  <p>The production version of the loss is short, but every line hides a decision:</p>
+
+<pre><code class="language-python">import torch.nn.functional as F
+
+def lm_loss(model, tokens, pad_id):
+    # tokens: (B, T) ids, right-padded with pad_id
+    inputs  = tokens[:, :-1]                        # (B, T-1) what the model reads
+    targets = tokens[:, 1:].clone()                 # (B, T-1) what it must predict: the shift by one
+    targets[targets == pad_id] = -100               # drop padding (wrong if pad_id == eos_id, see below)
+    logits = model(inputs).float()                  # (B, T-1, V) in fp32 for a stable softmax
+    return F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-100)   # mean over real tokens
+</code></pre>
+  <p class="small muted">The drill uses the equivalent convention that keeps length \(T\): inputs are the tokens themselves and labels are shifted left with \(-100\) in the last slot, so shapes match the logits and no slicing is needed.</p>
+
+  <ul>
+    <li><strong>Padding mask.</strong> Positions labeled \(-100\) are dropped from the loss and from the denominator. Masking padding <em>by token id</em> is a classic bug when the pad token doubles as end-of-sequence (common for chat models): the real EOS targets are masked too, and the model never learns to stop. Build the mask from sequence lengths or an attention mask instead.</li>
+    <li><strong>Normalization.</strong> The mean is over <em>tokens</em>: NLLs \([1, 2, 3, 2]\) and \([0.5, 1.5]\) give \(10/6 = 1.667\), not the mean of per-sequence means \((2.0 + 1.0)/2 = 1.5\), so long sequences weigh more. In distributed training, divide by the <em>global</em> token count rather than averaging per-rank means (<a href="19-sft-distillation.html">page 19</a> covers SFT and packing).</li>
+    <li><strong>Initial loss.</strong> Near-zero logits mean a uniform model, so the first-step loss should be about \(\ln V\): 10.82 for GPT-2's \(V = 50{,}257\) and 11.76 for Llama 3's \(V = 128{,}256\). A first-step loss far above that means large logits; a loss that collapses toward zero within a few hundred steps on natural text means <em>leakage</em> (no shift, or a mask that is not causal).</li>
+    <li><strong>Numerics.</strong> Compute the log-softmax in fp32 with max subtraction: \(e^{z}\) overflows fp32 near \(z = 88.7\), and bf16 keeps only 8 bits of precision.</li>
+  </ul>
+
+<pre><code class="language-python">def log_softmax(z):                                   # z: (..., V)
+    m = z.max(-1, keepdim=True).values                # subtract the max so every exp() lies in (0, 1]
+    return z - m - (z - m).exp().sum(-1, keepdim=True).log()
+</code></pre>
+  <p>Memory is the other constraint: 8,192 tokens \(\times\) 128,256 vocabulary entries \(\times\) 4 bytes \(\approx 4.2\) GB of fp32 logits per micro-batch, before gradients, so large-vocabulary training fuses or chunks the LM head with the loss (<a href="15-distributed-training.html">page 15</a>).</p>
+
+  <h3 id="exposure-bias">Exposure bias</h3>
+  <p>Teacher forcing creates a mismatch. In training the prefix comes from \(p_{\text{data}}\); at generation time it comes from the model itself. Ranzato et al. named this <strong>exposure bias</strong> <span class="zh">曝光偏差</span>: the model "is only exposed to the training data distribution, instead of its own predictions", so "errors may accumulate along the way" <a href="https://arxiv.org/abs/1511.06732">[Ranzato et al. 2016, Abstract and §1]</a>. Scheduled sampling was an early fix: flip a coin per token and feed the model's own prediction with a probability annealed upward over training <a href="https://arxiv.org/abs/1506.03099">[Bengio et al. 2015, §2.4]</a>.</p>
+  <p>How large is the effect for modern LMs? Smaller than the theory suggests. In open-ended generation with Transformer-XL on WikiText-103, He et al. found relative gaps of only about 1 to 2% between generations from ground-truth prefixes and from the model's own, with no growth over prefix length, and the LM recovers from corrupted prefixes ("self-recovery") <a href="https://arxiv.org/abs/1905.10617">[He et al., §6.2]</a>. The field did not adopt sampling-based pretraining. Instead, post-training RL trains on the model's <em>own</em> samples against a reward (<a href="22-rl-foundations.html">page 22</a>), and repetition is handled at decode time (<a href="06-decoding-kv-cache.html">page 06</a>).</p>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="metrics">Measuring a language model: loss, perplexity, bits per byte</h2>
+
+  <h3 id="ppl">Loss and perplexity</h3>
+  <p>Report the mean loss \(\ell\) in <strong>nats per token</strong> (natural log). Dividing by \(\ln 2\) gives bits: 1 nat \(= 1.4427\) bits. <strong>Perplexity</strong> <span class="zh">困惑度</span> is its exponential:</p>
+
+  <div class="eq-box">
+  \[ \operatorname{PPL} = e^{\ell} = \Big(\prod_{t} \frac{1}{p(x_t \mid x_{&lt;t})}\Big)^{1/N} \]
+  <div class="eq-label">Perplexity = geometric mean of the inverse probability of the true tokens = effective branching factor</div>
+  </div>
+
+  <p>The second form gives the "effective branching factor" reading: if the model spread its probability evenly over \(k\) tokens at every step, then \(\ell = \ln k\) and \(\operatorname{PPL} = k\). Ranzato et al. put it as the average number of words the model is "hesitating about", noting that a random model has perplexity near the vocabulary size while a good one on their data had about 50 <a href="https://arxiv.org/abs/1511.06732">[Ranzato et al. 2016, §3.2.2]</a>. Checking with our earlier example: the inverse probabilities are \(2,\ 4,\ 1.25,\ 10\), their product is \(100\), and \(100^{1/4} = 3.16 = e^{1.151}\).</p>
+
+  <p><strong>Worked conversions.</strong> Loss \(2.0\) nats gives \(\operatorname{PPL} = e^{2.0} = 7.39\). Perplexity \(10\) gives \(\ell = \ln 10 = 2.303\) nats \(= 3.32\) bits. A uniform model over Llama 3's vocabulary has \(\ell = \ln 128{,}256 = 11.76\) and \(\operatorname{PPL} = 128{,}256\). To aggregate across datasets, average the <em>losses</em> weighted by token counts and exponentiate once; averaging perplexities is wrong because the exponential is convex.</p>
+
+  <h3 id="tokenizer-dependence">Why perplexity does not transfer across tokenizers</h3>
+  <p>The "per token" in \(\ell\) is a per-<em>tokenizer</em> unit. The original Transformer paper already warns that its perplexities are per word piece and "should not be compared to per-word perplexities" <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, Tab. 3]</a>. What a model assigns to a text is its <em>total</em> NLL; a tokenizer only chooses how many tokens to divide that total by.</p>
+  <ul>
+    <li><strong>Toy case.</strong> A 4,000-byte text carries \(2000\) nats under both models. Tokenizer A cuts it into 1,000 tokens (4.0 bytes per token): \(\ell = 2.0\), \(\operatorname{PPL} = 7.39\). Tokenizer B cuts it into 2,000 tokens (2.0 bytes per token): \(\ell = 1.0\), \(\operatorname{PPL} = 2.72\). Same model quality, perplexities differ by 2.7 times.</li>
+    <li><strong>Real case.</strong> Llama 3's tokenizer averages 3.94 characters per token on English versus 3.17 for Llama 2's <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. At equal bits per character, the Llama 3 tokenizer therefore shows a per-token loss \(3.94/3.17 = 1.243\) times higher: \(2.0 \to 2.486\) nats, and \(\operatorname{PPL}\) from \(7.39\) to \(12.0\). A 1.63 times "worse" perplexity, for identical compression.</li>
+  </ul>
+
+  <h3 id="bpb">Bits per byte</h3>
+  <p>The tokenizer-independent fix is to divide the total NLL by a unit that does not depend on tokenization. The Pile paper's preferred unit is the UTF-8 <strong>byte</strong>, chosen for "its invariance to different tokenization schemes and the ambiguity of measuring characters in Unicode" <a href="https://arxiv.org/abs/2101.00027">[Gao et al. 2020, §3.1]</a>:</p>
+
+  <div class="eq-box">
+  \[ \text{bpb} = \frac{L_T}{L_B} \cdot \frac{\ell}{\ln 2} = \frac{\text{total NLL in nats}}{L_B \ln 2}, \qquad L_T = \text{tokens}, \ L_B = \text{UTF-8 bytes} \]
+  <div class="eq-label">Bits per byte: compressed bits per raw byte of the evaluation text</div>
+  </div>
+
+  <p><strong>Worked example.</strong> Loss \(\ell = 2.0\) nats per token at 4.0 bytes per token means \(L_T/L_B = 0.25\), so \(\text{bpb} = 2.0 \times 0.25 / 0.6931 = 0.7213\). Raw text costs 8 bits per byte, so this model compresses to \(0.7213/8 = 9.0\%\) of the original size (ignoring the size of the model itself). The toy tokenizer B above gives \(1.0 \times 0.5/0.6931 = 0.7213\) too. Bits per <em>character</em> is the same formula with characters instead of bytes; bytes are preferred because character counts are ambiguous across Unicode scripts.</p>
+
+  <p><strong>Real numbers.</strong> GPT-3 davinci on the Pile has a per-token perplexity of 5.4508 with the GPT-2 tokenizer, which averages 0.29335 tokens per byte (3.41 bytes per token). So \(\text{bpb} = \ln(5.4508) \times 0.29335 / \ln 2 = 1.6957 \times 0.29335 / 0.6931 = 0.7177\), matching the paper's Table 2 <a href="https://arxiv.org/abs/2101.00027">[Gao et al. 2020, Tab. 2, 8]</a>. DeepSeek-V3's report uses the same metric to compare base models with different tokenizers on the Pile test set: 0.548 for V3-Base, 0.542 for Llama-3.1 405B, 0.638 for Qwen2.5 72B and 0.606 for DeepSeek-V2 <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 3]</a>, measured in its own evaluation framework, so treat cross-paper numbers as indicative.</p>
+
+  <p><strong>Rules of thumb.</strong> Same tokenizer, same text, same context and packing protocol: compare loss or perplexity. Different tokenizers: compare bits per byte on identical text. Protocol still matters: the Pile scores each document independently, and later positions in a context have lower loss because they see more context <a href="https://arxiv.org/abs/2101.00027">[Gao et al. 2020, App. E.2]</a>. GPT-2 instead normalized by the benchmark's "canonical units" (a character, byte or word) <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, §3.1]</a>.</p>
+
+  <h3 id="reading-loss">Reading a loss number</h3>
+  <p>Loss differences that matter are small numbers, so calibrate. Kaplan et al. fit \(L(N) \propto N^{-0.076}\) for parameters (with enough data), so doubling \(N\) multiplies the loss by \(2^{-0.076} = 0.949\), a 5.1% drop <a href="https://arxiv.org/abs/2001.08361">[Kaplan et al. 2020, §1.2]</a>. At a loss of 2.10 that is about \(-0.108\) nats per doubling. A drop from 2.10 to 2.05 is \(-2.4\%\) in loss and \(-4.9\%\) in perplexity (\(8.17 \to 7.77\)); under that fit it is worth about \((2.05/2.10)^{-1/0.076} = 1.37\) times the parameters. Three qualifiers apply:</p>
+  <ul>
+    <li><strong>Distance to the floor.</strong> The power law has no irreducible term. Chinchilla's fit \(L = E + A/N^{0.34} + B/D^{0.28}\) has \(E = 1.69\) on its dataset and tokenizer, read as the entropy of natural text <a href="https://arxiv.org/abs/2203.15556">[Hoffmann et al. 2022, §3.3 and App. D.2]</a>. From that floor, 2.10 to 2.05 is \(0.41 \to 0.36\), a 12% cut of the reducible loss. But \(E\) is specific to that data and tokenizer and cannot be transplanted.</li>
+    <li><strong>Noise.</strong> Kaplan et al. saw about 0.05 run-to-run variation in loss for a 3M-parameter model in learning-rate sweeps, roughly constant across sizes <a href="https://arxiv.org/abs/2001.08361">[Kaplan et al. 2020, App. D]</a>. That is a small-scale setup, so measure your own seed noise; a paired comparison on the same held-out set removes evaluation-set variance but not training-seed variance.</li>
+    <li><strong>Downstream.</strong> Loss tracks benchmark accuracy task by task, not one to one: Llama 3 mapped FLOPs to the negative log-likelihood of the correct answers, then a sigmoid to accuracy <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2.1]</a>. In one-epoch pretraining, the running training loss on fresh batches is an unbiased estimate of held-out loss <a href="https://arxiv.org/abs/2203.15556">[Hoffmann et al. 2022, §1, footnote 2]</a>.</li>
+  </ul>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="families">Architectures: why decoder-only won</h2>
+
+  <p>Three families differ in their attention mask and objective. <strong>Encoder-only</strong> models (BERT: 110M and 340M parameters for Base and Large) use bidirectional attention and a masked-LM objective, and produce a representation per token for a task head <a href="https://arxiv.org/abs/1810.04805">[Devlin et al. 2018, §3]</a>. <strong>Encoder-decoder</strong> models, the original translation Transformer <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3]</a> and T5 (up to 11B), encode the input bidirectionally and generate the output with a causal decoder that cross-attends to it. <strong>Decoder-only</strong> models <span class="zh">仅解码器架构</span> use one causal stack trained on next-token prediction: GPT-2 (1.5B), GPT-3 (175B), Llama 3, DeepSeek-V3.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Encoder-only</th><th>Encoder-decoder</th><th>Decoder-only</th></tr></thead>
+    <tbody>
+      <tr><td>Attention</td><td>bidirectional</td><td>bidirectional encoder, causal decoder plus cross-attention</td><td>causal</td></tr>
+      <tr><td>Pretraining objective</td><td>masked LM (15%)</td><td>span corruption or prefix LM</td><td>next-token LM (100%)</td></tr>
+      <tr><td>Generates text?</td><td>not directly</td><td>yes, output conditioned on input</td><td>yes, prompt is a prefix</td></tr>
+      <tr><td>Task interface</td><td>fine-tune a head per task</td><td>text in, text out (T5)</td><td>text in, text out; few-shot in the prompt</td></tr>
+      <tr><td>Best-known strength</td><td>representations for understanding tasks at small scale</td><td>fine-tuned transfer; translation and summarization</td><td>zero-shot and few-shot generality; scaling</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="why-decoder-only">The case for decoder-only</h3>
+  <ul>
+    <li><strong>Training-signal density.</strong> A loss at every position (100%) versus 15 to 18% for the denoising objectives (<a href="#teacher-forcing">above</a>).</li>
+    <li><strong>One uniform stack, no objective hyperparameters.</strong> T5 needs a corruption rate, a span length and an encoder/decoder split; the causal LM has no such objective hyperparameters <a href="https://arxiv.org/abs/1910.10683">[Raffel et al. 2019, Tab. 6 and 7]</a>. Scaling means adding layers, width and tokens.</li>
+    <li><strong>The prompt is the interface.</strong> Any task can be written as a text prefix whose continuation is the answer, with no task heads. GPT-2's argument is formal: "the supervised objective is the same as the unsupervised objective but only evaluated on a subset of the sequence, [so] the global minimum of the unsupervised objective is also the global minimum of the supervised objective" <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, §2]</a>. GPT-3 then showed few-shot prompting improving with scale (<a href="#icl">below</a>).</li>
+    <li><strong>Zero-shot right after pretraining.</strong> In the most careful controlled comparison, causal decoders trained with full LM had the best zero-shot scores before any fine-tuning (next subsection).</li>
+    <li><strong>Cache friendliness.</strong> Under a causal mask, an earlier token's hidden state never changes when later tokens are appended, so the KV cache is append-only and a shared prefix (a system prompt, earlier chat turns) can be cached exactly across requests. With a bidirectional encoder over the prefix, appending a token changes every earlier representation and the history must be re-encoded. This is an engineering argument rather than a measured one (<a href="06-decoding-kv-cache.html">page 06</a>, <a href="17-inference-serving.html">page 17</a>).</li>
+    <li><strong>Path dependence.</strong> Scaling laws, kernels, parallelism strategies and data pipelines were then built around this shape. Part of the answer to "why did it win?" is that the ecosystem compounded.</li>
+  </ul>
+
+  <h3 id="counter-evidence">The counter-evidence, stated fairly</h3>
+  <p><strong>Wang et al. 2022</strong> ran the controlled study: three architectures (causal decoder, non-causal decoder, encoder-decoder) times two objectives (full LM and masked LM), trained on 168B tokens of C4, with decoder-only models of 4.8B parameters and encoder-decoders of 11B at matched compute <a href="https://arxiv.org/abs/2204.05832">[Wang et al. 2022, §3]</a>. Their two headline findings pull in opposite directions:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Setting (average accuracy)</th><th class="num">Causal decoder + full LM</th><th class="num">Encoder-decoder + masked LM</th></tr></thead>
+    <tbody>
+      <tr><td>Zero-shot after pretraining only, EAI-Eval (random baseline 32.9)</td><td class="num">44.2</td><td class="num">not evaluable (39.9 for the prefix-LM variant)</td></tr>
+      <tr class="hl"><td>After multitask fine-tuning, EAI-Eval</td><td class="num">50.4</td><td class="num">51.3</td></tr>
+      <tr class="hl"><td>After multitask fine-tuning, T0-Eval</td><td class="num">51.4</td><td class="num">60.6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: <a href="https://arxiv.org/abs/2204.05832">Wang et al. 2022, Tab. 3 and 8</a>. Masked-LM-only models "are not suitable for direct use in a zero-shot setting", so they have no zero-shot row. The T0-Eval scores right after pretraining are near the random baseline (42.4 vs 41.7), so only EAI-Eval is informative there.</p>
+  <p>The honest reading: a causal decoder is the best <em>generalist out of the box</em>, an encoder-decoder with masked LM is best once you spend a multitask fine-tuning stage, and conversion is cheap. A masked-LM-pretrained non-causal decoder converted to causal converged 1.6 times faster on the language-modeling task than training from scratch, and the reverse conversion converged 3.3 times faster on the masked-LM task. Encoder-decoders are not a dead end: adapting Gemma 2 decoder-only checkpoints into encoder-decoders gave, at a similar inference budget, comparable pretraining and substantially better fine-tuned performance (Gemma 2B-2B beat Gemma 2B by about 7% after instruction tuning) <a href="https://arxiv.org/abs/2504.06225">[Zhang et al. 2025, Abstract]</a>. Decoder-only won on generality, simplicity at scale and serving, not on a proof of dominance.</p>
+
+  <p><strong>Non-autoregressive alternatives, as of September 2026.</strong> Masked-diffusion LMs drop the left-to-right factorization: LLaDA trained an 8B model on 2.3T tokens that was competitive with Llama 3 8B on many benchmarks, without a KV cache <a href="https://arxiv.org/abs/2502.09992">[Nie et al. 2025, §2.2 and §3.2]</a>. DiffusionGemma converts rather than trains from scratch: it fine-tunes an autoregressive MoE (Gemma 4 26B A4B) with under 10% of that model's training tokens to refine 256-token blocks in parallel, reaching about 20 tokens per forward pass and 1,500 tokens per second on one H100, with lower benchmark scores than its starting point (GPQA Diamond 73.2 versus 79.8 in thinking mode) and autoregressive serving ahead beyond roughly 32 concurrent requests. The report opens with "Autoregressive (AR) models dominate the current Large Language Model (LLM) landscape" <a href="https://arxiv.org/abs/2608.00146">[DiffusionGemma report, Abstract, §1, §7, §10]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Decoder-only causal language model</div>
+    <dl>
+      <dt>Problem</dt><dd>Choose one architecture and one pretraining objective for a general-purpose, generative, scalable model.</dd>
+      <dt>Idea</dt><dd>A single stack of causal-attention blocks trained with next-token cross-entropy; the prompt conditions the model and the answer is a continuation.</dd>
+      <dt>Why it works</dt><dd>Dense supervision, no task heads, no objective hyperparameters, exact likelihoods and append-only caches; generation, scoring and in-context task specification are the same operation.</dd>
+      <dt>Evidence</dt><dd>Best zero-shot after pretraining in the controlled study <a href="https://arxiv.org/abs/2204.05832">[Wang et al. 2022, Tab. 3]</a>; GPT-3's few-shot results <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, §3]</a>; smooth scaling laws <a href="https://arxiv.org/abs/2001.08361">[Kaplan et al. 2020]</a>.</dd>
+      <dt>Cost</dt><dd>The prompt gets only causal context; decoding is sequential and bandwidth-bound; for fine-tuned understanding at small scale, encoder models can be cheaper and as good; the cache grows with context (<a href="07-kv-efficient-attention.html">page 07</a>).</dd>
+      <dt>Used by</dt><dd>GPT-3, Llama 3 (dense), DeepSeek-V3 (MoE with MLA), and the other models in <a href="33-architecture-atlas.html">page 33</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="pipeline">The pipeline: pretraining, SFT, preference optimization and RL</h2>
+
+  <p>A pretrained model is a document continuer, not an assistant. The InstructGPT authors state the mismatch directly: the language-modeling objective, predicting the next token on a webpage, is "different from the objective 'follow the user's instructions helpfully and safely'", so they call it misaligned <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §1]</a>. Modern models close that gap in stages. Llama 3's report frames it as two main stages, pretraining with next-token prediction and post-training to follow instructions, align with human preferences and improve specific capabilities <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-01-3-title">
+<title id="fig-01-3-title">The three-stage pipeline: pretraining, supervised fine-tuning, preference optimization and reinforcement learning, with data scale, what each stage adds, examples, and the DeepSeek-V3 split of GPU-hours</title>
+<defs><marker id="arrow-01-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="481" y="16" text-anchor="middle" class="s-small">rejection sampling and distillation feed SFT data</text>
+<path class="s-line s-dash" d="M602,42 L602,26 L360,26 L360,40" marker-end="url(#arrow-01-3)"/>
+<rect class="s-a" x="8" y="42" width="220" height="206" rx="8"/>
+<text x="20" y="66" class="s-bold">1 · Pretraining</text>
+<text x="20" y="88" class="s-small s-muted">next-token CE at every position</text>
+<text x="20" y="108" class="s-small">data: web, code, books, math</text>
+<text x="20" y="125" class="s-small">10<tspan baseline-shift="super" font-size="9">12</tspan> to 10<tspan baseline-shift="super" font-size="9">13</tspan> tokens</text>
+<text x="20" y="147" class="s-small">adds: language, world knowledge,</text>
+<text x="20" y="164" class="s-small">code, few-shot ability</text>
+<text x="20" y="186" class="s-small s-bold">output: base model</text>
+<text x="20" y="210" class="s-small s-muted">V3: 14.8T tokens</text>
+<text x="20" y="227" class="s-small s-muted">Llama 3: about 15T tokens</text>
+<rect class="s-b" x="250" y="42" width="220" height="206" rx="8"/>
+<text x="262" y="66" class="s-bold">2 · SFT</text>
+<text x="262" y="88" class="s-small s-muted">same CE, loss on response tokens</text>
+<text x="262" y="108" class="s-small">data: prompt / response pairs</text>
+<text x="262" y="125" class="s-small">10<tspan baseline-shift="super" font-size="9">4</tspan> to 10<tspan baseline-shift="super" font-size="9">6</tspan> examples</text>
+<text x="262" y="147" class="s-small">adds: instruction following,</text>
+<text x="262" y="164" class="s-small">chat format, tone</text>
+<text x="262" y="186" class="s-small s-bold">output: instruct / chat model</text>
+<text x="262" y="210" class="s-small s-muted">InstructGPT: 13k prompts</text>
+<text x="262" y="227" class="s-small s-muted">DeepSeek-V3: 1.5M instances</text>
+<rect class="s-c" x="492" y="42" width="220" height="206" rx="8"/>
+<text x="504" y="66" class="s-bold">3 · Preference opt. / RL</text>
+<text x="504" y="88" class="s-small s-muted">reward or preference signal</text>
+<text x="504" y="108" class="s-small">data: comparisons, or problems</text>
+<text x="504" y="125" class="s-small">with checkable answers</text>
+<text x="504" y="147" class="s-small">adds: helpfulness, safety, long</text>
+<text x="504" y="164" class="s-small">chain-of-thought reasoning</text>
+<text x="504" y="186" class="s-small s-bold">output: aligned or reasoning</text>
+<text x="504" y="210" class="s-small s-muted">Llama 3: DPO. R1: GRPO</text>
+<text x="504" y="227" class="s-small s-muted">InstructGPT: PPO</text>
+<path class="s-line" d="M228,145 L250,145" marker-end="url(#arrow-01-3)"/>
+<path class="s-line" d="M470,145 L492,145" marker-end="url(#arrow-01-3)"/>
+<text x="8" y="270" class="s-bold">Where the compute goes: DeepSeek-V3, 2.788M H800 GPU-hours in total</text>
+<rect class="s-a" x="8" y="280" width="669" height="22" rx="2"/>
+<text x="342" y="296" text-anchor="middle" class="s-small">pretraining: 2,664K (95.6%)</text>
+<rect class="s-b" x="677" y="280" width="30" height="22" rx="2"/>
+<rect class="s-c" x="706" y="280" width="3" height="22"/>
+<path class="s-line" d="M692,302 L692,310"/>
+<text x="686" y="320" text-anchor="end" class="s-small">context extension: 119K (4.3%)</text>
+<path class="s-line" d="M707.5,302 L707.5,328"/>
+<text x="706" y="340" text-anchor="end" class="s-small">post-training (SFT + RL): 5K (0.2%)</text>
+<text x="8" y="362" class="s-small s-muted">InstructGPT (175B), in PF-days: SFT 4.9 and PPO-ptx 60, against 3,640 for GPT-3 pretraining (0.1% and 1.6%).</text>
+</svg>
+    <figcaption><b>Figure 3.</b> The pipeline and its cost profile. Pretraining dominates compute; SFT and RL use orders of magnitude fewer tokens and GPU-hours but change behavior most visibly. The dashed arrow marks the reverse flow that is now standard: outputs of a stronger post-trained model become SFT data (rejection sampling, distillation). GPU-hour shares exclude data creation, annotation, prior research and ablations.</figcaption>
+  </figure>
+
+  <h3 id="stage-1">Stage 1: pretraining and the base model</h3>
+  <p><strong>Pretraining</strong> <span class="zh">预训练</span> is next-token cross-entropy on web text, code, books and math at trillion-token scale, producing a <strong>base model</strong> <span class="zh">基座模型</span> that continues text. It teaches language, world knowledge, code and the ability to pick up patterns from context. It is where nearly all compute goes.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Parameters</th><th class="num">Training tokens</th><th class="num">Tokens per parameter</th><th class="num">6ND FLOPs</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 175B <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, Tab. 2.1]</a></td><td class="num">175B</td><td class="num">300B</td><td class="num">1.7</td><td class="num">\(3.15 \times 10^{23}\)</td></tr>
+      <tr><td>Chinchilla <a href="https://arxiv.org/abs/2203.15556">[Hoffmann et al. 2022, Tab. 1]</a></td><td class="num">70B</td><td class="num">1.4T</td><td class="num">20</td><td class="num">\(5.9 \times 10^{23}\)</td></tr>
+      <tr><td>Llama 3 405B <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a></td><td class="num">405B</td><td class="num">15.6T</td><td class="num">38.5</td><td class="num">\(3.79 \times 10^{25}\)</td></tr>
+      <tr><td>Llama 3 8B (reference config)</td><td class="num">8.03B</td><td class="num">about 15T</td><td class="num">about 1,870</td><td class="num">\(7.2 \times 10^{23}\)</td></tr>
+      <tr class="hl"><td>DeepSeek-V3 (MoE) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Abstract]</a></td><td class="num">671B total, 37B activated</td><td class="num">14.8T</td><td class="num">400 per activated (22 per total)</td><td class="num">\(3.3 \times 10^{24}\) (activated)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">The 6ND column uses \(C \approx 6ND\) (<a href="04-transformer-block.html">page 04</a>, <a href="13-scaling-laws.html">page 13</a>): for example \(6 \times 405\text{B} \times 15.6\text{T} = 3.79 \times 10^{25}\) matches Llama 3's reported \(3.8 \times 10^{25}\), and GPT-3's report gives \(3.14 \times 10^{23}\). Llama 3's report gives "about 15T" tokens for the herd, with a similar recipe for 8B and 70B, and says the authors "train our smaller models for much longer than is compute-optimal" to do better at a fixed inference budget. The 405B run had three sub-stages: initial pretraining at 8K context, long-context extension to 128K over about 800B tokens, and annealing over the last 40M tokens <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4]</a>.</p>
+
+  <h3 id="stage-2">Stage 2: supervised fine-tuning</h3>
+  <p><strong>Supervised fine-tuning</strong> <span class="zh">监督微调</span> (SFT, or instruction tuning) continues training with the <em>same</em> cross-entropy on (prompt, response) pairs rendered in a chat template. The one change is that the loss is computed on the response tokens only: Llama 3 uses "a standard cross entropy loss on the target tokens (while masking loss on prompt tokens)" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.3]</a>. Data is tiny next to pretraining: about 13k training prompts for InstructGPT's SFT set <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.2]</a>, and 1.5M instances for two epochs for DeepSeek-V3, with reasoning data generated by an internal DeepSeek-R1 model and non-reasoning data from DeepSeek-V2.5 checked by human annotators <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §5.1]</a>. SFT adds a behavior (follow the instruction, use the format, know when to stop) rather than large amounts of new knowledge; <span class="unverified" title="Common heuristic in the literature (the 'superficial alignment' view); not checked against a primary source for this page.">how strictly that holds is debated</span>. Details: <a href="19-sft-distillation.html">page 19</a>.</p>
+
+  <h3 id="stage-3">Stage 3: preference optimization and reinforcement learning</h3>
+  <p>The last stage optimizes something a token-level imitation loss cannot express: which of two complete answers is better, or whether a final answer is correct. There are three variants you should be able to name:</p>
+  <ul>
+    <li><strong>RLHF</strong> <span class="zh">人类反馈强化学习</span>: collect human comparisons, train a reward model, then optimize the policy against it with PPO. InstructGPT used about 33k prompts for the reward model and 31k for PPO, and its 1.3B model was preferred to the 175B GPT-3 despite having over 100 times fewer parameters <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.2 and §4.1]</a>. It also documents an "alignment tax" (regressions on some public benchmarks, reduced by mixing pretraining gradients into PPO). See <a href="23-rlhf.html">page 23</a>.</li>
+    <li><strong>Offline preference optimization (DPO).</strong> Llama 3 ran several rounds of SFT (on data that includes reward-model-ranked, rejection-sampled responses) followed by DPO, and chose DPO over on-policy PPO because it "required less compute for large-scale models and performed better, especially on instruction following benchmarks" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.4]</a>. So "post-training" does not mean PPO. See <a href="21-preference-optimization.html">page 21</a>.</li>
+    <li><strong>RL with verifiable rewards (RLVR)</strong> for reasoning. DeepSeek-R1-Zero applies GRPO directly to the V3 base model with rule-based rewards (answer accuracy plus a format reward) and no SFT; average AIME 2024 pass@1 rose from 15.6% to 77.9% in the current arXiv version while responses grew longer <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2.3]</a>. R1 adds cold-start SFT on thousands of examples, a reasoning RL stage, rejection sampling plus SFT on reasoning and non-reasoning data, and a second RL stage with helpfulness and harmlessness rewards <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §3]</a>. See <a href="24-rlvr-reasoning.html">page 24</a>.</li>
+  </ul>
+  <p>What RL adds that SFT and pretraining lack: it optimizes a <em>sequence-level</em> outcome on the model's <em>own samples</em>, so it trains on the distribution the model will generate from (the exposure-bias mismatch, <a href="#exposure-bias">above</a>), and with a verifier it can exceed any human demonstration. Its risks are reward hacking (the R1 authors avoided neural reward models on reasoning tasks because they "are susceptible to reward hacking during large-scale reinforcement learning") and, for RLHF, the alignment tax.</p>
+
+  <div class="decision">
+    <div class="decision-title">Staging: pretrain, then SFT, then preference/RL</div>
+    <dl>
+      <dt>Problem</dt><dd>A base model has the capability but not the behavior: it continues documents, and next-token likelihood is a poor proxy for "helpful" or "correct".</dd>
+      <dt>Idea</dt><dd>Spend nearly all compute on a general next-token objective, then shape behavior with a little curated data (SFT) and a reward or preference signal (RL).</dd>
+      <dt>Why it works</dt><dd>Capabilities are learned once from abundant text; behaviors need far less data and iterate quickly; RL optimizes what imitation cannot express.</dd>
+      <dt>Evidence</dt><dd>1.3B InstructGPT preferred to 175B GPT-3 <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §4.1]</a>; R1-Zero's AIME gains from RL alone <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2.3]</a>; Llama 3 and V3 both ship multi-stage post-training.</dd>
+      <dt>Cost</dt><dd>Small GPU-hour share but large human and engineering cost; alignment tax; reward hacking; each stage can degrade the previous one.</dd>
+      <dt>Used by</dt><dd>InstructGPT, Llama 3 (SFT + rejection sampling + DPO), DeepSeek-V3 (SFT + GRPO), DeepSeek-R1 (RL first, then multi-stage).</dd>
+    </dl>
+  </div>
+
+  <h3 id="stage-costs">What each stage costs</h3>
+  <p>Reported numbers, with their limits. DeepSeek-V3: pretraining 2,664K H800 GPU-hours, context extension 119K and post-training 5K, 2.788M in total (about $5.6M at the report's assumed $2 per GPU-hour), that is 95.6%, 4.3% and 0.2%, excluding prior research and ablations <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 1]</a>. InstructGPT: 4.9 petaflop/s-days for the 175B SFT model and 60 for PPO-ptx, against 3,640 for GPT-3, or 0.1% and 1.6% <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §5.1]</a>. DeepSeek-R1 on top of the V3 base: 101K GPU-hours for R1-Zero, 5K to create SFT data and 41K for R1, 147K in all (about $294K) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. B.4.4, Tab. 7]</a>. Its two RL runs (142K) equal about 5% of V3's pretraining GPU-hours, so RL is a bigger share in the reasoning era than InstructGPT's 1.6%. Do not extrapolate from one report, and note that V3's SFT data came from R1-series models whose training Table 1 does not appear to count.</p>
+
+  <h3 id="model-types">Base, instruct and reasoning models</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Base</th><th>Instruct / chat</th><th>Reasoning</th></tr></thead>
+    <tbody>
+      <tr><td>Trained with</td><td>pretraining only</td><td>plus SFT and preference optimization or RLHF</td><td>plus large-scale RL with verifiable rewards (often with cold-start SFT)</td></tr>
+      <tr><td>What it outputs</td><td>a continuation of the text; may not stop; may imitate the prompt's style</td><td>an assistant-style answer that ends at an end-of-turn token</td><td>a long chain of thought (for example inside <code>&lt;think&gt;</code> tags) followed by a final answer; many more output tokens</td></tr>
+      <tr><td>How to prompt it</td><td>write text whose natural continuation is the answer: patterns, few-shot examples, "Q: ... A:"</td><td>chat template with system, user and assistant roles and special tokens (Llama 3 uses header and termination tokens, <a href="https://arxiv.org/abs/2407.21783">[§4.1.1]</a>)</td><td>chat template; usually no few-shot examples; some APIs expose a thinking budget</td></tr>
+      <tr><td>Typical use</td><td>starting point for fine-tuning, research, likelihood-based evals</td><td>products and assistants</td><td>hard math, code and agentic tasks; latency and cost scale with thought tokens</td></tr>
+    </tbody>
+  </table></div>
+  <p>R1-Zero's training template shows the reasoning format: a fixed preamble, then "<code>&lt;think&gt;</code> reasoning process here <code>&lt;/think&gt;</code> <code>&lt;answer&gt;</code> answer here <code>&lt;/answer&gt;</code>. User: prompt. Assistant:" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Tab. 1]</a>. A raw question fed to a base model typically yields more questions or a rambling continuation, and a chat template the model never saw in SFT degrades an instruct model, so match the format to the checkpoint.</p>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="icl">In-context learning and emergent abilities</h2>
+
+  <p><strong>In-context learning</strong> <span class="zh">上下文学习</span> (ICL) is performing a new task from instructions or a few demonstrations placed in the prompt, with no weight update. GPT-3 defined the settings: <em>zero-shot</em> (an instruction only), <em>one-shot</em> and <em>few-shot</em> (typically \(K = 10\) to \(100\) demonstrations, whatever fits in a 2,048-token window) <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, §2]</a>. TriviaQA closed-book accuracy was 64.3%, 68.0% and 71.2% zero-, one- and few-shot, and few-shot SuperGLUE reached 71.8 (32 examples in context) against 69.0 for fine-tuned BERT-Large and 89.0 for the fine-tuned state of the art <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, §1 and Tab. 3.8]</a>. The few-shot advantage grew with model size: larger models "make increasingly efficient use of in-context information" (their Figure 1.2).</p>
+
+  <h3 id="icl-surprise">Why it is surprising, and what explains it</h3>
+  <p>The model was trained only to predict the next token, never to "learn from these examples", and its weights are frozen at test time, yet its behavior on the query depends on the demonstrations as if it had learned. Three partial explanations, at different levels:</p>
+  <ul>
+    <li><strong>The objective itself.</strong> GPT-2 speculated that "a language model with sufficient capacity will begin to learn to infer and perform the tasks demonstrated in natural language sequences in order to better predict them", making the LM an "unsupervised multitask learner" <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, §2]</a>. Web text contains countless natural demonstrations, and inferring the task helps predict the next token.</li>
+    <li><strong>Mechanism.</strong> <em>Induction heads</em> (circuits that complete the pattern [A][B] ... [A] \(\to\) [B]) form in a sharp phase change early in training, coinciding with a jump in "in-context learning" measured as the loss at token 50 minus the loss at token 500 (from under 0.15 nats to about 0.4). The evidence is causal for small attention-only models and only correlational for large ones <a href="https://arxiv.org/abs/2209.11895">[Olsson et al. 2022, Args. 1 to 6]</a>. That paper's "in-context learning" (loss improving with position) is a different quantity from GPT-3's few-shot task performance.</li>
+    <li><strong>Behavioral.</strong> Replacing demonstration labels with random ones barely hurts classification and multiple-choice accuracy across 12 models including GPT-3; demonstrations mostly specify the <em>label space</em>, the <em>input distribution</em> and the <em>format</em> <a href="https://arxiv.org/abs/2202.12837">[Min et al. 2022, Abstract]</a>. Under a strict definition (learning a new input-to-label mapping) the model may not be learning at test time; under a broader one (locating and formatting a task it already knows) it is.</li>
+  </ul>
+
+  <h3 id="emergence">Emergent abilities: two readings</h3>
+  <p>Wei et al. define an ability as <strong>emergent</strong> <span class="zh">涌现能力</span> "if it is not present in smaller models but is present in larger models", so it cannot be predicted by extrapolating smaller models. Their examples: 3-digit addition and subtraction in GPT-3 appears around \(2 \times 10^{22}\) training FLOPs (13B parameters), and 57-topic MMLU rises above chance only near \(3 \times 10^{23}\) FLOPs (175B) <a href="https://arxiv.org/abs/2206.07682">[Wei et al. 2022, §2 and Tab. 1]</a>.</p>
+  <p>Schaeffer et al. argue much of the sharpness is a property of the <em>metric</em>. If per-token accuracy is \(p\) and a task scores exact match over \(L\) tokens, accuracy is about \(p^L\), which changes sharply even when \(p\) improves smoothly; multiple-choice grade is a step function of the probabilities. They report that over 92% of emergent abilities claimed on BIG-Bench appear under just two metrics, multiple-choice grade and exact string match, and they make abilities vanish by switching to token edit distance or Brier score. They also state that nothing in their paper "should be interpreted as claiming that large language models cannot display emergent abilities" <a href="https://arxiv.org/abs/2304.15004">[Schaeffer et al. 2023, §1 and §7]</a>.</p>
+  <p><strong>Worked numbers.</strong> A 10-token exact-match task with per-token accuracy \(p = 0.90, 0.95, 0.99\) scores \(0.349,\ 0.599,\ 0.904\): halving the per-token error from 10% to 5% lifts task accuracy 1.7 times, and \(p = 0.5\) scores \(0.001\), which looks like "no ability at all". Wei et al. themselves note that cross-entropy improves smoothly even where downstream metrics sit at chance, and that metric choice is only "an incomplete explanation" because emergence also appears on classification tasks <a href="https://arxiv.org/abs/2206.07682">[Wei et al. 2022, §5.1 and App. A]</a>. Neutral summary: for the tasks studied, apparent sharpness depends heavily on the metric, and whether genuinely discontinuous capability transitions exist remains open. The practical lesson is to forecast with continuous metrics such as the log-likelihood of the correct answer, as Llama 3 did (<a href="#reading-loss">above</a>).</p>
+</section>
+
+<!-- ===================================================================== -->
+<section>
+  <h2 id="course-map">Course map: where each part sits in the pipeline</h2>
+  <p>The pipeline in Figure 3 and the loop in Figure 1 are the two spines of the course. Each later part expands one piece of them.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Part</th><th>Pages</th><th>What it expands</th><th>Where it sits</th></tr></thead>
+    <tbody>
+      <tr><td>I. Foundations</td><td><a href="02-tokenization.html">02</a> to <a href="06-decoding-kv-cache.html">06</a></td><td>tokenization, attention, the block with exact parameter and FLOP counts, positions, decoding and the KV cache</td><td>the network itself and the generation loop (Figure 1)</td></tr>
+      <tr><td>II. Modern architecture</td><td><a href="07-kv-efficient-attention.html">07</a> to <a href="11-stability-tweaks.html">11</a></td><td>MQA/GQA/MLA, mixture of experts, sparse and linear attention, long context, stability tweaks</td><td>what "the network" is made of at frontier scale; stage 1 and serving</td></tr>
+      <tr><td>III. Pretraining and systems</td><td><a href="12-pretraining-data.html">12</a> to <a href="18-evaluation.html">18</a></td><td>data, scaling laws, optimizers, distributed training, kernels, inference serving, evaluation</td><td>stage 1 and the infrastructure under every stage; evaluation measures all stages</td></tr>
+      <tr><td>IV. Post-training</td><td><a href="19-sft-distillation.html">19</a> to <a href="21-preference-optimization.html">21</a></td><td>SFT and distillation, LoRA, reward models and DPO</td><td>stage 2 and the offline part of stage 3</td></tr>
+      <tr><td>V. Reinforcement learning</td><td><a href="22-rl-foundations.html">22</a> to <a href="25-rl-systems-agentic.html">25</a></td><td>policy gradient to PPO, RLHF, RLVR and GRPO, RL systems</td><td>stage 3, online</td></tr>
+      <tr><td>VI. Case studies</td><td><a href="26-deepseek-1-foundations.html">26</a> to <a href="33-architecture-atlas.html">33</a></td><td>DeepSeek, Llama, Qwen, Mistral/Gemma/gpt-oss, Kimi/GLM/MiniMax/OLMo/Nemotron, an atlas</td><td>the whole pipeline end to end</td></tr>
+      <tr><td>VII. Interview toolkit</td><td><a href="34-back-of-envelope.html">34</a> to <a href="37-reading-list-glossary.html">37</a></td><td>back-of-envelope calculations, coding drills, question bank, glossary</td><td>practice</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"A language model outputs a word."</strong> It outputs a distribution over \(V\) tokens at every position. A "next token" is what a sampler or argmax extracts from that distribution, and tokens are subword pieces, not words.</li>
+    <li><strong>"Perplexity is a universal quality score."</strong> It is per token, so it is comparable only across models sharing a tokenizer and evaluated on the same text with the same protocol. Across tokenizers use bits per byte. The same compression quality can show a 1.63 times higher perplexity just by changing the tokenizer (Llama 2 to Llama 3 example).</li>
+    <li><strong>"Perplexity 10 means the model is right 10% of the time."</strong> It is the geometric mean of the inverse probabilities of the true tokens, an effective branching factor. Top-1 accuracy is a different quantity.</li>
+    <li><strong>"Teacher forcing lets the model see the answer."</strong> It sees the ground-truth <em>prefix</em>, and the causal mask hides the target and everything after it. If the training loss collapses toward zero on natural text, suspect leakage (missing shift or a non-causal mask), not brilliance.</li>
+    <li><strong>"Masking padding by token id is always safe."</strong> If the pad token doubles as EOS, the real end-of-sequence targets are masked and the model never learns to stop. Mask by length or attention mask.</li>
+    <li><strong>"Decoder-only won because bidirectional attention is bad."</strong> Bidirectional context gives better representations of a fixed input, and encoder-decoder with masked LM was best after multitask fine-tuning in Wang et al. Decoder-only won on generality, dense supervision, simplicity at scale and serving, not on a proof of superiority.</li>
+    <li><strong>"Post-training means RLHF means PPO."</strong> Llama 3 used SFT, rejection sampling and DPO; DeepSeek-V3 used SFT plus GRPO; R1-Zero skipped SFT entirely. The algorithms differ, and the stages are defined by data and objective, not by PPO.</li>
+    <li><strong>"Emergence is proven" or "emergence is a mirage."</strong> Both are overstated. Sharpness is strongly metric-dependent for the tasks studied (Schaeffer et al.), while cross-entropy scales smoothly (Kaplan et al., Wei et al. App. A), and the existence of true phase transitions is unresolved.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Write the autoregressive factorization of a language model. What does the network output, and is the factorization an approximation?</summary>
+    <div class="answer">
+      <p>\(p(x_{1:T}) = \prod_{t} p(x_t \mid x_{&lt;t})\). It is the chain rule, so it is exact for any distribution; the only approximation is how well the network represents each conditional. With a BOS token in front, one forward pass returns logits of shape \((B, T, V)\), with row \(t\) depending only on \(x_{\le t}\) thanks to the causal mask, and a softmax over the last axis gives \(p(x_{t+1} \mid x_{\le t})\).</p>
+      <p>Because the conditionals are normalized and causal, the joint is a valid distribution: you can sample exactly, one token at a time, and compute \(\log p(x)\) exactly as a sum of gathered log-probabilities, which is why perplexity and bits per byte are well defined.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> A model has validation loss 2.0 nats per token. What is its perplexity, what loss does perplexity 10 correspond to, and what does perplexity 10 mean?</summary>
+    <div class="answer">
+      <p>\(\operatorname{PPL} = e^{\ell}\), so \(e^{2.0} = 7.39\). Inversely \(\ell = \ln 10 = 2.303\) nats (3.32 bits). Perplexity is the geometric mean of the inverse probabilities of the true tokens, an effective branching factor: perplexity 10 is as uncertain as a uniform choice among 10 tokens per step. Example: true-token probabilities \(1/2, 1/4, 4/5, 1/10\) have inverse probabilities with product 100, so \(\operatorname{PPL} = 100^{1/4} = 3.16 = e^{1.151}\). It is not an accuracy (a model with perplexity 10 can have 40% top-1 accuracy), and a freshly initialized model has perplexity near \(V\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is teacher forcing, and what is exposure bias?</summary>
+    <div class="answer">
+      <p><strong>Teacher forcing:</strong> in training, the input at each position is the ground-truth previous token, not the model's own sample, so all \(T\) conditionals are computed in parallel in one causal forward pass, with labels equal to the inputs shifted by one.</p>
+      <p><strong>Exposure bias</strong> (Ranzato et al. 2016): the model only sees data-distribution prefixes in training but conditions on its own samples at generation time, so an early mistake puts it in a rarely seen state and errors may compound. Scheduled sampling (Bengio et al. 2015) was an early fix. For modern LMs the measured effect is small (He et al.: about a 1 to 2% relative gap, not growing with prefix length, in open-ended generation), and the practical remedies are RL on the model's own samples in post-training and sensible decoding.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What are base, instruct and reasoning models, and how do you prompt each?</summary>
+    <div class="answer">
+      <p>A <strong>base</strong> model is the pretraining output. It continues text, so you write the start of a document whose continuation is the answer (few-shot patterns, "Q: ... A:"). An <strong>instruct/chat</strong> model adds SFT and preference optimization: you use a chat template with role tokens, and it answers and stops at an end-of-turn token. A <strong>reasoning</strong> model adds large-scale RL with verifiable rewards: it emits a long chain of thought (for R1, inside think tags) and then a final answer, so cost and latency scale with thought tokens. Mismatching format and checkpoint (a raw question to a base model, a foreign template to an instruct model) is a common cause of poor results.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why is next-token cross-entropy the maximum-likelihood objective? Derive it.</summary>
+    <div class="answer">
+      <p>MLE maximizes \(\sum_i \log p_\theta(x^{(i)})\). By the chain rule \(\log p_\theta(x) = \sum_t \log p_\theta(x_{t+1} \mid x_{\le t})\). Negating and dividing by the number of supervised positions \(N\) gives \(\mathcal{L}(\theta) = -\frac{1}{N}\sum \log p_\theta(x_{t+1} \mid x_{\le t})\), the average negative log-probability of the true next token. Each term is the cross-entropy between the one-hot label \(e_y\) and \(\softmax(z_t)\), that is \(\operatorname{logsumexp}(z_t) - z_{t,y}\), with gradient \(\softmax(z_t) - e_y\).</p>
+      <p>Equivalently, in expectation \(H(p_{\text{data}}, p_\theta) = H(p_{\text{data}}) + \KL(p_{\text{data}} \,\|\, p_\theta)\), so minimizing cross-entropy minimizes the KL divergence to the data distribution; the entropy term is constant in \(\theta\) and is the floor on the loss. Teacher forcing is what makes every term computable from the data in parallel.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why can't you compare perplexities of models with different tokenizers? What do you use instead? Show an example.</summary>
+    <div class="answer">
+      <p>Perplexity is \(e^{\ell}\) with \(\ell\) per token, and tokenizers cut the same text into different numbers of tokens. What a model assigns to a text is its total NLL; the tokenizer only decides what to divide by. A 4,000-byte text with total NLL 2,000 nats is 1,000 tokens under tokenizer A (\(\ell = 2.0\), \(\operatorname{PPL} = 7.39\)) and 2,000 tokens under B (\(\ell = 1.0\), \(\operatorname{PPL} = 2.72\)) at identical model quality. In practice, Llama 3's tokenizer averages 3.94 characters per token versus Llama 2's 3.17, so equal bits per character means a per-token loss 1.243 times higher (2.0 becomes 2.486 nats; perplexity 7.39 becomes 12.0).</p>
+      <p>Use <strong>bits per byte</strong>: \(\text{bpb} = (L_T/L_B)\,\ell/\ln 2 = \text{total NLL}/(L_B \ln 2)\). Here \(2.0 \times 0.25/0.6931 = 0.7213\) for A and \(1.0 \times 0.5/0.6931 = 0.7213\) for B. Bytes beat characters because character counts are ambiguous in Unicode. Also keep the evaluation text, context length and document handling identical.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you build inputs and labels for a padded batch, what breaks if the pad token equals EOS, and how should the loss be normalized?</summary>
+    <div class="answer">
+      <p>Either slice (\(\text{inputs} = x_{1:T-1}\), \(\text{labels} = x_{2:T}\)) or keep length \(T\) with \(\text{labels}[t] = x_{t+1}\) and \(-100\) in the last slot. Set the label to \(-100\) (<code>ignore_index</code>) wherever the target is padding, so those positions add neither loss nor gradient.</p>
+      <p>If padding is identified by token id and the pad token is also EOS, genuine EOS targets are masked too, so the model gets no gradient for emitting EOS and does not learn to stop; build the mask from sequence lengths or the attention mask instead. Normalize by the number of supervised <em>tokens</em> (NLLs \([1,2,3,2]\) and \([0.5,1.5]\) give \(10/6 = 1.667\), not the per-sequence mean 1.5), dividing by the global token count in data-parallel training, and compute the softmax in fp32 with max subtraction.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did decoder-only architectures win over encoder-decoder for general-purpose LLMs?</summary>
+    <div class="answer">
+      <p>Several reinforcing reasons, plus caveats. (1) <em>Supervision density:</em> a causal LM has a loss at 100% of positions; BERT-style masking 15%, span corruption about 18%. (2) <em>Simplicity:</em> one stack, one objective, no corruption-rate, span-length or encoder/decoder-depth hyperparameters. (3) <em>The prompt is the interface:</em> any task is a text prefix and the answer a continuation, so no task heads; GPT-2 argues the supervised objective is the unsupervised one evaluated on a subset, and GPT-3 showed few-shot ability growing with scale. (4) <em>Zero-shot out of the box:</em> in Wang et al., causal decoders with full LM were best straight after pretraining. (5) <em>Serving:</em> causal states never change when tokens are appended, so KV and prefix caches are exact and append-only. (6) Path dependence: scaling laws and tooling were built around it.</p>
+      <p>Caveats: the same study found encoder-decoder with masked LM best after multitask fine-tuning (T0-Eval 60.6 versus 51.4), T5 found denoising best for fine-tuned transfer, and adapting Gemma 2 to encoder-decoder gave better fine-tuned results at a similar inference budget. So the honest answer is generality, simplicity and serving at scale, not dominance.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What does each post-training stage add that pretraining lacks?</summary>
+    <div class="answer">
+      <p>Pretraining gives capability (language, knowledge, code, pattern use in context), but its objective, predict the next token of web text, is misaligned with "follow instructions helpfully and safely". <strong>SFT</strong> trains the same cross-entropy on (prompt, response) pairs, with loss on response tokens only, and adds the behavior: instruction following, chat format, stopping. It needs thousands to millions of examples (InstructGPT about 13k prompts; DeepSeek-V3 1.5M).</p>
+      <p><strong>Preference optimization / RL</strong> adds what imitation cannot express: a sequence-level objective evaluated on the model's own samples. With human preferences (RLHF with PPO, or offline DPO as in Llama 3) it improves helpfulness and harmlessness, and InstructGPT's 1.3B model beat GPT-3 175B in human preference. With verifiable rewards (GRPO in R1-Zero) it teaches long chain-of-thought behavior and can exceed human demonstrations. Costs: the alignment tax, reward hacking, and small GPU-hour shares that hide large data and engineering costs (V3: 5K of 2,788K GPU-hours).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A model's validation loss dropped from 2.10 to 2.05 nats per token. Is that a big improvement?</summary>
+    <div class="answer">
+      <p>Convert first: \(-0.05\) nats is \(-2.4\%\) in loss and \(8.17 \to 7.77\), or \(-4.9\%\), in perplexity. Calibrate against scaling: Kaplan et al.'s \(L \propto N^{-0.076}\) gives a 5.1% loss reduction per doubling of parameters (about \(-0.108\) at loss 2.10), so 0.05 is worth about \(1.37\times\) the parameters. Measured from an irreducible floor it looks larger: with Chinchilla's \(E = 1.69\) (specific to its data and tokenizer) the reducible loss goes \(0.41 \to 0.36\), a 12% cut.</p>
+      <p>Then ask the skeptical questions. Is it outside seed noise (Kaplan et al. saw about 0.05 run-to-run variation in a small setup, so run several seeds)? Same eval set, tokenizer and protocol? Did it cost extra compute or parameters? Does it transfer downstream (loss and benchmarks correlate task by task, and accuracy is nonlinear in loss)? Verdict: a real but modest gain, meaningful if replicated across seeds and free of extra compute.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is in-context learning, and why is it surprising?</summary>
+    <div class="answer">
+      <p>ICL is doing a new task from instructions or demonstrations in the prompt, with frozen weights. GPT-3 defined zero-, one- and few-shot (\(K\) about 10 to 100 in a 2,048-token window) and showed the few-shot advantage growing with size (TriviaQA 64.3, 68.0, 71.2; few-shot SuperGLUE 71.8 versus 69.0 for fine-tuned BERT-Large). It is surprising because nothing in the objective asks for it: the model only predicts next tokens, and no gradient step happens at test time.</p>
+      <p>Explanations at three levels: GPT-2's argument that inferring the task helps predict web text that contains demonstrations; a mechanism, induction heads, whose formation in a sharp phase change coincides with the jump in in-context ability (causal evidence only for small attention-only models); and a behavioral finding that random labels in demonstrations barely hurt (Min et al.), so demonstrations mostly convey label space, input distribution and format. Whether that counts as learning depends on the definition.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Debug: a 128,256-vocabulary model shows a first-step loss of 25, and in a second run the loss falls to about 0.05 within a few hundred steps on web text. What is wrong in each case?</summary>
+    <div class="answer">
+      <p>Expected initial loss is about \(\ln V = 11.76\), since near-zero logits are uniform. With logit standard deviation \(\sigma\), the loss is roughly \(\ln V + \sigma^2/2\) for moderate \(\sigma\), or about \(\sigma\sqrt{2\ln V} \approx 4.85\,\sigma\) when the maximum dominates, so a loss of 25 implies \(\sigma \approx 5\): an initialization or scale problem (unscaled tied embeddings, a missing final norm, a wrong output-head init). Check activations at init and the head's weight scale.</p>
+      <p>A loss near zero on natural text is impossible for an honest model (real text has substantial entropy), so it is <em>leakage</em>: labels not shifted (the model copies its input), a mask that is not causal (position \(t\) sees \(t+1\)), or nearly all labels ignored so the mean covers a few trivial tokens. Tests: perturb token \(t+1\) and assert the logits up to position \(t\) are unchanged; check that the loss on the first real token is high; count supervised tokens per batch; train on shuffled labels and confirm the loss returns to about \(\ln V\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: what do the public numbers say about splitting a budget across pretraining, SFT and RL, and what do they not say?</summary>
+    <div class="answer">
+      <p>What they say: DeepSeek-V3's 2.788M H800 GPU-hours split 95.6% pretraining, 4.3% context extension and 0.2% post-training. InstructGPT spent 0.1% (SFT) and 1.6% (PPO-ptx) of GPT-3's 3,640 PF-days and still beat a model 100 times larger on human preference. R1's two RL runs used about 142K GPU-hours, about 5% of V3's pretraining. So post-training is cheap in FLOPs per unit of behavior change, and its share is growing in the reasoning era.</p>
+      <p>What they do not say: (1) the figures exclude data creation, annotation, verifier and environment engineering, prior research and ablations; (2) Table 1 does not appear to count the R1-series models that generated V3's SFT data; (3) they are single reports, so marginal returns are unknown. The R1 authors say the effectiveness of RL from a base model depends heavily on model capacity <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Supp. G]</a>, so RL complements pretraining rather than replacing it. Decision rule: knowledge comes from pretraining scale, behavior and format from SFT, long-horizon reasoning and verifiable skills from RL given a reliable verifier. Put compute where the target capability is limited, and measure at each stage.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Explain Schaeffer et al.'s argument with numbers. Would a smoothly improving model ever look "emergent"?</summary>
+    <div class="answer">
+      <p>Suppose per-token accuracy \(p\) improves smoothly with scale and the task is scored by exact match over \(L = 10\) tokens. Accuracy is about \(p^{10}\): \(0.5 \to 0.001\), \(0.90 \to 0.349\), \(0.95 \to 0.599\), \(0.99 \to 0.904\). Against log-compute the score sits near zero and then rises steeply, like a threshold, although per-token cross-entropy, which the scaling law predicts, moved smoothly throughout. A discontinuous metric such as multiple-choice grade (1 if the correct option has the top probability) is step-like for the same reason. Switching to token edit distance or the Brier score, which are roughly linear or continuous in \(p\), removes the apparent emergence, and low test-set resolution hides above-chance accuracy at small scale.</p>
+      <p>Limits: Schaeffer et al. do not claim emergence is impossible, and Wei et al. note that jumps also appear on classification metrics and that loss shows an elbow at the point of emergence on some tasks. Metrics explain much of the sharpness in the tasks studied, though not obviously all of it.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>The language-modeling loss and its metrics.</strong> Implement four functions: <code>shift_for_lm</code> (inputs, and labels shifted left with padding and the final slot set to \(-100\)), <code>lm_cross_entropy</code> (token-mean NLL with a hand-written log-softmax using the max-subtraction trick, not <code>F.cross_entropy</code>), <code>perplexity</code> and <code>bits_per_byte</code>. The tests compare against <code>F.cross_entropy</code> including gradients, check logits of magnitude \(10^4\), a token-mean versus sequence-mean case, padding invariance, and the tokenizer-independence of bits per byte. An interviewer would expect the shift and the stable cross-entropy in 20 to 30 minutes, and will probe the stability and the ignore-index normalization. <span class="ex-path">exercises/drills/lm_loss.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_lm_loss.py</code>; add <code>--solutions</code> to check the reference.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">Radford et al. (2019). Language Models are Unsupervised Multitask Learners (GPT-2).</a> <span class="why">Why read it: §2 states the factorization and the "unsupervised multitask learning" argument; §3.1 shows how to normalize perplexity across tokenizations.</span></li>
+    <li><a href="https://arxiv.org/abs/2005.14165">Brown et al. (2020). Language Models are Few-Shot Learners (GPT-3).</a> <span class="why">Why read it: defines zero/one/few-shot in-context learning and gives the scale anchors (175B parameters, 300B tokens).</span></li>
+    <li><a href="https://arxiv.org/abs/1810.04805">Devlin et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers.</a> <span class="why">Why read it: the masked-LM objective (15%, 80/10/10) and the honest note that it converges slower than left-to-right.</span></li>
+    <li><a href="https://arxiv.org/abs/1910.10683">Raffel et al. (2019). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (T5).</a> <span class="why">Why read it: span corruption, the architecture comparison in Table 2, and the text-to-text framing.</span></li>
+    <li><a href="https://arxiv.org/abs/2204.05832">Wang et al. (2022). What Language Model Architecture and Pretraining Objective Work Best for Zero-Shot Generalization?</a> <span class="why">Why read it: the controlled evidence for and against decoder-only, plus the cost of converting between architectures.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.02155">Ouyang et al. (2022). Training language models to follow instructions with human feedback (InstructGPT).</a> <span class="why">Why read it: the SFT, reward-model and PPO pipeline, dataset sizes, compute versus pretraining, and the alignment tax.</span></li>
+    <li>Emergence: <a href="https://arxiv.org/abs/2206.07682">Wei et al. (2022), Emergent Abilities of Large Language Models</a> and <a href="https://arxiv.org/abs/2304.15004">Schaeffer et al. (2023), Are Emergent Abilities of Large Language Models a Mirage?</a> <span class="why">Why read them: both sides of the debate; read Wei App. A and Schaeffer §2 for the metric argument.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">Why read it: the best public description of a full pipeline (pretraining, long-context extension, annealing, SFT, rejection sampling, DPO), with the tokenizer compression numbers.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: the GPU-hour split across stages in Table 1, SFT and GRPO details, and bits-per-byte comparisons in Table 3.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.</a> <span class="why">Why read it: R1-Zero (RL without SFT), the multi-stage R1 pipeline, and the cost table.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>\(p(x_{1:T}) = \prod_t p(x_t \mid x_{&lt;t})\), exact. One pass gives logits \((B, T, V)\); position \(t\) predicts \(x_{t+1}\); softmax over the last axis.</li>
+      <li>Loss = mean NLL over supervised tokens = cross-entropy = MLE = \(\KL(p_{\text{data}} \| p_\theta) + H(p_{\text{data}})\). \(\partial \ell / \partial z = \softmax(z) - e_y\). Initial loss \(\approx \ln V\) (128,256: 11.76; 50,257: 10.82).</li>
+      <li>Teacher forcing: inputs are ground-truth prefixes; labels are inputs shifted left; last slot and padding are \(-100\); token-mean normalization; mask padding by length, not id, if pad = EOS.</li>
+      <li>\(\operatorname{PPL} = e^{\ell}\): 2.0 nats is 7.389; PPL 10 is 2.303 nats; uniform over \(k\) tokens is PPL \(k\). Average losses, never perplexities.</li>
+      <li>\(\text{bpb} = (L_T/L_B)\,\ell/\ln 2\): 2.0 nats at 4.0 bytes per token is 0.7213. Never compare perplexity across tokenizers (Llama 3 vs 2: 3.94 vs 3.17 characters per token, 1.243 times per-token loss).</li>
+      <li>Loss scale: doubling \(N\) multiplies loss by 0.949 (Kaplan); 0.05 nats at loss 2.10 is about \(1.37\times\) parameters. Check seed noise first.</li>
+      <li>Supervised positions: causal LM 100%, prefix LM about 50%, span corruption about 18%, masked LM 15%. Decoder-only won on generality, density, simplicity, prompt-as-interface and caching; encoder-decoder with masked LM is best after multitask fine-tuning (Wang et al.).</li>
+      <li>Pipeline: pretrain (\(10^{13}\) tokens; 95.6% of V3's GPU-hours), SFT (\(10^4\) to \(10^6\) examples, loss on response tokens), preference/RL (PPO, DPO, GRPO): small in FLOPs, large in data and engineering.</li>
+      <li>Anchors: GPT-3 175B on 300B tokens; Llama 3 405B on 15.6T (\(3.8 \times 10^{25}\) FLOPs); V3 671B total and 37B activated on 14.8T, 2.788M H800 GPU-hours; R1 on V3-Base about 147K GPU-hours.</li>
+      <li>Generation: tokenize, embed, \(L\) blocks, logits, sample, append. Prefill is parallel and compute-bound; decode is one token per pass, bandwidth-bound, with the KV cache.</li>
+      <li>ICL: task from demonstrations, no weight update; demonstrations mostly convey label space, input distribution and format (Min et al.). Emergence is largely metric-dependent (\(p^{L}\) for exact match) and still debated.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

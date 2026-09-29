@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Attention from scratch · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="03" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part I · Foundations · Page 03</div>
+  <h1>Attention from scratch</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~50 min</span>
+    <span>Prereqs: <a href="01-big-picture.html">01 Big picture</a></span>
+  </div>
+  <p class="lede">Every model in this course is a stack of attention layers and MLPs. This page derives scaled dot-product attention, multi-head attention and causal masking from first principles: the exact shapes, the reason for the \(1/\sqrt{d_h}\), the numerical traps (softmax overflow, NaN rows, misaligned masks), and the quadratic cost in real numbers. The goal is that you can write the layer on a whiteboard and defend every line.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Implement it live:</strong> causal multi-head attention in PyTorch in 15 to 20 minutes, with the right shapes at every step, the reshape/transpose done correctly, and the mask applied before the softmax.</li>
+    <li><strong>The scale factor:</strong> derive \(\mathrm{Var}(q\cdot k)=d_h\), explain what a saturated softmax does to gradients, and say what changes once the i.i.d. assumption fails (QK-norm, μP).</li>
+    <li><strong>Masking correctness:</strong> why the mask is added before the softmax, why a fully masked row turns the loss into NaN, the end-aligned mask when a KV cache exists, and why training is parallel but generation is not.</li>
+    <li><strong>Cost estimates:</strong> attention FLOPs, score-matrix memory, and where the \(T^2\) term overtakes the linear layers, with Llama-3-8B numbers.</li>
+    <li><strong>Why heads:</strong> the \(4d^2\) parameter count, why more heads cost no extra matmul FLOPs, and what is (and is not) known about what heads learn.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Write scaled dot-product attention and causal multi-head attention with correct shapes at every step, including the end-aligned mask when \(T \ne S\).</li>
+    <li>Derive the \(1/\sqrt{d_h}\) scale, and compute the logit standard deviation and the softmax saturation for \(d_h = 128\) with and without it.</li>
+    <li>Explain softmax shift invariance, the max-subtraction trick, temperature, and why every attention output is a convex combination of value vectors.</li>
+    <li>Diagnose the fully-masked-row NaN, name three fixes, and explain why the causal mask makes parallel training exact.</li>
+    <li>Count parameters and FLOPs: \(4d^2\) per attention layer, \(4T^2d\) for scores plus weighted sum, \(n_h T^2\) score elements, and the sequence length where attention overtakes the linear layers (about 26.6K tokens at Llama-3-8B's width).</li>
+    <li>Prove that self-attention without positions is permutation-equivariant and state what that implies for language models.</li>
+    <li>Describe induction heads and attention sinks, and how strong the evidence for each is.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="dictionary">Attention as a soft dictionary lookup</h2>
+
+  <p>A Python <code>dict</code> maps a key to a value by exact match. <strong>Attention</strong> <span class="zh">注意力机制</span> is the differentiable version: a <strong>query</strong> is compared with every <strong>key</strong>, the comparison scores become weights that are non-negative and sum to one, and the output is the weighted average of the <strong>values</strong> <span class="zh">查询、键、值</span>. The query says what this position is looking for, the key is what a position advertises for matching, and the value is what it hands over when selected. Keeping keys and values separate lets "where to look" and "what to copy" use different learned features.</p>
+
+  <p>The idea entered neural sequence models in translation. Encoder-decoder RNNs squeezed a whole source sentence into one fixed-length vector, which Bahdanau et al. conjectured was a bottleneck. Their decoder instead computes, at every output step \(i\), weights \(\alpha_{ij} = \softmax_j(e_{ij})\) over all encoder states with a learned additive score \(e_{ij} = v^\top \tanh(W s_{i-1} + U h_j)\), and reads the context vector \(c_i = \sum_j \alpha_{ij} h_j\) <a href="https://arxiv.org/abs/1409.0473">[Bahdanau et al. 2014, Eqs. 5-6, App. A.1.2]</a>. Vaswani et al. (2017) removed the RNN entirely, made queries, keys and values linear projections of the same sequence (<strong>self-attention</strong> <span class="zh">自注意力</span>), replaced the additive score by a dot product, and added multiple heads.</p>
+
+  <h3 id="sdpa">Scaled dot-product attention with shapes</h3>
+  <p>Notation follows the course convention: token vectors are row vectors, so linear maps are \(xW\). Let \(X \in \R^{T\times d}\) hold the query-side tokens and \(M \in \R^{S\times d}\) the key/value-side tokens (\(M = X\) in self-attention). For one head with head dimension \(d_h\) and value dimension \(d_v\) (equal to \(d_h\) in practice):</p>
+
+  <div class="eq-box">
+  \[ \begin{aligned} Q &= XW^Q \in \R^{T\times d_h}\\ K &= MW^K \in \R^{S\times d_h}\\ V &= MW^V \in \R^{S\times d_v} \end{aligned} \]
+  \[ \operatorname{Attn}(Q,K,V) = \softmax\!\left(\frac{QK^\top}{\sqrt{d_h}}\right) V \ \in \R^{T\times d_v} \]
+  <div class="eq-label">Scaled dot-product attention <span class="zh">缩放点积注意力</span> <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, Eq. 1]</a></div>
+  </div>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>\(Q\)</td><td>\(T \times d_h\)</td><td>one query per output position</td></tr>
+      <tr><td>\(K\)</td><td>\(S \times d_h\)</td><td>one key per attendable position</td></tr>
+      <tr><td>\(V\)</td><td>\(S \times d_v\)</td><td>one value per attendable position</td></tr>
+      <tr><td>\(Z = QK^\top/\sqrt{d_h}\)</td><td>\(T \times S\)</td><td>logits (scores): query \(i\) against key \(j\)</td></tr>
+      <tr><td>\(A = \softmax(Z)\)</td><td>\(T \times S\)</td><td>attention weights; each row is a distribution over keys</td></tr>
+      <tr><td>\(O = AV\)</td><td>\(T \times d_v\)</td><td>output: row \(i\) is \(\sum_j a_{ij} v_j\)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Row by row, \(o_i = \sum_j a_{ij} v_j\) with</p>
+  \[ a_{ij} = \frac{\exp(q_i\cdot k_j/\sqrt{d_h})}{\sum_{j'} \exp(q_i\cdot k_{j'}/\sqrt{d_h})} . \]
+  <p>This is exactly a <strong>kernel smoother</strong> (Nadaraya-Watson): a weighted average of the values with weights \(\kappa(q_i,k_j) / \sum_{j'}\kappa(q_i,k_{j'})\) and the exponential kernel \(\kappa(q,k) = \exp(q\cdot k/\sqrt{d_h})\), an asymmetric kernel because \(q\) and \(k\) come from different projections <a href="https://arxiv.org/abs/1908.11775">[Tsai et al. 2019, §2.2]</a>. Bahdanau's phrasing is the probabilistic one: \(o_i\) is an <em>expected value</em> of the values under the distribution \(a_i\).</p>
+
+  <div class="decision">
+    <div class="decision-title">Dot-product scoring</div>
+    <dl>
+      <dt>Problem</dt><dd>Additive attention needs a small feed-forward network evaluated for every (query, key) pair, which is slow and memory-hungry on accelerators.</dd>
+      <dt>Idea</dt><dd>Score with \(q\cdot k\) after learned linear projections, so all \(T\times S\) scores come from one matrix multiplication.</dd>
+      <dt>Why it works</dt><dd>The projections make the score a learned bilinear form \(x W^Q (W^K)^\top x'^\top\) of rank at most \(d_h\); the softmax turns it into a positive kernel. Matmuls run near hardware peak.</dd>
+      <dt>Evidence</dt><dd>Vaswani et al. report that the two are similar in theoretical complexity, but dot-product attention is "much faster and more space-efficient in practice, since it can be implemented using highly optimized matrix multiplication code" <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.1]</a>.</dd>
+      <dt>Cost</dt><dd>Queries and keys must share a dimension, and the raw score grows with \(d_h\), which forces the scale factor of the <a href="#scaling">next section</a>.</dd>
+      <dt>Used by</dt><dd>Essentially every LLM. Additive scoring survives mainly in older seq2seq models.</dd>
+    </dl>
+  </div>
+
+  <h3 id="cross">Self-attention versus cross-attention</h3>
+  <p>In <strong>self-attention</strong> queries, keys and values all come from one sequence, so \(S = T\) (or \(S \ge T\) when a cache of earlier keys and values exists). In <strong>cross-attention</strong> <span class="zh">交叉注意力</span> the queries come from one sequence and the keys and values from another, so \(S\) is the length of the <em>other</em> sequence. The original Transformer's decoder used both: causal self-attention over the target prefix, then cross-attention over the encoder output, with no causal mask because every source position is visible <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.3]</a>. Because the source keys and values do not change during decoding, they are computed once and reused. Multimodal models use the same operation when text queries attend over image or audio features, although many designs instead project those features into the token sequence and rely on self-attention alone. Modern LLMs are decoder-only (<a href="01-big-picture.html">page 01</a>), so the rest of this page is about causal self-attention, but every shape below already allows \(T \ne S\).</p>
+</section>
+
+<section>
+  <h2 id="scaling">Why divide by \(\sqrt{d_h}\)</h2>
+
+  <p>The logit \(q\cdot k\) is a sum of \(d_h\) products. Sums of many independent terms grow like \(\sqrt{d_h}\) in typical size, so without a correction the logits get larger as heads get wider, and the softmax stops being a smooth weighting and becomes an argmax. The correction is a fixed <strong>temperature</strong> <span class="zh">温度</span> of \(\sqrt{d_h}\).</p>
+
+  <h3 id="variance">The variance argument</h3>
+  <p>Assume the components of \(q\) and \(k\) are independent with mean 0 and variance 1 <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, footnote 4]</a>. Each product has \(\E[q_ik_i] = 0\) and \(\mathrm{Var}(q_ik_i) = \E[q_i^2]\,\E[k_i^2] = 1\), and the \(d_h\) products are independent, so</p>
+  \[ \E[q\cdot k] = 0, \qquad \mathrm{Var}(q\cdot k) = \sum_{i=1}^{d_h} \mathrm{Var}(q_ik_i) = d_h . \]
+  <p>The standard deviation is \(\sqrt{d_h}\): 8 for the original Transformer's \(d_k = 64\), and \(\sqrt{128} = 11.31\) for Llama-3-8B's heads. Dividing by \(\sqrt{d_h}\) restores unit variance. Vaswani et al. state the saturation explanation as a suspicion ("We suspect that for large values of \(d_k\), the dot products grow large in magnitude, pushing the softmax function into regions where it has extremely small gradients"), citing that additive attention beat unscaled dot-product attention at large \(d_k\) <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.1]</a>. The next two subsections make the mechanism precise and measure it.</p>
+
+  <h3 id="jacobian">The softmax Jacobian and why saturation kills gradients</h3>
+  <p>For \(a = \softmax(z)\), \(\partial a_i/\partial z_j = a_i(\delta_{ij} - a_j)\), that is \(J = \mathrm{diag}(a) - aa^\top\). Given an upstream gradient \(g = \partial L/\partial a\), the gradient reaching logit \(j\) is</p>
+  \[ \frac{\partial L}{\partial z_j} = a_j\Big(g_j - \sum_i a_i g_i\Big). \]
+  <p>Every logit's gradient is proportional to <em>its own weight</em> \(a_j\). Now suppose the row is nearly one-hot on key \(m\). For \(j \ne m\) the factor \(a_j\) is tiny. For \(j = m\), \(g_m - \sum_i a_i g_i = \sum_{i \ne m} a_i (g_m - g_i)\) is also tiny, because \(1 - a_m = \sum_{i\ne m} a_i\). So the whole row's gradient vanishes: a key that currently has weight \(10^{-5}\) receives a gradient scaled by \(10^{-5}\), even if attending to it would lower the loss. The head is frozen on whatever it picked at initialization. A concrete case: logits \([11.3, 0, 0, 0]\), a gap of one standard deviation of an unscaled \(d_h=128\) logit, give the weights \([0.99996,\ 1.2\times10^{-5},\ 1.2\times10^{-5},\ 1.2\times10^{-5}]\).</p>
+
+  <h3 id="scale-numbers">Worked numbers: \(d_h = 128\), 1024 random keys</h3>
+  <p>We draw one query and \(T = 1024\) keys with i.i.d. \(\mathcal{N}(0,1)\) entries, form the logits with and without the scale, and average over 1000 trials:</p>
+
+<pre><code class="language-python">import math, torch
+torch.manual_seed(0)
+d_h, T, trials = 128, 1024, 1000
+for name, scale in [("unscaled", 1.0), ("scaled", d_h ** -0.5)]:
+    q = torch.randn(trials, 1, d_h, dtype=torch.float64)       # one query per trial
+    k = torch.randn(trials, T, d_h, dtype=torch.float64)       # T random keys
+    z = (q @ k.transpose(-1, -2)).squeeze(1) * scale           # (trials, T) logits
+    a = z.softmax(-1)
+    top = a.max(-1).values
+    ent = -(a * a.clamp_min(1e-300).log()).sum(-1)
+    print(f"{name:9s} logit std {z.std():5.2f} | mean top weight {top.mean():.3f} | "
+          f"P(top &gt; 0.99) {(top &gt; 0.99).double().mean():.2f} | entropy {ent.mean():.2f} of {math.log(T):.2f}")
+</code></pre>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th class="num">Logit std</th><th class="num">Mean top weight</th><th class="num">P(top weight &gt; 0.99)</th><th class="num">Entropy (max 6.93 nats)</th></tr></thead>
+    <tbody>
+      <tr><td>No scale</td><td class="num">11.35</td><td class="num">0.792</td><td class="num">0.21</td><td class="num">0.60</td></tr>
+      <tr class="hl"><td>Scaled by \(1/\sqrt{128}\)</td><td class="num">1.00</td><td class="num">0.016</td><td class="num">0.00</td><td class="num">6.44</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Output of the snippet above (PyTorch 2.14, CPU). The predicted logit variance is 128, that is, standard deviation 11.31, and the simulation gives 11.35.</p>
+
+  <p>Without the scale, a randomly initialized head is already close to a hard argmax over random keys: on average 79% of the weight sits on one key, and one row in five puts more than 99% on a single key. Those rows have almost no gradient. With the scale, the row is broad (entropy 6.44 out of a possible 6.93), so gradients reach many keys and the head can sharpen selectively as it learns. One more effect is numeric: if scores are materialized in bf16 (8 significant bits), representable values in \([64, 128)\) are 0.5 apart, so a logit near 100 is rounded to the nearest 0.5, changing its weight by up to \(e^{0.25} = 1.28\times\). Large logits are also coarse logits.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p>The scale is \(1/\sqrt{d_h}\), the <em>head</em> dimension, not \(1/\sqrt{d}\). Llama-3-8B has \(d = 4096\) but scales by \(1/\sqrt{128}\). The scale is a temperature: it keeps attention logits at order 1 at initialization so the softmax starts in its sensitive region.</p>
+  </aside>
+
+  <h3 id="folding">Folding the scale, and when the argument breaks</h3>
+  <p><strong>Folding.</strong> Because \(q\cdot k/\sqrt{d_h} = (q/\sqrt{d_h})\cdot k\), the constant can be absorbed into \(W^Q\) (or \(W^K\)); Shazeer's einsum code omits it for exactly this reason <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.2 note]</a>. That is free at inference. It is <em>not</em> equivalent during training: a fixed multiplier on a parameter changes backpropagation and, with Adam, the effective step size of that matrix, so it cannot be absorbed into the initialization in general. It can always be absorbed into the weights after training <a href="https://arxiv.org/abs/2203.03466">[Yang et al. 2022, App. A]</a>. Frameworks keep the explicit scale: the Hugging Face Llama implementation sets <code>self.scaling = self.head_dim**-0.5</code> <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">[modeling_llama.py, main branch]</a>.</p>
+  <p><strong>When the assumption fails.</strong> The derivation needs \(\mathrm{Var}(q_i) = \mathrm{Var}(k_i) = 1\), which depends on the initialization scale and on the normalization before the projection. If the inputs have unit second moment and the projection weights have standard deviation \(\sigma\), then \(\mathrm{Var}(q_i) = d\sigma^2\) and the <em>scaled</em> logit variance is \((d\sigma^2)^2\). With \(\sigma = 1/\sqrt d\) it is 1; with \(d = 768\) and \(\sigma = 0.02\) it is \(0.31^2 \approx 0.09\), a nearly uniform head at initialization. After training, \(q\) and \(k\) are no longer independent, so \(q\cdot k\) scales like \(d_h\) rather than \(\sqrt{d_h}\) by the law of large numbers, which is why μP prescribes \(1/d_h\) attention instead <a href="https://arxiv.org/abs/2203.03466">[Yang et al. 2022, Def. 4.1 and fn. 8]</a> (<a href="14-optimization.html">page 14</a>). Unbounded logit growth during training is a known source of instability, which QK-norm addresses (<a href="11-stability-tweaks.html">page 11</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Scaled logits (1/√d_h)</div>
+    <dl>
+      <dt>Problem</dt><dd>Unscaled dot products have variance \(d_h\), so at initialization the softmax is nearly one-hot and its gradient nearly zero.</dd>
+      <dt>Idea</dt><dd>Divide the logits by \(\sqrt{d_h}\), a fixed temperature.</dd>
+      <dt>Why it works</dt><dd>It restores unit logit variance under the i.i.d. assumption, so rows start broad (entropy 6.44 of 6.93 in the experiment above) and gradients reach many keys.</dd>
+      <dt>Evidence</dt><dd>Motivated by the observation that unscaled dot-product attention loses to additive attention at large \(d_k\) <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.1]</a>. The paper states the mechanism as a suspicion and gives no ablation of the scale itself; the simulation above measures the mechanism.</dd>
+      <dt>Cost</dt><dd>It fixes the scale at initialization only. It ties the effective learning rate of \(W^Q\) to the multiplier, and does not stop logits from growing during training.</dd>
+      <dt>Used by</dt><dd>Essentially all softmax-attention transformers. μP models use \(1/d_h\).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="softmax">Softmax: invariance, stability, temperature</h2>
+
+  <p>\(\softmax(z)_j = e^{z_j}/\sum_k e^{z_k}\). Three properties matter for implementations and for interviews.</p>
+
+  <p><strong>Shift invariance and the stable form.</strong> Adding a constant to every logit multiplies numerator and denominator by \(e^c\), so \(\softmax(z + c\mathbf{1}) = \softmax(z)\). Choosing \(c = -\max_k z_k\) makes every exponent \(\le 0\): each \(e^{\cdot}\) lies in \((0,1]\), the maximal entry contributes exactly 1, and the denominator lies in \([1, T]\), so there is neither overflow nor a zero denominator. This is <strong>numerical stability</strong> <span class="zh">数值稳定性</span> in one line. Without it, \(e^{z}\) overflows float32 for \(z > 88.72\) and float16 for \(z > 11.09\) (its maximum is 65504); the naive softmax of \([1000, 1001, 1002]\) is NaN (\(\infty/\infty\)), while the stable one gives \([0.090, 0.245, 0.665]\). Underflow after the shift is harmless: a weight that underflows to zero was negligible. The same trick gives the log-sum-exp \(\log\sum_j e^{z_j} = m + \log\sum_j e^{z_j - m}\) used in cross-entropy, and FlashAttention's online softmax maintains a running max and running sum so that the keys can be processed in blocks <a href="https://arxiv.org/abs/2205.14135">[Dao et al. 2022, §3.1]</a> (<a href="16-gpus-kernels.html">page 16</a>).</p>
+
+  <p><strong>Temperature.</strong> \(\softmax(z/\tau)\) interpolates between a hard argmax (\(\tau \to 0\)) and the uniform distribution (\(\tau \to \infty\)). The \(1/\sqrt{d_h}\) factor is a fixed \(\tau = \sqrt{d_h}\) on the attention logits. The same knob reappears at sampling time on the output logits (<a href="06-decoding-kv-cache.html">page 06</a>), but it is a different application.</p>
+
+  <p><strong>Convex combination.</strong> Because \(a_{ij} \ge 0\) and \(\sum_j a_{ij} = 1\), each output \(o_i = \sum_j a_{ij} v_j\) lies in the convex hull of the value vectors, so \(\|o_i\| \le \max_j \|v_j\|\). Three consequences follow. Attention cannot amplify: its output is bounded by the values it reads. A head cannot output "nothing": the weights must sum to one, so a head that wants to contribute almost nothing has to put its mass on tokens whose values contribute little (which is why <a href="#sinks">attention sinks</a> are useful). And a single head averages, blending everything it attends to into one vector, which is the motivation for <a href="#mha">multiple heads</a>.</p>
+
+<pre><code class="language-python">import torch
+
+def softmax(x, dim=-1):
+    m = x.amax(dim=dim, keepdim=True)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))   # all -inf slice: avoid (-inf) - (-inf) = nan
+    e = torch.exp(x - m)                                         # exponents &lt;= 0: no overflow
+    s = e.sum(dim=dim, keepdim=True)
+    return e / torch.where(s &gt; 0, s, torch.ones_like(s))         # fully masked slice → zeros, not nan
+
+def sdpa(q, k, v, mask=None):
+    # q: (..., T, d)  k: (..., S, d)  v: (..., S, d_v)  mask: bool, broadcastable to (..., T, S), True = keep
+    z = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5             # (..., T, S) logits
+    if mask is not None:
+        z = z.masked_fill(~mask, float("-inf"))                  # block BEFORE the softmax
+    return softmax(z, -1) @ v                                    # (..., T, d_v)
+</code></pre>
+  <p class="small muted">In production you call <code>torch.softmax</code> or <code>F.scaled_dot_product_attention</code>; writing the stable version by hand is the first drill. Practical rule: keep the softmax max and sum in float32 even for bf16 activations. The Hugging Face Llama code does <code>softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)</code>.</p>
+</section>
+
+<section>
+  <h2 id="causal">Causal masking</h2>
+
+  <p>A language model predicts token \(t+1\) from tokens \(\le t\). During training the whole sequence is available, so we feed it in one pass and must stop position \(t\) from reading positions after it. The <strong>causal mask</strong> <span class="zh">因果掩码</span> does this inside attention: add a matrix \(M\) to the logits before the softmax,</p>
+  <div class="eq-box">
+  \[ A = \softmax\!\Big(\frac{QK^\top}{\sqrt{d_h}} + M\Big), \qquad M_{ij} = \begin{cases} 0 & j \le i \\ -\infty & j \gt i \end{cases} \]
+  <div class="eq-label">Causal self-attention, T = S <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.3]</a></div>
+  </div>
+  <p>Since \(e^{-\infty} = 0\), blocked keys get weight exactly 0 and the remaining weights renormalize over \(j \le i\). The order matters. Zeroing the weights <em>after</em> the softmax would leave the denominator containing the future logits, so the weights on the past would still depend on the future (a leak), and the rows would not sum to one. Adding \(-\infty\) before the softmax is identical to taking the softmax over the allowed keys only.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 348" role="img" aria-labelledby="fig-03-1-title">
+<title id="fig-03-1-title">Causal mask matrices: square mask for training, end-aligned mask for a chunk of new queries over a cache, a single decode step, and the top-left aligned mask that F.scaled_dot_product_attention builds for is_causal=True when T is less than S</title>
+<text x="20" y="20" class="s-bold">(a) Training and prefill</text>
+<text x="20" y="36" class="s-small s-muted">T = S = 6</text>
+<rect class="s-a" x="44" y="72" width="22" height="22"/>
+<rect class="s-plain" x="66" y="72" width="22" height="22"/>
+<rect class="s-plain" x="88" y="72" width="22" height="22"/>
+<rect class="s-plain" x="110" y="72" width="22" height="22"/>
+<rect class="s-plain" x="132" y="72" width="22" height="22"/>
+<rect class="s-plain" x="154" y="72" width="22" height="22"/>
+<rect class="s-a" x="44" y="94" width="22" height="22"/>
+<rect class="s-a" x="66" y="94" width="22" height="22"/>
+<rect class="s-plain" x="88" y="94" width="22" height="22"/>
+<rect class="s-plain" x="110" y="94" width="22" height="22"/>
+<rect class="s-plain" x="132" y="94" width="22" height="22"/>
+<rect class="s-plain" x="154" y="94" width="22" height="22"/>
+<rect class="s-a" x="44" y="116" width="22" height="22"/>
+<rect class="s-a" x="66" y="116" width="22" height="22"/>
+<rect class="s-a" x="88" y="116" width="22" height="22"/>
+<rect class="s-plain" x="110" y="116" width="22" height="22"/>
+<rect class="s-plain" x="132" y="116" width="22" height="22"/>
+<rect class="s-plain" x="154" y="116" width="22" height="22"/>
+<rect class="s-a" x="44" y="138" width="22" height="22"/>
+<rect class="s-a" x="66" y="138" width="22" height="22"/>
+<rect class="s-a" x="88" y="138" width="22" height="22"/>
+<rect class="s-a" x="110" y="138" width="22" height="22"/>
+<rect class="s-plain" x="132" y="138" width="22" height="22"/>
+<rect class="s-plain" x="154" y="138" width="22" height="22"/>
+<rect class="s-a" x="44" y="160" width="22" height="22"/>
+<rect class="s-a" x="66" y="160" width="22" height="22"/>
+<rect class="s-a" x="88" y="160" width="22" height="22"/>
+<rect class="s-a" x="110" y="160" width="22" height="22"/>
+<rect class="s-a" x="132" y="160" width="22" height="22"/>
+<rect class="s-plain" x="154" y="160" width="22" height="22"/>
+<rect class="s-a" x="44" y="182" width="22" height="22"/>
+<rect class="s-a" x="66" y="182" width="22" height="22"/>
+<rect class="s-a" x="88" y="182" width="22" height="22"/>
+<rect class="s-a" x="110" y="182" width="22" height="22"/>
+<rect class="s-a" x="132" y="182" width="22" height="22"/>
+<rect class="s-a" x="154" y="182" width="22" height="22"/>
+<text x="55.0" y="66" text-anchor="middle" class="s-small s-muted">0</text>
+<text x="77.0" y="66" text-anchor="middle" class="s-small s-muted">1</text>
+<text x="99.0" y="66" text-anchor="middle" class="s-small s-muted">2</text>
+<text x="121.0" y="66" text-anchor="middle" class="s-small s-muted">3</text>
+<text x="143.0" y="66" text-anchor="middle" class="s-small s-muted">4</text>
+<text x="165.0" y="66" text-anchor="middle" class="s-small s-muted">5</text>
+<text x="36" y="87.0" text-anchor="end" class="s-small s-muted">0</text>
+<text x="36" y="109.0" text-anchor="end" class="s-small s-muted">1</text>
+<text x="36" y="131.0" text-anchor="end" class="s-small s-muted">2</text>
+<text x="36" y="153.0" text-anchor="end" class="s-small s-muted">3</text>
+<text x="36" y="175.0" text-anchor="end" class="s-small s-muted">4</text>
+<text x="36" y="197.0" text-anchor="end" class="s-small s-muted">5</text>
+<text x="20" y="226" class="s-small s-muted">row i = query, column j = key</text>
+<text x="20" y="242" class="s-small s-muted">keep iff j ≤ i</text>
+<text x="250" y="20" class="s-bold">(b) New tokens after a cache</text>
+<text x="250" y="36" class="s-small s-muted">T = 3 new queries, S = 7 keys (4 cached)</text>
+<rect class="s-a" x="272" y="72" width="22" height="22"/>
+<rect class="s-a" x="294" y="72" width="22" height="22"/>
+<rect class="s-a" x="316" y="72" width="22" height="22"/>
+<rect class="s-a" x="338" y="72" width="22" height="22"/>
+<rect class="s-a" x="360" y="72" width="22" height="22"/>
+<rect class="s-plain" x="382" y="72" width="22" height="22"/>
+<rect class="s-plain" x="404" y="72" width="22" height="22"/>
+<rect class="s-a" x="272" y="94" width="22" height="22"/>
+<rect class="s-a" x="294" y="94" width="22" height="22"/>
+<rect class="s-a" x="316" y="94" width="22" height="22"/>
+<rect class="s-a" x="338" y="94" width="22" height="22"/>
+<rect class="s-a" x="360" y="94" width="22" height="22"/>
+<rect class="s-a" x="382" y="94" width="22" height="22"/>
+<rect class="s-plain" x="404" y="94" width="22" height="22"/>
+<rect class="s-a" x="272" y="116" width="22" height="22"/>
+<rect class="s-a" x="294" y="116" width="22" height="22"/>
+<rect class="s-a" x="316" y="116" width="22" height="22"/>
+<rect class="s-a" x="338" y="116" width="22" height="22"/>
+<rect class="s-a" x="360" y="116" width="22" height="22"/>
+<rect class="s-a" x="382" y="116" width="22" height="22"/>
+<rect class="s-a" x="404" y="116" width="22" height="22"/>
+<text x="283.0" y="66" text-anchor="middle" class="s-small s-muted">0</text>
+<text x="305.0" y="66" text-anchor="middle" class="s-small s-muted">1</text>
+<text x="327.0" y="66" text-anchor="middle" class="s-small s-muted">2</text>
+<text x="349.0" y="66" text-anchor="middle" class="s-small s-muted">3</text>
+<text x="371.0" y="66" text-anchor="middle" class="s-small s-muted">4</text>
+<text x="393.0" y="66" text-anchor="middle" class="s-small s-muted">5</text>
+<text x="415.0" y="66" text-anchor="middle" class="s-small s-muted">6</text>
+<text x="264" y="87.0" text-anchor="end" class="s-small s-muted">4</text>
+<text x="264" y="109.0" text-anchor="end" class="s-small s-muted">5</text>
+<text x="264" y="131.0" text-anchor="end" class="s-small s-muted">6</text>
+<text x="250" y="66" text-anchor="start" class="s-small s-muted"></text>
+<path class="s-line" d="M272,146 L272,151 L360,151 L360,146"/>
+<text x="316" y="165" text-anchor="middle" class="s-small">cached</text>
+<path class="s-line" d="M362,146 L362,151 L426,151 L426,146"/>
+<text x="393" y="165" text-anchor="middle" class="s-small">new</text>
+<text x="250" y="184" class="s-small s-muted">row labels: absolute position i + (S − T)</text>
+<text x="250" y="200" class="s-small s-muted">keep iff j ≤ i + (S − T)</text>
+<text x="250" y="244" class="s-bold">(c) One decode step</text>
+<text x="250" y="260" class="s-small s-muted">T = 1, S = 7: the mask is all True</text>
+<rect class="s-a" x="272" y="276" width="22" height="22"/>
+<rect class="s-a" x="294" y="276" width="22" height="22"/>
+<rect class="s-a" x="316" y="276" width="22" height="22"/>
+<rect class="s-a" x="338" y="276" width="22" height="22"/>
+<rect class="s-a" x="360" y="276" width="22" height="22"/>
+<rect class="s-a" x="382" y="276" width="22" height="22"/>
+<rect class="s-a" x="404" y="276" width="22" height="22"/>
+<text x="264" y="291.0" text-anchor="end" class="s-small s-muted">6</text>
+<text x="490" y="20" class="s-bold">(d) The is_causal=True trap</text>
+<text x="490" y="36" class="s-small s-muted">T = 3, S = 7, top-left aligned</text>
+<rect class="s-a" x="512" y="72" width="22" height="22"/>
+<rect class="s-e" x="534" y="72" width="22" height="22"/>
+<rect class="s-e" x="556" y="72" width="22" height="22"/>
+<rect class="s-e" x="578" y="72" width="22" height="22"/>
+<rect class="s-e" x="600" y="72" width="22" height="22"/>
+<rect class="s-plain" x="622" y="72" width="22" height="22"/>
+<rect class="s-plain" x="644" y="72" width="22" height="22"/>
+<rect class="s-a" x="512" y="94" width="22" height="22"/>
+<rect class="s-a" x="534" y="94" width="22" height="22"/>
+<rect class="s-e" x="556" y="94" width="22" height="22"/>
+<rect class="s-e" x="578" y="94" width="22" height="22"/>
+<rect class="s-e" x="600" y="94" width="22" height="22"/>
+<rect class="s-e" x="622" y="94" width="22" height="22"/>
+<rect class="s-plain" x="644" y="94" width="22" height="22"/>
+<rect class="s-a" x="512" y="116" width="22" height="22"/>
+<rect class="s-a" x="534" y="116" width="22" height="22"/>
+<rect class="s-a" x="556" y="116" width="22" height="22"/>
+<rect class="s-e" x="578" y="116" width="22" height="22"/>
+<rect class="s-e" x="600" y="116" width="22" height="22"/>
+<rect class="s-e" x="622" y="116" width="22" height="22"/>
+<rect class="s-e" x="644" y="116" width="22" height="22"/>
+<text x="523.0" y="66" text-anchor="middle" class="s-small s-muted">0</text>
+<text x="545.0" y="66" text-anchor="middle" class="s-small s-muted">1</text>
+<text x="567.0" y="66" text-anchor="middle" class="s-small s-muted">2</text>
+<text x="589.0" y="66" text-anchor="middle" class="s-small s-muted">3</text>
+<text x="611.0" y="66" text-anchor="middle" class="s-small s-muted">4</text>
+<text x="633.0" y="66" text-anchor="middle" class="s-small s-muted">5</text>
+<text x="655.0" y="66" text-anchor="middle" class="s-small s-muted">6</text>
+<text x="504" y="87.0" text-anchor="end" class="s-small s-muted">4</text>
+<text x="504" y="109.0" text-anchor="end" class="s-small s-muted">5</text>
+<text x="504" y="131.0" text-anchor="end" class="s-small s-muted">6</text>
+<text x="490" y="165" class="s-small">the newest query (position 6) sees</text>
+<text x="490" y="181" class="s-small">only keys 0 to 2 and misses the cache</text>
+<text x="490" y="197" class="s-small s-muted">no error is raised: outputs are just wrong</text>
+<rect class="s-a" x="20" y="322" width="14" height="12" rx="2"/><text x="40" y="333" class="s-small">may attend (mask True)</text>
+<rect class="s-plain" x="200" y="322" width="14" height="12" rx="2"/><text x="220" y="333" class="s-small">blocked (−∞ added to the logit)</text>
+<rect class="s-e" x="430" y="322" width="14" height="12" rx="2"/><text x="450" y="333" class="s-small">should attend but the top-left mask blocks it</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Mask matrices, rows are queries and columns are keys. (a) The standard lower triangle for training. (b) When \(T\) new tokens follow a cache, query \(i\) sits at absolute position \(i + (S-T)\), so the triangle is shifted right: the mask is <em>end-aligned</em>. (c) A single decode step sees every cached key. (d) The trap: <code>F.scaled_dot_product_attention(..., is_causal=True)</code> aligns the triangle to the top-left, which is wrong whenever \(T \lt S\).</figcaption>
+  </figure>
+
+  <h3 id="parallel">Why training on all positions in parallel is exact</h3>
+  <p>Claim: with a causal mask (and per-position MLPs, norms and residuals), the hidden state at position \(t\) in every layer depends only on the tokens \(x_{\le t}\). Proof by induction over layers. The embedding \(h^0_t\) depends on \(x_t\) alone. In layer \(\ell\), the attention output at \(t\) is \(\sum_{j\le t} a_{tj} v_j\), where \(a_t\) and every \(v_j\) with \(j \le t\) are functions of \(h^{\ell-1}_{\le t}\); the MLP, norms and residual act on each position separately. So \(h^\ell_t\) is a function of \(h^{\ell-1}_{\le t}\), hence of \(x_{\le t}\). Therefore the output at position \(t\) is <em>identical</em> to what a forward pass on the prefix \(x_{1:t}\) alone would produce. One pass over a length-\(T\) sequence yields \(T\) exact next-token predictions \(p(x_{t+1}\mid x_{\le t})\), and the summed loss is exactly the sum of \(T\) prefix losses with exact gradients. Conditioning on the true prefix at every position is <strong>teacher forcing</strong> <span class="zh">教师强制</span> (<a href="01-big-picture.html">page 01</a>).</p>
+  <p>Generation cannot do this because \(x_{t+1}\) does not exist until it is sampled: each new token needs its own forward pass, conditioned on the previous one. Shazeer states the asymmetry directly: during training the target sequence is known and the layer can be computed in parallel, but at inference the output of the layer at one position affects the input at the next, and this dependency prevents parallel computation <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.4]</a>. The KV cache (<a href="06-decoding-kv-cache.html">page 06</a>) exists to avoid recomputing the prefix's keys and values at every step. The consequence for hardware is that a training step processes thousands of positions per sequence (compute-bound), while a decode step processes one new position per sequence (memory-bound, <a href="07-kv-efficient-attention.html">page 07</a>).</p>
+
+  <h3 id="end-aligned">The end-aligned mask with a cache</h3>
+  <p>With a cache, keys cover \(S\) positions (\(S - T\) cached plus \(T\) new) while only \(T\) queries are computed. The \(T\) queries are the <em>last</em> \(T\) positions, so query \(i\) (0-based among the new ones) sits at absolute position \(S - T + i\) and may attend to key \(j\) iff \(j \le i + (S-T)\). Three regimes fall out: \(T = S\) is the ordinary triangle; \(T = 1\) is one decode step and the mask is all True; \(1 \lt T \lt S\) is chunked prefill or the verification pass of speculative decoding (<a href="17-inference-serving.html">page 17</a>).</p>
+
+<pre><code class="language-python">def causal_mask(T, S=None, device=None):
+    S = T if S is None else S
+    i = torch.arange(T, device=device)[:, None] + (S - T)   # absolute position of each query
+    j = torch.arange(S, device=device)[None, :]
+    return j &lt;= i                                            # (T, S), True = may attend
+</code></pre>
+
+  <h3 id="packing">Packed sequences and document masks</h3>
+  <p>Pretraining packs many documents into each fixed-length sequence, so a plain causal mask lets a token attend to unrelated documents earlier in the same sequence. A <strong>document mask</strong> adds the condition that query and key belong to the same document: \(M_{ij} = 0\) iff \(j \le i\) and \(\mathrm{doc}(i) = \mathrm{doc}(j)\), a block-diagonal lower triangle. Every row keeps its diagonal, so no row is fully masked. Whether it matters is a live design choice: Llama 3 uses it and reports "limited impact" in standard pretraining but importance in continued pretraining on very long sequences <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>, while DeepSeek-V3 packs documents but does "not incorporate cross-sample attention masking during training" <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.1]</a>.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: <code>is_causal=True</code> is top-left aligned</div>
+    <p>PyTorch's reference implementation of <code>F.scaled_dot_product_attention</code> builds <code>torch.ones(L, S).tril(diagonal=0)</code> for <code>is_causal=True</code>. For \(T = S\) this is right. For \(T \lt S\) it lets the newest query see only the first \(T\) keys. Nothing raises an error; the outputs are silently wrong. (Checked on PyTorch 2.14: <code>is_causal=True</code> equals the top-left mask and differs from the end-aligned one.) With a cache, pass an explicit end-aligned mask.</p>
+  </aside>
+
+  <h3 id="nan">Fully masked rows and the NaN loss</h3>
+  <p>If a query has no allowed key, every logit in its row is \(-\infty\). The stable softmax computes \(z - \max z = (-\infty) - (-\infty) = \text{NaN}\); even the naive form gives \(0/0\). Rows like this appear with left-padded batches (a pad query can only see pad keys), with a padding mask combined with a causal or sliding-window mask, or with an end-aligned mask when \(S \lt T\) by mistake. The NaN then poisons everything: it enters the residual stream, and excluding that position from the loss does not help, because in the backward pass a zero loss weight multiplied by a NaN activation gradient is still NaN (\(0\times\text{NaN} = \text{NaN}\)), so the weights receive NaN gradients. Three fixes:</p>
+  <ol>
+    <li><strong>Never build such rows.</strong> Guarantee that every query may attend to at least one key (for example, pad queries attend to themselves or to a BOS token). This is the cleanest fix.</li>
+    <li><strong>Use the smallest finite number</strong> (<code>torch.finfo(dtype).min</code>) instead of \(-\infty\). The row becomes uniform over its masked keys: finite but meaningless, so it must be excluded from the loss. Do not stack two additive masks that each hold <code>finfo.min</code>: their sum overflows to \(-\infty\) in the same dtype.</li>
+    <li><strong>Safe softmax:</strong> return zeros for rows with no allowed key, as the <code>softmax</code> above does. Recent PyTorch returns zeros for such rows in <code>F.scaled_dot_product_attention</code> (checked on 2.14, CPU), whereas a hand-written <code>masked_fill(-inf).softmax</code> returns NaN, so do not rely on backend-specific behavior.</li>
+  </ol>
+
+  <div class="decision">
+    <div class="decision-title">Causal mask as an additive −∞ before the softmax</div>
+    <dl>
+      <dt>Problem</dt><dd>Position \(t\) must not see positions after it, yet we want all \(T\) next-token predictions from one parallel pass.</dd>
+      <dt>Idea</dt><dd>Add \(-\infty\) to the logits of future keys before the softmax.</dd>
+      <dt>Why it works</dt><dd>\(e^{-\infty}=0\) removes future keys from both numerator and denominator, so each row is a proper distribution over the past, and by the induction above every hidden state depends only on the prefix.</dd>
+      <dt>Evidence</dt><dd>Vaswani et al. implement it "by masking out (setting to \(-\infty\)) all values in the input of the softmax which correspond to illegal connections" <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.3]</a>; Shazeer's batched code adds a mask tensor to the logits <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.3]</a>.</dd>
+      <dt>Cost</dt><dd>Half of the score matrix is wasted unless the kernel skips fully masked blocks; FlashAttention-2 skips them for about a 1.7 to 1.8× speedup over the unmasked case <a href="https://arxiv.org/abs/2307.08691">[Dao 2023, §3.1.1]</a>. Fully masked rows produce NaN unless handled.</dd>
+      <dt>Used by</dt><dd>Every decoder-only LM. Encoder-style models (BERT, your jet tagger) use only padding masks.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="mha">Multi-head attention</h2>
+
+  <p>One attention head produces, for each query, a single weighted average of the values: whatever it attends to is blended into one vector. <strong>Multi-head attention</strong> <span class="zh">多头注意力</span> runs \(n_h\) attentions in parallel, each in its own low-dimensional subspace with its own softmax, and concatenates the results. Vaswani et al. put the motivation in one sentence: "Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this" <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.2]</a>.</p>
+
+  <div class="eq-box">
+  \[ \begin{aligned} \mathrm{head}_i &= \operatorname{Attn}(XW^Q_i,\ XW^K_i,\ XW^V_i)\\ \mathrm{MHA}(X) &= \concat(\mathrm{head}_1,\dots,\mathrm{head}_{n_h})\,W^O \end{aligned} \]
+  <div class="eq-label">\(W^Q_i, W^K_i, W^V_i \in \R^{d\times d_h}\), \(W^O \in \R^{n_h d_h \times d}\), and usually \(d_h = d/n_h\)</div>
+  </div>
+  <p>In practice the per-head matrices are stored as one \(d \times d\) matrix for each of \(Q\), \(K\), \(V\): head \(i\) owns columns \(i\,d_h\) to \((i+1)\,d_h - 1\). Splitting \(W^O\) into row blocks \(W^O_i \in \R^{d_h \times d}\) shows that concatenate-then-project equals \(\sum_i \mathrm{head}_i W^O_i\): each head writes its own \(d_h\)-dimensional output into the residual stream through its own slice of \(W^O\). This additive view is the one used in mechanistic interpretability, and it matches Shazeer's einsum formulation, where the output projection carries a head index <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.2]</a>.</p>
+
+  <h3 id="mechanics">Reshape and transpose mechanics</h3>
+  <p>The whole thing is six matmuls (four projections and the two attention products) and two reshapes, and the reshapes are where bugs live. Figure 2 shows every intermediate shape; the code below is a complete causal implementation (this is the drill).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 566" role="img" aria-labelledby="fig-03-2-title">
+<title id="fig-03-2-title">Shape flow of causal multi-head attention: hidden states to Q, K, V, split into heads, logits, mask, softmax, weighted sum of values, merge heads, output projection</title>
+<defs><marker id="arrow-03-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="30" y="12" width="350" height="44" rx="6"/>
+<text x="42" y="30" class="s-bold">x: hidden states</text>
+<text x="42" y="47" class="s-mono">(B, T, d)</text>
+<text x="402" y="38.0" class="s-small s-muted">one row vector per token</text>
+<path class="s-line" d="M205.0,56 L205.0,70" marker-end="url(#arrow-03-2)"/>
+<rect class="s-a" x="30" y="70" width="350" height="44" rx="6"/>
+<text x="42" y="88" class="s-bold">Q = xW<tspan baseline-shift="super" font-size="9">Q</tspan>,  K = xW<tspan baseline-shift="super" font-size="9">K</tspan>,  V = xW<tspan baseline-shift="super" font-size="9">V</tspan></text>
+<text x="42" y="105" class="s-mono">3 × (B, T, d)</text>
+<text x="402" y="88.5" class="s-small s-muted">learned projections; often fused into one</text>
+<text x="402" y="103.5" class="s-small s-muted">d → 3d matmul</text>
+<path class="s-line" d="M205.0,114 L205.0,128" marker-end="url(#arrow-03-2)"/>
+<rect class="s-plain" x="30" y="128" width="350" height="44" rx="6"/>
+<text x="42" y="146" class="s-bold">split into heads: view + transpose</text>
+<text x="42" y="163" class="s-mono">3 × (B, n<tspan baseline-shift="sub" font-size="9">h</tspan>, T, d<tspan baseline-shift="sub" font-size="9">h</tspan>)</text>
+<text x="402" y="146.5" class="s-small s-muted">d = n<tspan baseline-shift="sub" font-size="9">h</tspan>·d<tspan baseline-shift="sub" font-size="9">h</tspan>; head h owns columns</text>
+<text x="402" y="161.5" class="s-small s-muted">h·d<tspan baseline-shift="sub" font-size="9">h</tspan> to (h+1)·d<tspan baseline-shift="sub" font-size="9">h</tspan> − 1 of the d axis</text>
+<path class="s-line" d="M205.0,172 L205.0,186" marker-end="url(#arrow-03-2)"/>
+<rect class="s-b" x="30" y="186" width="350" height="44" rx="6"/>
+<text x="42" y="204" class="s-bold">logits  Z = Q Kᵀ / √d<tspan baseline-shift="sub" font-size="9">h</tspan></text>
+<text x="42" y="221" class="s-mono">(B, n<tspan baseline-shift="sub" font-size="9">h</tspan>, T, S)</text>
+<text x="402" y="204.5" class="s-small s-muted">2·T·S·d<tspan baseline-shift="sub" font-size="9">h</tspan> FLOPs per head</text>
+<text x="402" y="219.5" class="s-small s-muted">this T × S matrix is the quadratic part</text>
+<path class="s-line" d="M205.0,230 L205.0,244" marker-end="url(#arrow-03-2)"/>
+<rect class="s-b" x="30" y="244" width="350" height="44" rx="6"/>
+<text x="42" y="262" class="s-bold">mask: Z + M,  M = −∞ where blocked</text>
+<text x="42" y="279" class="s-mono">(B, n<tspan baseline-shift="sub" font-size="9">h</tspan>, T, S)</text>
+<text x="402" y="262.5" class="s-small s-muted">M is (T, S), broadcast over batch and heads</text>
+<text x="402" y="277.5" class="s-small s-muted">end-aligned when S > T (a cache exists)</text>
+<path class="s-line" d="M205.0,288 L205.0,302" marker-end="url(#arrow-03-2)"/>
+<rect class="s-b" x="30" y="302" width="350" height="44" rx="6"/>
+<text x="42" y="320" class="s-bold">softmax over the key axis</text>
+<text x="42" y="337" class="s-mono">A: (B, n<tspan baseline-shift="sub" font-size="9">h</tspan>, T, S)</text>
+<text x="402" y="320.5" class="s-small s-muted">rows sum to 1; blocked keys get exactly 0</text>
+<text x="402" y="335.5" class="s-small s-muted">accumulate in fp32</text>
+<path class="s-line" d="M205.0,346 L205.0,360" marker-end="url(#arrow-03-2)"/>
+<rect class="s-c" x="30" y="360" width="350" height="44" rx="6"/>
+<text x="42" y="378" class="s-bold">weighted sum of values: A V</text>
+<text x="42" y="395" class="s-mono">(B, n<tspan baseline-shift="sub" font-size="9">h</tspan>, T, d<tspan baseline-shift="sub" font-size="9">h</tspan>)</text>
+<text x="402" y="378.5" class="s-small s-muted">2·T·S·d<tspan baseline-shift="sub" font-size="9">h</tspan> FLOPs per head</text>
+<text x="402" y="393.5" class="s-small s-muted">each row is a convex combination of value rows</text>
+<path class="s-line" d="M205.0,404 L205.0,418" marker-end="url(#arrow-03-2)"/>
+<rect class="s-plain" x="30" y="418" width="350" height="44" rx="6"/>
+<text x="42" y="436" class="s-bold">merge heads: transpose + reshape</text>
+<text x="42" y="453" class="s-mono">(B, T, n<tspan baseline-shift="sub" font-size="9">h</tspan>·d<tspan baseline-shift="sub" font-size="9">h</tspan>) = (B, T, d)</text>
+<text x="402" y="436.5" class="s-small s-muted">transpose(1, 2) is non-contiguous,</text>
+<text x="402" y="451.5" class="s-small s-muted">so use reshape, not view</text>
+<path class="s-line" d="M205.0,462 L205.0,476" marker-end="url(#arrow-03-2)"/>
+<rect class="s-a" x="30" y="476" width="350" height="44" rx="6"/>
+<text x="42" y="494" class="s-bold">output projection W<tspan baseline-shift="super" font-size="9">O</tspan></text>
+<text x="42" y="511" class="s-mono">(B, T, d)</text>
+<text x="402" y="494.5" class="s-small s-muted">mixes the heads; each head writes through</text>
+<text x="402" y="509.5" class="s-small s-muted">its own d<tspan baseline-shift="sub" font-size="9">h</tspan> × d slice of W<tspan baseline-shift="super" font-size="9">O</tspan></text>
+<rect class="s-a" x="30" y="540" width="14" height="12" rx="2"/><text x="50" y="551" class="s-small">learned weights</text>
+<rect class="s-b" x="170" y="540" width="14" height="12" rx="2"/><text x="190" y="551" class="s-small">T × S tensors (memory and FLOPs grow as T²)</text>
+<rect class="s-c" x="470" y="540" width="14" height="12" rx="2"/><text x="490" y="551" class="s-small">reads V, output is T × d</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Shape flow of causal multi-head attention. Blue boxes are learned matrices, orange boxes are the \(T \times S\) tensors that make attention quadratic, and the two grey boxes are pure reshapes. Heads behave like an extra batch axis in the middle stages: no data moves between heads until the merge and \(W^O\).</figcaption>
+  </figure>
+
+<pre><code class="language-python">import math, torch
+import torch.nn as nn
+
+class CausalMHA(nn.Module):
+    def __init__(self, d, n_heads):
+        super().__init__()
+        assert d % n_heads == 0
+        self.h, self.dh = n_heads, d // n_heads
+        self.qkv = nn.Linear(d, 3 * d, bias=False)           # fused W^Q | W^K | W^V
+        self.o = nn.Linear(d, d, bias=False)                 # W^O
+
+    def forward(self, x):                                    # x: (B, T, d)
+        B, T, d = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)               # each (B, T, d)
+        q, k, v = (t.view(B, T, self.h, self.dh).transpose(1, 2) for t in (q, k, v))  # (B, h, T, dh)
+        z = q @ k.transpose(-1, -2) / math.sqrt(self.dh)     # (B, h, T, T)
+        blocked = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)         # j &gt; i
+        a = z.masked_fill(blocked, float("-inf")).softmax(-1)                         # rows sum to 1
+        o = (a @ v).transpose(1, 2).reshape(B, T, d)         # (B, h, T, dh) → (B, T, h*dh)
+        return self.o(o)
+</code></pre>
+  <p>The usual bugs, in order of frequency: calling <code>.view(B, h, T, dh)</code> directly on a \((B,T,d)\) tensor (this is legal, silently mixes tokens into heads, and passes shape checks); forgetting that <code>transpose</code> returns a non-contiguous tensor, so the final merge needs <code>reshape</code> (or <code>.contiguous().view</code>); scaling by \(\sqrt{d}\) instead of \(\sqrt{d_h}\); and applying the mask after the softmax. For \(T = S\) the production replacement is <code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code>, which dispatches to a fused FlashAttention-style kernel when available.</p>
+
+  <h3 id="params">Parameters and FLOPs</h3>
+  <p>Each of \(W^Q, W^K, W^V, W^O\) is \(d \times (n_h d_h)\) or its transpose, so with \(n_h d_h = d\) and no biases, an attention layer has <strong>\(4d^2\)</strong> parameters regardless of \(n_h\). The general count, with \(n_{kv}\) key/value heads (<a href="07-kv-efficient-attention.html">page 07</a>), is \(d\,d_h\,(2n_h + 2n_{kv})\). For Llama-3-8B (\(d = 4096\), \(n_h = 32\), \(n_{kv} = 8\), \(d_h = 128\)):</p>
+  \[ \begin{aligned} 4096 \cdot 128 \cdot (2\cdot 32 + 2\cdot 8) &= 41{,}943{,}040 \approx 41.9\text{M}\\ \text{plain MHA: } 4 \cdot 4096^2 &= 67{,}108{,}864 \approx 67.1\text{M} \end{aligned} \]
+  <p>Matmul FLOPs do not depend on the number of heads: each head's \(QK^\top\) costs \(2\,T S\,d_h\), and \(n_h\) heads with \(n_h d_h = d\) cost \(2\,TSd\), the same as one head of width \(d\). The same holds for \(AV\). Vaswani et al.: "Due to the reduced dimension of each head, the total computational cost is similar to that of single-head attention with full dimensionality" <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.2.2]</a>. What heads do change is the score memory (\(n_h\times\) larger) and the number of softmaxes.</p>
+
+  <h3 id="why-heads">Why heads help, and what is known</h3>
+  <p>Each head has its own softmax, so a token can take one weighted average of the previous token and, in the same layer, another of a distant subject, without blending them; and each head has its own rank-\(d_h\) similarity form \(W^Q_i (W^K_i)^\top\), so different heads can measure different kinds of relatedness. Evidence at constant compute comes from the original ablation on WMT14 English-German (base model: \(d = 512\), 65M parameters):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Heads \(h\)</th><th class="num">\(d_k = d_v\)</th><th class="num">Dev PPL</th><th class="num">Dev BLEU</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="num">512</td><td class="num">5.29</td><td class="num">24.9</td></tr>
+      <tr><td>4</td><td class="num">128</td><td class="num">5.00</td><td class="num">25.5</td></tr>
+      <tr class="hl"><td>8 (base)</td><td class="num">64</td><td class="num">4.92</td><td class="num">25.8</td></tr>
+      <tr><td>16</td><td class="num">32</td><td class="num">4.91</td><td class="num">25.8</td></tr>
+      <tr><td>32</td><td class="num">16</td><td class="num">5.01</td><td class="num">25.4</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: Vaswani et al. 2017, Table 3 rows (A). Single runs, per-wordpiece perplexity. The authors note that single-head attention is 0.9 BLEU worse than the best setting and that quality also drops with too many heads <a href="https://arxiv.org/abs/1706.03762">[§6.2]</a>. Directional evidence at small scale, not a law.</p>
+
+  <p>The drop at 32 heads is the <strong>low-rank bottleneck</strong> <span class="zh">低秩瓶颈</span>. With \(d\) fixed, more heads means smaller \(d_h\), and each head's logit matrix \(XW^Q_i(XW^K_i)^\top\) has rank at most \(d_h\). Bhojanapalli et al. prove that if \(d_h \lt T\), there are inputs and target attention patterns that a head cannot represent (their Theorem 1 needs \(d_h \ge T\) to represent any pattern). They show that BERT-large (24 layers, \(d = 1024\), 336M parameters, sequences of 128 tokens) gets worse when going from 8 to 16 to 32 heads at fixed parameters (SQuAD F1 90.89, 90.61, 90.45), and propose decoupling the head size from \(d/n_h\) <a href="https://arxiv.org/abs/2002.07028">[Bhojanapalli et al. 2020, Thm. 1, Tab. 1]</a>. Read it critically: the theorem is a worst-case representability statement, not a measurement of what trained models need, and LLMs run \(T\) in the thousands with \(d_h\) of 64 to 256 and work well, which suggests that real attention patterns need far less than arbitrary expressivity. The practical lesson did stick, though: <strong>\(d_h\) is a free hyperparameter, not necessarily \(d/n_h\)</strong>. Gemma-7B has \(d = 3072\) with 16 heads of size 256 (\(n_hd_h = 4096\)) <a href="https://arxiv.org/abs/2403.08295">[Gemma 2024, Tab. 1]</a>; gpt-oss has \(d = 2880\) with 64 query heads of dimension 64 (\(n_hd_h = 4096\)) <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>; DeepSeek-V3 has \(d = 7168\) with 128 heads of dimension 128 (\(n_hd_h = 16384\)) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.2]</a>. In those models \(W^Q\) is \(d \times n_hd_h\), not \(d\times d\), and the general parameter formula above applies.</p>
+
+  <div class="decision">
+    <div class="decision-title">Multi-head attention</div>
+    <dl>
+      <dt>Problem</dt><dd>A single softmax gives one weighted average per query, so information from several attended positions is blended into one vector.</dd>
+      <dt>Idea</dt><dd>Run \(n_h\) attentions in \(d_h\)-dimensional subspaces, concatenate, and mix with \(W^O\).</dd>
+      <dt>Why it works</dt><dd>Each head has its own distribution over positions and its own similarity form, at the same matmul FLOPs and \(4d^2\) parameters as one wide head.</dd>
+      <dt>Evidence</dt><dd>Constant-compute ablation: 1 head loses 0.9 BLEU and 0.37 PPL against the base 8 heads <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, Tab. 3(A)]</a>. Heads visibly specialize, as in the syntax-related patterns shown in that paper's appendix, and some implement identifiable circuits (<a href="#heads">below</a>).</dd>
+      <dt>Cost</dt><dd>\(n_h\times\) the score memory and softmax work; \(d_h\) shrinks as \(n_h\) grows at fixed \(d\); the KV cache grows with the number of key/value heads (<a href="07-kv-efficient-attention.html">page 07</a>).</dd>
+      <dt>Used by</dt><dd>All transformers. Llama-3-8B: 32 query heads of dimension 128 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 3]</a>; the original base model: 8 heads of dimension 64.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="permutation">Permutation equivariance, and why LLMs need positions</h2>
+
+  <p>A function \(f\) is <strong>permutation-equivariant</strong> <span class="zh">排列等变性</span> if permuting the input rows permutes the output rows the same way: \(f(\Pi X) = \Pi f(X)\) for every permutation matrix \(\Pi\). Self-attention without a mask and without positional information has this property. Proof: with \(Q' = \Pi X W^Q = \Pi Q\), and likewise \(K' = \Pi K\), \(V' = \Pi V\), the logits become \(Z' = \Pi Q (\Pi K)^\top/\sqrt{d_h} = \Pi Z \Pi^\top\). A row-wise softmax commutes with this: permuting rows only relabels queries, and permuting columns permutes the arguments of each row's softmax, which is symmetric in its arguments. So \(A' = \Pi A \Pi^\top\) and \(O' = \Pi A \Pi^\top \Pi V = \Pi A V = \Pi O\). Position-wise MLPs, norms and residuals act on each token separately, so a whole stack without positional information is equivariant (Lee et al. use exactly this in the Set Transformer, where equivariant attention blocks are followed by an invariant pooling <a href="https://arxiv.org/abs/1810.00825">[Lee et al. 2019, §3]</a>).</p>
+
+  <p><strong>Implication.</strong> Such a model sees a bag of tokens: "dog bites man" and "man bites dog" produce the same token representations up to reordering, so order is invisible. Language models must inject order: sinusoidal or learned vectors added at the input, rotations of \(q\) and \(k\) (RoPE), or biases added to the logits (ALiBi, relative biases). Those are the subject of <a href="05-positional-encoding.html">page 05</a>. The causal mask itself is <em>not</em> equivariant, because different queries see different numbers of keys <a href="https://arxiv.org/abs/1908.11775">[Tsai et al. 2019, Prop. 1]</a>, so some order information leaks in. How much a decoder can recover from that alone is the "NoPE" question on <a href="05-positional-encoding.html">page 05</a>. One small data point: on WikiText-103 language modeling, removing positional embeddings from a decoder-only model left perplexity almost unchanged (30.92 without versus 30.97 with sinusoidal embeddings), whereas in translation, removing them from the whole encoder-decoder model collapsed BLEU from 34.71 to 14.47 (their kernel variant) <a href="https://arxiv.org/abs/1908.11775">[Tsai et al. 2019, Tab. 3]</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Equivariance is exactly why plain attention suited your tagger. Particle Transformer treats a jet as a particle cloud and adds no positional encoding "as the particles in a jet are permutation invariant"; a class token that attends over all particles then gives an invariant readout <a href="https://arxiv.org/abs/2202.03772">[Qu et al. 2022, §4]</a>. Its P-MHA adds pairwise physics features \(U\) to the logits, \(\softmax(QK^\top/\sqrt{d_k} + U)V\) (their Eq. 4), which is the same additive-bias mechanism that language models use for relative positions. A language model needs the opposite symmetry: it must know order, and it must be causal. Positional information, which you could drop, is what you must add back.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="cost">Cost: FLOPs, memory, and where \(T^2\) bites</h2>
+
+  <p><strong>FLOPs.</strong> Per head, \(QK^\top\) multiplies a \(T\times d_h\) matrix by a \(d_h\times S\) matrix: \(TSd_h\) multiply-adds, that is \(2TSd_h\) FLOPs. \(AV\) costs the same. Summing over \(n_h\) heads with \(n_hd_h = d\), and setting \(S = T\):</p>
+  <div class="eq-box">
+  \[ \text{FLOPs}_{\text{attn}} = 2T^2d + 2T^2d = 4T^2d \quad\text{per layer, per sequence, forward} \]
+  <div class="eq-label">Multiply-add = 2 FLOPs. The projections add \(8Td^2\) (MHA). Fused kernels that skip fully masked blocks do about half.</div>
+  </div>
+  <p>Vaswani's Table 1 gives the same order, \(O(n^2\cdot d)\) per layer, with \(O(1)\) sequential operations and \(O(1)\) maximum path length between positions, and observes that self-attention is cheaper than a recurrent layer when \(n \lt d\) <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, Tab. 1, §4]</a>. For LLMs \(n \gg d\): the quadratic term is the price paid for constant path length. Training multiplies the forward cost by 3 (forward plus backward, which is why the widely used model-FLOPs formula is \(6TN + 12\,L\,d\,T^2\) per sequence of \(T\) tokens <a href="https://arxiv.org/abs/2307.08691">[Dao 2023, §4.2]</a>; the first term is the familiar \(6ND\) of <a href="13-scaling-laws.html">page 13</a>, the second is the attention correction).</p>
+
+  <p><strong>Memory.</strong> A naive implementation materializes the logits \(Z\) and the weights \(A\), each with \(B\cdot n_h\cdot T\cdot S\) elements, and the backward pass needs the weights again unless they are recomputed <a href="https://arxiv.org/abs/2205.14135">[Dao et al. 2022, Alg. 0]</a>, <a href="https://arxiv.org/abs/2307.08691">[Dao 2023, §2.2]</a>.</p>
+
+  <h3 id="cost-numbers">Worked numbers: Llama-3-8B width</h3>
+  <p>Use \(d = 4096\), \(n_h = 32\), \(d_{ff} = 14336\) (SwiGLU). Per-layer matrix parameters, as counted on <a href="04-transformer-block.html">page 04</a> (which also adds 8,192 RMSNorm weights, negligible here): attention \(2\cdot 4096^2 + 2\cdot 4096\cdot 1024 = 41{,}943{,}040\); MLP \(3\cdot 4096\cdot 14336 = 176{,}160{,}768\); total \(P = 218{,}103{,}808\). Each weight takes part in one multiply-add per token, so the linear layers cost \(2P = 436{,}207{,}616\) FLOPs per token per layer, that is \(2PT\) for a sequence. Dividing:</p>
+  <div class="eq-box">
+  \[ \begin{aligned} \frac{\text{attention FLOPs}}{\text{linear FLOPs}} &= \frac{4T^2d}{2PT} = \frac{2Td}{P} \approx \frac{T}{6d}\quad(P \approx 12d^2)\\ T^\ast &= \frac{P}{2d} = \frac{218{,}103{,}808}{8192} = 26{,}624 \end{aligned} \]
+  <div class="eq-label">Llama-3-8B has \(P = 13.0\,d^2\), so attention overtakes the linear layers at \(T^\ast = 6.5\,d\). With causal block skipping the crossover moves to \(P/d = 53{,}248\).</div>
+  </div>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>\(T\)</th><th class="num">Attention \(4T^2d\)</th><th class="num">Linear \(2PT\)</th><th class="num">Attn / linear</th><th class="num">Score elements \(n_hT^2\)</th><th class="num">bf16 bytes per sequence per layer</th></tr></thead>
+    <tbody>
+      <tr><td>8,192</td><td class="num">1.10 TFLOP</td><td class="num">3.57 TFLOP</td><td class="num">0.31</td><td class="num">\(2^{31}\) = 2.15 G</td><td class="num">4 GiB</td></tr>
+      <tr class="hl"><td>131,072</td><td class="num">281.5 TFLOP</td><td class="num">57.2 TFLOP</td><td class="num">4.92</td><td class="num">\(2^{39}\) = 550 G</td><td class="num">1 TiB</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Arithmetic: \(4\cdot 8192^2\cdot 4096 = 1.0995\times10^{12}\); \(2\cdot 218{,}103{,}808\cdot 8192 = 3.573\times10^{12}\); \(32\cdot 8192^2 = 2^{5}\cdot2^{26} = 2^{31}\) elements at 2 bytes is \(2^{32}\) B; at \(T = 131{,}072 = 2^{17}\), \(32\cdot 2^{34} = 2^{39}\) elements and \(2^{40}\) B. Ratios at 128K with causal skipping: 2.46 (attention is 71% of the layer's forward FLOPs, versus 83% without skipping).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 344" role="img" aria-labelledby="fig-03-3-title">
+<title id="fig-03-3-title">Log-log chart of forward FLOPs per layer per sequence at Llama-3-8B width: attention score and value matmuls grow with slope 2 and cross the linear-layer FLOPs at about 26.6K tokens</title>
+<line class="s-line s-dash" x1="92" y1="294.0" x2="692" y2="294.0" opacity="0.35"/>
+<text x="84" y="298.0" text-anchor="end" class="s-small s-muted">0.01</text>
+<line class="s-line s-dash" x1="92" y1="244.0" x2="692" y2="244.0" opacity="0.35"/>
+<text x="84" y="248.0" text-anchor="end" class="s-small s-muted">0.1</text>
+<line class="s-line s-dash" x1="92" y1="194.0" x2="692" y2="194.0" opacity="0.35"/>
+<text x="84" y="198.0" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line s-dash" x1="92" y1="144.0" x2="692" y2="144.0" opacity="0.35"/>
+<text x="84" y="148.0" text-anchor="end" class="s-small s-muted">10</text>
+<line class="s-line s-dash" x1="92" y1="94.0" x2="692" y2="94.0" opacity="0.35"/>
+<text x="84" y="98.0" text-anchor="end" class="s-small s-muted">100</text>
+<line class="s-line s-dash" x1="92" y1="44.0" x2="692" y2="44.0" opacity="0.35"/>
+<text x="84" y="48.0" text-anchor="end" class="s-small s-muted">1000</text>
+<line class="s-line s-dash" x1="92.0" y1="44" x2="92.0" y2="294" opacity="0.35"/>
+<text x="92.0" y="310" text-anchor="middle" class="s-small s-muted">1K</text>
+<line class="s-line s-dash" x1="177.7" y1="44" x2="177.7" y2="294" opacity="0.35"/>
+<text x="177.7" y="310" text-anchor="middle" class="s-small s-muted">2K</text>
+<line class="s-line s-dash" x1="263.4" y1="44" x2="263.4" y2="294" opacity="0.35"/>
+<text x="263.4" y="310" text-anchor="middle" class="s-small s-muted">4K</text>
+<line class="s-line s-dash" x1="349.1" y1="44" x2="349.1" y2="294" opacity="0.35"/>
+<text x="349.1" y="310" text-anchor="middle" class="s-small s-muted">8K</text>
+<line class="s-line s-dash" x1="434.9" y1="44" x2="434.9" y2="294" opacity="0.35"/>
+<text x="434.9" y="310" text-anchor="middle" class="s-small s-muted">16K</text>
+<line class="s-line s-dash" x1="520.6" y1="44" x2="520.6" y2="294" opacity="0.35"/>
+<text x="520.6" y="310" text-anchor="middle" class="s-small s-muted">32K</text>
+<line class="s-line s-dash" x1="606.3" y1="44" x2="606.3" y2="294" opacity="0.35"/>
+<text x="606.3" y="310" text-anchor="middle" class="s-small s-muted">64K</text>
+<line class="s-line s-dash" x1="692.0" y1="44" x2="692.0" y2="294" opacity="0.35"/>
+<text x="692.0" y="310" text-anchor="middle" class="s-small s-muted">128K</text>
+<line class="s-line" x1="92" y1="294" x2="692" y2="294"/><line class="s-line" x1="92" y1="44" x2="92" y2="294"/>
+<text x="392.0" y="328" text-anchor="middle" class="s-small">sequence length T (tokens, log scale)</text>
+<text x="20" y="28" class="s-small">TFLOP per layer per sequence, forward (log scale)</text>
+<path class="s-line-a" d="M92.0,211.5 L692.0,106.1"/>
+<path class="s-line-b" d="M92.0,282.2 L692.0,71.5"/>
+<path class="s-line-b s-dash" d="M92.0,297.3 L692.0,86.6"/>
+<circle class="s-fill-b" cx="349.1" cy="191.9" r="4"/>
+<circle class="s-fill-a" cx="349.1" cy="166.3" r="4"/>
+<circle class="s-fill-b" cx="692.0" cy="71.5" r="4"/>
+<circle class="s-fill-a" cx="692.0" cy="106.1" r="4"/>
+<circle class="s-fill-d" cx="494.9" cy="140.8" r="5.5"/>
+<circle class="s-fill-d" cx="580.6" cy="125.7" r="5.5"/>
+<rect class="s-plain" x="430" y="206" width="262" height="70" rx="6"/>
+<path class="s-line-a" d="M440,222 L470,222"/><text x="478" y="226" class="s-small">linear layers: 2PT (P = 218.1M)</text>
+<path class="s-line-b" d="M440,242 L470,242"/><text x="478" y="246" class="s-small">attention scores and AV: 4T²d</text>
+<path class="s-line-b s-dash" d="M440,262 L470,262"/><text x="478" y="266" class="s-small">same, masked blocks skipped: 2T²d</text>
+<rect class="s-plain" x="108" y="66" width="352" height="116" rx="6"/>
+<text x="120" y="84" class="s-small s-bold s-td">Crossovers (purple dots)</text>
+<text x="120" y="100" class="s-small">T* = P / (2d) = 26,624 tokens (full 4T²d)</text>
+<text x="120" y="116" class="s-small">T* = P / d = 53,248 tokens (causal skipping)</text>
+<text x="120" y="140" class="s-small s-bold">Dots at T = 8K and 128K (attention / linear)</text>
+<text x="120" y="156" class="s-small">8K: 1.10 / 3.57 TFLOP, ratio 0.31</text>
+<text x="120" y="172" class="s-small">128K: 281 / 57.2 TFLOP, ratio 4.9</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Forward FLOPs per layer per sequence at Llama-3-8B width, log-log. The linear layers grow with slope 1, attention with slope 2. At 8K attention is a third of the linear cost; at 128K it is nearly five times larger. The dashed line assumes a kernel that skips masked blocks.</figcaption>
+  </figure>
+
+  <p><strong>Where is the bottleneck at 128K?</strong> Three different answers, depending on the implementation. A naive implementation is limited by memory long before compute: 1 TiB of bf16 scores per layer per sequence cannot exist. <strong>FlashAttention</strong> computes exactly the same attention with tiling and an online softmax, keeps only \(O(T)\) extra memory, and needs \(O(T^2d)\) FLOPs <a href="https://arxiv.org/abs/2205.14135">[Dao et al. 2022, Thm. 1]</a>; it cuts HBM traffic from \(\Theta(Td + T^2)\) to \(\Theta(T^2d^2/M)\) for on-chip memory \(M\) (Thm. 2). It changes the memory and the bandwidth cost, not the math and not the asymptotic FLOPs: in their GPT-2-medium benchmark (forward plus backward, \(N = 1024\), 16 heads of size 64, batch 64, A100) it performs slightly <em>more</em> FLOPs (75.2 versus 66.6 GFLOPs, from recomputation) but moves 4.4 GB instead of 40.3 GB and runs in 7.3 ms instead of 41.7 ms <a href="https://arxiv.org/abs/2205.14135">[Dao et al. 2022, Fig. 2]</a>. Once memory is solved, compute remains: at 128K, attention is 83% of a layer's forward FLOPs (71% with block skipping). At the H100's roughly 989 TFLOP/s dense bf16 peak (<a href="07-kv-efficient-attention.html">page 07</a>), 281.5 TFLOP is 0.285 s per layer per sequence at 100% utilization, so 32 layers take at least 9.1 s of forward attention per 128K sequence (about 4.6 s with skipping). In decoding the picture flips: each new token does \(4Sd\) attention FLOPs per layer but must read the whole KV cache, which is bandwidth-bound (<a href="06-decoding-kv-cache.html">page 06</a>, <a href="07-kv-efficient-attention.html">07</a>). Approaches that change the asymptotics (sliding window, sparse, linear attention) alter the model and are covered in <a href="09-beyond-full-attention.html">page 09</a>; sharding the sequence across GPUs is in <a href="15-distributed-training.html">page 15</a> (Llama 3 trains at up to 128K with context parallelism, which all-gathers the keys and values, small thanks to GQA, and computes attention for each rank's local queries <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>).</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A jet has \(O(10)\) to \(O(100)\) particles <a href="https://arxiv.org/abs/2202.03772">[Qu et al. 2022, §1]</a>, and the ParT baseline uses \(d = 128\) with 8 heads of dimension 16 (§4). The score matrix has at most about \(10^4\) entries per head, so \(T^2\) never mattered; the authors mention the pairwise cost only as a limitation. At \(T = 131{,}072\) there are \(1.7\times 10^{10}\) entries per head. That gap is why a whole sub-field (FlashAttention, GQA, MLA, sparse and linear attention) exists on the language-model side.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="heads">What heads learn: induction heads and attention sinks</h2>
+
+  <p>Two findings are worth knowing at interview depth. Both are empirical; keep the strength of each claim in mind.</p>
+
+  <h3 id="induction">Induction heads</h3>
+  <p>An <strong>induction head</strong> <span class="zh">归纳头</span> completes patterns of the form \([A][B]\dots[A] \to [B]\): it finds an earlier occurrence of the current token \(A\), attends to the token \(B\) that followed it, and copies \(B\) into the prediction. Olsson et al. define it behaviorally, on a repeated random token sequence, by two properties: <em>prefix matching</em> (attend to the token after an earlier copy of the current token) and <em>copying</em> (the head's output raises the logit of the attended token) <a href="https://arxiv.org/abs/2209.11895">[Olsson et al. 2022, Key Concepts]</a>. Mechanically it needs two attention layers. A "previous-token head" in an early layer writes, into each position, information about the token before it; the induction head in a later layer uses that in its <em>keys</em> (K-composition), so that the current token's query matches positions whose predecessor was that token. One-layer models cannot form induction heads.</p>
+  <p>The claim that matters for LLMs: induction heads form during a sudden "phase change" early in training (in their models between roughly \(2.5\times10^9\) and \(5\times10^9\) tokens), which coincides with a bump in the loss curve and a sharp jump in <strong>in-context learning</strong> <span class="zh">上下文学习</span>, measured as the loss at token 500 minus the loss at token 50 of a 512-token context. Evidence is causal for small attention-only models (ablating the heads removes most in-context learning) and only correlational for larger models with MLPs; the authors call it "preliminary and indirect" <a href="https://arxiv.org/abs/2209.11895">[Olsson et al. 2022, Abstract, Arguments 1 to 6]</a>. The takeaway is a mechanism for in-context copying, and a reason depth matters: attention layers compose.</p>
+
+  <h3 id="sinks">Attention sinks</h3>
+  <p>In trained LLMs a large share of attention goes to the first few tokens, whatever they are. Xiao et al. attribute this to the softmax: the weights must sum to one, so when a query has no strong match, "the model still needs to allocate these unneeded attention values somewhere", and initial tokens, visible to every later token, are the easiest place to learn to put them. Their evidence is practical. Sliding-window attention that evicts the first tokens' keys and values collapses: Llama-2-13B perplexity is 5158 with a 1024-token window, but 5.40 when the first 4 tokens are kept alongside the most recent 1020 (they replace the four with newline tokens and recover 5.60, so position, not content, matters). Keeping 4 sink tokens plus a rolling window lets models run stably on 4M tokens, and a learnable sink token added at pretraining makes one token sufficient <a href="https://arxiv.org/abs/2309.17453">[Xiao et al. 2023, Tab. 1, §3]</a>. It does not extend the context window; it only stabilizes attention over the recent window.</p>
+  <p>The convex-combination property explains why a sink is useful: the weights must go somewhere, so a head that wants to contribute almost nothing needs a place to put its mass. Architectures now provide that place explicitly. gpt-oss gives each attention head "a learned bias in the denominator of the softmax, similar to off-by-one attention and attention sinks, which enables the attention mechanism to pay no attention to any tokens" <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>. Qiu et al. multiply each head's output by a head-specific sigmoid gate; in their 15B-parameter MoE ablation the average share of attention on the first token drops from 46.7% to 4.8% and long-context extrapolation improves <a href="https://arxiv.org/abs/2505.06708">[Qiu et al. 2025, Tab. 4, §4.3 to 4.4]</a>. Sinks matter again for long-context extension (<a href="10-long-context.html">page 10</a>) and for stability tweaks such as gating (<a href="11-stability-tweaks.html">page 11</a>); gpt-oss is covered on <a href="31-mistral-gemma-gptoss.html">page 31</a>.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"The scale is \(1/\sqrt{d}\) with \(d\) the model width."</strong> It is \(1/\sqrt{d_h}\), the per-head dimension. Llama-3-8B scales by \(1/\sqrt{128}\), not \(1/\sqrt{4096}\).</li>
+    <li><strong>"More heads means more compute and more parameters."</strong> With \(n_hd_h = d\), matmul FLOPs and the \(4d^2\) parameter count are independent of \(n_h\). More heads cost score memory (\(n_hT^2\)) and softmax work, and shrink \(d_h\).</li>
+    <li><strong>"Masking means multiplying the attention weights by 0 or 1."</strong> Do it on the logits with \(-\infty\), before the softmax. Zeroing afterwards leaves rows that do not sum to one and lets the future leak in through the denominator.</li>
+    <li><strong>"\(-\infty\) masking is always safe."</strong> A row with no allowed key gives NaN, and the NaN survives loss masking because \(0\times\text{NaN}=\text{NaN}\) in the backward pass. Guarantee at least one visible key, or use a safe softmax.</li>
+    <li><strong>"<code>is_causal=True</code> handles a KV cache."</strong> It is top-left aligned, so for \(T \lt S\) it hides most of the cache from the newest tokens. Pass an end-aligned mask.</li>
+    <li><strong>"FlashAttention approximates attention or removes the \(T^2\) cost."</strong> It is exact and its FLOPs are still \(O(T^2d)\). It removes the \(T^2\) <em>memory</em> and most of the HBM traffic.</li>
+    <li><strong>"Attention is order-aware by itself."</strong> Without positional information and without a mask it is permutation-equivariant: order is invisible. Order enters through positional encodings (and, weakly, the causal mask).</li>
+    <li><strong>"Attention weights show what matters."</strong> They show where values are read from, not how much the value matters. In one baseline 15B MoE, 46.7% of attention (averaged over layers) sits on the first token, which carries little semantic content.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> <span>State the shapes in single-head attention and say what each row of the attention matrix means.</span></summary>
+    <div class="answer">
+      <p>\(Q\) is \(T\times d_h\), \(K\) is \(S\times d_h\), \(V\) is \(S\times d_v\). Logits \(Z = QK^\top/\sqrt{d_h}\) are \(T\times S\); the weights \(A = \softmax(Z)\) (over the key axis) are also \(T\times S\); the output \(AV\) is \(T\times d_v\). Row \(i\) of \(A\) is a probability distribution over the \(S\) keys: how query \(i\) distributes its reading across positions. The output row \(o_i = \sum_j a_{ij}v_j\) is the expectation of the values under that distribution, a convex combination of the value rows. In self-attention \(S = T\) (or \(S\ge T\) with a cache).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> <span>Why do we subtract the row maximum before the exponential, and does it change the result?</span></summary>
+    <div class="answer">
+      <p>It does not change the result: \(\softmax(z + c) = \softmax(z)\) because \(e^c\) cancels between numerator and denominator. It changes the numerics. \(e^z\) overflows float32 for \(z > 88.7\) and float16 for \(z > 11.1\), giving \(\infty/\infty = \text{NaN}\); after subtracting the max every exponent is \(\le 0\), each \(e^{\cdot}\in(0,1]\), the max entry contributes exactly 1, and the denominator is in \([1,T]\). Underflow to zero of very negative entries is harmless. The same idea gives a stable log-sum-exp, and FlashAttention's online softmax keeps a running max and sum to process keys in blocks.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> <span>Count the parameters of one attention layer for Llama-3-8B (\(d = 4096\), 32 query heads, 8 KV heads, \(d_h = 128\)) and compare with plain multi-head attention.</span></summary>
+    <div class="answer">
+      <p>General count without biases: \(d\,d_h\,(2n_h + 2n_{kv})\), because \(W^Q\) and \(W^O\) are \(d\times n_hd_h\) and \(W^K, W^V\) are \(d\times n_{kv}d_h\). With the numbers: \(4096\cdot128\cdot(64+16) = 41{,}943{,}040\), that is \(2\cdot4096^2 = 33.6\text{M}\) for \(W^Q, W^O\) plus \(2\cdot4096\cdot1024 = 8.4\text{M}\) for \(W^K, W^V\). Plain MHA (\(n_{kv} = 32\)) would have \(4\cdot4096^2 = 67{,}108{,}864\). GQA saves 25.2M parameters per layer, but its main purpose is a smaller KV cache (page 07). Neither count depends on how many heads split the width when \(n_hd_h = d\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> <span>Why is the causal mask added to the logits as \(-\infty\) rather than applied to the softmax output?</span></summary>
+    <div class="answer">
+      <p>Because the softmax normalizes over all keys. If you zero the future weights afterwards, the denominator still contains the future logits, so the remaining weights depend on the future (an information leak) and no longer sum to one. Adding \(-\infty\) before the softmax gives \(e^{-\infty} = 0\) in both numerator and denominator, which is exactly the softmax over the allowed keys only, a proper distribution that depends only on the past. (Multiplying by a 0/1 mask after the softmax and renormalizing is equivalent, but the additive form is one fused op and is what kernels implement.)</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>Why do we divide by \(\sqrt{d_h}\)? What happens if we don't?</span></summary>
+    <div class="answer">
+      <p>If the components of \(q\) and \(k\) are independent with mean 0 and variance 1, each product \(q_ik_i\) has variance 1, so \(\mathrm{Var}(q\cdot k) = d_h\) and the logit standard deviation is \(\sqrt{d_h}\) (11.3 for \(d_h = 128\)). Dividing by \(\sqrt{d_h}\) restores unit variance.</p>
+      <p>Without it the softmax saturates. With \(d_h = 128\) and 1024 random keys, a simulation gives a mean top weight of 0.79 unscaled versus 0.016 scaled, and a 21% chance that one key gets more than 99% of the weight (0% scaled). Saturation kills gradients: \(\partial L/\partial z_j = a_j(g_j - \sum_ia_ig_i)\) is proportional to \(a_j\), so when the row is one-hot every logit's gradient is tiny and the head cannot move attention to a key that currently has near-zero weight. It also hurts low-precision numerics, since large logits are coarsely represented in bf16. The scale is a fixed temperature \(\sqrt{d_h}\); it uses the head dimension, not the model width.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>Implement causal multi-head attention.</span></summary>
+    <div class="answer">
+      <p>A compact version (weights passed as \(d\times d\) matrices):</p>
+<pre><code class="language-python">def causal_mha(x, Wq, Wk, Wv, Wo, n_heads):
+    B, T, d = x.shape
+    dh = d // n_heads
+    q, k, v = (t.view(B, T, n_heads, dh).transpose(1, 2) for t in (x @ Wq, x @ Wk, x @ Wv))  # (B, h, T, dh)
+    z = q @ k.transpose(-1, -2) / dh ** 0.5                                                    # (B, h, T, T)
+    z = z.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))              # block j &gt; i
+    o = z.softmax(-1) @ v                                                                      # (B, h, T, dh)
+    return o.transpose(1, 2).reshape(B, T, d) @ Wo                                             # merge heads, project
+</code></pre>
+      <p>What the interviewer checks: (1) reshape to \((B,T,n_h,d_h)\) <em>then</em> transpose, never a direct view to \((B,n_h,T,d_h)\); (2) scale by \(\sqrt{d_h}\); (3) mask before the softmax, with \(-\infty\); (4) softmax over the key axis; (5) merge with transpose plus <code>reshape</code>; (6) \(W^O\) at the end. Then expect follow-ups: use an end-aligned mask when there is a KV cache, how you would test it (compare with <code>F.scaled_dot_product_attention</code> and check that changing future tokens leaves earlier outputs unchanged), what it costs (\(O(T^2)\) memory, so use a fused kernel), and how GQA changes it (fewer K/V heads, then repeat them).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>What are the time and memory complexity of attention? Where is the bottleneck at 128K tokens?</span></summary>
+    <div class="answer">
+      <p>Per layer per sequence, forward: \(4T^2d\) FLOPs (\(2T^2d\) for \(QK^\top\) plus \(2T^2d\) for \(AV\)), plus \(8Td^2\) for projections. Memory for a naive implementation: \(B\,n_h\,T^2\) elements for logits and again for weights. At Llama-3-8B width (\(d=4096\), 32 heads), \(T = 131{,}072\): attention is 281.5 TFLOP versus 57.2 TFLOP for the linear layers (\(2PT\) with \(P = 218.1\text{M}\)), a ratio of 4.9; the naive scores are \(2^{39}\) elements, 1 TiB in bf16 per layer per sequence.</p>
+      <p>So: a naive implementation is memory-bound and infeasible; FlashAttention fixes memory (\(O(T)\) extra) and HBM traffic without changing the math or the \(O(T^2d)\) FLOPs; then compute is the bottleneck, with attention 83% of layer FLOPs (71% if masked blocks are skipped). Attention overtakes the linear layers at \(T^\ast = P/(2d) \approx 26.6\text{K}\). Beyond that you need sequence/context parallelism, or a different attention (window, sparse, linear). At decode time the cost is different: each token does \(4Sd\) FLOPs but streams the whole KV cache, so it is bandwidth-bound.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>Why multiple heads rather than one head of width \(d\)? Is the parameter count the same?</span></summary>
+    <div class="answer">
+      <p>Yes, the same: \(4d^2\) parameters (\(W^Q,W^K,W^V,W^O\), each \(d\times d\)), and the same matmul FLOPs, since \(n_h\) heads of size \(d/n_h\) cost \(n_h\cdot 2TS\,(d/n_h) = 2TSd\), like one wide head. What changes is expressivity: one softmax yields one weighted average of the values per query, blending everything attended to into a single vector ("averaging inhibits this"). With \(n_h\) heads each query gets \(n_h\) separate distributions over positions and \(n_h\) separate similarity forms \(W^Q_i(W^K_i)^\top\), and the outputs are concatenated, not averaged. In the original ablation at constant compute, 1 head was 0.9 BLEU worse than 8 (PPL 5.29 versus 4.92), while 32 heads (\(d_k = 16\)) was also worse than 8, so there is a sweet spot. The price is \(n_h\times\) more score memory and softmax work, and a smaller \(d_h\), the low-rank bottleneck argument of Bhojanapalli et al.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>A row of your attention mask is fully masked and your loss becomes NaN. Why, and how do you fix it?</span></summary>
+    <div class="answer">
+      <p>With every logit in the row equal to \(-\infty\), the stable softmax computes \((-\infty) - (-\infty) = \text{NaN}\) (the naive one computes \(0/0\)). The NaN goes into the residual stream and on through all later layers. Masking that position out of the loss does not help, because in the backward pass a zero loss weight times a NaN gradient is still NaN, so the parameters receive NaN gradients.</p>
+      <p>Fixes: (1) avoid such rows: make sure every query can see at least one key (pad queries attend to themselves or a BOS token; be careful with left padding, since a pad query sees only pads); (2) use <code>torch.finfo(dtype).min</code> instead of \(-\infty\), which yields a finite, uniform row over masked keys that must be excluded from the loss, and do not add two such masks, since the sum overflows to \(-\infty\); (3) use a safe softmax that returns zeros when a row has no allowed key (recent PyTorch's fused SDPA does, but do not depend on it). To debug, check <code>mask.any(-1).all()</code> and find the first layer with a non-finite activation.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>Why can we train on all \(T\) positions in parallel but must generate one token at a time?</span></summary>
+    <div class="answer">
+      <p>Under the causal mask, the hidden state at position \(t\) in every layer depends only on \(x_{\le t}\) (induction over layers: attention at \(t\) reads only positions \(\le t\), and MLPs, norms and residuals act per position). So a single forward pass over a known sequence computes the same outputs as \(T\) separate forward passes over its prefixes, giving \(T\) exact next-token losses and gradients (teacher forcing). At generation time the next input token is the model's own sample, which does not exist until the previous step finishes, so steps are inherently sequential. The KV cache stores past keys and values so each step computes only the new token's projections. Consequences: in training each weight load is amortized over thousands of positions, so it is compute-bound; in decoding each weight and KV-cache load serves one new position per sequence, so it is memory-bound, which is why speculative decoding, batching and KV-efficient attention exist.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>You decode with a KV cache of 4 tokens and feed 3 new tokens. Write the mask, and say what goes wrong with <code>is_causal=True</code>.</span></summary>
+    <div class="answer">
+      <p>Here \(T = 3\), \(S = 7\). The new queries sit at absolute positions 4, 5, 6, and query \(i\) may attend to key \(j\) iff \(j \le i + (S - T) = i + 4\):</p>
+      <p>row 0 (position 4): keys 0 to 4; row 1: keys 0 to 5; row 2: keys 0 to 6. In code: <code>torch.arange(S)[None, :] &lt;= torch.arange(T)[:, None] + (S - T)</code>.</p>
+      <p><code>F.scaled_dot_product_attention(..., is_causal=True)</code> uses <code>tril(diagonal=0)</code> on a \(T\times S\) matrix, which is top-left aligned: row 0 sees only key 0, row 2 only keys 0 to 2. The cache is largely invisible and no error is raised, so outputs are silently wrong. A single decode step (\(T=1\)) should see everything, and with the top-left mask it would see only key 0. Use an explicit end-aligned mask whenever \(T \ne S\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> <span>What is an induction head, and why does it matter?</span></summary>
+    <div class="answer">
+      <p>A head that implements \([A][B]\dots[A]\to[B]\): it looks back for an earlier occurrence of the current token, attends to the token that followed it, and copies that token into the prediction. It needs two layers: a previous-token head writes each token's predecessor into its position, and the induction head uses that in its keys (K-composition) so the current token's query matches positions whose predecessor was the current token; its OV circuit then copies the attended token's identity to the logits. Olsson et al. define induction heads behaviorally (prefix matching plus copying on repeated random tokens) and show that they form abruptly early in training, simultaneously with a bump in the loss and a jump in in-context learning (loss at token 500 minus token 50). The evidence is causal in small attention-only models (ablation) and correlational in large ones, so "induction heads explain most in-context learning" is a well-supported hypothesis, not a proof. It matters because it shows a concrete circuit for in-context copying and why depth (composition across layers) is needed.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> <span>Why is softmax attention permutation-equivariant, and what does that imply for language models?</span></summary>
+    <div class="answer">
+      <p>Without a mask and without positional information, permuting the inputs by \(\Pi\) gives \(Q'=\Pi Q\), \(K'=\Pi K\), \(V'=\Pi V\), so logits \(Z' = \Pi Z\Pi^\top\). Row-wise softmax commutes with the row permutation, and permuting the columns only reorders the arguments of each row's (symmetric) softmax: \(A' = \Pi A\Pi^\top\). Then \(O' = \Pi A\Pi^\top\Pi V = \Pi O\). Norms, MLPs and residuals are per-token, so the whole stack is equivariant; pooling or a class token that attends over all tokens makes the model invariant.</p>
+      <p>Implications: the model sees a bag of tokens, so word order must be injected: positional embeddings, RoPE, or logit biases (page 05). The causal mask breaks equivariance (query \(i\) sees exactly \(i\) keys), so a decoder can in principle infer position by counting (in one small experiment, removing sinusoidal embeddings from a decoder-only language model barely changed perplexity, 30.92 versus 30.97, Tsai et al. Tab. 3), but explicit encodings are still standard. Equivariance is exactly why plain attention suits particle clouds (no positional encoding, invariant readout through a class token), and why the jet tagger and an LM differ: the tagger wants the symmetry, the LM must break it.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> <span>The variance argument assumes i.i.d. unit-variance components. Is \(1/\sqrt{d_h}\) still right for a trained model? What do people do?</span></summary>
+    <div class="answer">
+      <p>It is right only at initialization and only if the initialization matches. With unit-second-moment inputs and projection weights of standard deviation \(\sigma\), \(\mathrm{Var}(q_i) = d\sigma^2\) and the scaled logit variance is \((d\sigma^2)^2\): 1 for \(\sigma = 1/\sqrt d\), but for \(d = 768\), \(\sigma = 0.02\) it is about 0.09, so heads start nearly uniform. After training, \(q\) and \(k\) are correlated and \(q\cdot k\) scales like \(d_h\) (law of large numbers), not \(\sqrt{d_h}\); this is why μP prescribes \(1/d_h\) attention (with a base-width constant so it matches the standard scale at the base width), which lets you tune at small width and transfer (page 14). Logits can also grow without bound during training, sharpening rows toward one-hot, which is a known instability; QK-norm (normalizing \(q\) and \(k\)) bounds them (page 11). Practically: keep \(1/\sqrt{d_h}\) as the default, use μP's \(1/d_h\) when doing width transfer, and consider QK-norm for large or long runs. Also note the scale can be folded into \(W^Q\) for inference but not for training, because a multiplier changes the gradient (and Adam's effective step) unlike an initialization change.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> <span>Why do LLMs put so much attention on the first token, and what can you do about it?</span></summary>
+    <div class="answer">
+      <p>Softmax weights must sum to one and the output is a convex combination of values, so a head with nothing useful to read still has to put its mass somewhere. The first tokens are visible to every later query, so they are the easiest place for training to learn to park that mass, which lets a head contribute little when nothing matches. (The pattern is what Xiao et al. establish; that the parked-on values are small is the usual interpretation, not something they prove.) Xiao et al. show that this is position-driven (replacing the first four tokens with newlines restores perplexity) and that evicting them from a sliding-window cache destroys the model (Llama-2-13B perplexity 5158 versus 5.40 with 4 sinks kept), so streaming inference keeps 4 sink tokens plus a rolling window; this stabilizes attention but does not extend usable context.</p>
+      <p>Fixes at the architecture level: a learnable sink token during pretraining (one token then suffices), an "off-by-one" softmax with an extra zero-logit slot, a learned per-head bias in the denominator (gpt-oss), or a head-specific sigmoid gate on the attention output (Qiu et al.: first-token share 46.7% to 4.8% in their MoE ablation, with better long-context extrapolation). The trade-off: sinks are a useful mechanism for the model, so removing them by design needs a substitute no-op path, and cache-eviction schemes must respect them.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> <span>Design question: you are choosing the number of heads \(n_h\) and head size \(d_h\) for a new dense model with \(d = 4096\). What constrains the choice?</span></summary>
+    <div class="answer">
+      <p>Start from what \(n_hd_h\) controls: \(QK^\top\) and \(AV\) FLOPs scale with \(n_hd_h\) (\(4T^2n_hd_h\)), as do \(W^Q\) and \(W^O\) sizes. The default \(n_hd_h = d\) keeps \(4d^2\) parameters; going above it (Gemma-7B: 4096 versus \(d = 3072\); gpt-oss: 4096 versus 2880; DeepSeek-V3: 16384 versus 7168) buys attention capacity at a cost in parameters, FLOPs and activations. Then the split:</p>
+      <ul>
+        <li><strong>Too few heads</strong> blend information (1 head was 0.9 BLEU worse at equal compute); <strong>too many</strong> shrink \(d_h\) into the low-rank bottleneck (32 heads also lost in the same ablation; BERT-large degraded from 8 to 32 heads at fixed parameters). In the models cited on this page \(d_h\) is 64, 128 or 256.</li>
+        <li><strong>KV cache</strong> per token is \(2\,n_{kv}d_h\) per layer, so choose \(n_{kv}\) (GQA, page 07) for the serving budget; the group size \(n_h/n_{kv}\) sets decode arithmetic intensity.</li>
+        <li><strong>Parallelism:</strong> \(n_h\) and \(n_{kv}\) should divide the tensor-parallel degree (8 KV heads for 8-way TP).</li>
+        <li><strong>Kernels:</strong> fused attention kernels are tuned per head dimension (FlashAttention-2 tunes block sizes per head size), so unusual \(d_h\) can be slow.</li>
+      </ul>
+      <p>A strong answer proposes something concrete (for example 32 query heads, 8 KV heads, \(d_h = 128\) at \(d = 4096\)), states what each choice buys, and says how to validate it with small-scale ablations at matched FLOPs.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Attention from scratch.</strong> Implement, without <code>torch.softmax</code> or <code>F.scaled_dot_product_attention</code>: a numerically stable <code>softmax</code> (large logits, \(-\infty\) entries, all-\(-\infty\) rows returning zeros); the end-aligned <code>causal_mask(T, S)</code>; <code>scaled_dot_product_attention(q, k, v, mask)</code> with a boolean mask, safe on fully masked rows with finite gradients; and a <code>MultiHeadAttention</code> module with <code>forward(x, causal=True)</code>. The tests compare against <code>F.scaled_dot_product_attention</code>, against <code>nn.MultiheadAttention</code> with copied weights, and against a per-head loop written in the test, and they check causality (changing future tokens leaves earlier outputs unchanged) and permutation equivariance without the mask. An interviewer would expect the first three functions in about 15 minutes and the module in another 15 to 20. <span class="ex-path">exercises/drills/attention.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_attention.py</code>; add <code>--solutions</code> to check the reference. The KV-cache and GQA variants of this drill are on <a href="07-kv-efficient-attention.html">page 07</a>, and <a href="35-coding-drills.html">page 35</a> collects the from-scratch drills.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/1706.03762">Vaswani et al. (2017). Attention Is All You Need.</a> <span class="why">Why read it: §3.2 (scaled dot-product, multi-head, masking), Table 1 (complexity) and Table 3(A) (the head-count ablation) are the source for most of this page.</span></li>
+    <li><a href="https://arxiv.org/abs/1409.0473">Bahdanau, Cho, Bengio (2014). Neural Machine Translation by Jointly Learning to Align and Translate.</a> <span class="why">Why read it: where attention started, and the clearest statement of it as an expectation over alignments.</span></li>
+    <li><a href="https://arxiv.org/abs/1911.02150">Shazeer (2019). Fast Transformer Decoding: One Write-Head is All You Need.</a> <span class="why">Why read it: the cleanest einsum formulation of batched and incremental multi-head attention, the note on folding the scale, and the training-versus-inference asymmetry.</span></li>
+    <li><a href="https://arxiv.org/abs/2002.07028">Bhojanapalli et al. (2020). Low-Rank Bottleneck in Multi-head Attention Models.</a> <span class="why">Why read it: the argument that \(d_h \lt T\) limits a head, and the case for decoupling head size from \(d/n_h\).</span></li>
+    <li><a href="https://arxiv.org/abs/2209.11895">Olsson et al. (2022). In-context Learning and Induction Heads.</a> <span class="why">Why read it: the definition of induction heads, the training phase change, and a model of how to weigh circumstantial interpretability evidence.</span></li>
+    <li><a href="https://arxiv.org/abs/2309.17453">Xiao et al. (2023). Efficient Streaming Language Models with Attention Sinks.</a> <span class="why">Why read it: the softmax explanation of attention sinks and the sink-plus-window cache that follows from it.</span></li>
+    <li><a href="https://arxiv.org/abs/2205.14135">Dao et al. (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.</a> <span class="why">Why read it: Algorithm 0 (what naive attention writes to HBM) and Algorithm 1 (tiling with online softmax), plus the IO-complexity argument.</span></li>
+    <li><a href="https://arxiv.org/abs/2307.08691">Dao (2023). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.</a> <span class="why">Why read it: causal block skipping, the FLOP-counting conventions used in benchmarks, and the model-FLOPs formula with the \(T^2\) attention term.</span></li>
+    <li><a href="https://arxiv.org/abs/1908.11775">Tsai et al. (2019). Transformer Dissection: A Unified Understanding of Transformer's Attention via the Lens of Kernel.</a> <span class="why">Why read it: attention as a kernel smoother, and the observation that causal self-attention is not permutation-equivariant.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.03466">Yang et al. (2022). Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer.</a> <span class="why">Why read it: why μP uses \(1/d\) attention, and the note that parameter multipliers cannot be absorbed into the initialization.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>\(\operatorname{Attn}(Q,K,V) = \softmax(QK^\top/\sqrt{d_h})V\). Shapes: \(Q\ T\times d_h\), \(K\ S\times d_h\), \(V\ S\times d_v\), logits and weights \(T\times S\), output \(T\times d_v\). Each output row is a convex combination of value rows.</li>
+      <li>\(\mathrm{Var}(q\cdot k) = d_h\) for i.i.d. unit entries. Scale by \(1/\sqrt{d_h}\) (head dim, not \(d\)). Unscaled at \(d_h=128\): std 11.3, mean top weight 0.79 over 1024 keys, saturated softmax, vanishing gradients. μP uses \(1/d_h\).</li>
+      <li>\(\partial L/\partial z_j = a_j(g_j - \sum_ia_ig_i)\): gradient is proportional to the weight, so a one-hot row has no gradient.</li>
+      <li>Softmax: shift-invariant; subtract the row max (float32 overflow at \(z > 88.7\), float16 at \(11.1\)); keep max and sum in float32; temperature \(\tau = \sqrt{d_h}\).</li>
+      <li>Causal mask: add \(-\infty\) to logits <em>before</em> softmax, \(M_{ij}=0\) iff \(j \le i + (S-T)\) (end-aligned). \(T=1\): all True. <code>is_causal=True</code> is top-left aligned: wrong for \(T \lt S\).</li>
+      <li>Fully masked row gives NaN, and \(0\times\text{NaN}=\text{NaN}\) defeats loss masking. Fix: guarantee one visible key, <code>finfo.min</code> (do not stack masks), or safe softmax.</li>
+      <li>Parallel training is exact because hidden state \(t\) depends only on \(x_{\le t}\) (induction over layers). Generation is sequential because \(x_{t+1}\) is not known yet.</li>
+      <li>MHA: reshape \((B,T,d)\to(B,T,n_h,d_h)\to(B,n_h,T,d_h)\); merge with transpose plus <code>reshape</code>; \(4d^2\) parameters, general \(d\,d_h(2n_h+2n_{kv})\); Llama-3-8B attention 41.9M. Same matmul FLOPs as one wide head; \(n_h\times\) score memory. \(d_h\) need not equal \(d/n_h\) (Gemma-7B, gpt-oss, DeepSeek-V3).</li>
+      <li>Without positions and mask, attention is permutation-equivariant, so LMs need positional information (page 05). The causal mask weakly breaks the symmetry.</li>
+      <li>Cost per layer per sequence: attention \(4T^2d\); linear layers \(2PT\); ratio \(2Td/P \approx T/6d\). Llama-3-8B: 0.31 at 8K, 4.92 at 128K, crossover 26.6K (53.2K with causal skipping). Scores: \(n_hT^2\) elements, 4 GiB at 8K, 1 TiB at 128K in bf16. FlashAttention: exact, \(O(T)\) memory, same FLOPs order.</li>
+      <li>Induction heads: \([A][B]\dots[A]\to[B]\), two layers (previous-token head plus K-composition), phase change early in training. Attention sinks: softmax must sum to one, so mass parks on early tokens; fixes are a sink token, off-by-one softmax, per-head bias (gpt-oss) or output gating.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Positional encoding &amp; RoPE · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="05" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part I · Foundations · Page 05</div>
+  <h1>Positional encoding &amp; RoPE</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~55 min</span>
+    <span>Prereqs: <a href="03-attention.html">03 Attention</a></span>
+  </div>
+  <p class="lede">Self-attention has no notion of order, so every language model must inject it. This page derives the scheme almost every open LLM now uses, rotary position embedding (RoPE), compares it with the alternatives (sinusoidal, learned, relative bias, ALiBi, no encoding at all), and explains why the RoPE base and position rescaling are the levers of long-context extension.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The derivation:</strong> show on a whiteboard that the RoPE score depends only on \(t-j\), in complex form and in real matrix form, with the transposes right, and say why it acts on queries and keys but not values.</li>
+    <li><strong>Back-of-envelope:</strong> "For head dimension 128, what is the slowest wavelength at base 10,000 versus 500,000, and how does it compare with an 8K or 128K context?"</li>
+    <li><strong>Implementation:</strong> both pair layouts (interleaved and <code>rotate_half</code>), why a converted checkpoint silently breaks if you mix them, the cos/sin cache, and which position ids to use with a KV cache.</li>
+    <li><strong>Alternatives:</strong> ALiBi's slopes and bias, T5's bucketed bias, NoPE, and what the evidence says about extrapolation.</li>
+    <li><strong>Long context:</strong> why models fail past their training length, extrapolation versus interpolation, why Llama 3 raised the base, and how MLA (decoupled RoPE) and Llama 4 (iRoPE) bend the recipe.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Prove that attention without positional information is permutation-equivariant, and explain how a causal decoder can still infer position.</li>
+    <li>Write the sinusoidal encoding and ALiBi's bias (including the slopes for \(n\) heads) and state the failure mode of each.</li>
+    <li>Derive RoPE's relative-position property in complex form and in real block-rotation form, and explain why it is applied after the projections and only to \(q\) and \(k\).</li>
+    <li>Compute RoPE wavelengths and accumulated angles from \((d_h, b)\) and compare them with a context length.</li>
+    <li>Implement RoPE in both layouts, convert a checkpoint between them with a permutation, and explain partial RoPE and MLA's decoupled RoPE.</li>
+    <li>Explain NoPE and RoPE/NoPE hybrids, and the evidence for and against them.</li>
+    <li>Explain why RoPE models fail beyond their training length and distinguish extrapolation from interpolation.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="why-position">Why position information is needed</h2>
+
+  <h3 id="equivariance">Attention is permutation-equivariant</h3>
+  <p>Stack the token vectors as the rows of \(X \in \R^{T \times d}\) (row-vector convention, as on <a href="03-attention.html">page 03</a>) and let \(P\) be any \(T \times T\) permutation matrix. With no mask, one attention head computes</p>
+  \[ \operatorname{Attn}(X) = \softmax\!\left(\frac{X W^Q W^{K\top} X^\top}{\sqrt{d_h}}\right) X W^V . \]
+  <p>Feed \(PX\) instead. The score matrix becomes \(P S P^\top\), where \(S\) is the original one. The softmax acts along rows, so \(\softmax(P S P^\top) = P\,\softmax(S)\,P^\top\), and because \(P^\top P = I\):</p>
+  <div class="eq-box">
+  \[ \operatorname{Attn}(PX) = P\,\operatorname{Attn}(X) \]
+  <div class="eq-label">Permutation equivariance <span class="zh">置换等变性</span>: shuffle the input tokens and the outputs are the same vectors, shuffled</div>
+  </div>
+  <p>Norms, FFNs and residual adds act on each token independently, so a whole stack with no positional information is equivariant. The output at a token is a function of that token and of the <em>set</em> of the others. "Dog bites man" and "man bites dog" contain the same tokens, so the model cannot tell them apart.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger relied on exactly this property. Particles in a jet have no canonical order, so you wanted equivariant attention layers and a permutation-invariant readout (pooling) on top. A language model needs the opposite: order carries meaning, so we must break the symmetry deliberately, and in a way that generalizes across positions rather than memorizing them.</p>
+  </aside>
+
+  <h3 id="causal-leak">The causal mask leaks position</h3>
+  <p>A decoder-only model adds a causal mask, so row \(t\) of the softmax runs over keys \(1,\dots,t\) only. The output at \(t\) is still blind to the <em>order</em> of its predecessors, but it is not blind to their <em>number</em>, and that is enough to recover absolute position. Kazemnejad et al. give an explicit first-layer construction: set \(W^K\) so that every key is the same constant, which makes all visible scores tie and every weight \(1/t\), and let \(W^V\) copy a flag that is 1 only on the <code>&lt;bos&gt;</code> token. The head outputs \(1/t\), which is strictly monotone in \(t\), and the FFN can decode \(t\) from it <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, Thm. 1, App. C.1]</a>. A second construction shows that later layers can turn this absolute signal into a relative one, so that a score has the form \(f_{\text{cnt}}(q,k) + f_{\text{rel}}(t-j)\) <a href="https://arxiv.org/abs/2305.19466">[Thm. 2]</a>. So a causal transformer <em>can</em> learn positions with none supplied. That is why the <a href="#nope">NoPE</a> results later on this page are not absurd.</p>
+  <p>A bidirectional encoder has no such leak: without positional encoding, a BERT-style model is a bag of words <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, §2]</a>. That was your tagger's regime, by design.</p>
+
+  <h3 id="desiderata">What a positional scheme should do</h3>
+  <ul>
+    <li><strong>Be relative.</strong> Language statistics are shift-invariant: a determiner followed by a noun looks the same at index 5 or index 5,000. The useful quantity is the offset \(t-j\).</li>
+    <li><strong>Survive depth.</strong> Position must remain available in every layer. Schemes that act inside every attention layer do not rely on the residual stream to carry it.</li>
+    <li><strong>Generalize in length</strong> (see <a href="#length-generalization">below</a>).</li>
+    <li><strong>Be cheap and compatible</strong>: few parameters, no \(T \times T\) tensor, works with fused attention kernels and with the KV cache from <a href="06-decoding-kv-cache.html">page 06</a>.</li>
+  </ul>
+  <p>The schemes differ in <em>where</em> position enters: added to the input embeddings (sinusoidal, learned), added to the attention logits (Shaw, T5, ALiBi), applied to queries and keys (RoPE), or absent (NoPE). The next two sections cover the first two families, then RoPE.</p>
+</section>
+
+<section>
+  <h2 id="absolute">Absolute encodings: sinusoidal and learned</h2>
+
+  <h3 id="sinusoidal">Sinusoidal</h3>
+  <p>The original Transformer adds a fixed vector to each input embedding before the first layer <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.5]</a>:</p>
+  \[ PE_{t,2i} = \sin\!\big(t / 10000^{2i/d}\big), \qquad PE_{t,2i+1} = \cos\!\big(t / 10000^{2i/d}\big), \qquad i = 0, \dots, d/2 - 1 . \]
+  <p>(Vaswani et al. first multiply the token embeddings by \(\sqrt{d_{\text{model}}}\) and apply dropout to the sum <a href="https://arxiv.org/abs/1706.03762">[§3.4, §5.4]</a>.) Write \(\theta_i = 10000^{-2i/d}\). Each pair \((PE_{t,2i}, PE_{t,2i+1})\) is a point moving around the unit circle at \(\theta_i\) radians per position, a sinusoid of wavelength \(2\pi/\theta_i = 2\pi \cdot 10000^{2i/d}\). The wavelengths form a geometric progression from \(2\pi \approx 6.3\) tokens to about \(10000 \cdot 2\pi \approx 62{,}800\) tokens (for \(d = 512\) the last pair has \(2\pi \cdot 10000^{510/512} \approx 60{,}600\)). Fast pairs resolve fine position but repeat quickly (they alias); slow pairs are coarse but unambiguous over long ranges. Together they work like the digits of a number written in mixed scales.</p>
+
+  <p><strong>The linear-offset property.</strong> For a fixed offset \(k\), the pair at position \(t + k\) is</p>
+  \[ \big(\sin\theta_i(t{+}k),\ \cos\theta_i(t{+}k)\big) = \big(\sin\theta_i t \cos\theta_i k + \cos\theta_i t \sin\theta_i k,\ \ \cos\theta_i t \cos\theta_i k - \sin\theta_i t \sin\theta_i k\big), \]
+  <p>which is the pair at \(t\) rotated by the angle \(\theta_i k\), the same rotation for every \(t\). So \(PE_{t+k} = PE_t M_k\) for a block-diagonal rotation \(M_k\) that depends on \(k\) alone. Vaswani et al. hypothesized this would let the model "easily learn to attend by relative positions" <a href="https://arxiv.org/abs/1706.03762">[§3.5]</a>. A corollary: \(PE_t \cdot PE_{t+k} = \sum_i \cos(k\theta_i)\) depends only on \(k\).</p>
+
+  <p><strong>Why that does not make attention relative.</strong> Let \(x_t = e_t + p_t\) (token embedding plus encoding) and \(W = W^Q W^{K\top}\). The logit between positions \(t\) and \(j\) expands into four terms:</p>
+  \[ (e_t + p_t)\, W\, (e_j + p_j)^\top = e_t W e_j^\top + e_t W p_j^\top + p_t W e_j^\top + p_t W p_j^\top . \]
+  <p>Only the last is purely positional, and \(p_t W p_j^\top\) is a function of \(t-j\) alone only if the learned matrix \(W\) commutes with the rotations \(M_k\) (then \(M_t W M_j^\top = W M_{t-j}\)). Generally it does not, and the other three terms mix content with absolute position. This is the decomposition in <a href="https://arxiv.org/abs/2104.09864">[Su et al. 2021, Eq. 6]</a>. The model has to <em>learn</em> to make the score relative. RoPE hard-wires the missing step by putting the rotation between \(q\) and \(k\).</p>
+
+  <h3 id="learned">Learned absolute embeddings, and the length limit</h3>
+  <p>Replace the formula with a trainable table \(P \in \R^{L_{\max} \times d}\). BERT has 512 rows and GPT-2 has 1,024 (<a href="https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json">BERT config</a>, <a href="https://huggingface.co/openai-community/gpt2/blob/main/config.json">GPT-2 config</a>: <code>max_position_embeddings</code> 512, <code>n_positions</code> 1024). Beyond \(L_{\max}\) there is no row at all, so context length is a hard architectural limit, and the rows for late positions are trained on fewer examples than early ones.</p>
+  <p>Vaswani et al. tried both variants and found nearly identical quality: learned embeddings give 4.92 dev perplexity and 25.7 BLEU, against 4.92 and 25.8 for sinusoids <a href="https://arxiv.org/abs/1706.03762">[Table 3, row (E)]</a>. They kept the sinusoids because they "may allow the model to extrapolate" <a href="https://arxiv.org/abs/1706.03762">[§3.5]</a>. In practice they do not: Press et al. found that a sinusoidal model cannot extrapolate "to more than a few dozen tokens beyond \(L\)"; trained at \(L = 512\), perplexity is 20.05 at 512 tokens, 24.86 at 712, and 132.41 at 2,512 <a href="https://arxiv.org/abs/2108.12409">[Press et al. 2021, §2.2, App. Table 2]</a>.</p>
+</section>
+
+<section>
+  <h2 id="relative">Relative encodings: Shaw, T5 bias, ALiBi</h2>
+
+  <h3 id="shaw">Shaw et al.: learned relative embeddings</h3>
+  <p>Shaw et al. modify attention itself. The logit and the value each receive an extra learned vector indexed by the clipped offset between query \(i\) and key \(j\) <a href="https://arxiv.org/abs/1803.02155">[Shaw et al. 2018, §3.1-3.2]</a>:</p>
+  \[ e_{ij} = \frac{x_i W^Q \big(x_j W^K + a^K_{ij}\big)^\top}{\sqrt{d_z}}, \qquad z_i = \sum_j \alpha_{ij}\big(x_j W^V + a^V_{ij}\big), \qquad a^K_{ij} = w^K_{\operatorname{clip}(j-i,\,k)} , \]
+  <p>with \(\operatorname{clip}(x,k) = \max(-k, \min(k, x))\), so only \(2k+1\) vectors are learned per type. Their reasoning: "precise relative position information is not useful beyond a certain distance", and clipping "enables the model to generalize to sequence lengths not seen during training". On WMT14 En-De they report 26.5 to 26.8 BLEU (base) and 27.9 to 29.2 (big), and on En-Fr 38.2 to 38.7 and 41.2 to 41.5, over absolute encodings, at a cost of about 7% fewer training steps per second <a href="https://arxiv.org/abs/1803.02155">[Table 1, §3.3]</a>.</p>
+  <p>The ablations say more than the headline. With clipping distance \(k = 0\) (no position information at all) BLEU is 12.5; \(k = 1\) gives 25.5; \(k \ge 2\) stays near 25.8 to 25.9 <a href="https://arxiv.org/abs/1803.02155">[Table 2]</a>. Dropping the value-side \(a^V\) costs nothing (25.8), while dropping the logit-side \(a^K\) costs 0.5 <a href="https://arxiv.org/abs/1803.02155">[Table 3]</a>. So local order matters most, and the logit is where it belongs. Every later scheme in this section keeps only that logit-side term.</p>
+
+  <h3 id="t5">T5: a scalar bias per bucket</h3>
+  <p>T5 simplifies further: each "embedding" is one learned scalar added to the logit, chosen by the key-query offset <a href="https://arxiv.org/abs/1910.10683">[Raffel et al. 2020, §2.1]</a>. There are 32 of them, with bucket widths growing logarithmically up to an offset of 128, and every larger offset shares one bucket. The parameters are shared across layers, but each head has its own. As the authors note, one layer is insensitive to relative position beyond 128, but later layers can build sensitivity to larger offsets by combining local information. The learned biases are not all recency biases: in T5-3B some heads mask distant tokens while others attend to them <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, Fig. F.3]</a>. The price is a \((n_h \times T \times T)\) bias to build and add before the softmax; Press et al. measured it as considerably slower and more memory-hungry than sinusoidal encodings <a href="https://arxiv.org/abs/2108.12409">[Press et al. 2021, §1, Fig. 2]</a>.</p>
+
+  <h3 id="alibi">ALiBi: a fixed linear penalty</h3>
+  <p>ALiBi (Attention with Linear Biases) replaces T5's table with a fixed linear function of distance <a href="https://arxiv.org/abs/2108.12409">[Press et al. 2021, §3]</a>. For query \(i\) (1-indexed) attending to keys \(1,\dots,i\) in one head:</p>
+  \[ \softmax\!\big( q_i K^\top + m \cdot [-(i-1), \dots, -2, -1, 0] \big) , \]
+  <p>that is, a logit bias of \(-m\,(i-j)\) on key \(j\). The slope \(m\) is head-specific, fixed before training and not learned; no positional embedding is added at the input; and the bias is not multiplied by the \(1/\sqrt{d_k}\) scale <a href="https://arxiv.org/abs/2108.12409">[§3, footnote 10]</a>. For \(n\) heads (a power of two) the slopes are the geometric sequence that starts at \(2^{-8/n}\) and uses the same value as its ratio. For 8 heads that is \(2^{-1}, 2^{-2}, \dots, 2^{-8}\); for 16 heads it starts at \(2^{-0.5}\). Like T5 bias and RoPE, ALiBi acts on queries and keys in every layer and never on values.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>ALiBi, 8 heads</th><th class="num">h1</th><th class="num">h2</th><th class="num">h3</th><th class="num">h4</th><th class="num">h5</th><th class="num">h6</th><th class="num">h7</th><th class="num">h8</th></tr></thead>
+    <tbody>
+      <tr><td>slope \(m = 2^{-h}\)</td><td class="num">1/2</td><td class="num">1/4</td><td class="num">1/8</td><td class="num">1/16</td><td class="num">1/32</td><td class="num">1/64</td><td class="num">1/128</td><td class="num">1/256</td></tr>
+      <tr><td>bias at distance 10</td><td class="num">−5</td><td class="num">−2.5</td><td class="num">−1.25</td><td class="num">−0.63</td><td class="num">−0.31</td><td class="num">−0.16</td><td class="num">−0.08</td><td class="num">−0.04</td></tr>
+      <tr><td>bias at distance 100</td><td class="num">−50</td><td class="num">−25</td><td class="num">−12.5</td><td class="num">−6.25</td><td class="num">−3.13</td><td class="num">−1.56</td><td class="num">−0.78</td><td class="num">−0.39</td></tr>
+      <tr><td>bias at distance 1,000</td><td class="num">−500</td><td class="num">−250</td><td class="num">−125</td><td class="num">−62.5</td><td class="num">−31.3</td><td class="num">−15.6</td><td class="num">−7.81</td><td class="num">−3.91</td></tr>
+    </tbody>
+  </table></div>
+  <p>Read the slopes as spans. A penalty of one nat sits at distance \(1/m\), so the eight heads have soft windows of roughly 2, 4, 8, ..., 256 tokens. Head 1 is a local head. Head 8 reaches far, but even it pays \(-3.9\) at distance 1,000 and \(-512\) at distance 131,072 (\(131072/256\)), a penalty no content match can overcome.</p>
+  <p><strong>Implementation trick.</strong> Since \(-m(i-j) = -m\,i + m\,j\), and \(-m\,i\) is the same for every key in a row, the softmax is invariant to it. The authors' reference code therefore adds only \(m\,j\), one broadcast add (their code comment: the softmax "is invariant to translation"). For \(n\) not a power of two, the code takes the slopes for the closest power of two below \(n\) and borrows every other slope from the sequence for twice that number: 12 heads get the 8-head slopes, then \(2^{-0.5}, 2^{-1.5}, 2^{-2.5}, 2^{-3.5}\). The <code>alibi_bias</code> drill reproduces this and its test checks the equivalence.</p>
+
+  <p><strong>The extrapolation claim.</strong> Press et al. claim that a model trained on \(L\) tokens keeps working on longer inputs. Their evidence, a 16-layer, \(d = 1024\), 8-head model on WikiText-103 trained at \(L = 512\) <a href="https://arxiv.org/abs/2108.12409">[App. Table 2]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Validation perplexity at inference length</th><th class="num">512</th><th class="num">612</th><th class="num">712</th><th class="num">1,012</th><th class="num">2,512</th></tr></thead>
+    <tbody>
+      <tr><td>Sinusoidal</td><td class="num">20.05</td><td class="num">20.59</td><td class="num">24.86</td><td class="num">43.54</td><td class="num">132.41</td></tr>
+      <tr><td>Rotary</td><td class="num">20.07</td><td class="num">19.81</td><td class="num">19.79</td><td class="num">21.37</td><td class="num">31.58</td></tr>
+      <tr><td>T5 bias</td><td class="num">19.65</td><td class="num">19.27</td><td class="num">19.10</td><td class="num">18.79</td><td class="num">20.41</td></tr>
+      <tr class="hl"><td>ALiBi</td><td class="num">19.73</td><td class="num">19.38</td><td class="num">19.14</td><td class="num">18.73</td><td class="num">18.41</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: Press et al. 2021, Appendix Table 2 (WikiText-103 validation, trained on \(L = 512\)). Lower is better.</p>
+  <p>At larger scale, a 1.3B model trained at \(L = 1024\) reaches 8.92 validation perplexity at 2,048 tokens, against 9.01 for a sinusoidal model trained at 2,048, while training 11% faster and using 11% less memory <a href="https://arxiv.org/abs/2108.12409">[Abstract, Table 11]</a>. Performance peaks near twice the training length and stays strong out to 10,000 tokens <a href="https://arxiv.org/abs/2108.12409">[§1]</a>.</p>
+  <p><strong>The limits, stated carefully.</strong></p>
+  <ul>
+    <li>Perplexity is dominated by local context, and ALiBi builds in a recency prior. Kazemnejad et al. note that Chi et al. (2023) reproduced ALiBi's length generalization with a plain window mask <a href="https://arxiv.org/abs/2305.19466">[§7]</a>.</li>
+    <li>On downstream length-generalization tasks (ten synthetic tasks, roughly 107M-parameter decoders trained from scratch, so small and synthetic) ALiBi is mid-pack: mean reciprocal rank 0.50, against 0.55 for T5 bias and 0.69 for NoPE <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, Fig. 1]</a>.</li>
+    <li>The penalty is unbounded, so sharp retrieval from far away is penalized by construction (the \(-512\) above).</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">ALiBi</div>
+    <dl>
+      <dt>Problem</dt><dd>Absolute encodings cannot extrapolate past the training length. T5's learned bias can, but is slow and adds memory and parameters.</dd>
+      <dt>Idea</dt><dd>Add a fixed \(-m_h \cdot \text{distance}\) to each head's logits, with slopes in a geometric ladder.</dd>
+      <dt>Why it works</dt><dd>It is a recency prior with a different soft window per head, needs no parameters, and its bias grows smoothly past any length the model has seen.</dd>
+      <dt>Evidence</dt><dd>Trained at 512, perplexity keeps falling as the inference length grows (19.73 at 512, 18.41 at 2,512) and stays flat out to 12,512 tokens (18.31) <a href="https://arxiv.org/abs/2108.12409">[Press et al. 2021, App. Tab. 2]</a>. Downstream length generalization is only mid-pack <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, Fig. 1]</a>.</dd>
+      <dt>Cost</dt><dd>A hard recency bias that weakens long-range retrieval, and no way to rescale it for a longer context the way RoPE can be rescaled.</dd>
+      <dt>Used by</dt><dd>BLOOM <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, §2]</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="rope">Rotary position embedding (RoPE)</h2>
+  <p>RoPE <span class="zh">旋转位置编码</span> <a href="https://arxiv.org/abs/2104.09864">[Su et al. 2021]</a> is the position scheme in the Llama, Qwen, Mistral, DeepSeek and Gemma families and most other open models (the <a href="#base-table">table below</a> lists the configs). It keeps the good property of sinusoidal encodings, a rotation that depends on position, and moves it to the one place where it produces a relative score: between the query and the key.</p>
+
+  <h3 id="rope-requirement">The requirement, and the 2-D solution</h3>
+  <p>We want functions \(f_q, f_k\) that inject position into a query and a key so that their inner product depends on the two positions only through the offset <a href="https://arxiv.org/abs/2104.09864">[Su et al. 2021, Eq. 11]</a>:</p>
+  \[ \langle f_q(x_m, m),\, f_k(x_n, n) \rangle = g(x_m, x_n, m - n) . \]
+  <p>Take the plane (\(d = 2\)) and write the projected vectors as complex numbers. Under the paper's assumptions, two facts fall out <a href="https://arxiv.org/abs/2104.09864">[§3.4.1, Eq. 26-30]</a>. Setting \(m = n\) shows the <em>norm</em> cannot depend on position. Setting \(n = m+1\) shows the <em>angle</em> added at position \(m+1\) minus the angle added at \(m\) is a constant independent of \(m\), so the angle is affine in position. The solution is therefore "rotate by an angle linear in position": \(f(x, m) = (W x)\, e^{i m \theta}\). To handle \(d_h\) dimensions, split them into \(d_h/2\) planes, each with its own \(\theta_i\); the inner product is a sum over planes, so the property survives.</p>
+
+  <h3 id="rope-complex">Complex form and proof</h3>
+  <p>Let \(q_t\) and \(k_j\) be a head's projected query and key (row vectors in \(\R^{d_h}\)). Group entries into pairs and set \(z^q_i = q_{2i} + \mathrm{i}\, q_{2i+1}\), \(z^k_i = k_{2i} + \mathrm{i}\, k_{2i+1}\) for \(i = 0, \dots, d_h/2 - 1\). RoPE rotates pair \(i\) by an angle proportional to position:</p>
+  \[ \tilde z^q_i = z^q_i\, e^{\mathrm{i}\, t \theta_i}, \qquad \tilde z^k_i = z^k_i\, e^{\mathrm{i}\, j \theta_i}, \qquad \theta_i = b^{-2i/d_h}. \]
+  <p>The real inner product of two points in the plane is \(\operatorname{Re}(u \bar v)\). Summing over pairs,</p>
+  <div class="eq-box">
+  \[ \tilde q_t \cdot \tilde k_j = \sum_{i} \operatorname{Re}\!\big( z^q_i e^{\mathrm{i} t\theta_i}\; \overline{z^k_i e^{\mathrm{i} j\theta_i}} \big) = \sum_{i} \operatorname{Re}\!\big( z^q_i\, \overline{z^k_i}\; e^{\mathrm{i}(t-j)\theta_i} \big) \]
+  <div class="eq-label">The unit-modulus phases combine into \(e^{\mathrm{i}(t-j)\theta_i}\): the score depends on \(t\) and \(j\) only through \(t-j\)</div>
+  </div>
+  <p>Expanding the real part (with \(a = q_{2i}, b = q_{2i+1}, c = k_{2i}, e = k_{2i+1}\)) gives the form you can code directly, and the one in <a href="https://arxiv.org/abs/2306.15595">[Chen et al. 2023, Eq. 2]</a>:</p>
+  \[ \tilde q_t \cdot \tilde k_j = \sum_{i} \Big[ (a c + b e) \cos\!\big((t-j)\theta_i\big) + (a e - b c) \sin\!\big((t-j)\theta_i\big) \Big] . \]
+  <p>Worked micro-example: one pair with \(q = k = (1, 0)\) and \(\theta = 0.5\) rad gives score \(\cos(0.5\,\delta)\) at offset \(\delta = t-j\): 1 at \(\delta = 0\), 0.540 at \(\delta = 2\), \(-0.416\) at \(\delta = 4\). A real head sums 64 such oscillations at different frequencies, weighted by the content-dependent coefficients \(z^q_i \overline{z^k_i}\).</p>
+
+  <h3 id="rope-matrix">Real block-rotation form</h3>
+  <p>With row vectors, a counter-clockwise rotation by \(\varphi\) acts as \((a, b)\,G(\varphi) = (a\cos\varphi - b\sin\varphi,\ a\sin\varphi + b\cos\varphi)\), where</p>
+  \[ G(\varphi) = \begin{pmatrix} \cos\varphi & \sin\varphi \\ -\sin\varphi & \cos\varphi \end{pmatrix}, \qquad R_t = \operatorname{diag}\big(G(t\theta_0),\, G(t\theta_1),\, \dots,\, G(t\theta_{d_h/2-1})\big). \]
+  <p>This is exactly multiplication by \(e^{\mathrm{i}\varphi}\) in the complex picture. RoPE is \(\tilde q_t = q_t R_t\) and \(\tilde k_j = k_j R_j\). Two facts about 2-D rotations do all the work: \(G(\alpha) G(\beta) = G(\alpha + \beta)\) (they commute) and \(G(\varphi)^\top = G(-\varphi)\). Hence</p>
+  <div class="eq-box">
+  \[ R_t R_j^\top = R_{t-j}, \qquad \tilde q_t \tilde k_j^\top = q_t R_t R_j^\top k_j^\top = q_t\, R_{t-j}\, k_j^\top . \]
+  <div class="eq-label">Relative-position property (row-vector convention, as on page 07). \(R_t\) is orthogonal, so \(\|\tilde q_t\| = \|q_t\|\)</div>
+  </div>
+  <p><strong>Matching the paper.</strong> RoFormer writes column vectors and a rotation matrix \(R^{\text{col}}(\varphi) = G(\varphi)^\top\), so its score is \((R_m q)^\top (R_n k) = q^\top R_{n-m} k\) <a href="https://arxiv.org/abs/2104.09864">[Su et al. 2021, Eq. 16]</a>. It is the same number: \(G(t-j) = R^{\text{col}}(j-t)\). Sign slips here are the classic whiteboard error, so state which convention you use. The <code>rope</code> drill checks the complex form, the real form and the shift-invariance numerically.</p>
+
+  <h3 id="rope-where">Where it is applied, and why only \(q\) and \(k\)</h3>
+  <p>RoPE is applied <strong>after</strong> the \(W^Q, W^K\) projections, <strong>per head</strong>, in <strong>every layer</strong>, to queries and keys only. Nothing is added to the residual stream.</p>
+  <ul>
+    <li><strong>Why after the projection.</strong> Rotating the input first would give \(x_t R_t W^Q W^{K\top} R_j^\top x_j^\top\). The middle matrix \(W^Q W^{K\top}\) is a generic learned matrix that does not commute with \(R\), so \(R_t\) and \(R_j\) cannot merge into \(R_{t-j}\) and the score is no longer relative. The rotation must sit directly between \(q\) and \(k\).</li>
+    <li><strong>Why not values.</strong> The relative trick works because a dot product is bilinear: \(R_t\) and \(R_j\) meet and collapse. The attention output \(o_t = \sum_j a_{tj} v_j\) is a weighted sum, not a product. Rotating \(v_j\) by \(R_j\) would make the output depend on the absolute position of every attended token, and nothing cancels it. Values carry content to be read out, not compared, so they stay unrotated, as in Su et al., T5 bias and ALiBi <a href="https://arxiv.org/abs/2108.12409">[Press et al. 2021, §3]</a>.</li>
+  </ul>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 346" role="img" aria-labelledby="fig-05-1-title">
+<title id="fig-05-1-title">One 2-D pair of a query and a key rotated to positions (3, 1) and to positions (5, 3): the angle between them is the same because the offset is the same</title>
+<defs><marker id="arrow-05-1q" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-fill-b"/></marker><marker id="arrow-05-1k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-fill-a"/></marker></defs>
+<text x="180" y="22" text-anchor="middle" class="s-bold">positions t = 3, j = 1</text>
+<text x="180" y="40" text-anchor="middle" class="s-small s-muted">offset t − j = 2</text>
+<circle class="s-line s-dash" cx="180" cy="165" r="100"/>
+<line class="s-line" x1="72" y1="165" x2="288" y2="165"/>
+<line class="s-line" x1="180" y1="273" x2="180" y2="57"/>
+<line class="s-line-b s-dash" x1="180" y1="165" x2="259.7" y2="119.0" opacity="0.45"/>
+<line class="s-line-a s-dash" x1="180" y1="165" x2="166.8" y2="90.2" opacity="0.45"/>
+<line class="s-line-b" x1="180" y1="165" x2="180.0" y2="73.0" stroke-width="2.4" marker-end="url(#arrow-05-1q)"/>
+<line class="s-line-a" x1="180" y1="165" x2="142.0" y2="99.2" stroke-width="2.4" marker-end="url(#arrow-05-1k)"/>
+<text x="180.0" y="63.0" text-anchor="middle" class="s-small s-tb">q̃<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+<text x="135.0" y="91.1" text-anchor="middle" class="s-small s-ta">k̃<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<path class="s-line" d="M180.0,125.0 A40,40 0 0 0 160.0,130.4"/>
+<text x="165.5" y="114.9" text-anchor="middle" class="s-small s-bold">30°</text>
+<text x="180" y="295" text-anchor="middle" class="s-small">q turned 60°, k turned 20°</text>
+<text x="180" y="311" text-anchor="middle" class="s-small">angle = (100° − 30°) + (j − t)·20° = 70° − 40° = 30°</text>
+<text x="540" y="22" text-anchor="middle" class="s-bold">positions t = 5, j = 3</text>
+<text x="540" y="40" text-anchor="middle" class="s-small s-muted">offset t − j = 2</text>
+<circle class="s-line s-dash" cx="540" cy="165" r="100"/>
+<line class="s-line" x1="432" y1="165" x2="648" y2="165"/>
+<line class="s-line" x1="540" y1="273" x2="540" y2="57"/>
+<line class="s-line-b s-dash" x1="540" y1="165" x2="619.7" y2="119.0" opacity="0.45"/>
+<line class="s-line-a s-dash" x1="540" y1="165" x2="526.8" y2="90.2" opacity="0.45"/>
+<line class="s-line-b" x1="540" y1="165" x2="480.9" y2="94.5" stroke-width="2.4" marker-end="url(#arrow-05-1q)"/>
+<line class="s-line-a" x1="540" y1="165" x2="468.6" y2="139.0" stroke-width="2.4" marker-end="url(#arrow-05-1k)"/>
+<text x="471.9" y="87.8" text-anchor="middle" class="s-small s-tb">q̃<tspan baseline-shift="sub" font-size="9">5</tspan></text>
+<text x="455.4" y="138.2" text-anchor="middle" class="s-small s-ta">k̃<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+<path class="s-line" d="M514.3,134.4 A40,40 0 0 0 502.4,151.3"/>
+<text x="494.1" y="136.9" text-anchor="middle" class="s-small s-bold">30°</text>
+<text x="540" y="295" text-anchor="middle" class="s-small">q turned 100°, k turned 60°</text>
+<text x="540" y="311" text-anchor="middle" class="s-small">angle = (100° − 30°) + (j − t)·20° = 70° − 40° = 30°</text>
+<line class="s-line-b" x1="260" y1="332" x2="286" y2="332" stroke-width="2.4"/><text x="292" y="336" class="s-small">query pair</text>
+<line class="s-line-a" x1="372" y1="332" x2="398" y2="332" stroke-width="2.4"/><text x="404" y="336" class="s-small">key pair</text>
+<line class="s-line s-dash" x1="476" y1="332" x2="502" y2="332"/><text x="508" y="336" class="s-small">unrotated (position 0)</text>
+</svg>
+    <figcaption><b>Figure 1.</b> One 2-D pair of a query and a key, with an illustrative rotation of \(\theta = 20^\circ\) per position and unrotated angles of \(30^\circ\) (query) and \(100^\circ\) (key). Left: positions \((t, j) = (3, 1)\). Right: both positions shifted by 2, so \((5, 3)\). Each vector turns further, but the angle between them, and so \(\tilde q \cdot \tilde k = \|q\|\|k\|\cos(\text{angle})\) for this pair, is unchanged. Only the offset \(t - j\) matters.</figcaption>
+  </figure>
+
+  <h3 id="rope-frequencies">Frequencies and wavelengths</h3>
+  <p>Pair \(i\) rotates by \(\theta_i = b^{-2i/d_h}\) radians per token, so it completes a full turn every \(\lambda_i = 2\pi / \theta_i = 2\pi\, b^{2i/d_h}\) tokens. These are the sinusoidal encoding's frequencies with \(d = d_h\), as Su et al. note <a href="https://arxiv.org/abs/2104.09864">[§3.3]</a>. For a head with \(d_h = 128\) (Llama-3-8B, and also its 70B and 405B siblings <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 3]</a>) there are 64 pairs. The fastest has \(\theta_0 = 1\) rad/token and wavelength \(2\pi \approx 6.28\) tokens. The slowest is pair 63:</p>
+  \[ \lambda_{63} = 2\pi\, b^{126/128} = \begin{cases} 2\pi \cdot 10^{4 \times 0.984375} = 2\pi \cdot 8{,}660 \approx 54{,}410 \text{ tokens} & b = 10^4 \\[2pt] 2\pi \cdot (5 \times 10^5)^{0.984375} = 2\pi \cdot 10^{5.6099} = 2\pi \cdot 407{,}300 \approx 2.56\text{M tokens} & b = 5 \times 10^5 \end{cases} \]
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>\(d_h = 128\), 64 pairs</th><th class="num">\(b = 10^4\)</th><th class="num">\(b = 5 \times 10^5\)</th></tr></thead>
+    <tbody>
+      <tr><td>fastest pair: \(\theta_0\), \(\lambda_0\)</td><td class="num">1 rad/token, 6.28 tokens</td><td class="num">1 rad/token, 6.28 tokens</td></tr>
+      <tr><td>slowest pair: \(\theta_{63}\)</td><td class="num">\(1.155 \times 10^{-4}\) rad/token</td><td class="num">\(2.455 \times 10^{-6}\) rad/token</td></tr>
+      <tr><td>slowest wavelength \(\lambda_{63}\)</td><td class="num">54,410 tokens</td><td class="num">2,559,196 tokens</td></tr>
+      <tr><td>slowest pair's angle after 8,192 tokens</td><td class="num">0.946 rad = 54° (0.15 turns)</td><td class="num">0.0201 rad = 1.15° (0.003 turns)</td></tr>
+      <tr><td>slowest pair's angle after 131,072 tokens</td><td class="num">15.14 rad (2.41 turns)</td><td class="num">0.322 rad = 18.4° (0.051 turns)</td></tr>
+      <tr><td>pairs with \(\lambda &lt; 8\text{K}\) (complete a turn within 8K)</td><td class="num">50 of 64</td><td class="num">35 of 64</td></tr>
+      <tr><td>pairs with \(\lambda &lt; 128\text{K}\)</td><td class="num">64 of 64</td><td class="num">49 of 64</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Computed from \(\theta_i = b^{-2i/128}\). Pair counts solve \(2\pi b^{2i/128} &lt; L\), i.e. \(i &lt; 64 \log_b(L/2\pi)\): for \(b = 10^4\), \(i &lt; 49.8\) at \(L = 8192\); for \(b = 5\times10^5\), \(i &lt; 35.0\) at 8192 and \(i &lt; 48.5\) at 131,072.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 384" role="img" aria-labelledby="fig-05-2-title">
+<title id="fig-05-2-title">Rotation per token for each of the 64 RoPE pairs at head dimension 128, for base 10,000 and base 500,000, with the 8K and 128K one-full-turn thresholds</title>
+<text x="12" y="16" class="s-small s-muted">θ<tspan baseline-shift="sub" font-size="9">i</tspan> = b^(−2i/128), rad per token, log scale</text>
+<line class="s-line" x1="80" y1="30.0" x2="640" y2="30.0" opacity="0.25"/>
+<text x="72" y="34.0" text-anchor="end" class="s-small s-mono">1</text>
+<line class="s-line" x1="80" y1="73.1" x2="640" y2="73.1" opacity="0.25"/>
+<text x="72" y="77.1" text-anchor="end" class="s-small s-mono">1e-1</text>
+<line class="s-line" x1="80" y1="116.2" x2="640" y2="116.2" opacity="0.25"/>
+<text x="72" y="120.2" text-anchor="end" class="s-small s-mono">1e-2</text>
+<line class="s-line" x1="80" y1="159.2" x2="640" y2="159.2" opacity="0.25"/>
+<text x="72" y="163.2" text-anchor="end" class="s-small s-mono">1e-3</text>
+<line class="s-line" x1="80" y1="202.3" x2="640" y2="202.3" opacity="0.25"/>
+<text x="72" y="206.3" text-anchor="end" class="s-small s-mono">1e-4</text>
+<line class="s-line" x1="80" y1="245.4" x2="640" y2="245.4" opacity="0.25"/>
+<text x="72" y="249.4" text-anchor="end" class="s-small s-mono">1e-5</text>
+<line class="s-line" x1="80" y1="288.5" x2="640" y2="288.5" opacity="0.25"/>
+<text x="72" y="292.5" text-anchor="end" class="s-small s-mono">1e-6</text>
+<line class="s-line" x1="80.0" y1="310" x2="80.0" y2="315"/>
+<text x="80.0" y="329" text-anchor="middle" class="s-small s-mono">0</text>
+<line class="s-line" x1="222.2" y1="310" x2="222.2" y2="315"/>
+<text x="222.2" y="329" text-anchor="middle" class="s-small s-mono">16</text>
+<line class="s-line" x1="364.4" y1="310" x2="364.4" y2="315"/>
+<text x="364.4" y="329" text-anchor="middle" class="s-small s-mono">32</text>
+<line class="s-line" x1="506.7" y1="310" x2="506.7" y2="315"/>
+<text x="506.7" y="329" text-anchor="middle" class="s-small s-mono">48</text>
+<line class="s-line" x1="640.0" y1="310" x2="640.0" y2="315"/>
+<text x="640.0" y="329" text-anchor="middle" class="s-small s-mono">63</text>
+<line class="s-line" x1="80" y1="30" x2="80" y2="310"/>
+<line class="s-line" x1="80" y1="310" x2="640" y2="310"/>
+<text x="360" y="346" text-anchor="middle" class="s-small">pair index i (0 = fastest)</text>
+<line class="s-line s-dash" x1="80" y1="164.2" x2="640" y2="164.2"/>
+<text x="90" y="158.2" class="s-small s-bold">8K: θ = 2π/8192</text>
+<line class="s-line s-dash" x1="80" y1="216.1" x2="640" y2="216.1"/>
+<text x="90" y="210.1" class="s-small s-bold">128K: θ = 2π/131072</text>
+<polyline class="s-line-b" points="80.0,30.0 88.9,32.7 97.8,35.4 106.7,38.1 115.6,40.8 124.4,43.5 133.3,46.2 142.2,48.8 151.1,51.5 160.0,54.2 168.9,56.9 177.8,59.6 186.7,62.3 195.6,65.0 204.4,67.7 213.3,70.4 222.2,73.1 231.1,75.8 240.0,78.5 248.9,81.2 257.8,83.8 266.7,86.5 275.6,89.2 284.4,91.9 293.3,94.6 302.2,97.3 311.1,100.0 320.0,102.7 328.9,105.4 337.8,108.1 346.7,110.8 355.6,113.5 364.4,116.2 373.3,118.8 382.2,121.5 391.1,124.2 400.0,126.9 408.9,129.6 417.8,132.3 426.7,135.0 435.6,137.7 444.4,140.4 453.3,143.1 462.2,145.8 471.1,148.5 480.0,151.2 488.9,153.8 497.8,156.5 506.7,159.2 515.6,161.9 524.4,164.6 533.3,167.3 542.2,170.0 551.1,172.7 560.0,175.4 568.9,178.1 577.8,180.8 586.7,183.5 595.6,186.2 604.4,188.8 613.3,191.5 622.2,194.2 631.1,196.9 640.0,199.6" stroke-width="2.4"/>
+<text x="648" y="203.6" class="s-small s-bold s-tb">b = 1e4</text>
+<circle class="s-fill-b" cx="523.1" cy="164.2" r="4.5"/>
+<polyline class="s-line-a" points="80.0,30.0 88.9,33.8 97.8,37.7 106.7,41.5 115.6,45.3 124.4,49.2 133.3,53.0 142.2,56.9 151.1,60.7 160.0,64.5 168.9,68.4 177.8,72.2 186.7,76.0 195.6,79.9 204.4,83.7 213.3,87.5 222.2,91.4 231.1,95.2 240.0,99.0 248.9,102.9 257.8,106.7 266.7,110.6 275.6,114.4 284.4,118.2 293.3,122.1 302.2,125.9 311.1,129.7 320.0,133.6 328.9,137.4 337.8,141.2 346.7,145.1 355.6,148.9 364.4,152.7 373.3,156.6 382.2,160.4 391.1,164.3 400.0,168.1 408.9,171.9 417.8,175.8 426.7,179.6 435.6,183.4 444.4,187.3 453.3,191.1 462.2,194.9 471.1,198.8 480.0,202.6 488.9,206.4 497.8,210.3 506.7,214.1 515.6,218.0 524.4,221.8 533.3,225.6 542.2,229.5 551.1,233.3 560.0,237.1 568.9,241.0 577.8,244.8 586.7,248.6 595.6,252.5 604.4,256.3 613.3,260.2 622.2,264.0 631.1,267.8 640.0,271.7" stroke-width="2.4"/>
+<text x="648" y="275.7" class="s-small s-bold s-ta">b = 5e5</text>
+<circle class="s-fill-a" cx="391.0" cy="164.2" r="4.5"/>
+<circle class="s-fill-a" cx="511.2" cy="216.1" r="4.5"/>
+<text x="80" y="368" class="s-small"><tspan class="s-bold s-tb">b = 1e4:</tspan> 50 of 64 pairs have wavelength &lt; 8K, and all 64 have wavelength &lt; 128K (slowest: 54.4K).</text>
+<text x="80" y="384" class="s-small"><tspan class="s-bold s-ta">b = 5e5:</tspan> 35 of 64 pairs have wavelength &lt; 8K, 49 have wavelength &lt; 128K (slowest: 2.56M).</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Rotation per token \(\theta_i\) for each of the 64 pairs, on a log scale. Both bases share the fastest pair (\(\theta_0 = 1\)); raising the base stretches the geometric ladder downward. A pair that lies below a dashed line completes at least one full turn inside that context (its wavelength is shorter than the context). At \(b = 10^4\) the ladder crosses the 8K line at pair 49.8 and never reaches the 128K line: every pair completes a turn within 128K. At \(b = 5\times10^5\) the crossings sit at pairs 35.0 (8K) and 48.5 (128K), so 15 pairs never complete a turn within 128K.</figcaption>
+  </figure>
+
+  <p>How to read the spectrum:</p>
+  <ul>
+    <li><strong>Fast pairs</strong> resolve exact local offsets but alias: pair 0 makes offsets 0 and 6 look almost the same (6 rad \(\approx 2\pi - 0.28\)).</li>
+    <li><strong>Middle pairs</strong> give the mixed-scale code, like the digits of a number.</li>
+    <li><strong>Slow pairs</strong> barely turn inside the training context. At \(b = 5\times10^5\) the slowest pair turns 1.15° in 8K tokens, so its score contribution is almost position-independent to first order: a content-only channel.</li>
+    <li>A pair whose wavelength exceeds the training length has never seen a full period. That is where out-of-distribution angles appear first when you run longer (<a href="#length-generalization">below</a>).</li>
+  </ul>
+
+  <h3 id="rope-decay">The "long-term decay" claim</h3>
+  <p>Su et al. claim RoPE with \(\theta_i = 10000^{-2i/d}\) gives a long-term decay: the inner product decays as the relative distance grows <a href="https://arxiv.org/abs/2104.09864">[§3.3, §3.4.3]</a>. Their argument writes the score as \(\operatorname{Re}\sum_i h_i e^{\mathrm{i}(m-n)\theta_i}\) with \(h_i = z^q_i \overline{z^k_i}\), applies Abel summation, and bounds it by \(\big(\max_i |h_{i+1} - h_i|\big) \sum_i |S_{i+1}|\), where \(S_j = \sum_{i \lt j} e^{\mathrm{i}(m-n)\theta_i}\). They plot that \(\frac{1}{d/2}\sum_i |S_i|\) shrinks as the distance grows <a href="https://arxiv.org/abs/2104.09864">[Eq. 36-37, Fig. 2]</a>. State it precisely:</p>
+  <ul>
+    <li>It is an <em>upper bound</em> over worst-case coefficients \(h_i\), and the decay of the bound is shown numerically. It says nothing about the score a trained model actually produces.</li>
+    <li>The bound may be very loose. Chen et al. show that a score of this form can be tiny on \([0, L]\) and huge beyond it, and call the bound "vacuous" for that purpose <a href="https://arxiv.org/abs/2306.15595">[§2.2]</a>. Trained models also retrieve from far away, so decay is at most a prior in the geometry.</li>
+    <li>A cleaner statement is Men et al.'s. For a query \(q\), a similar key \(k^* = q + \epsilon\) and a random key \(k\), with i.i.d. components of standard deviation \(\sigma\): \(\mathbb{E}[q R_m k^*] - \mathbb{E}[q R_m k] = 2\sigma^2 \sum_i \cos(m\theta_i)\) <a href="https://arxiv.org/abs/2405.14591">[Men et al. 2024, Thm. 1]</a>. This is the advantage of a content match over noise as a function of distance \(m\).</li>
+  </ul>
+  <p>Normalizing by the number of pairs, \(C(m) = \tfrac{2}{d_h}\sum_i \cos(m\theta_i)\), and evaluating for \(d_h = 128\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>\(C(m)\), \(d_h = 128\)</th><th class="num">m = 1</th><th class="num">10</th><th class="num">100</th><th class="num">1,000</th><th class="num">4,096</th><th class="num">8,192</th><th class="num">32,768</th><th class="num">131,072</th></tr></thead>
+    <tbody>
+      <tr><td>\(b = 10^4\)</td><td class="num">0.970</td><td class="num">0.669</td><td class="num">0.477</td><td class="num">0.159</td><td class="num">−0.053</td><td class="num">0.025</td><td class="num">0.056</td><td class="num">−0.006</td></tr>
+      <tr><td>\(b = 5\times10^5\)</td><td class="num">0.978</td><td class="num">0.764</td><td class="num">0.611</td><td class="num">0.492</td><td class="num">0.383</td><td class="num">0.265</td><td class="num">0.210</td><td class="num">0.048</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Our computation from Men et al.'s Theorem 1. \(C(m)\) first goes negative at \(m = 1{,}707\) for \(b = 10^4\) and at \(m = 18{,}438\) for \(b = 5\times10^5\). This assumes isotropic \(q, k\); real heads can concentrate energy in slow pairs, which is how long-range retrieval is possible at all.</p>
+  <p>With base \(10^4\), the expected content advantage is already near zero by a few thousand tokens. A larger base keeps it alive longer. This is one way to see why the base has to grow with the context length.</p>
+
+  <h3 id="rope-base">The base \(b\)</h3>
+  <p>The base sets the whole geometric ladder of wavelengths, \(\lambda_i = 2\pi b^{2i/d_h}\). Larger \(b\) means smaller \(\theta_i\) for every pair except the first: more pairs with wavelengths beyond the training context, slower decay of the content advantage (previous section), and fewer pairs devoted to short ranges (50 of 64 pairs below 8K wavelength at \(b=10^4\), 35 of 64 at \(b=5\times10^5\)). The base is chosen together with the target context length:</p>
+  <div class="table-wrap" id="base-table"><table class="data">
+    <thead><tr><th class="num">Base \(b\)</th><th>Model (source)</th><th>Context and notes</th></tr></thead>
+    <tbody>
+      <tr><td class="num">10,000</td><td>Llama 1 and 2 <a href="https://arxiv.org/abs/2405.14591">[Men et al., Tab. 1]</a>; GPT-NeoX-20B <a href="https://huggingface.co/EleutherAI/gpt-neox-20b/blob/main/config.json">[config]</a>; Mistral-7B v0.1 <a href="https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/main/config.json">[config]</a>; DeepSeek-V3 <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json">[config]</a></td><td>Llama 2: 4K. GPT-NeoX-20B: 2K, partial RoPE. Mistral v0.1: 32K positions, 4K sliding window. DeepSeek-V3: YaRN factor 40 over 4,096 (RoPE on the decoupled 64-dim path only)</td></tr>
+      <tr><td class="num">50,000</td><td>Kimi K2 <a href="https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json">[config]</a></td><td>131,072 positions, YaRN from 4,096; MLA with 64 heads</td></tr>
+      <tr><td class="num">150,000</td><td>gpt-oss-20b <a href="https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json">[config]</a></td><td>131,072 positions, YaRN from 4,096; \(d_h = 64\)</td></tr>
+      <tr><td class="num">500,000</td><td>Llama 3 and 3.1 <a href="https://arxiv.org/abs/2407.21783">[Tab. 3]</a>; Llama 4 Scout (config); OLMo 2 7B <a href="https://huggingface.co/allenai/OLMo-2-1124-7B/blob/main/config.json">[config]</a></td><td>Llama 3: 8K pretraining, 128K after staged extension. Llama 3.1's config also applies a frequency-dependent rescaling (factor 8 over 8,192; <a href="10-long-context.html">page 10</a>)</td></tr>
+      <tr><td class="num">1,000,000</td><td>Qwen2.5-7B <a href="https://huggingface.co/Qwen/Qwen2.5-7B/blob/main/config.json">[config]</a>; Qwen3-8B <a href="https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json">[config]</a>; Mistral-7B v0.3 <a href="https://huggingface.co/mistralai/Mistral-7B-v0.3/blob/main/config.json">[config]</a>; GLM-4.5 <a href="https://huggingface.co/zai-org/GLM-4.5/blob/main/config.json">[config]</a>; Gemma 3 global layers <a href="https://arxiv.org/abs/2503.19786">[§2]</a></td><td>Qwen2.5-7B: 131,072 positions; Qwen3-8B: 40,960; Mistral v0.3: 32,768; GLM-4.5: partial RoPE (factor 0.5). Gemma 3 keeps 10,000 on its local layers</td></tr>
+      <tr><td class="num">5,000,000</td><td>MiniMax-M2 <a href="https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/config.json">[config]</a></td><td>Rotates 64 of 128 dims (<code>rotary_dim</code>)</td></tr>
+      <tr><td class="num">10,000,000</td><td>Qwen3-Next-80B-A3B <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json">[config]</a></td><td>Partial RoPE: factor 0.25 of \(d_h = 256\), i.e. 64 rotated dims</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Configs read in September 2026 from the public repositories (Llama 4 Scout from an unsloth mirror of Meta's gated config: <code>rope_theta</code> 500,000). The list is illustrative, not the newest releases; base and context length are chosen together, so a rising base tracks rising context.</p>
+  <p>Llama 3 is the reference story. Meta "increase[d] the RoPE base frequency hyperparameter to 500,000", noting that Xiong et al. had shown this value effective for contexts up to 32,768 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. It then extended the context from 8K to 128K in six stages over about 800B tokens, checking after each stage that short-context quality had recovered and that needle-in-a-haystack retrieval was perfect at that length <a href="https://arxiv.org/abs/2407.21783">[§3.4.2]</a>. Xiong et al.'s own experiment (they call it RoPE ABF, adjusted base frequency) continues pretraining Llama 2 7B on 32,768-token sequences after raising the base from 10,000 to 500,000: validation perplexity on 32K-token Books samples is 6.548 for unmodified RoPE, 6.341 for position interpolation and 6.323 for ABF <a href="https://arxiv.org/abs/2309.16039">[Xiong et al. 2023, §4.1, Tab. 5]</a>. One analysis derives a lower bound on the base for a given context, roughly \(8.4\times10^4\) for 8K, \(6.4\times10^5\) for 32K and \(7.8\times10^6\) for 128K; the authors caution the boundary is not strict, because stacked layers can extend the range <a href="https://arxiv.org/abs/2405.14591">[Men et al. 2024, Tab. 2]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Raising the RoPE base</div>
+    <dl>
+      <dt>Problem</dt><dd>With \(b = 10^4\) the slow pairs have wavelengths of tens of thousands of tokens, so a model trained on a few thousand tokens has seen only a sliver of their range, and the expected content-match advantage \(C(m)\) is near zero beyond a few thousand tokens.</dd>
+      <dt>Idea</dt><dd>Increase \(b\), stretching the wavelength ladder \(\lambda_i = 2\pi b^{2i/d_h}\) so slow pairs stay in a small, well-trained angle range over the whole context.</dd>
+      <dt>Why it works</dt><dd>Every pair except pair 0 turns more slowly. The content advantage decays more slowly (table above), and angles seen at long range stay closer to those seen in training.</dd>
+      <dt>Evidence</dt><dd>Xiong et al.: 6.323 vs 6.548 perplexity at 32K after continued training <a href="https://arxiv.org/abs/2309.16039">[§4.1, Tab. 5]</a>. Llama 3 uses 500,000 <a href="https://arxiv.org/abs/2407.21783">[§3.2]</a>.</dd>
+      <dt>Cost</dt><dd>It changes every pair but the first, so it needs continued training; flipping the base on a checkpoint trained with another silently degrades it. Fewer pairs remain at short wavelengths. In RoPE/NoPE hybrids a large base can hurt: Yang et al. see the 128K needle score fall from 8.04 (base 10K) to 6.20 (base 4M) <a href="https://arxiv.org/abs/2501.18795">[Yang et al. 2025, Tab. 3]</a>.</dd>
+      <dt>Used by</dt><dd>Llama 3 (500K), Qwen (1M), Gemma 3 global layers (1M), and the table above.</dd>
+    </dl>
+  </div>
+
+  <h3 id="rope-layouts">Implementation: two pair layouts</h3>
+  <p>The derivation pairs adjacent entries \((x_{2i}, x_{2i+1})\). That is the <strong>interleaved</strong> layout: the original RoFormer paper, GPT-J (Hugging Face <code>rotate_every_two</code>), DeepSeek-V3's reference inference code and Llama 4's Hugging Face implementation (both use <code>view_as_complex</code> on trailing pairs). The other common choice is <strong>split halves</strong>, pairing \((x_i, x_{i+d_h/2})\) and using <code>rotate_half</code>: GPT-NeoX and the Hugging Face Llama implementation. Neither is more correct. They are the same function class under a fixed permutation of each head's dimensions, and the permutation can be absorbed into \(W^Q\) and \(W^K\).</p>
+
+<pre><code class="language-python">import torch
+
+def rope_cos_sin(pos, d_h, base=10000.0):
+    inv_freq = base ** (-torch.arange(0, d_h, 2, dtype=torch.float32) / d_h)   # (d_h/2,)  theta_i
+    ang = pos.float()[:, None] * inv_freq[None, :]                              # (T, d_h/2) angles in fp32
+    return ang.cos(), ang.sin()                                                 # the "cos/sin cache"
+
+def rope_interleaved(x, cos, sin):            # x: (B, T, H, d_h); cos, sin: (T, d_h/2)
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]                     # broadcast over B and H
+    a, b = x[..., 0::2], x[..., 1::2]                                           # pair i = (x[2i], x[2i+1])
+    return torch.stack((a * cos - b * sin, a * sin + b * cos), dim=-1).flatten(-2)
+
+def rotate_half(x):
+    h = x.shape[-1] // 2
+    return torch.cat((-x[..., h:], x[..., :h]), dim=-1)                         # (-x2, x1)
+
+def rope_half(x, cos, sin):                   # GPT-NeoX / Hugging Face Llama layout
+    cos = torch.cat((cos, cos), dim=-1)[None, :, None, :]                       # frequency i sits at i and i + d_h/2
+    sin = torch.cat((sin, sin), dim=-1)[None, :, None, :]
+    return x * cos + rotate_half(x) * sin                                       # pair i = (x[i], x[i + d_h/2])
+
+d_h = 8                                                                         # convert interleaved -> half:
+perm = torch.cat((torch.arange(0, d_h, 2), torch.arange(1, d_h, 2)))            # [0, 2, 4, 6, 1, 3, 5, 7]
+# x_half = x_interleaved[..., perm]; fold it into W_q, W_k per head:  W.view(d, n_h, d_h)[:, :, perm]
+</code></pre>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 312" role="img" aria-labelledby="fig-05-3-title">
+<title id="fig-05-3-title">Interleaved and split-half RoPE layouts for a head of dimension 8: the same four 2-D pairs, stored in different positions, related by a fixed permutation</title>
+<text x="8" y="64" class="s-small s-bold">interleaved</text><text x="8" y="80" class="s-small s-muted">(x[2i], x[2i+1])</text>
+<text x="8" y="192" class="s-small s-bold">split halves</text><text x="8" y="208" class="s-small s-muted">(x[i], x[i+d/2])</text>
+<rect class="s-a" x="130" y="50" width="54" height="34" rx="4"/>
+<text x="157.0" y="72" text-anchor="middle" class="s-mono">0</text>
+<rect class="s-a" x="198" y="50" width="54" height="34" rx="4"/>
+<text x="225.0" y="72" text-anchor="middle" class="s-mono">1</text>
+<rect class="s-b" x="266" y="50" width="54" height="34" rx="4"/>
+<text x="293.0" y="72" text-anchor="middle" class="s-mono">2</text>
+<rect class="s-b" x="334" y="50" width="54" height="34" rx="4"/>
+<text x="361.0" y="72" text-anchor="middle" class="s-mono">3</text>
+<rect class="s-c" x="402" y="50" width="54" height="34" rx="4"/>
+<text x="429.0" y="72" text-anchor="middle" class="s-mono">4</text>
+<rect class="s-c" x="470" y="50" width="54" height="34" rx="4"/>
+<text x="497.0" y="72" text-anchor="middle" class="s-mono">5</text>
+<rect class="s-d" x="538" y="50" width="54" height="34" rx="4"/>
+<text x="565.0" y="72" text-anchor="middle" class="s-mono">6</text>
+<rect class="s-d" x="606" y="50" width="54" height="34" rx="4"/>
+<text x="633.0" y="72" text-anchor="middle" class="s-mono">7</text>
+<text x="191.0" y="42" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">0</tspan></text>
+<text x="327.0" y="42" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<text x="463.0" y="42" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">2</tspan></text>
+<text x="599.0" y="42" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+<rect class="s-a" x="130" y="178" width="54" height="34" rx="4"/>
+<text x="157.0" y="200" text-anchor="middle" class="s-mono">0</text>
+<text x="157.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">0</tspan></text>
+<rect class="s-b" x="198" y="178" width="54" height="34" rx="4"/>
+<text x="225.0" y="200" text-anchor="middle" class="s-mono">1</text>
+<text x="225.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<rect class="s-c" x="266" y="178" width="54" height="34" rx="4"/>
+<text x="293.0" y="200" text-anchor="middle" class="s-mono">2</text>
+<text x="293.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">2</tspan></text>
+<rect class="s-d" x="334" y="178" width="54" height="34" rx="4"/>
+<text x="361.0" y="200" text-anchor="middle" class="s-mono">3</text>
+<text x="361.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+<rect class="s-a" x="402" y="178" width="54" height="34" rx="4"/>
+<text x="429.0" y="200" text-anchor="middle" class="s-mono">4</text>
+<text x="429.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">0</tspan></text>
+<rect class="s-b" x="470" y="178" width="54" height="34" rx="4"/>
+<text x="497.0" y="200" text-anchor="middle" class="s-mono">5</text>
+<text x="497.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<rect class="s-c" x="538" y="178" width="54" height="34" rx="4"/>
+<text x="565.0" y="200" text-anchor="middle" class="s-mono">6</text>
+<text x="565.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">2</tspan></text>
+<rect class="s-d" x="606" y="178" width="54" height="34" rx="4"/>
+<text x="633.0" y="200" text-anchor="middle" class="s-mono">7</text>
+<text x="633.0" y="228" text-anchor="middle" class="s-small s-bold">θ<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+<line class="s-line-a" x1="157.0" y1="84" x2="157.0" y2="178"/>
+<line class="s-line-a" x1="225.0" y1="84" x2="429.0" y2="178"/>
+<line class="s-line-b" x1="293.0" y1="84" x2="225.0" y2="178"/>
+<line class="s-line-b" x1="361.0" y1="84" x2="497.0" y2="178"/>
+<line class="s-line-c" x1="429.0" y1="84" x2="293.0" y2="178"/>
+<line class="s-line-c" x1="497.0" y1="84" x2="565.0" y2="178"/>
+<line class="s-line-d" x1="565.0" y1="84" x2="361.0" y2="178"/>
+<line class="s-line-d" x1="633.0" y1="84" x2="633.0" y2="178"/>
+<text x="8" y="266" class="s-small">Same color = same 2-D pair = same frequency θ<tspan baseline-shift="sub" font-size="9">i</tspan>.</text>
+<text x="8" y="284" class="s-small">perm[s·(d/2) + i] = 2i + s: all even (real) entries first, then all odd (imaginary) entries.</text>
+<text x="8" y="302" class="s-small">x_half = x_interleaved[..., perm], applied per head to the outputs of W^Q and W^K.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One head with \(d_h = 8\). Both layouts rotate the same four pairs with the same four frequencies; only the storage positions differ. The permutation moves entry \(2i + s\) to position \(s\cdot d_h/2 + i\): all real parts first, then all imaginary parts. Rotate-then-permute equals permute-then-rotate.</figcaption>
+  </figure>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: mixing layouts corrupts a converted checkpoint silently</div>
+    <p>If weights trained with one layout are loaded into code that assumes the other, nothing crashes and no value is NaN. Every pair is rotated by the wrong angle (entries \(2i, 2i{+}1\) get treated as \(i, i{+}d_h/2\), with the wrong frequencies), so attention scores are wrong and the model just gets much worse. Hugging Face's Llama converter therefore permutes the rows of \(W^Q\) and \(W^K\) per head with <code>w.view(n_heads, dim1 // n_heads // 2, 2, dim2).transpose(1, 2).reshape(dim1, dim2)</code>, commented "permute for sliced rotary" <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py">[convert_llama_weights_to_hf.py]</a>. Hugging Face's DeepSeek-V3 code does the equivalent at runtime: it reshapes \(q\) and \(k\) to <code>(..., d/2, 2)</code>, transposes, and then applies <code>rotate_half</code> <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py">[modeling_deepseek.py]</a>. The defense is a numerical test: compare logits on a fixed prompt against the reference implementation, or check score equivalence under the permutation (the drill does).</p>
+  </aside>
+
+  <h3 id="rope-cost">Cost, precision and the KV cache</h3>
+  <ul>
+    <li><strong>Compute is negligible.</strong> Rotating one \(d_h\)-vector is 4 multiplies and 2 adds per pair, \(3 d_h\) FLOPs, 384 for \(d_h = 128\). The projection that produced it costs \(2 d\, d_h = 2 \cdot 4096 \cdot 128 \approx 1.05\)M FLOPs per head per token. The ratio is 0.04%. It is an elementwise, memory-bound op, usually fused into the attention kernel or the projection epilogue.</li>
+    <li><strong>The cos/sin cache</strong> holds \(T_{\max} \times d_h/2\) entries each. For 131,072 positions, \(d_h = 128\), fp32: \(131072 \cdot 64 \cdot 2 \cdot 4\) B = 64 MiB, shared by all layers and heads.</li>
+    <li><strong>Compute angles in fp32.</strong> bfloat16 has 8 significant bits, so at 8,192 the spacing between representable numbers is 64: an angle of 8,192 rad is unrepresentable to within 64 rad, which is meaningless. Hugging Face forces fp32 for the angles regardless of autocast (its code comment: "to really force fp32") <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">[modeling_llama.py]</a>. Cast <code>cos</code> and <code>sin</code> to the activation dtype only after the trig.</li>
+    <li><strong>KV cache.</strong> During decoding, the cache stores keys that are <em>already rotated</em> by their absolute position, so each step rotates only the new \(q\) and \(k\), at position \(=\) current length (<a href="06-decoding-kv-cache.html">page 06</a>). MLA does the same with its rotated key \(k^R\) (<a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>). Consequences: position ids must continue from the cache length in decode and in chunked prefill (a chunk restarted at position 0 is a silent bug), and a shared prefix in a prefix cache must sit at the same positions. Because rotations compose, moving a cached key by \(\delta\) positions is one more rotation \(R_\delta\), which is how you would close a gap after evicting tokens.</li>
+  </ul>
+<pre><code class="language-python"># decode step with a KV cache: rotate only the new token, at its absolute position
+pos = torch.tensor([cache_len])                      # NOT 0: the token's index in the full sequence
+cos, sin = rope_cos_sin(pos, d_h)
+q = rope_half(q_new, cos, sin)                       # (B, 1, n_h, d_h)
+k = rope_half(k_new, cos, sin)                       # stored already rotated
+k_cache = torch.cat([k_cache, k], dim=1)             # (B, S+1, n_kv, d_h);  v_cache gets v_new unrotated
+</code></pre>
+
+  <h3 id="rope-partial">Partial RoPE and decoupled RoPE</h3>
+  <p>Nothing requires rotating all \(d_h\) dimensions. <strong>Partial RoPE</strong> rotates only the first \(r\) and leaves the rest untouched. GPT-NeoX-20B applies rotary embeddings "only to the first 25% of embedding vector dimensions", following GPT-J, because "initial experiments indicate that this strikes the best balance of performance and computational efficiency" <a href="https://arxiv.org/abs/2204.06745">[Black et al. 2022, §2.1.1; config <code>rotary-pct</code> 0.25]</a>. With 64 heads of \(6144/64 = 96\) dims, that is 24 rotated dims (12 pairs). GPT-J itself rotates 64 of 256 (<a href="https://huggingface.co/EleutherAI/gpt-j-6b/blob/main/config.json">config</a>). Several recent open models do the same: GLM-4.5 rotates half of each head, Qwen3-Next a quarter (64 of 256), MiniMax-M2 64 of 128 (configs in the table above). The frequencies are computed for the rotated slice, \(\theta_i = b^{-2i/r}\), so the full geometric ladder is packed into \(r\) dimensions. A plausible reason it works (our reading, beyond what GPT-NeoX reports) is that the unrotated dimensions are position-free content channels, like the slowest pairs.</p>
+  <p><strong>Decoupled RoPE</strong> in MLA is partial RoPE by necessity rather than by choice: the rotation cannot sit on the compressed content path without breaking weight absorption, so DeepSeek adds a separate 64-dim rotated path (per-head \(q^R\), one shared \(k^R\)) and leaves the 128-dim content path unrotated. RoPE then covers 64 of the 192 score dimensions. The argument is in <a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Rotary position embedding</div>
+    <dl>
+      <dt>Problem</dt><dd>Absolute encodings added at the input do not yield a relative score (four-term expansion above), and bias-based schemes need a \(T\times T\) tensor and a kernel that supports it.</dd>
+      <dt>Idea</dt><dd>Rotate each 2-D pair of \(q\) and \(k\) by an angle linear in position, with a geometric ladder of frequencies \(\theta_i = b^{-2i/d_h}\).</dd>
+      <dt>Why it works</dt><dd>Rotations are orthogonal and commute, so \(R_t R_j^\top = R_{t-j}\): the score depends only on the offset, with no parameters. It acts before the attention kernel, so any fused kernel works unchanged, and cached keys are rotated once.</dd>
+      <dt>Evidence</dt><dd>Modest and mixed. RoFormer reports 27.5 vs 27.3 BLEU on WMT14 En-De and faster MLM convergence than BERT <a href="https://arxiv.org/abs/2104.09864">[Su et al. 2021, Tab. 1, §4.2]</a>. In Press et al.'s test, rotary matches sinusoidal in-distribution (20.07 vs 20.05) and extrapolates badly (31.58 at 2,512 tokens). Kazemnejad et al. find it generalizes in length about like absolute embeddings. GPT-NeoX adopted it on "positive prior experiences".</dd>
+      <dt>Cost</dt><dd>Poor extrapolation without rescaling (perplexity above \(10^3\) just past the training length for LLaMA-7B <a href="https://arxiv.org/abs/2306.15595">[Chen et al. 2023, Tab. 1]</a>), a base that must be co-designed with the context, the layout hazard, and incompatibility with weight absorption (MLA).</dd>
+      <dt>Used by</dt><dd>Llama, Qwen, Mistral, DeepSeek, Gemma, GLM, OLMo and the other models in the base table; partial in GPT-NeoX, GLM-4.5, Qwen3-Next.</dd>
+    </dl>
+  </div>
+  <p>Why then did RoPE win? Our assessment: not because of dramatic in-distribution quality gains (the evidence above is thin) but because it is parameter-free, composes with the KV cache and fused kernels, and exposes continuous knobs (the base, position scaling) that let a lab extend a pretrained model's context with a modest amount of continued training. PI needed about 1,000 fine-tuning steps <a href="https://arxiv.org/abs/2306.15595">[Chen et al. 2023, Abstract]</a>. Every extension method in <a href="10-long-context.html">page 10</a> is built on RoPE.</p>
+</section>
+
+<section>
+  <h2 id="nope">NoPE and RoPE/NoPE hybrids</h2>
+
+  <h3 id="nope-results">No positional encoding</h3>
+  <p>The causal-mask argument (<a href="#causal-leak">above</a>) says a decoder can learn positions unaided. Kazemnejad et al. tested it: decoder-only models with five schemes (sinusoidal, T5 bias, ALiBi, rotary, none) trained from scratch, ~107M parameters, on ten algorithmic and reasoning tasks (copy, reverse, addition, sorting, parity, and others), trained on lengths up to \(L = 20\) and tested up to \(2L\). Aggregated mean reciprocal rank on length generalization: NoPE 0.69, T5 bias 0.55, ALiBi 0.50, rotary 0.33, absolute embeddings 0.22 <a href="https://arxiv.org/abs/2305.19466">[Kazemnejad et al. 2023, Fig. 1]</a>. In-distribution, all schemes fit equally well. They also find that NoPE's learned attention patterns most resemble T5's relative bias, and that rotary behaves like absolute embeddings for length generalization <a href="https://arxiv.org/abs/2305.19466">[§4-5]</a>. Post-submission, ~1B models with 1,024-token context trained on code: rotary's perplexity "explodes" beyond the training length, while NoPE and ALiBi hold up to about twice the training context, with ALiBi more stable further out <a href="https://arxiv.org/abs/2305.19466">[§7]</a>.</p>
+  <p>Read this with its caveats. The models are small, the tasks synthetic, and the training length tiny. At 8B scale on standard data, Cohere's controlled comparison found pure NoPE clearly worse: validation loss 1.58 vs 1.52 for RoPE, MMLU 47.6 vs 48.6, though its long-context needle score was close (9.03 vs 9.82) <a href="https://arxiv.org/abs/2501.18795">[Yang et al. 2025, Tab. 2]</a>. Nobody ships pure NoPE at scale; the interesting use is in hybrids.</p>
+
+  <h3 id="hybrids">Interleaving RoPE and NoPE layers</h3>
+  <p>Yang et al. (Cohere) noticed that the two behave differently: NoPE layers are strong at retrieval (high attention mass on the needle, with an attention sink), while RoPE layers have a strong recency bias. Interleaving them produced a spontaneous "division of labor": RoPE layers aggregate local information, NoPE layers retrieve from far away <a href="https://arxiv.org/abs/2501.18795">[§2.2.3]</a>. Their final design, RNope-SWA, alternates three sliding-window RoPE layers (window 4,096) with one full-attention NoPE layer, and needs no RoPE base scaling for long context (its base stays constant while the RoPE baseline uses 1M at 32K and 8M at 128K) <a href="https://arxiv.org/abs/2501.18795">[§3-4]</a>. At 5T tokens it is on par or better on most short benchmarks (MMLU 59.5 vs 57.5; ARC-E is lower, 82.5 vs 84.6) and degrades much less at length: RULER retrieval at 256K is 74.8 vs 57.1, at 128K 90.0 vs 83.0 <a href="https://arxiv.org/abs/2501.18795">[Tab. 4, Tab. 6]</a>. It also cuts the KV cache of three quarters of the layers to a window (see <a href="09-beyond-full-attention.html">page 09</a>). Cohere's Command A uses this recipe, 3:1 sliding-window RoPE to full-attention NoPE <a href="https://arxiv.org/abs/2504.00698">[Command A, §2.3]</a>.</p>
+  <p><strong>Llama 4's iRoPE.</strong> Meta describes "interleaved attention layers without positional embeddings" plus "inference time temperature scaling of attention to enhance length generalization", calling the combination iRoPE, and gives Llama 4 Scout a 10M-token context <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta, Llama 4 announcement]</a>. The Hugging Face implementation and Scout's config give the details:</p>
+  <ul>
+    <li>48 layers with <code>no_rope_layers</code> \(= [1,1,1,0]\) repeated 12 times: every fourth layer skips RoPE (default <code>no_rope_layer_interval</code> = 4). RoPE base 500,000.</li>
+    <li>RoPE layers use chunked attention with chunk size 8,192, so they see at most 8,192 positions and never meet angles outside that range. NoPE layers use full attention and carry the long range.</li>
+    <li>NoPE layers scale the queries by \(1 + 0.1 \cdot \ln\!\big(1 + \lfloor (p+1)/8192 \rfloor\big)\) at position \(p\) (<code>attn_temperature_tuning</code>, <code>attn_scale</code> 0.1, <code>floor_scale</code> 8192): 1 for the first 8,191 positions, about 1.48 at 1M tokens and 1.72 at 10.5M. QK-norm is applied on the RoPE layers only <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/modeling_llama4.py">[modeling_llama4.py]</a>, <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/configuration_llama4.py">[configuration_llama4.py]</a>.</li>
+  </ul>
+  <p>Why scale by a slowly growing log? A softmax over \(N\) keys with bounded logits spreads its mass thin as \(N\) grows (worked numbers in the <a href="#length-generalization">next section</a>), and a factor that grows like \(\ln N\) counteracts that. <span class="unverified" title="Meta's announcement says only that the scaling is 'to enhance length generalization'; the dilution rationale is our reading, not a stated design reason.">This is our interpretation of the design, not a rationale Meta states.</span> For the model-level treatment see <a href="29-llama.html">page 29</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Interleaved RoPE and NoPE layers</div>
+    <dl>
+      <dt>Problem</dt><dd>Full-attention RoPE models need base tuning and staged training to reach long contexts and still degrade; pure NoPE is weaker in-distribution at scale.</dd>
+      <dt>Idea</dt><dd>Make most layers local with RoPE, and every few layers a full-attention layer with no positional encoding.</dd>
+      <dt>Why it works</dt><dd>Local RoPE layers supply order and recency and never leave their trained angle range. The NoPE layers compare pure content over the full context, and the earlier layers' order information reaches them through the residual stream.</dd>
+      <dt>Evidence</dt><dd>RNope-SWA at 5T tokens: RULER retrieval at 256K 74.8 vs 57.1, MMLU 59.5 vs 57.5 <a href="https://arxiv.org/abs/2501.18795">[Yang et al. 2025, Tab. 4, 6]</a>. Command A and Llama 4 adopted the pattern; Llama 4's quality attributable to iRoPE alone has not been published as an ablation that we know of.</dd>
+      <dt>Cost</dt><dd>Two attention types to implement and shard. Long-range retrieval rests on a few layers. A large RoPE base can hurt in the hybrid (128K needle score 8.04 at base 10K vs 6.20 at 4M).</dd>
+      <dt>Used by</dt><dd>Command A (3:1), Llama 4 (Scout config: 1 in 4).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="length-generalization">Length generalization: extrapolation versus interpolation</h2>
+  <p><strong>Extrapolation</strong> <span class="zh">长度外推</span> means running a model on inputs longer than any it trained on. <strong>Interpolation</strong> <span class="zh">位置插值</span> means squeezing the longer range into the range the model already knows. RoPE models fail at extrapolation for two separable reasons.</p>
+
+  <h3 id="ood-angles">Reason 1: angles the network never saw</h3>
+  <p>The score's dependence on the offset \(s = t - j\) is \(a(s) = \operatorname{Re}\sum_i h_i e^{\mathrm{i} s\theta_i}\): a sum of sinusoids whose coefficients \(h_i\) depend on the content of \(q\) and \(k\). Training only ever evaluates it at \(s \in [0, L]\). Trigonometric functions are a universal approximator, so nothing forces \(a(s)\) to stay small outside that range. Chen et al. fit such a function on \([0, 2048]\) with \(d = 128\): it stays within \([-1, 1]\) inside and exceeds 8,000 outside <a href="https://arxiv.org/abs/2306.15595">[Chen et al. 2023, §2.2, Fig. 2]</a>. In practice, LLaMA-7B trained at 2,048 shows PG19 perplexity 7.20 at 2,048 and more than \(10^3\) at 4,096 <a href="https://arxiv.org/abs/2306.15595">[Tab. 1]</a>, and the failure is catastrophic even for evidence only 100 tokens away <a href="https://arxiv.org/abs/2306.15595">[§2.2]</a>. The slow pairs (Figure 2) are the ones that meet unseen phases first: at \(b = 10^4\), \(d_h = 128\), a model trained on 4,096 tokens has seen slowest-pair angles up to \(4096\,\theta_{63} = 0.47\) rad; at 16K it needs 1.9 rad.</p>
+
+  <h3 id="dilution">Reason 2: attention dilution</h3>
+  <p>Even with perfect positions, a softmax over more keys spreads its mass more thinly. If one relevant key has a logit advantage \(\Delta\) over \(N-1\) equal distractors, its attention weight is \(e^{\Delta} / (e^{\Delta} + N - 1)\). For \(\Delta = 8\) (\(e^8 \approx 2981\)) that is 0.42 at \(N = 4{,}096\) but 0.022 at \(N = 131{,}072\). A model calibrates its logit sharpness to the lengths it trained on. This is the intuition behind attention-temperature fixes (YaRN's scale, and the log-scaling in Llama 4's NoPE layers above).</p>
+
+  <h3 id="remedies">Remedies, and what each costs</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Approach</th><th>Idea</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Extrapolate as is</td><td>Run longer, change nothing</td><td>LLaMA-7B at 2K: perplexity above \(10^3\) at 4K <a href="https://arxiv.org/abs/2306.15595">[Chen et al., Tab. 1]</a></td></tr>
+      <tr><td>Direct fine-tuning</td><td>Train on longer sequences with unchanged positions</td><td>10,000 steps to 8K: 7.21 / 7.34 / 7.69 at 2K / 4K / 8K, and the effective window only grew from 2,048 to 2,560 <a href="https://arxiv.org/abs/2306.15595">[Tab. 1, Tab. 4]</a></td></tr>
+      <tr><td>Position interpolation (PI)</td><td>Use \(f(x, mL/L')\): rescale positions into the trained range</td><td>1,000 steps to 8K: 7.13 / 6.96 / 6.95; a small loss inside the original window (0.01 to 0.05 perplexity on Proof-pile) <a href="https://arxiv.org/abs/2306.15595">[§3.2, Tab. 1]</a></td></tr>
+      <tr><td>Raise the base (ABF)</td><td>Slow every pair, keep integer positions</td><td>6.323 vs 6.548 (RoPE) at 32K <a href="https://arxiv.org/abs/2309.16039">[Xiong et al., Tab. 5]</a>; Llama 3 <a href="https://arxiv.org/abs/2407.21783">[§3.2]</a></td></tr>
+      <tr><td>NTK-aware, YaRN, LongRoPE</td><td>Frequency-dependent rescaling plus attention temperature</td><td><a href="10-long-context.html">Page 10</a></td></tr>
+      <tr><td>Change the architecture</td><td>Local RoPE layers plus NoPE global layers, or windows</td><td><a href="#hybrids">Hybrids above</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>Chen et al. also give a bound: for an interpolated position the attention score is within \(\tfrac{d}{32 \ln b}\max_i|h_i|\) of the linear interpolation of its two integer neighbors, roughly 600 times smaller than the worst-case extrapolation bound they compare against <a href="https://arxiv.org/abs/2306.15595">[Thm. 2.1, §2.3]</a>. It is a bound, not a measurement, but it matches the experiments. Interpolation has a cost of its own: neighboring tokens' angles now differ by \(\theta_i L/L'\), so fine local resolution shrinks, which is why some fine-tuning is needed.</p>
+  <aside class="callout warn">
+    <div class="callout-title">Perplexity can hide a broken long context</div>
+    <p>Men et al. fine-tuned Llama 2 7B to 32K with a small base (500). Perplexity stayed low even at 128K, yet the model could not retrieve information from as little as 1K tokens back <a href="https://arxiv.org/abs/2405.14591">[Men et al. 2024, §3, Fig. 3]</a>. Judge a long-context extension with retrieval tests (needle, RULER; <a href="10-long-context.html">page 10</a>), not perplexity alone.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="comparison">Side by side</h2>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Enters at</th><th>Learned or fixed</th><th>Relative or absolute</th><th>Extrapolation (evidence)</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Learned absolute</td><td>Input embedding</td><td>Learned table \(L_{\max}\times d\)</td><td>Absolute</td><td>None: no row past \(L_{\max}\)</td><td>BERT (512), GPT-2 (1,024), GPT-3, OPT</td></tr>
+      <tr><td>Sinusoidal</td><td>Input embedding</td><td>Fixed</td><td>Absolute (linear-offset property)</td><td>Weak: 20.05 to 24.86 perplexity at +200 tokens <a href="https://arxiv.org/abs/2108.12409">[Press]</a></td><td>Original Transformer</td></tr>
+      <tr><td>Shaw relative</td><td>Logits and values</td><td>Learned, \(2k{+}1\) vectors</td><td>Relative (clipped)</td><td>Same vector beyond clip distance</td><td>Shaw et al. (MT)</td></tr>
+      <tr><td>T5 bias</td><td>Logits</td><td>Learned scalar per head and bucket</td><td>Relative (bucketed)</td><td>Good: 20.41 at 5× training length <a href="https://arxiv.org/abs/2108.12409">[Press]</a>; slow and memory-heavy</td><td>T5</td></tr>
+      <tr><td>ALiBi</td><td>Logits</td><td>Fixed slopes</td><td>Relative (linear)</td><td>Best perplexity: 18.41 at 5×; weaker downstream, unbounded penalty</td><td>BLOOM</td></tr>
+      <tr><td>RoPE</td><td>\(q\), \(k\), every layer</td><td>Fixed (hyperparameter \(b\))</td><td>Relative score, absolute rotation</td><td>Poor as is (above \(10^3\) perplexity); extended by base change, PI, YaRN (<a href="10-long-context.html">page 10</a>)</td><td>Llama, Qwen, Mistral, DeepSeek, Gemma, GLM, OLMo</td></tr>
+      <tr><td>NoPE</td><td>Nowhere</td><td>None</td><td>Implicit, learned</td><td>Best on small synthetic tasks (MRR 0.69); worse in-distribution at 8B <a href="https://arxiv.org/abs/2501.18795">[Yang]</a></td><td>Only in hybrids: Command A, Llama 4</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: Vaswani et al. 2017; Shaw et al. 2018; Raffel et al. 2020; Press et al. 2021 (Table 2); Su et al. 2021; Kazemnejad et al. 2023; Yang et al. 2025. Extrapolation numbers are from single, small-scale experiments and are not directly comparable across rows.</p>
+  <p>The honest summary: absolute encodings are dead for long context; bias schemes extrapolate in perplexity but are limited by recency; RoPE dominates for practical reasons (parameter-free, cache-friendly, retrofit-able) plus an ecosystem of extension methods; and NoPE layers are entering through hybrids.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"RoPE adds a positional embedding to the input."</strong> It adds nothing. It rotates \(q\) and \(k\) inside every attention layer; the residual stream and \(v\) are untouched.</li>
+    <li><strong>"RoPE encodes only relative position."</strong> Each vector is rotated by its <em>absolute</em> index; only the resulting score depends on the offset alone. Absolute position is also recoverable elsewhere in a causal model (the mask leak).</li>
+    <li><strong>"The long-term decay means RoPE models attend less to far tokens, so they cannot do long-range retrieval."</strong> The decay is an upper bound for worst-case coefficients, and Chen et al. call it vacuous for extrapolation. Trained models retrieve from 128K tokens away.</li>
+    <li><strong>"Raising the base is a config change."</strong> It changes every pair but the first. It needs continued training, and running a checkpoint with the wrong base degrades it silently, exactly like the wrong pair layout.</li>
+    <li><strong>"Interleaved and rotate_half are different position schemes."</strong> They are the same function up to a fixed per-head permutation of \(q\) and \(k\) dimensions. The bug is loading weights into the wrong one.</li>
+    <li><strong>"ALiBi extrapolates, so it is best for long context."</strong> It extrapolates perplexity, largely because of its recency prior. Downstream length generalization is mid-pack, its penalty grows without bound, and RoPE plus rescaling won in practice.</li>
+    <li><strong>"NoPE means the model has no position information."</strong> The causal mask leaks it, and models can compute it in the first layer. Pure NoPE lags at scale, but NoPE layers inside hybrids ship in production models.</li>
+    <li><strong>"Computing RoPE angles in bf16 is fine."</strong> At position 8,192 bf16 spacing is 64. Compute angles in fp32 (or fp64), then cast cos and sin.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why does a transformer need positional information? Does a causal decoder strictly need it?</summary>
+    <div class="answer">
+      <p>Self-attention is permutation-equivariant: \(\operatorname{Attn}(PX) = P\operatorname{Attn}(X)\), because the score matrix becomes \(PSP^\top\) and softmax acts row-wise. FFNs, norms and residuals are per-token, so the whole stack has no idea of order and "dog bites man" equals "man bites dog" up to a shuffle. Order therefore has to be injected.</p>
+      <p>A causal decoder does not <em>strictly</em> need it. Row \(t\) of the softmax covers keys \(1..t\), so a head can compute the mean over the prefix; if a value channel flags the BOS token, the output is \(1/t\), from which the FFN can decode absolute position (Kazemnejad et al., Thm. 1). So NoPE decoders train and work. But it is implicit and learned, and bidirectional encoders, with no mask, become bags of words without it. In practice everyone supplies position explicitly, or uses NoPE only in some layers.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Write the sinusoidal encoding. What is its wavelength range, and what is the "linear offset" property?</summary>
+    <div class="answer">
+      <p>\(PE_{t,2i} = \sin(t/10000^{2i/d})\), \(PE_{t,2i+1} = \cos(t/10000^{2i/d})\), added to the token embeddings. Pair \(i\) has wavelength \(2\pi \cdot 10000^{2i/d}\): a geometric progression from \(2\pi \approx 6.3\) tokens to about \(10000 \cdot 2\pi\). For a fixed offset \(k\), \((\sin\theta(t{+}k), \cos\theta(t{+}k))\) is the pair at \(t\) rotated by \(\theta k\), the same for every \(t\), so \(PE_{t+k} = PE_t M_k\) for a block-diagonal rotation. It does not make attention relative, though: with \(x = e + p\) the logit has four terms, and \(p_t W p_j^\top\) depends on \(t-j\) only if \(W = W^QW^{K\top}\) commutes with the rotations. RoPE fixes this by putting the rotation between \(q\) and \(k\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate: ALiBi with 8 heads. What are the slopes, and what bias does the steepest head add for query 5 attending to key 2?</summary>
+    <div class="answer">
+      <p>Slopes are the geometric sequence starting at \(2^{-8/n}\) with the same ratio: \(1/2, 1/4, \dots, 1/256\). The bias is \(-m(i-j)\) added to the logit after \(q K^\top\), before the softmax, and not scaled by \(1/\sqrt{d}\). For \(i = 5, j = 2\) the distance is 3, so the steepest head (\(m = 1/2\)) adds \(-1.5\) and the flattest (\(m = 1/256\)) adds \(-0.0117\). Slopes are fixed, not learned, and nothing is added to the input embeddings. The penalty reaches one nat at distance \(1/m\), so the heads have soft windows of about 2 to 256 tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why apply RoPE to queries and keys but not to values?</summary>
+    <div class="answer">
+      <p>The relative-position trick relies on a dot product being bilinear: \(\tilde q_t \tilde k_j^\top = q R_t R_j^\top k^\top\), and the two rotations meet and collapse into \(R_{t-j}\). The output \(o_t = \sum_j a_{tj} v_j\) is a weighted sum, not a product. Rotating \(v_j\) by \(R_j\) would make the output depend on the absolute position of every attended token and nothing cancels it. Values carry content to be read out rather than compared, so they stay unrotated. (Similarly it must be applied after the \(W^Q, W^K\) projections: before them, \(W^QW^{K\top}\) would sit between the rotations and does not commute with them.)</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive RoPE's relative-position property.</summary>
+    <div class="answer">
+      <p><strong>Complex form.</strong> Pair entries into \(z^q_i = q_{2i} + \mathrm{i}\,q_{2i+1}\) and \(z^k_i\) likewise. RoPE sets \(\tilde z^q_i = z^q_i e^{\mathrm{i}t\theta_i}\), \(\tilde z^k_i = z^k_i e^{\mathrm{i}j\theta_i}\). The real inner product of two points is \(\operatorname{Re}(u\bar v)\), so the score is \(\sum_i \operatorname{Re}\big(z^q_i e^{\mathrm{i}t\theta_i}\,\overline{z^k_i}\,e^{-\mathrm{i}j\theta_i}\big) = \sum_i \operatorname{Re}\big(z^q_i\overline{z^k_i}\,e^{\mathrm{i}(t-j)\theta_i}\big)\). Only \(t-j\) appears.</p>
+      <p><strong>Matrix form</strong> (row vectors). \(G(\varphi) = \left(\begin{smallmatrix}\cos\varphi &amp; \sin\varphi\\ -\sin\varphi &amp; \cos\varphi\end{smallmatrix}\right)\) rotates \((a,b)\) counter-clockwise; \(R_t = \operatorname{diag}(G(t\theta_i))\). Since \(G(\alpha)G(\beta) = G(\alpha+\beta)\) and \(G(\varphi)^\top = G(-\varphi)\), \(R_tR_j^\top = R_{t-j}\), so \(\tilde q_t\tilde k_j^\top = q_tR_tR_j^\top k_j^\top = q_tR_{t-j}k_j^\top\). \(R\) is orthogonal, so norms are preserved. In the paper's column convention the same statement is \(q^\top R_{n-m}k\). Explicitly, each pair contributes \((ac+be)\cos((t-j)\theta_i) + (ae-bc)\sin((t-j)\theta_i)\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What does the RoPE base control? Why did Llama 3 raise it to 500,000?</summary>
+    <div class="answer">
+      <p>The base sets the geometric ladder of rotation frequencies \(\theta_i = b^{-2i/d_h}\), i.e. wavelengths \(\lambda_i = 2\pi b^{2i/d_h}\) from \(2\pi\) tokens up to \(2\pi b^{(d_h-2)/d_h}\). Raising \(b\) slows every pair except the first, moving wavelengths beyond the training context and slowing the decay of the score's content-match advantage. For \(d_h = 128\), the slowest wavelength is 54K tokens at \(b = 10^4\) and 2.56M at \(b = 5\times10^5\); at 128K the slowest pair has turned 2.4 times versus 0.05 times.</p>
+      <p>Llama 3 needed 128K context. Meta raised the base to 500,000, citing Xiong et al. (who showed it works to 32K), and extended the context from 8K in six stages over ~800B tokens, checking short-context recovery and needle retrieval at each stage. The cost is that it changes every pair, so it needs continued training, and fewer pairs remain at short wavelengths (35 of 64 below 8K instead of 50).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: for a 128-dimensional head, the slowest RoPE wavelength at base 10,000 and at base 500,000, and how many pairs complete a full turn within 8K and within 128K tokens.</summary>
+    <div class="answer">
+      <p>\(\lambda_{63} = 2\pi b^{126/128}\). For \(b = 10^4\): \(10^{4\times0.984375} = 10^{3.9375} \approx 8{,}660\), times \(2\pi\) is about 54,400 tokens. For \(b = 5\times10^5\): \(10^{5.699\times0.984375} = 10^{5.6099} \approx 407{,}300\), times \(2\pi\) is about 2.56M tokens.</p>
+      <p>Pair \(i\) completes a turn within \(L\) tokens iff \(2\pi b^{2i/128} &lt; L\), i.e. \(i &lt; 64\log_b(L/2\pi)\). \(b = 10^4\): \(i &lt; 49.8\) at 8K, so 50 of 64 pairs; at 128K the threshold exceeds 63, so all 64. \(b = 5\times10^5\): \(i &lt; 35.0\) at 8K, so 35 pairs; \(i &lt; 48.5\) at 128K, so 49 pairs. The other 29 (8K) or 15 (128K) pairs never complete a turn: they are near-constant channels within the context.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Interleaved versus <code>rotate_half</code> RoPE: are they equivalent? What breaks if you mix them up?</summary>
+    <div class="answer">
+      <p>Interleaved pairs \((x_{2i}, x_{2i+1})\); <code>rotate_half</code> pairs \((x_i, x_{i+d_h/2})\). Each pair gets frequency \(\theta_i\) in both. With \(\text{perm}[s\cdot d_h/2 + i] = 2i+s\), \(\text{RoPE}_{\text{half}}(x[\text{perm}]) = \text{RoPE}_{\text{int}}(x)[\text{perm}]\). So attention scores are identical if \(q\) and \(k\) are permuted the same way, and the permutation can be folded into the output columns of \(W^Q\) and \(W^K\) per head (not \(W^V\), not across heads).</p>
+      <p>Mixing them, i.e. running weights trained in one layout through code for the other, rotates the wrong pairs with the wrong frequencies. Nothing crashes and there are no NaNs; the model is simply much worse. That is why HF's Llama converter permutes \(W^Q, W^K\), and HF's DeepSeek-V3 code permutes activations at runtime. Guard with a logits comparison against the reference implementation.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> RoPE versus ALiBi: how do they differ, and which extrapolates better in practice?</summary>
+    <div class="answer">
+      <p>Both are relative and act on \(q\), \(k\) in every layer, never \(v\). ALiBi adds a fixed \(-m_h\cdot\text{distance}\) to the logits (a recency prior; no rotation, no parameters, but needs a bias-capable kernel). RoPE rotates \(q\) and \(k\), so the score is an oscillating function of the offset whose shape is learned through the content coefficients, and needs no extra tensor.</p>
+      <p>ALiBi extrapolates far better as is: trained at 512, perplexity is 18.41 at 2,512 versus 31.58 for rotary and 132.41 for sinusoidal (Press et al.). But that is partly the recency prior (a window mask reproduces it), downstream length generalization is only mid-pack (MRR 0.50 vs NoPE 0.69), and its penalty is unbounded (\(-512\) at 128K even for the flattest head). RoPE extrapolates poorly as is but can be retrofitted (base increase, PI, YaRN) with modest continued training, which is why it dominates practice.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What are partial RoPE and decoupled RoPE, and why use them?</summary>
+    <div class="answer">
+      <p><strong>Partial RoPE</strong> rotates only the first \(r\) dims of each head and leaves the rest position-free; frequencies use \(r\) as the denominator, \(\theta_i = b^{-2i/r}\). GPT-NeoX-20B rotates 25% of each 96-dim head (24 dims) following GPT-J, reporting the best performance/compute balance in initial experiments. GLM-4.5 (half), Qwen3-Next (a quarter of 256) and MiniMax-M2 (64 of 128) do similarly. A plausible benefit is content-only channels, though only the empirical claim is reported.</p>
+      <p><strong>Decoupled RoPE</strong> (MLA) is forced: rotating the compressed content keys would put \(R_{t-j}\) between \(q\) and \(W^{UK}\) and break weight absorption. So MLA keeps the content path unrotated and adds a 64-dim rotated path (per-head \(q^R\), one shared \(k^R\) that is cached). Details on page 07.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> With a KV cache, do you cache rotated or unrotated keys, and what position ids do you use?</summary>
+    <div class="answer">
+      <p>Cache the keys <em>after</em> rotation: each key is rotated once by its absolute position, so a decode step only rotates the new \(q\) and \(k\). Values are never rotated. The new token's position id is the current sequence length (cache length), not 0; in chunked prefill each chunk starts at the number of tokens already processed. A shared prefix in a prefix cache must occupy identical positions, since the stored keys carry their rotations. Because rotations compose, shifting a cached key by \(\delta\) is one more \(R_\delta\), which is how you could re-close a gap after evicting tokens. MLA works the same way with \(k^R\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why is RoPE incompatible with MLA's weight absorption?</summary>
+    <div class="answer">
+      <p>Absorption folds the key up-projection into the query: \(q\cdot(c_jW^{UK})^\top = (qW^{UK\top})\cdot c_j\), so one absorbed query is dotted with every cached latent. With RoPE on the decompressed keys the score becomes \(q R_{t-j} W^{UK\top} c_j^\top\): the position-dependent \(R_{t-j}\) sits between \(q\) and \(W^{UK}\) and changes with every cached position \(j\), so there is no single absorbed query. You would need one per \(j\), which costs as much as decompressing every key. The fix is decoupled RoPE: an unrotated absorbable content path plus a small rotated path with a shared, cached key. See <a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Can a causal decoder learn positions with no positional encoding? Would you use NoPE?</summary>
+    <div class="answer">
+      <p>Yes in principle: the causal mask gives row \(t\) exactly \(t\) keys, so a uniform-attention head over a BOS-flag value outputs \(1/t\), and the FFN decodes absolute position; later layers can derive relative terms (Kazemnejad et al., Thm. 1 and 2). Empirically NoPE beat RoPE, ALiBi and T5 bias on length generalization in ~107M-parameter models on synthetic tasks (MRR 0.69 vs 0.33 for rotary), and its attention resembles T5's relative bias.</p>
+      <p>I would not use pure NoPE for a frontier model: at 8B, Cohere found validation loss 1.58 vs 1.52 and lower MMLU. I would consider the hybrid: local RoPE layers (sliding window or chunked) plus periodic full-attention NoPE layers (Command A 3:1, Llama 4 1 in 4). It gives long-range retrieval from the NoPE layers, no OOD angles in the RoPE layers, and a smaller KV cache, though the evidence is one ablation (Cohere) plus shipped models.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why do RoPE models fail beyond their training length, and how do extrapolation and interpolation differ?</summary>
+    <div class="answer">
+      <p>Two causes. (1) Unseen phases: the score's dependence on offset \(s\) is \(\sum_i h_ie^{\mathrm{i}s\theta_i}\), trained only for \(s\le L\). Nothing bounds it beyond, and Chen et al. show fitted curves within \([-1,1]\) on \([0,2048]\) reaching over 8,000 outside; LLaMA-7B goes from perplexity 7.20 to above \(10^3\) at 4K. The slow pairs, whose wavelengths exceed \(L\), hit unseen angles first. (2) Attention dilution: with more keys and bounded logits the softmax flattens (\(\Delta = 8\) gives weight 0.42 at 4K keys but 0.022 at 128K).</p>
+      <p>Extrapolation runs the model at unseen positions. Interpolation maps the longer range back into the trained one: PI uses \(f(x, mL/L')\), so all angles stay in range (interpolation error bounded ~600× tighter than extrapolation's, and 1,000 fine-tuning steps suffice), at the cost of finer local resolution being squeezed. Raising the base (ABF) slows all pairs instead. NTK-aware/YaRN mix the two by frequency (page 10).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design: your model was pretrained at 8K with RoPE base 500,000 and must now serve 128K. What do you do, and what do you check?</summary>
+    <div class="answer">
+      <p><strong>Recipe.</strong> Attention cost is quadratic, so train long only at the end: continued pretraining in stages (Llama 3: six increments from 8K to 128K over ~800B tokens), raising the base or rescaling frequencies (PI/YaRN, page 10) with a long-sequence data mix, keeping the short-context mix so nothing regresses. Use document masking so packed documents do not attend across boundaries (Llama 3 found it important at long lengths). Alternatively for a from-scratch design, use a hybrid with local RoPE and NoPE global layers (no scaling needed in Cohere's RNope-SWA).</p>
+      <p><strong>Checks.</strong> (1) Short-context benchmarks recover fully. (2) Needle-in-a-haystack and RULER at every length up to 128K, not perplexity alone (a small base gives low perplexity but broken retrieval). (3) Perplexity per position beyond the trained range. (4) Behavior of RoPE base bounds: 500K sits below the ~\(7.8\times10^6\) one analysis suggests for 128K, so verify by retrieval rather than trust the bound. <strong>Trade-offs:</strong> a larger base helps reach but costs short-range resolution and (in hybrids) can hurt; PI needs few steps but degrades the original window slightly.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>RoPE in both layouts, sinusoidal and ALiBi.</strong> Implement <code>rope_frequencies</code>, <code>apply_rope_interleaved</code> and <code>apply_rope_half</code> (shapes <code>(B, T, H, d)</code> or <code>(B, T, d)</code>, arbitrary position ids), the <code>interleaved_to_half_permutation</code> that converts one layout to the other, <code>apply_partial_rope</code>, <code>sinusoidal_embedding</code>, and <code>alibi_slopes</code> / <code>alibi_bias</code> (causal, with the reference code's slope rule for non-power-of-two heads). The tests check the complex-number and <code>rotate_half</code> references, norm preservation, that scores depend only on the relative offset (shift both positions and nothing changes), that the layouts agree after permutation and disagree without it, incremental (KV-cache style) position ids, and ALiBi's slopes and shape. An interviewer would expect <code>apply_rope_half</code> plus the shift-invariance check in about 20 minutes; the full drill fits in about 40. <span class="ex-path">exercises/drills/rope.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_rope.py</code>; add <code>--solutions</code> to check the reference.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2104.09864">Su et al. (2021). RoFormer: Enhanced Transformer with Rotary Position Embedding.</a> <span class="why">Why read it: §3.2 is the derivation, §3.4.3 the "long-term decay" bound that later papers qualify.</span></li>
+    <li><a href="https://arxiv.org/abs/1706.03762">Vaswani et al. (2017). Attention Is All You Need.</a> <span class="why">Why read it: §3.5 for the sinusoidal encoding, its wavelengths and the linear-offset hypothesis; Table 3 row (E) for learned vs fixed.</span></li>
+    <li><a href="https://arxiv.org/abs/1803.02155">Shaw et al. (2018). Self-Attention with Relative Position Representations.</a> <span class="why">Why read it: the clipped relative embeddings, and ablations showing local order and the logit-side term carry the gain.</span></li>
+    <li><a href="https://arxiv.org/abs/1910.10683">Raffel et al. (2019). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (T5).</a> <span class="why">Why read it: §2.1 defines the bucketed scalar relative bias in one paragraph.</span></li>
+    <li><a href="https://arxiv.org/abs/2108.12409">Press et al. (2021). Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation.</a> <span class="why">Why read it: the ALiBi definition, the slopes, and the extrapolation tables comparing sinusoidal, rotary, T5 and ALiBi.</span></li>
+    <li><a href="https://arxiv.org/abs/2305.19466">Kazemnejad et al. (2023). The Impact of Positional Encoding on Length Generalization in Transformers.</a> <span class="why">Why read it: the NoPE construction (Thm. 1-2) and a controlled comparison of five schemes.</span></li>
+    <li><a href="https://arxiv.org/abs/2204.06745">Black et al. (2022). GPT-NeoX-20B: An Open-Source Autoregressive Language Model.</a> <span class="why">Why read it: §2.1.1 documents partial rotary (25% of dimensions) and Table 1 the <code>rotary-pct</code> setting.</span></li>
+    <li><a href="https://arxiv.org/abs/2306.15595">Chen et al. (2023). Extending Context Window of Large Language Models via Position Interpolation.</a> <span class="why">Why read it: the clearest account of why RoPE extrapolation fails (§2.2) and the interpolation bound (Thm. 2.1).</span></li>
+    <li><a href="https://arxiv.org/abs/2309.16039">Xiong et al. (2023). Effective Long-Context Scaling of Foundation Models.</a> <span class="why">Why read it: the origin of raising the base to 500,000 (RoPE ABF), the recipe Llama 3 cites, with the comparison to PI.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.18795">Yang et al. (2025). Rope to Nope and Back Again: A New Hybrid Attention Strategy.</a> <span class="why">Why read it: the controlled RoPE vs NoPE study behind interleaved designs like Command A and the iRoPE pattern.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>Attention is permutation-equivariant: \(\operatorname{Attn}(PX) = P\operatorname{Attn}(X)\). A causal mask leaks order (row \(t\) sees \(t\) keys), so NoPE can work; encoders without PE are bags of words.</li>
+      <li>Sinusoidal: \(PE_{t,2i}=\sin(t/10000^{2i/d})\), \(PE_{t,2i+1}=\cos(\cdot)\), wavelengths \(2\pi\) to \(10000\cdot2\pi\); \(PE_{t+k}=PE_tM_k\) (rotation), but added at the input so the logit is not relative. Learned tables: hard limit \(L_{\max}\) (BERT 512, GPT-2 1,024).</li>
+      <li>ALiBi: logit bias \(-m_h(i-j)\), slopes \(2^{-8h/n}\) (8 heads: \(1/2,\dots,1/256\)), fixed, no \(1/\sqrt d\), no input embedding; best perplexity extrapolation, unbounded penalty (\(-512\) at 128K for \(m = 1/256\)).</li>
+      <li>T5 bias: learned scalar per head, 32 buckets, log-spaced to 128, shared across layers. Shaw: \(2k+1\) clipped vectors; \(k=1\) already recovers almost everything.</li>
+      <li>RoPE (row vectors): \(\tilde q_t = q_tR_t\), \(R_t=\operatorname{diag}(G(t\theta_i))\), \(\theta_i=b^{-2i/d_h}\), \(R_tR_j^\top=R_{t-j}\Rightarrow \tilde q_t\tilde k_j^\top = q_tR_{t-j}k_j^\top\). Complex: \(\sum_i\operatorname{Re}(z^q_i\overline{z^k_i}e^{\mathrm{i}(t-j)\theta_i})\). Applied to \(q,k\) only, after projection, per head, every layer.</li>
+      <li>Wavelength \(\lambda_i=2\pi b^{2i/d_h}\). \(d_h=128\): slowest \(\lambda_{63}\) = 54.4K tokens (\(b=10^4\)), 2.56M (\(b=5\times10^5\)); pairs with \(\lambda&lt;8\)K: 50 vs 35 of 64; with \(\lambda&lt;128\)K: 64 vs 49.</li>
+      <li>Bases: 10K (Llama 1-2, GPT-NeoX, DeepSeek-V3), 500K (Llama 3, 4, OLMo 2), 1M (Qwen2.5/3, Mistral v0.3, GLM-4.5, Gemma 3 global), 5M (MiniMax-M2), 10M (Qwen3-Next). Llama 3: 8K to 128K in six stages, ~800B tokens.</li>
+      <li>Layouts: interleaved \((x_{2i},x_{2i+1})\) (GPT-J, DeepSeek reference, Llama 4 HF) vs half \((x_i,x_{i+d/2})\) (GPT-NeoX, HF Llama). \(\text{perm}[s\,d/2+i]=2i+s\). Mixing them silently breaks checkpoints. Angles in fp32; cache stores rotated keys; position id = cache length.</li>
+      <li>Cost: 6 FLOPs per pair (0.04% of the projection); cos/sin cache for 128K at \(d_h=128\) fp32 = 64 MiB. Partial RoPE: GPT-NeoX 25%, GLM-4.5 50%, Qwen3-Next 25%; MLA decoupled RoPE = 64-dim rotated path.</li>
+      <li>Length failure: unseen phases (slow pairs) plus attention dilution (\(\Delta=8\): weight 0.42 at 4K keys, 0.022 at 128K). PI: scale positions by \(L/L'\), ~1,000 steps; ABF: raise base; YaRN etc. on page 10. Perplexity can hide broken retrieval.</li>
+      <li>Hybrids: 3 local RoPE layers + 1 full NoPE layer (Command A, Cohere RNope-SWA: RULER 256K 74.8 vs 57.1); Llama 4 Scout: every 4th of 48 layers NoPE, RoPE layers chunked at 8,192, query scale \(1+0.1\ln(1+\lfloor(p+1)/8192\rfloor)\) on NoPE layers.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

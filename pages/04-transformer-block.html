@@ -1,0 +1,944 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · The Transformer block, params &amp; FLOPs · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="04" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part I · Foundations · Page 04</div>
+  <h1>The Transformer block, params &amp; FLOPs</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~70 min</span>
+    <span>Prereqs: <a href="01-big-picture.html">01 Big picture</a>, <a href="03-attention.html">03 Attention</a></span>
+  </div>
+  <p class="lede">This page assembles the full decoder-only model from the attention layer of page 03 and makes you fluent in the two calculations every model-building interview asks for: the exact parameter count of a real config (Llama-3-8B has 8,030,261,248) and the training compute (\(C \approx 6ND\)). Along the way, every modern default (pre-norm, RMSNorm, SwiGLU, no biases, no dropout, tied or untied embeddings) gets its reason and its evidence.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Exact counting:</strong> "How many parameters does Llama-3-8B have?" You are expected to go from the config to 8,030,261,248, line by line, and to say which terms scale as \(d^2\) and which as \(V \cdot d\).</li>
+    <li><strong>The 6ND derivation:</strong> where the 2 (forward), the 4 (backward) and the 6 come from, what the formula leaves out (attention, embeddings), and how to turn it into GPU-hours with a stated MFU.</li>
+    <li><strong>Why each default:</strong> pre-norm over post-norm, RMSNorm over LayerNorm, SwiGLU with \(d_{ff} \approx \tfrac{8}{3}d\), no biases, no dropout, untied embeddings in large models. Each answer needs a mechanism and a piece of evidence, not "it works better".</li>
+    <li><strong>Writing a block from memory:</strong> shapes, the residual structure, the causal mask, GQA, initialization, and a correct loss.</li>
+    <li><strong>Where the cost lives:</strong> about 70% of an 8B model's parameters sit in the MLPs, and attention scores only rival the linear layers once the context exceeds roughly \(6d\) to \(12d\) tokens.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Draw a decoder-only transformer as a residual stream with \(2L\) additive sublayers, and write both the Post-LN and Pre-LN equations.</li>
+    <li>Explain, from gradient norms at initialization, why Pre-LN trains without the warm-up that Post-LN needs, and name what Pre-LN costs.</li>
+    <li>Write RMSNorm (epsilon inside the square root, statistics in float32) and say exactly what it drops relative to LayerNorm.</li>
+    <li>Write SwiGLU and derive both \(d_{ff} \approx \tfrac{8}{3}d\) and Llama's rounding to 14,336.</li>
+    <li>Count the parameters of Llama-3-8B to the last digit and of GPT-2 small to the last digit, and estimate any dense model with \(13Ld^2 + 2Vd\) or \(12Ld^2\).</li>
+    <li>Derive \(C \approx 6ND\), convert a token budget to GPU-hours at a given MFU, and compute when attention FLOPs rival the linear layers.</li>
+    <li>Implement a complete GPT (RMSNorm, GQA causal attention, SwiGLU, pre-norm blocks, tied or untied head) and check it against a closed-form parameter count.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="residual-stream">The residual stream: one model, \(L\) identical blocks</h2>
+
+  <p>Page 03 gave you attention. A <strong>decoder-only</strong> language model is that attention layer plus a per-position MLP, each wrapped in a residual connection <span class="zh">残差连接</span>, stacked \(L\) times between a token embedding and a projection back to the vocabulary. Nothing else. Following the course convention, a token's hidden state \(x_t \in \R^d\) is a row vector and linear maps are \(xW\). For a batch of \(B\) sequences of \(T\) token ids, the whole forward pass is:</p>
+
+  \[
+  \begin{aligned}
+  x^{(0)} &amp;= E[\text{ids}] \;(+\;P) &amp;&amp; \in \R^{B \times T \times d} &amp;&amp; \text{embedding lookup, plus a position table if there is one}\\
+  x^{(l)} &amp;= \text{Block}_l\big(x^{(l-1)}\big), \quad l = 1, \dots, L &amp;&amp; \in \R^{B \times T \times d}\\
+  \text{logits} &amp;= \RMSNorm\big(x^{(L)}\big)\, W_U &amp;&amp; \in \R^{B \times T \times V} &amp;&amp; \text{final norm, then the LM head}
+  \end{aligned}
+  \]
+
+  <p>Every position predicts the next token, so the loss is the mean over all \(B \cdot T\) positions of \(-\log \softmax(\text{logits}_t)[\text{id}_{t+1}]\) (page 01). One forward pass therefore yields \(B \cdot T\) training examples. A pre-norm block, the modern default, is two lines:</p>
+
+  <div class="eq-box">
+  \[ h = x + \text{Attn}\big(\RMSNorm(x)\big), \qquad x' = h + \text{FFN}\big(\RMSNorm(h)\big) \]
+  <div class="eq-label">Pre-norm decoder block. Attn is causal (page 03); the feed-forward network <span class="zh">前馈网络</span> FFN acts on each position separately.</div>
+  </div>
+
+  <p>The useful mental picture, due to <a href="https://transformer-circuits.pub/2021/framework/index.html">[Elhage et al. 2021]</a>, is the <strong>residual stream</strong> <span class="zh">残差流</span>: the vector each token carries through the network. Each sublayer "reads" from the stream (a linear projection of a normalized copy) and "writes" to it by adding its output. Attention is the only place where positions exchange information. The FFN is <em>position-wise</em>: the same function, with the same weights, applied to every \(t\) independently. Unrolling the recursion shows that the final state is the embedding plus \(2L\) additive writes:</p>
+
+  \[ x^{(L)} = x^{(0)} + \sum_{j=1}^{2L} f_j\big(\text{Norm}(x^{[j]})\big) \]
+
+  <p>where \(x^{[j]}\) is the stream just before the \(j\)-th sublayer.</p>
+
+  <h3 id="why-residual">Why residual connections make depth trainable</h3>
+  <p>With identity skip connections, the loss gradient at layer \(l\) splits into a term that flows straight back and a term that flows through the weights <a href="https://arxiv.org/abs/1603.05027">[He et al. 2016, Eq. 4-5]</a>:</p>
+
+  \[ \frac{\partial \mathcal{L}}{\partial x_l} = \frac{\partial \mathcal{L}}{\partial x_L}\left(I + \frac{\partial}{\partial x_l}\sum_{i=l}^{L-1} F_i(x_i)\right) \]
+
+  <p>The additive identity means, in He et al.'s words, that "the gradient of a layer does not vanish even when the weights are arbitrarily small." They also test breaking the shortcut. On a 110-layer ResNet, scaling it by 0.5, gating it, or replacing it with a 1×1 convolution all did worse than the plain identity (6.61% test error, against 8.70% to 12.86% for the variants that converged), and the unrescaled 0.5 shortcut and a shortcut with dropout failed outright (error above 20%) <a href="https://arxiv.org/abs/1603.05027">[He et al. 2016, Table 1]</a>. Their conclusion, "keep the shortcut clean," is the design principle behind everything in the next section.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>If your tagger used the standard encoder recipe, its block was this block. Three things change. First, the attention mask is causal: position \(t\) sees only positions \(\le t\), so the model is deliberately <em>not</em> permutation-invariant and needs positional information (page 05). Second, instead of pooling to one class token and a small head, every position emits a distribution over \(V \approx 128{,}000\) classes. Third, the norm moves in front of the sublayers, and if you followed the original recipe you used post-norm with a warm-up schedule, which is exactly what the next section explains.</p>
+  </aside>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 362" role="img" aria-labelledby="fig-04-1-title">
+<title id="fig-04-1-title">A decoder-only model as a pipeline from token ids to logits, and one pre-norm block drawn with the residual stream as a horizontal bus</title>
+<defs><marker id="arrow-04-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="6" y="12" width="88" height="46" rx="6"/>
+<text x="50" y="31" text-anchor="middle" class="s-bold">token ids</text>
+<text x="50" y="47" text-anchor="middle" class="s-small s-muted">(B, T)</text>
+<path class="s-line" d="M94,35 L110,35" marker-end="url(#arrow-04-1)"/>
+<rect class="s-a" x="112" y="12" width="96" height="46" rx="6"/>
+<text x="160" y="31" text-anchor="middle" class="s-bold">Embedding</text>
+<text x="160" y="47" text-anchor="middle" class="s-small s-muted">table V × d</text>
+<path class="s-line" d="M208,35 L224,35" marker-end="url(#arrow-04-1)"/>
+<rect class="s-d" x="226" y="12" width="150" height="46" rx="6"/>
+<text x="301" y="31" text-anchor="middle" class="s-bold">Block × L</text>
+<text x="301" y="47" text-anchor="middle" class="s-small s-muted">(B, T, d) in and out</text>
+<path class="s-line" d="M376,35 L392,35" marker-end="url(#arrow-04-1)"/>
+<rect class="s-b" x="394" y="12" width="84" height="46" rx="6"/>
+<text x="436" y="31" text-anchor="middle" class="s-bold">RMSNorm</text>
+<text x="436" y="47" text-anchor="middle" class="s-small s-muted">final</text>
+<path class="s-line" d="M478,35 L494,35" marker-end="url(#arrow-04-1)"/>
+<rect class="s-a" x="496" y="12" width="96" height="46" rx="6"/>
+<text x="544" y="31" text-anchor="middle" class="s-bold">LM head</text>
+<text x="544" y="47" text-anchor="middle" class="s-small s-muted">d × V</text>
+<path class="s-line" d="M592,35 L608,35" marker-end="url(#arrow-04-1)"/>
+<rect class="s-box" x="610" y="12" width="104" height="46" rx="6"/>
+<text x="662" y="31" text-anchor="middle" class="s-bold">logits</text>
+<text x="662" y="47" text-anchor="middle" class="s-small s-muted">(B, T, V)</text>
+<path class="s-line s-dash" d="M226,58 L6,96"/>
+<path class="s-line s-dash" d="M376,58 L714,96"/>
+<rect class="s-plain s-dash" x="6" y="96" width="708" height="256" rx="10"/>
+<text x="18" y="116" class="s-bold">One pre-norm block (the same shape, L times)</text>
+<text x="702" y="116" text-anchor="end" class="s-small s-muted">Llama-3-8B: d = 4096, L = 32</text>
+<text x="360" y="146" text-anchor="middle" class="s-small s-muted">residual stream: one d-dimensional vector per token; sublayers read a normalized copy and add their output</text>
+<rect class="s-a" x="22" y="176" width="660" height="8" rx="4"/>
+<path class="s-fill-a" d="M680,170 L698,180 L680,190 z"/>
+<text x="22" y="164" class="s-bold">x</text>
+<text x="38" y="164" class="s-small s-muted">(B, T, d)</text>
+<text x="698" y="164" text-anchor="end" class="s-small s-muted">x′ (B, T, d)</text>
+<circle class="s-fill-a" cx="60" cy="180" r="4"/>
+<path class="s-line" d="M60,184 L60,248 L76,248" marker-end="url(#arrow-04-1)"/>
+<text x="66" y="210" class="s-small s-muted">read</text>
+<rect class="s-b" x="78" y="228" width="76" height="40" rx="6"/>
+<text x="116" y="245" text-anchor="middle" class="s-bold">RMSNorm</text>
+<text x="116" y="260" text-anchor="middle" class="s-small s-muted">gain, d</text>
+<path class="s-line" d="M154,248 L172,248" marker-end="url(#arrow-04-1)"/>
+<rect class="s-a" x="174" y="228" width="140" height="40" rx="6"/>
+<text x="244" y="245" text-anchor="middle" class="s-bold">Causal attention</text>
+<text x="244" y="260" text-anchor="middle" class="s-small s-muted">Wq Wk Wv, SDPA, Wo</text>
+<path class="s-line" d="M314,248 L338,248 L338,192" marker-end="url(#arrow-04-1)"/>
+<text x="332" y="210" text-anchor="end" class="s-small s-muted">write</text>
+<circle class="s-box" cx="338" cy="180" r="11"/>
+<text x="338" y="185" text-anchor="middle" class="s-bold">+</text>
+<circle class="s-fill-a" cx="392" cy="180" r="4"/>
+<path class="s-line" d="M392,184 L392,248 L408,248" marker-end="url(#arrow-04-1)"/>
+<text x="398" y="210" class="s-small s-muted">read</text>
+<rect class="s-b" x="410" y="228" width="76" height="40" rx="6"/>
+<text x="448" y="245" text-anchor="middle" class="s-bold">RMSNorm</text>
+<text x="448" y="260" text-anchor="middle" class="s-small s-muted">gain, d</text>
+<path class="s-line" d="M486,248 L504,248" marker-end="url(#arrow-04-1)"/>
+<rect class="s-a" x="506" y="228" width="132" height="40" rx="6"/>
+<text x="572" y="245" text-anchor="middle" class="s-bold">SwiGLU FFN</text>
+<text x="572" y="260" text-anchor="middle" class="s-small s-muted">gate, up, down</text>
+<path class="s-line" d="M638,248 L656,248 L656,192" marker-end="url(#arrow-04-1)"/>
+<text x="650" y="210" text-anchor="end" class="s-small s-muted">write</text>
+<circle class="s-box" cx="656" cy="180" r="11"/>
+<text x="656" y="185" text-anchor="middle" class="s-bold">+</text>
+<text x="244" y="298" text-anchor="middle" class="s-mono">h = x + Attn(RMSNorm(x))</text>
+<text x="522" y="298" text-anchor="middle" class="s-mono">x′ = h + FFN(RMSNorm(h))</text>
+<text x="244" y="320" text-anchor="middle" class="s-small s-muted">the only place tokens exchange information</text>
+<text x="522" y="320" text-anchor="middle" class="s-small s-muted">per position; 70% of Llama-3-8B's parameters</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Top: the whole model as a pipeline. Bottom: one block drawn with the residual stream as a horizontal bus. Each sublayer taps the bus, normalizes its private copy, computes, and adds the result back. The bus itself is never scaled, gated or normalized between blocks. The single norm after the last block feeds the LM head. Shapes are for a batch of \(B\) sequences of \(T\) tokens.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2 id="pre-norm">Where to put the norm: Post-LN versus Pre-LN</h2>
+
+  <p>Normalization is not optional: a Transformer with no normalization at all failed to train in the RMSNorm paper's WMT14 experiment (BLEU 0) <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, Table 4]</a>. The design question is <em>where</em> the norm goes relative to the residual connection. The original Transformer normalizes after the addition, and this is called <strong>Post-LN</strong> <span class="zh">后归一化</span> <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.1]</a>:</p>
+
+  \[ \textbf{Post-LN:}\quad y = \LayerNorm\big(x + F(x)\big) \]
+
+  <p>Modern LLMs normalize the input of each sublayer instead, called <strong>Pre-LN</strong> <span class="zh">预归一化</span>, and add one more norm after the last block <a href="https://arxiv.org/abs/2002.04745">[Xiong et al. 2020, Table 1]</a>:</p>
+
+  \[ \textbf{Pre-LN:}\quad y = x + F\big(\LayerNorm(x)\big), \qquad \text{output} = \LayerNorm\big(x^{(L)}\big) \]
+
+  <p>GPT-2 made the same move ("layer normalization was moved to the input of each sub-block ... and an additional layer normalization was added after the final self-attention block") <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, §2.3]</a>, and Llama's architecture section lists "pre-normalization" first among its changes to the original design <a href="https://arxiv.org/abs/2302.13971">[Touvron et al. 2023, §2.2]</a>.</p>
+
+  <h3 id="prenorm-why">Why the placement changes optimization</h3>
+  <p>Read the two equations through the lens of the previous section. In Pre-LN, the residual path is untouched: \(x^{(L)} = x^{(0)} + \sum_j F_j(\LayerNorm(\cdot))\), so the identity term of the gradient survives all \(L\) layers. In Post-LN, every layer's output passes through a LayerNorm, so backpropagating to layer \(l\) multiplies \(L - l\) normalization Jacobians, each of size \(O(\sqrt{d}/\|x\|)\) <a href="https://arxiv.org/abs/2002.04745">[Xiong et al. 2020, Lemma 3]</a>. There is no clean path.</p>
+
+  <p>Xiong et al. make this quantitative with a mean-field analysis at initialization (a simplified model: single-head attention with zero-initialized query and key matrices, ReLU FFN, Gaussian inputs). For the weight \(W_{2,L}\) of the <em>last</em> FFN layer they prove, with high probability <a href="https://arxiv.org/abs/2002.04745">[Xiong et al. 2020, Thm. 1]</a>:</p>
+
+  <div class="eq-box">
+  \[ \Big\|\tfrac{\partial \tilde{\mathcal L}}{\partial W_{2,L}}\Big\|_F \le O\big(d\sqrt{\ln d}\big) \ \ \text{(Post-LN)}, \qquad \Big\|\tfrac{\partial \tilde{\mathcal L}}{\partial W_{2,L}}\Big\|_F \le O\Big(d\sqrt{\tfrac{\ln d}{L}}\Big) \ \ \text{(Pre-LN)} \]
+  <div class="eq-label">Post-LN's bound does not shrink with depth; Pre-LN's shrinks as \(1/\sqrt{L}\)</div>
+  </div>
+
+  <p>Their extended analysis and measurements show the layer-wise picture: in Post-LN the expected gradient grows toward the output layers, while in Pre-LN it is roughly constant across layers <a href="https://arxiv.org/abs/2002.04745">[§3.3-3.4, Fig. 3]</a>. The mechanism is the norm of the stream: at initialization the Post-LN state entering each LayerNorm has a depth-independent scale, whereas in Pre-LN the stream norm grows with depth (\((1 + l/2)\,d \le \E\|x_l\|^2 \le (1 + 3l/2)\,d\), Lemma 2), so the final LayerNorm divides the gradients by roughly \(\sqrt{L}\).</p>
+
+  <p>Large gradients on the parameters nearest the output mean that a large learning rate at step 0 is unsafe, which is the standard explanation for why Post-LN needs a <strong>learning-rate warm-up</strong>. The experiments agree:</p>
+  <ul>
+    <li>IWSLT14 De-En with Adam: Post-LN without warm-up reaches BLEU 8.45, against about 34 with warm-up <a href="https://arxiv.org/abs/2002.04745">[Xiong et al. 2020, §3.2]</a>.</li>
+    <li>Pre-LN without warm-up reaches about 34 BLEU and a comparable validation loss on the same task, and on BERT pre-training the authors report a roughly 40% speed-up <a href="https://arxiv.org/abs/2002.04745">[§4]</a>.</li>
+  </ul>
+
+  <h3 id="prenorm-cost">What Pre-LN costs</h3>
+  <ul>
+    <li><strong>The stream norm grows with depth.</strong> Later sublayers write into a larger and larger vector, so their relative contribution shrinks. Sun et al. (2025) find that many deep layers of Pre-LN LLMs (Llama 2, Qwen3, DeepSeek) can be pruned with small MMLU loss, and argue that the growing output variance pushes deep blocks toward identity maps <a href="https://arxiv.org/abs/2502.05795">[Sun et al. 2025, §2-3]</a>. That explanation is one paper's, though the pruning observation itself is cited there from several earlier studies.</li>
+    <li><strong>A final norm is mandatory</strong>, because the stream reaching the LM head is otherwise unnormalized and of depth-dependent scale.</li>
+    <li><strong>It does not remove warm-up in practice.</strong> Llama 1 warms up for 2,000 steps <a href="https://arxiv.org/abs/2302.13971">[§2.3]</a> and Llama 3 405B for 8,000 steps <a href="https://arxiv.org/abs/2407.21783">[§3.4.1]</a>. Xiong et al. show warm-up <em>can</em> be dropped on their tasks, and note that the benefit of warm-up has also been attributed to variance in Adam's early adaptive learning rates <a href="https://arxiv.org/abs/2002.04745">[Related work]</a>.</li>
+  </ul>
+
+  <h3 id="norm-variants">Newer variants (page 11 has the full treatment)</h3>
+  <p>Two recent open recipes keep the norm out of the residual path but add norms elsewhere. <strong>Gemma 2</strong> applies RMSNorm to both the input and the output of every sublayer, \(x + \RMSNorm(F(\RMSNorm(x)))\) <a href="https://arxiv.org/abs/2408.00118">[Gemma Team 2024, §2, Table 1]</a>. <strong>OLMo 2</strong> drops the input norm and instead normalizes the sublayer <em>outputs</em>, \(h = x + \RMSNorm(\text{Attn}(x))\) and \(x' = h + \RMSNorm(\text{FFN}(h))\), together with QK-norm. In their ablation neither change helped alone, but together they cut the gradient-norm "spike score" from 0.108 to 0.069 <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1, §3.3.2]</a>. Both are consistent with He et al.'s principle: the norm only rescales what a branch adds, and the bus stays clean.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 412" role="img" aria-labelledby="fig-04-2-title">
+<title id="fig-04-2-title">Post-LN and Pre-LN transformer layers side by side, showing where LayerNorm sits relative to the residual path</title>
+<defs><marker id="arrow-04-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<line class="s-line s-dash" x1="360" y1="6" x2="360" y2="404"/>
+<text x="180" y="16" text-anchor="middle" class="s-big">Post-LN</text>
+<text x="180" y="32" text-anchor="middle" class="s-small s-muted">y = LN(x + F(x)), original Transformer</text>
+<text x="150" y="52" text-anchor="middle" class="s-bold">x<tspan baseline-shift="sub" font-size="9">l</tspan></text>
+<circle class="s-fill-muted" cx="150" cy="66" r="4"/>
+<path class="s-line" d="M150,70 L150,84" marker-end="url(#arrow-04-2)"/>
+<rect class="s-a" x="100" y="84" width="100" height="30" rx="6"/>
+<text x="150" y="103" text-anchor="middle" class="s-bold">Attention</text>
+<path class="s-line" d="M150,114 L150,132" marker-end="url(#arrow-04-2)"/>
+<path class="s-line" d="M154,66 L232,66 L232,144 L161,144" marker-end="url(#arrow-04-2)"/>
+<circle class="s-box" cx="150" cy="144" r="11"/>
+<text x="150" y="149" text-anchor="middle" class="s-bold">+</text>
+<path class="s-line" d="M150,155 L150,160" marker-end="url(#arrow-04-2)"/>
+<rect class="s-b" x="100" y="160" width="100" height="28" rx="6"/>
+<text x="150" y="178" text-anchor="middle" class="s-bold">LayerNorm</text>
+<path class="s-line" d="M150,188 L150,206"/>
+<circle class="s-fill-muted" cx="150" cy="206" r="4"/>
+<path class="s-line" d="M150,210 L150,224" marker-end="url(#arrow-04-2)"/>
+<rect class="s-a" x="100" y="224" width="100" height="30" rx="6"/>
+<text x="150" y="243" text-anchor="middle" class="s-bold">FFN</text>
+<path class="s-line" d="M150,254 L150,272" marker-end="url(#arrow-04-2)"/>
+<path class="s-line" d="M154,206 L232,206 L232,284 L161,284" marker-end="url(#arrow-04-2)"/>
+<circle class="s-box" cx="150" cy="284" r="11"/>
+<text x="150" y="289" text-anchor="middle" class="s-bold">+</text>
+<path class="s-line" d="M150,295 L150,300" marker-end="url(#arrow-04-2)"/>
+<rect class="s-b" x="100" y="300" width="100" height="28" rx="6"/>
+<text x="150" y="318" text-anchor="middle" class="s-bold">LayerNorm</text>
+<path class="s-line" d="M150,328 L150,346" marker-end="url(#arrow-04-2)"/>
+<text x="150" y="362" text-anchor="middle" class="s-bold">x<tspan baseline-shift="sub" font-size="9">l+1</tspan></text>
+<text x="246" y="170" class="s-small s-muted">LN sits ON the</text>
+<text x="246" y="184" class="s-small s-muted">residual path</text>
+<text x="180" y="384" text-anchor="middle" class="s-small s-muted">last-layer gradient at init: O(d sqrt(ln d)), same for any L</text>
+<text x="180" y="400" text-anchor="middle" class="s-small s-muted">needs warm-up; a large LR at init is unstable</text>
+<text x="540" y="16" text-anchor="middle" class="s-big">Pre-LN</text>
+<text x="540" y="32" text-anchor="middle" class="s-small s-muted">y = x + F(LN(x)), GPT-2, Llama and most LLMs</text>
+<text x="510" y="52" text-anchor="middle" class="s-bold">x<tspan baseline-shift="sub" font-size="9">l</tspan></text>
+<circle class="s-fill-c" cx="510" cy="66" r="4"/>
+<path class="s-line-c" d="M510,66 L510,167"/>
+<path class="s-line" d="M514,66 L590,66 L590,82" marker-end="url(#arrow-04-2)"/>
+<rect class="s-b" x="550" y="82" width="80" height="28" rx="6"/>
+<text x="590" y="100" text-anchor="middle" class="s-bold">LayerNorm</text>
+<path class="s-line" d="M590,110 L590,128" marker-end="url(#arrow-04-2)"/>
+<rect class="s-a" x="540" y="128" width="100" height="30" rx="6"/>
+<text x="590" y="147" text-anchor="middle" class="s-bold">Attention</text>
+<path class="s-line" d="M590,158 L590,178 L521,178" marker-end="url(#arrow-04-2)"/>
+<circle class="s-box" cx="510" cy="178" r="11"/>
+<text x="510" y="183" text-anchor="middle" class="s-bold">+</text>
+<path class="s-line-c" d="M510,189 L510,196"/>
+<circle class="s-fill-c" cx="510" cy="196" r="4"/>
+<path class="s-line-c" d="M510,196 L510,297"/>
+<path class="s-line" d="M514,196 L590,196 L590,212" marker-end="url(#arrow-04-2)"/>
+<rect class="s-b" x="550" y="212" width="80" height="28" rx="6"/>
+<text x="590" y="230" text-anchor="middle" class="s-bold">LayerNorm</text>
+<path class="s-line" d="M590,240 L590,258" marker-end="url(#arrow-04-2)"/>
+<rect class="s-a" x="540" y="258" width="100" height="30" rx="6"/>
+<text x="590" y="277" text-anchor="middle" class="s-bold">FFN</text>
+<path class="s-line" d="M590,288 L590,308 L521,308" marker-end="url(#arrow-04-2)"/>
+<circle class="s-box" cx="510" cy="308" r="11"/>
+<text x="510" y="313" text-anchor="middle" class="s-bold">+</text>
+<path class="s-line-c" d="M510,319 L510,326"/>
+<rect class="s-b" x="460" y="326" width="100" height="28" rx="6"/>
+<text x="510" y="344" text-anchor="middle" class="s-bold">final LN</text>
+<path class="s-line" d="M510,354 L510,372" marker-end="url(#arrow-04-2)"/>
+<text x="510" y="386" text-anchor="middle" class="s-bold">to LM head</text>
+<text x="496" y="118" text-anchor="end" class="s-small s-tc">clean identity path:</text>
+<text x="496" y="132" text-anchor="end" class="s-small s-tc">no norm, no scaling</text>
+<text x="540" y="404" text-anchor="middle" class="s-small s-muted">last-layer gradient: O(d sqrt(ln d / L)); trains without warm-up (Xiong)</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Post-LN (left) puts a LayerNorm on the residual path after every addition, so the signal and its gradient are re-normalized \(2L\) times. Pre-LN (right) moves the norm onto the branch; the green path from block input to block output has no operation on it except addition. The price is one extra norm before the LM head and a stream whose norm grows with depth.</figcaption>
+  </figure>
+
+  <div class="decision">
+    <div class="decision-title">Pre-LN (norm inside the residual branch)</div>
+    <dl>
+      <dt>Problem</dt><dd>Post-LN's gradients at initialization are large near the output and independent of depth, so training diverges without a long, carefully tuned learning-rate warm-up, and very deep stacks are fragile.</dd>
+      <dt>Idea</dt><dd>Normalize the input of each sublayer instead of the sum, keep the skip path free of operations, and add a final norm before the head.</dd>
+      <dt>Why it works</dt><dd>The identity term in the gradient survives all layers, per-layer gradient scales at initialization are roughly equal, and the final LayerNorm scales the gradient down as the stream norm grows with depth.</dd>
+      <dt>Evidence</dt><dd>IWSLT14 De-En: Post-LN without warm-up 8.45 BLEU versus about 34; Pre-LN about 34 with no warm-up. BERT pre-training about 40% faster <a href="https://arxiv.org/abs/2002.04745">[Xiong et al. 2020, §3.2, §4]</a>.</dd>
+      <dt>Cost</dt><dd>Stream norm grows with depth and deep layers contribute less <a href="https://arxiv.org/abs/2502.05795">[Sun et al. 2025]</a>. Warm-up is still used in every large recipe.</dd>
+      <dt>Used by</dt><dd>GPT-2, Llama 1 and 3, Qwen2 and Qwen3. Gemma 2 and OLMo 2 add norms on the sublayer outputs.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="rmsnorm">LayerNorm versus RMSNorm</h2>
+
+  <p>Normalization acts on the last axis of one token's vector \(x \in \R^d\) and never mixes tokens. <strong>LayerNorm</strong> <span class="zh">层归一化</span> <a href="https://arxiv.org/abs/1607.06450">[Ba et al. 2016]</a> subtracts the mean, divides by the standard deviation, then applies a learned per-channel gain and bias:</p>
+
+  \[ \LayerNorm(x) = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} \odot \gamma + \beta, \qquad \mu = \frac1d \sum_i x_i, \quad \sigma^2 = \frac1d \sum_i (x_i - \mu)^2 \]
+
+  <p><strong>RMSNorm</strong> <span class="zh">均方根归一化</span> keeps only the rescaling <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, Eq. 4]</a>:</p>
+
+  <div class="eq-box">
+  \[ \RMSNorm(x) = \frac{x}{\sqrt{\tfrac{1}{d}\sum_i x_i^2 + \epsilon}} \odot g \]
+  <div class="eq-label">No mean subtraction, no bias. The gain \(g \in \R^d\) starts at 1. \(\epsilon\) is inside the square root.</div>
+  </div>
+
+  <p>Two things are dropped: the <strong>re-centering</strong> (subtracting \(\mu\)) and the bias \(\beta\). The norm therefore has \(d\) parameters instead of \(2d\). The two are closely related, since \(\sigma^2 = \tfrac1d\sum_i x_i^2 - \mu^2\): LayerNorm is RMSNorm applied to the centered vector, and when \(\mu = 0\) they coincide exactly <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, §4]</a>.</p>
+
+  <h3 id="rms-why">Why dropping the mean is nearly free</h3>
+  <p>Zhang and Sennrich's hypothesis is that the useful property of LayerNorm is <em>re-scaling invariance</em>, not re-centering invariance. RMS is homogeneous, \(\text{RMS}(\alpha x) = \alpha\,\text{RMS}(x)\), so the normalized output does not change if the input, or the weight matrix that produced it, is rescaled (their Eq. 6-7). Subtracting the mean removes exactly one direction of \(\R^d\), the all-ones vector. RMSNorm keeps that direction, and a plausible reason this is harmless is that the linear layer that follows can learn to ignore it. That last step is my reasoning, not a theorem, and the evidence is empirical:</p>
+  <ul>
+    <li><strong>Translation.</strong> A Transformer-base on WMT14 En-De reached 26.8 / 27.7 BLEU (newstest2014 / 2017) with RMSNorm against 26.6 / 27.7 with LayerNorm, and trained 6.9% faster per step (231 s versus 248 s per 1k steps on a V100) <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, Table 4]</a>. Across all their models and frameworks the speed-up ranged from 7% to 64%. It is small for Transformers because they have "significantly fewer sequential normalization operations" than RNNs.</li>
+    <li><strong>LLM practice.</strong> Llama adopted RMSNorm <a href="https://arxiv.org/abs/2302.13971">[Touvron et al. 2023, §2.2]</a>. PaLM used bias-free LayerNorm <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §2]</a>. OLMo 2 switched from non-parametric LayerNorm to RMSNorm and reports that "ablations show no difference between the two" <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §3.3.1]</a>. Quality is not sensitive to this choice.</li>
+    <li><strong>Where the speed comes from.</strong> A norm costs about \(5d\) to \(7d\) FLOPs per token, so two per layer are about \(10d\) against roughly \(26d^2\) for the matmuls of a block: at \(d = 4096\) that is 0.01% (my estimate). The saving is in memory traffic and kernel simplicity, since one fewer reduction means one fewer pass over the activations.</li>
+  </ul>
+
+  <h3 id="rms-eps">Details that interviewers check</h3>
+  <p><strong>Epsilon goes inside the square root.</strong> The reference code is <code>x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)</code> with \(\epsilon = 10^{-5}\) in the Llama 3 config <a href="https://github.com/meta-llama/llama3/blob/main/llama/model.py">[Llama 3 reference code]</a>. This keeps the map smooth and finite at \(x = 0\) (the output is exactly 0, not NaN). It also matters numerically at initialization: token embeddings start with standard deviation 0.02, so the mean square is \(4 \times 10^{-4}\) and \(\epsilon = 10^{-5}\) is 2.5% of it, shrinking the output by 1.2%. Putting \(\epsilon\) outside the root (\(x/(\text{rms} + \epsilon)\)) gives visibly different values for small inputs.</p>
+  <p><strong>Compute the statistics in float32.</strong> Squaring and averaging 4,096 bfloat16 values loses precision. The reference implementation upcasts, normalizes, casts back to the input dtype, and then multiplies by the gain <a href="https://github.com/meta-llama/llama3/blob/main/llama/model.py">[Llama 3 reference code]</a>.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))        # gain g; no bias
+
+    def forward(self, x):                                   # x: (..., dim)
+        dtype = x.dtype
+        x = x.float()                                       # statistics in fp32, even for bf16 input
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)   # eps INSIDE the sqrt
+        return (self.weight.float() * x).to(dtype)          # Llama casts before the gain: same for bf16 weights
+</code></pre>
+
+  <div class="decision">
+    <div class="decision-title">RMSNorm</div>
+    <dl>
+      <dt>Problem</dt><dd>LayerNorm's mean and bias add a reduction and parameters to every normalization, and normalization is applied twice per block.</dd>
+      <dt>Idea</dt><dd>Normalize by the root mean square only, keep a per-channel gain, drop the mean subtraction and the bias.</dd>
+      <dt>Why it works</dt><dd>Re-scaling invariance, not re-centering, is what stabilizes training. The dropped direction (the all-ones vector) can be ignored by the next linear layer.</dd>
+      <dt>Evidence</dt><dd>Transformer-base WMT14: 26.8 vs 26.6 BLEU, 6.9% faster <a href="https://arxiv.org/abs/1910.07467">[Zhang &amp; Sennrich 2019, Tab. 4]</a>. OLMo 2: no difference from the LayerNorm variant it replaced <a href="https://arxiv.org/abs/2501.00656">[§3.3.1]</a>.</dd>
+      <dt>Cost</dt><dd>Loses invariance to a constant shift of the input. Any effect on quality is too small to have been measured cleanly, and LayerNorm remains fine (PaLM used it).</dd>
+      <dt>Used by</dt><dd>Llama 1 and 3, Qwen2 and Qwen3, OLMo 2, Gemma (Gemma 2 adds post-norms).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="ffn">The feed-forward network: from ReLU MLP to SwiGLU</h2>
+
+  <p>The original FFN is two linear maps with a ReLU between them, applied to each position independently, with a hidden width \(d_{ff} = 4d\) (2,048 for \(d = 512\)) <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.3]</a>:</p>
+
+  \[ \text{FFN}(x) = \max(0,\, xW_1 + b_1)\,W_2 + b_2, \qquad W_1 \in \R^{d \times d_{ff}},\ W_2 \in \R^{d_{ff} \times d} \]
+
+  <p>This has \(2 \cdot d \cdot 4d = 8d^2\) weights, and therefore \(16d^2\) forward FLOPs per token. It is also the largest block of parameters in the model, as the count in <a href="#param-count">the parameter section</a> will show.</p>
+
+  <h3 id="glu">Gated linear units and SwiGLU</h3>
+  <p>A <strong>gated linear unit</strong> <span class="zh">门控线性单元</span> multiplies two linear projections of the input component-wise, one of which is first passed through an activation. Shazeer replaced the first linear layer and activation of the FFN with such a pair. With the SiLU (also called Swish\(_1\)) activation \(\text{SiLU}(z) = z\,\sigma(z)\), this is <strong>SwiGLU</strong> <a href="https://arxiv.org/abs/2002.05202">[Shazeer 2020, Eq. 6]</a>:</p>
+
+  <div class="eq-box">
+  \[ \text{FFN}_{\text{SwiGLU}}(x) = \big(\text{SiLU}(x W_1) \odot (x W_3)\big)\, W_2, \qquad W_1, W_3 \in \R^{d \times d_{ff}},\ W_2 \in \R^{d_{ff} \times d} \]
+  <div class="eq-label">Three matrices. \(W_1\) is the gate, \(W_3\) the up projection, \(W_2\) the down projection (Llama's names). No biases.</div>
+  </div>
+
+  <h3 id="dff-83">Why \(d_{ff} \approx \tfrac{8}{3}d\)</h3>
+  <p>A three-matrix FFN with the same \(d_{ff}\) as the two-matrix one has 50% more parameters and FLOPs. To compare fairly, Shazeer shrinks the hidden layer by a factor of \(\tfrac23\) "to keep the number of parameters and the amount of computation constant" (T5-base: \(d_{ff}\) from 3,072 to 2,048 at \(d = 768\)) <a href="https://arxiv.org/abs/2002.05202">[Shazeer 2020, §2-3.1]</a>. In general:</p>
+
+  \[ 2 \cdot d \cdot 4d = 3 \cdot d \cdot d_{ff} \quad\Longrightarrow\quad d_{ff} = \tfrac{8}{3}\,d \approx 2.67\,d \]
+
+  <p>Check with T5-base: \(3 \cdot 768 \cdot 2048 = 4{,}718{,}592 = 2 \cdot 768 \cdot 3072\). Llama 1 states this rule directly: "We use a dimension of \(\tfrac23 4d\) instead of \(4d\) as in PaLM" <a href="https://arxiv.org/abs/2302.13971">[Touvron et al. 2023, §2.2]</a>. The PaLM comparison is instructive: PaLM used SwiGLU but kept \(d_{ff} = 4d\) <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §2, Table 1]</a>, so its MLP has \(3 \cdot 4d^2 = 12d^2\) weights per layer, 50% more than the classical MLP. Both choices exist in the wild, and they differ in how much of the budget goes to the MLP.</p>
+
+  <h3 id="dff-round">Llama's rounding, and what Llama 3 actually does</h3>
+  <p>The Llama reference code computes the hidden width in three steps <a href="https://github.com/meta-llama/llama3/blob/main/llama/model.py">[Llama 3 reference code, FeedForward]</a>: take \(\tfrac23\) of \(4d\) and truncate to an integer, optionally scale by a multiplier, then round <em>up</em> to a multiple of <code>multiple_of</code>.</p>
+
+<pre><code class="language-python">def llama_ffn_dim(dim, multiple_of, ffn_dim_multiplier=None):
+    hidden = int(2 * (4 * dim) / 3)                  # 8d/3, truncated (the reference code is passed 4*dim)
+    if ffn_dim_multiplier is not None:
+        hidden = int(ffn_dim_multiplier * hidden)
+    return multiple_of * ((hidden + multiple_of - 1) // multiple_of)   # round UP to a multiple
+
+llama_ffn_dim(4096, 1024, 1.3)   # 10922 -> 14198 -> 14336  (Llama-3-8B)
+</code></pre>
+
+  <p>With Llama-3-8B's settings, <span class="unverified" title="The official params.json is gated. multiple_of = 1024 and ffn_dim_multiplier = 1.3 are taken from a community printout of the file; they do reproduce the paper's 14,336.">multiple_of = 1024 and ffn_dim_multiplier = 1.3</span>, the chain is \(16384 \to 10922 \to 14198 \to 14336 = 14 \times 1024\), which matches Table 3 of the Llama 3 paper <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024, Table 3]</a>. Two lessons follow.</p>
+  <ul>
+    <li><strong>Llama 3 does not use \(\tfrac83 d\).</strong> Its FFN widths are 14,336, 28,672 and 53,248 for 8B, 70B and 405B, i.e. \(3.5d\), \(3.5d\) and \(3.25d\). The MLP has \(3 \cdot 3.5\,d^2 = 10.5\,d^2\) weights per layer: 31% more than the classical \(8d^2\) and 12.5% less than PaLM's \(12d^2\). The 8/3 rule is what you derive when asked to <em>match</em> a 4d MLP, not a law.</li>
+    <li><strong>The rounding is for hardware.</strong> OLMo 2 states the same practice ("approximately \(\tfrac83 d\), but increased to the closest multiple of 128 (11,008 for our 7B model) to improve throughput") <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1]</a>. The usual reasons are GEMM tile sizes and divisibility by the tensor-parallel degree (14,336 = \(2^{11} \cdot 7\)); the sources above give the practice and the throughput motive, not a breakdown.</li>
+  </ul>
+
+  <h3 id="glu-evidence">The evidence for gating</h3>
+  <p>Shazeer's comparison uses a T5-base-size encoder-decoder (12 + 12 layers, \(d = 768\)) pre-trained on C4 span-filling for 524,288 steps, with all variants matched for parameters and compute <a href="https://arxiv.org/abs/2002.05202">[Shazeer 2020, Table 1]</a>. The metric is held-out log-perplexity (lower is better):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>FFN variant</th><th class="num">65,536 steps (± std of 4 runs)</th><th class="num">524,288 steps</th></tr></thead>
+    <tbody>
+      <tr><td>ReLU (baseline)</td><td class="num">1.997 (0.005)</td><td class="num">1.677</td></tr>
+      <tr><td>GELU</td><td class="num">1.983 (0.005)</td><td class="num">1.679</td></tr>
+      <tr><td>Swish</td><td class="num">1.994 (0.003)</td><td class="num">1.683</td></tr>
+      <tr><td>GLU (sigmoid gate)</td><td class="num">1.982 (0.006)</td><td class="num">1.663</td></tr>
+      <tr><td>Bilinear (no activation)</td><td class="num">1.960 (0.005)</td><td class="num">1.648</td></tr>
+      <tr><td>ReGLU</td><td class="num">1.953 (0.003)</td><td class="num">1.645</td></tr>
+      <tr><td>GEGLU</td><td class="num">1.942 (0.004)</td><td class="num">1.633</td></tr>
+      <tr class="hl"><td><strong>SwiGLU</strong></td><td class="num">1.944 (0.010)</td><td class="num">1.636</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Read it carefully. The best gated variants beat the ReLU baseline by about 0.05 nats at 65K steps, which is 5 to 14 times the reported run-to-run standard deviations (0.003 to 0.010), and by about 0.04 at the end. The <em>bilinear</em> layer, which has no activation function at all, beats plain GELU: the multiplicative interaction between two projections is doing the work, not the particular nonlinearity. On downstream tasks the gated variants win on most GLUE, SuperGLUE and SQuAD averages (SuperGLUE average 74.56 for SwiGLU against 72.76 for ReLU), though those results are noisy <a href="https://arxiv.org/abs/2002.05202">[Tables 2-4]</a>. Shazeer offers no mechanism: "We offer no explanation as to why these architectures seem to work; we attribute their success, as all else, to divine benevolence." A common intuition is that a data-dependent, per-feature gate gives each parameter more expressive power, but that is an intuition, not an established result. PaLM adopted SwiGLU on the strength of these compute-matched experiments <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §2]</a>.</p>
+
+<pre><code class="language-python">import torch.nn.functional as F
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff, bias=False):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff, bias=bias)    # gate
+        self.w3 = nn.Linear(d_model, d_ff, bias=bias)    # up
+        self.w2 = nn.Linear(d_ff, d_model, bias=bias)    # down
+
+    def forward(self, x):                                # x: (B, T, d)
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))  # (B, T, d_ff) gated, then back to (B, T, d)
+</code></pre>
+
+  <div class="decision">
+    <div class="decision-title">SwiGLU feed-forward</div>
+    <dl>
+      <dt>Problem</dt><dd>The ReLU/GELU MLP is the main place parameters and FLOPs go, so any quality gain per parameter there is worth a lot.</dd>
+      <dt>Idea</dt><dd>Replace \(\sigma(xW_1)W_2\) with \((\text{SiLU}(xW_1) \odot xW_3)W_2\), and shrink \(d_{ff}\) to about \(\tfrac83 d\) to hold parameters constant.</dd>
+      <dt>Why it works</dt><dd>Not established. The bilinear result shows the multiplicative interaction matters more than the activation.</dd>
+      <dt>Evidence</dt><dd>Log-perplexity 1.944 vs 1.997 (ReLU) at 65K steps, 1.636 vs 1.677 at 524K, at matched parameters and compute <a href="https://arxiv.org/abs/2002.05202">[Shazeer 2020, Tab. 1]</a>. One encoder-decoder at T5-base scale.</dd>
+      <dt>Cost</dt><dd>Three matmuls instead of two (more kernel launches and a wider intermediate activation to store), and a less round \(d_{ff}\).</dd>
+      <dt>Used by</dt><dd>PaLM (with \(d_{ff} = 4d\)), Llama 1 (\(\tfrac83 d\)) and Llama 3 (\(3.5d\)), OLMo 2 (\(\tfrac83 d\) rounded up), Qwen. Gemma uses the GELU-gated variant GEGLU <a href="https://arxiv.org/abs/2403.08295">[Gemma Team 2024]</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="embeddings-init">Embeddings, the LM head, biases, dropout and initialization</h2>
+
+  <h3 id="embeddings">Embedding, position table and LM head</h3>
+  <p>The token embedding <span class="zh">词嵌入</span> \(E \in \R^{V \times d}\) turns each id into a row: a gather, with \(V \cdot d\) parameters and zero FLOPs. The LM head (unembedding) \(W_U \in \R^{d \times V}\) is a real matmul costing \(2dV\) FLOPs per token: 1.05 GFLOPs for Llama-3-8B, 7.0% of its forward FLOPs. The logits tensor is also the largest single activation of the model in fp32: for \(B = 1\), \(T = 8192\), \(V = 128{,}256\) it is \(8192 \times 128256 \times 4\) bytes = 3.9 GiB, and the cross-entropy loss must keep it for the backward pass <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, §4.3]</a>.</p>
+  <p>Position enters in one of two ways. A <strong>learned absolute table</strong> \(P \in \R^{T_{\max} \times d}\) is added to the token embeddings (GPT-2: \(1024 \times 768 = 786{,}432\) parameters); Vaswani et al. found learned and sinusoidal positions nearly identical (25.7 versus 25.8 BLEU, Table 3 row E). Modern models use RoPE inside attention, which has <em>no parameters</em> (page 05), so their parameter counts have no position term. The drill's <code>max_seq_len</code> is the number of rows of the learned table, and 0 means none.</p>
+  <p>One bookkeeping detail: Llama 3's paper lists a vocabulary of 128,000, while the config has 128,256 rows. The difference is 256 reserved special tokens added by the reference tokenizer (<code>num_reserved_special_tokens = 256</code>) <a href="https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py">[Llama 3 tokenizer code]</a>. Count parameters from the config, not from the paper's table.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your inputs were continuous features per particle, mapped to width \(d\) by a linear layer, a matmul. An LLM's input is a lookup in a \(V \times d\) table, a gather that costs no FLOPs but holds 6.5% of Llama-3-8B's parameters. The output side is the mirror image: a classification head with 128,256 classes at every position, where yours had a handful of classes for the whole jet.</p>
+  </aside>
+
+  <h3 id="tying">Weight tying</h3>
+  <p><strong>Weight tying</strong> <span class="zh">权重共享</span> sets \(W_U = E^\top\) so one \(V \times d\) matrix serves as input embedding and output classifier <a href="https://arxiv.org/abs/1608.05859">[Press &amp; Wolf 2016]</a>. Their argument is about gradients. In an untied model, the input embedding updates only the row of the current input token, so rare words are updated rarely; the output embedding updates every row at every step, because the softmax normalizes over the whole vocabulary. A tied matrix receives both updates and, in their words, "evolves in a more similar way to the output embedding" than to the input embedding (abstract and §3). Results (all 2016-era LSTM language models and NMT models): a large PTB LSTM went from 66M to 51M parameters with test perplexity falling from 78.4 to 74.3 (Table 5), and translation models lost 28% of their parameters (52% with three-way tying of encoder input, decoder input and decoder output) at similar BLEU (Table 8). The original Transformer adopted it, multiplying the tied weights by \(\sqrt{d_{\text{model}}}\) in the embedding layer <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.4]</a>.</p>
+
+  <p>Who ties today follows a pattern, and it is a tendency rather than a rule:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th>Tied?</th><th class="num">Embedding matrix / total params</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-2 small</td><td>yes</td><td class="num">38.6M / 124.4M = 31.0%</td><td>our count below; nanoGPT ties them</td></tr>
+      <tr><td>Llama 3.2 1B</td><td>yes</td><td class="num">262.7M / 1,235.8M = 21.3%</td><td>its config.json</td></tr>
+      <tr><td>Gemma 2 2B</td><td>yes</td><td class="num">590.1M / 2,614.6M = 22.6%</td><td><a href="https://arxiv.org/abs/2408.00118">Gemma 2, Tab. 1-2</a></td></tr>
+      <tr><td>Gemma 2 27B</td><td>yes</td><td class="num">1,180.2M / 27,227.7M = 4.3%</td><td><a href="https://arxiv.org/abs/2408.00118">Gemma 2, Tab. 1-2</a></td></tr>
+      <tr><td>PaLM 540B</td><td>yes</td><td class="num">not stated</td><td><a href="https://arxiv.org/abs/2204.02311">PaLM, §2</a></td></tr>
+      <tr><td>Qwen3 0.6B / 1.7B / 4B</td><td>yes</td><td class="num"></td><td rowspan="2"><a href="https://arxiv.org/abs/2505.09388">Qwen3, Tab. 1</a></td></tr>
+      <tr><td>Qwen3 8B / 14B / 32B</td><td>no</td><td class="num"></td></tr>
+      <tr><td>Qwen2 0.5B / 1.5B vs 7B / 72B</td><td>yes vs no</td><td class="num"></td><td><a href="https://arxiv.org/abs/2407.10671">Qwen2, Tab. 1</a></td></tr>
+      <tr class="hl"><td>Llama 3 8B</td><td>no</td><td class="num">525.3M / 8,030.3M = 6.5% (13.1% for both matrices)</td><td>its config.json</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>Why large models tend to untie.</strong> Labs rarely publish this ablation, so the following are the standard explanations, not measured results. (1) The saving shrinks with scale: tying Llama-3-8B would remove 525M parameters (6.5%) and zero FLOPs, since the LM head still multiplies. (2) The two matrices do different jobs. Input rows must keep the early residual stream well scaled (OLMo 2 found that weight decay shrinking the embeddings inflates early-layer gradients, because the Jacobian of a norm is inversely proportional to the input norm <a href="https://arxiv.org/abs/2501.00656">[§3.4.2]</a>), while output rows act as class weights whose norm sets the logit scale. A tied matrix must satisfy both, and the patches in tied models show the tension: Vaswani multiplies embeddings by \(\sqrt{d}\), and PaLM initializes embeddings at \(\mathcal N(0,1)\) and scales the logits by \(1/\sqrt{d}\) <a href="https://arxiv.org/abs/2204.02311">[PaLM, §5]</a>. (3) <span class="unverified" title="Widely known Megatron-style implementation detail; I did not check a primary source for it.">With pipeline parallelism the embedding sits on the first stage and the LM head on the last, so tying forces a gradient synchronization across stages.</span> The counterexamples show it is a tendency: Gemma 2 27B and PaLM 540B tie, while Qwen2 and Qwen3 switch to untied at 7B and 8B respectively. A useful rule of thumb is that models tie when the embedding matrix is more than about a fifth of the parameters.</p>
+
+  <h3 id="biases">Biases</h3>
+  <p>Llama 3's config sets <code>attention_bias: false</code> and <code>mlp_bias: false</code>, and RMSNorm has no bias. PaLM was explicit about why: "No biases were used in any of the dense kernels or layer norms. We found this to result in increased training stability for large models" <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §2]</a>. OLMo excludes all bias terms as well <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §2.1]</a>, and Shazeer's T5-style FFNs have none <a href="https://arxiv.org/abs/2002.05202">[§1]</a>.</p>
+  <p>The reason is not the parameter count. For Llama-3-8B, biases on every attention and FFN projection would add \(32 \times (4096 + 1024 + 1024 + 4096 + 2 \cdot 14336 + 4096) = 1{,}376{,}256\) parameters, 0.017% of the model. Two of the four attention biases are in fact mathematically redundant. A key bias adds \(q_t \cdot b_K\) to every score of query \(t\), the same constant for all keys \(j\), which the softmax cancels. A value bias adds \(\sum_j a_{tj}\, b_V = b_V\) to the attention output (the weights sum to 1), which the output projection can absorb into its own bias. Only the query bias and the MLP biases can change what the network computes. The practical case for dropping them is simplicity, one fewer set of tensors to shard and initialize, and PaLM's unquantified stability claim. Not everyone agrees: Qwen2 kept QKV biases <a href="https://arxiv.org/abs/2407.10671">[Qwen2, §2.2.1]</a>, and Qwen3 removed them again and added QK-Norm instead <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>.</p>
+
+  <h3 id="dropout">Dropout</h3>
+  <p>The original Transformer used dropout 0.1 on every sublayer output and on the embeddings, and its ablation shows why it was there: removing it dropped WMT14 En-De BLEU from 25.8 to 24.6 <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §5.4, §6.2, Table 3 row D]</a>. That setting is heavily multi-epoch: 100,000 steps of about 25,000 source tokens is about \(2.5 \times 10^9\) source tokens drawn from 4.5M sentence pairs (on the order of \(10^8\) tokens at typical sentence lengths), so each example is seen on the order of 20 times. LLM pre-training is different. PaLM "was trained without dropout, although dropout of 0.1 is used for finetuning in most cases" <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §5]</a>; Shazeer's T5-style runs used "no dropout during pre-training" and "find this to produce superior results" <a href="https://arxiv.org/abs/2002.05202">[§3.2]</a>; Llama's config has <code>attention_dropout: 0.0</code>. The reason is the data regime: with a trillion-token corpus, most tokens are seen once (Llama 1: "each token is used only once during training, with the exception of the Wikipedia and Books domains," which get about two epochs <a href="https://arxiv.org/abs/2302.13971">[§2.1]</a>), so the training loss is an unbiased estimate of the validation loss. Dropout is a regularizer against overfitting, and a model that cannot overfit only pays for it in slower fitting. The caveat is data-constrained training, where repeated data returns overfitting risk (page 13).</p>
+
+  <h3 id="init">Initialization</h3>
+  <p>The default is all weight matrices and embeddings \(\sim \mathcal N(0, 0.02^2)\), biases zero, norm gains one. Llama's config carries <code>initializer_range: 0.02</code>, nanoGPT's <code>_init_weights</code> does the same, and OLMo 2 initializes <em>every</em> parameter from a truncated normal with standard deviation 0.02 <a href="https://arxiv.org/abs/2501.00656">[OLMo Team 2025, §3.2]</a>. GPT-2 added a depth correction: "We scale the weights of residual layers at initialization by a factor of \(1/\sqrt{N}\) where \(N\) is the number of residual layers" <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, §2.3]</a>. In nanoGPT this is implemented as <code>std = 0.02 / math.sqrt(2 * n_layer)</code> on each block's output projections (<code>c_proj</code>), because each block has two residual additions, so \(N = 2L\).</p>
+  <p>The reasoning is a variance budget. If each of the \(2L\) sublayer writes has variance \(\sigma^2\) and they are roughly independent, the stream variance after \(L\) blocks is about \(\sigma_{\text{emb}}^2 + 2L\sigma^2\), which grows linearly with depth (Xiong et al.'s Lemma 2 shows exactly this linear growth of \(\E\|x_l\|^2\) at standard initialization). Scaling each write's output projection by \(1/\sqrt{2L}\) makes the total \(O(1)\) regardless of depth. It is not settled practice. OLMo 2 <em>removed</em> depth-scaled initialization: plain \(\mathcal N(0, 0.02^2)\) everywhere cut the gradient-norm spike score from 0.40 to 0.03 in their setup and showed properties associated with hyperparameter transfer across widths <a href="https://arxiv.org/abs/2501.00656">[§3.2]</a>. Note that their old baseline was more aggressive than GPT-2's: it scaled input projections by \(1/\sqrt{d}\) and output projections by \(1/\sqrt{2 \cdot d \cdot \text{layer\_idx}}\), so later layers started with smaller weights. That is evidence against strong depth-scaling, not proof that GPT-2's constant \(1/\sqrt{2L}\) is wrong. Width-aware rules (\(\mu\)P) are on page 14.</p>
+  <p><strong>A free sanity check:</strong> with small random weights the logits are near zero, so the initial loss should be close to \(\ln V\). That is \(\ln 128{,}256 = 11.76\) nats for Llama 3 (\(\ln 50{,}257 = 10.82\) for GPT-2). A run that starts far above it usually has a scale bug, for example logits that are too large from a missing norm or a wrong tie.</p>
+</section>
+
+<section>
+  <h2 id="param-count">Counting parameters exactly</h2>
+
+  <p>Every parameter count in an interview reduces to summing the shapes of weight matrices. For the architecture of this page (GQA, SwiGLU, RMSNorm, no biases, RoPE so no position table), each layer holds \(W_q \in \R^{d \times n_h d_h}\), \(W_k, W_v \in \R^{d \times n_{kv} d_h}\), \(W_o \in \R^{n_h d_h \times d}\), the three FFN matrices, and two norm gains:</p>
+
+  <div class="eq-box">
+  \[ N = \underbrace{Vd}_{\text{embedding}} + L\Big(\underbrace{2d\,n_h d_h + 2d\,n_{kv} d_h}_{\text{attention}} + \underbrace{3\,d\,\dff}_{\text{FFN}} + \underbrace{2d}_{\text{norms}}\Big) + \underbrace{d}_{\text{final norm}} + \underbrace{Vd}_{\text{LM head, if untied}} \]
+  <div class="eq-label">With \(n_h d_h = d\) the attention term is \(2d^2 + 2d\,n_{kv}d_h\). Add \(T_{\max} d\) for a learned position table and drop \(Vd\) if the head is tied.</div>
+  </div>
+
+  <p>Now apply it to <strong>Llama-3-8B</strong>: \(L = 32\), \(d = 4096\), \(n_h = 32\), \(n_{kv} = 8\), \(d_h = 128\) (so \(n_{kv} d_h = 1024\)), \(d_{ff} = 14{,}336\), \(V = 128{,}256\), untied, no biases <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024, Table 3]</a> and the <code>config.json</code> of Llama-3.1-8B.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th>Shape</th><th class="num">Parameters</th></tr></thead>
+    <tbody>
+      <tr><td>Token embedding \(E\)</td><td>128,256 × 4,096</td><td class="num">525,336,576</td></tr>
+      <tr><td>\(W_q\)</td><td>4,096 × 4,096</td><td class="num">16,777,216</td></tr>
+      <tr><td>\(W_k\)</td><td>4,096 × 1,024</td><td class="num">4,194,304</td></tr>
+      <tr><td>\(W_v\)</td><td>4,096 × 1,024</td><td class="num">4,194,304</td></tr>
+      <tr><td>\(W_o\)</td><td>4,096 × 4,096</td><td class="num">16,777,216</td></tr>
+      <tr><td><em>Attention, per layer</em></td><td></td><td class="num"><em>41,943,040</em></td></tr>
+      <tr><td>\(W_1\) (gate), \(W_3\) (up), \(W_2\) (down)</td><td>3 × (4,096 × 14,336)</td><td class="num">3 × 58,720,256 = 176,160,768</td></tr>
+      <tr><td>Two RMSNorm gains</td><td>2 × 4,096</td><td class="num">8,192</td></tr>
+      <tr><td><em>Per layer</em></td><td></td><td class="num"><em>218,112,000</em></td></tr>
+      <tr><td>32 layers</td><td>32 × 218,112,000</td><td class="num">6,979,584,000</td></tr>
+      <tr><td>Final RMSNorm</td><td>4,096</td><td class="num">4,096</td></tr>
+      <tr><td>LM head \(W_U\) (untied)</td><td>4,096 × 128,256</td><td class="num">525,336,576</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td></td><td class="num"><strong>8,030,261,248</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Check: 525,336,576 + 6,979,584,000 + 4,096 + 525,336,576 = 8,030,261,248. The model is "8B" in the name and 8.03B in fact.</p>
+
+  <p>Three observations turn the table into an estimator. First, attention plus FFN per layer is \(218{,}103{,}808 = 13d^2\) exactly: attention is \(2.5d^2\) (because \(n_{kv}d_h = d/4\), so \(2d^2 + 2d \cdot d/4\)) and the FFN is \(3 \cdot 3.5\,d^2 = 10.5\,d^2\). So \(N \approx 13Ld^2 + 2Vd\), which gives 8,029,995,008 here, within 0.004% of the truth. Second, the norms are 266,240 parameters, invisible. Third, the split in Figure 3: the MLPs hold 70% of everything, so the FFN width is the main lever on model size.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 206" role="img" aria-labelledby="fig-04-3-title">
+<title id="fig-04-3-title">Where the 8,030,261,248 parameters of Llama-3-8B live: MLP 70.2 percent, attention 16.7 percent, embedding and LM head 13.1 percent, norms 0.003 percent</title>
+<rect class="s-a" x="40" y="22" width="449.3" height="46" rx="4"/>
+<text x="264.6" y="50" text-anchor="middle" class="s-bold">MLP (SwiGLU)  70.2%</text>
+<rect class="s-c" x="489.3" y="22" width="107" height="46" rx="4"/>
+<text x="542.8" y="50" text-anchor="middle" class="s-bold">Attn 16.7%</text>
+<rect class="s-b" x="596.3" y="22" width="83.7" height="46" rx="4"/>
+<text x="638.2" y="50" text-anchor="middle" class="s-bold">Emb 13.1%</text>
+<rect class="s-a" x="40" y="96" width="14" height="12" rx="2"/>
+<text x="64" y="107">MLP: 32 × 3 × 4096 × 14336 = 5,637,144,576</text>
+<rect class="s-c" x="40" y="118" width="14" height="12" rx="2"/>
+<text x="64" y="129">Attention: 32 × 41,943,040 = 1,342,177,280</text>
+<rect class="s-b" x="40" y="140" width="14" height="12" rx="2"/>
+<text x="64" y="151">Embedding + LM head: 2 × 525,336,576 = 1,050,673,152</text>
+<rect class="s-box" x="40" y="162" width="14" height="12" rx="2"/>
+<text x="64" y="173">RMSNorm gains: 32 × 8,192 + 4,096 = 266,240 (0.003%, too thin to see)</text>
+<text x="40" y="198" class="s-bold">Total: 8,030,261,248 parameters</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Where Llama-3-8B's parameters live. Bar widths are proportional to parameter counts. The two vocabulary matrices together hold 13.1% of the model, and they hold no FLOPs except the LM head's matmul.</figcaption>
+  </figure>
+
+  <h3 id="rule-12">The 12Ld² rule and why it is only a rule of thumb</h3>
+  <p>The classical estimate <a href="https://arxiv.org/abs/2001.08361">[Kaplan et al. 2020, Eq. 2.1]</a> is \(N \approx 2\,d\,L\,(2\,d_{\text{attn}} + d_{ff}) = 12Ld^2\) for \(d_{\text{attn}} = d_{ff}/4 = d\), "where we have excluded biases and other sub-leading terms," and excluding embeddings. It assumes multi-head attention (\(4d^2\)) and a 4d two-matrix MLP (\(8d^2\)). For GPT-2 small it is excellent: the twelve blocks hold 85,054,464 parameters and \(12 \cdot 12 \cdot 768^2 = 84{,}934{,}656\), only 0.14% less. For Llama-3-8B it undershoots the non-embedding count by 7.7% (\(12Ld^2 = 6.44\)B against 6.98B) because GQA lowers the attention term (\(2.5d^2\) instead of \(4d^2\)) while the 3.5d SwiGLU raises the MLP term (\(10.5d^2\) instead of \(8d^2\)). Use \(12Ld^2\) for a GPT-style model and rederive the coefficient for anything else.</p>
+
+  <p><strong>Worked check, GPT-2 small</strong> (12 layers, \(d = 768\), \(V = 50{,}257\), context 1,024, biases everywhere, LayerNorm with gain and bias, GELU MLP with \(d_{ff} = 3072\), learned positions, tied head):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th>Arithmetic</th><th class="num">Parameters</th></tr></thead>
+    <tbody>
+      <tr><td>Token embedding (shared with the head)</td><td>50,257 × 768</td><td class="num">38,597,376</td></tr>
+      <tr><td>Position table</td><td>1,024 × 768</td><td class="num">786,432</td></tr>
+      <tr><td>Block: 2 LayerNorms</td><td>2 × 2 × 768</td><td class="num">3,072</td></tr>
+      <tr><td>Block: fused QKV projection</td><td>768 × 2,304 + 2,304</td><td class="num">1,771,776</td></tr>
+      <tr><td>Block: attention output projection</td><td>768 × 768 + 768</td><td class="num">590,592</td></tr>
+      <tr><td>Block: MLP up and down</td><td>(768 × 3,072 + 3,072) + (3,072 × 768 + 768)</td><td class="num">4,722,432</td></tr>
+      <tr><td><em>Block total, times 12</em></td><td>7,087,872 × 12</td><td class="num"><em>85,054,464</em></td></tr>
+      <tr><td>Final LayerNorm</td><td>2 × 768</td><td class="num">1,536</td></tr>
+      <tr class="hl"><td><strong>Total (tied)</strong></td><td></td><td class="num"><strong>124,439,808</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>The GPT-2 paper's Table 2 lists this size as 117M <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">[Radford et al. 2019, Table 2]</a>, while counting the architecture as described gives 124.4M. Untied it would be 163,037,184. Two lessons: paper headline counts are not always exact, and the embedding table is 31% of this model, which is why nobody untied it.</p>
+</section>
+
+<section>
+  <h2 id="flops">FLOPs: the 6ND rule and what it leaves out</h2>
+
+  <h3 id="flops-6nd">Forward 2N, backward 4N</h3>
+  <p>Count a multiply-add as 2 FLOPs. A linear layer \(y = xW\) with \(W \in \R^{d_{in} \times d_{out}}\), applied to one token, does \(d_{in} d_{out}\) multiplications and as many additions: \(2\,d_{in} d_{out}\) FLOPs, which is 2 FLOPs per weight. Summed over every weight matrix, the forward pass costs \(\approx 2N\) FLOPs per token. The backward pass of \(Y = XW\) needs two matmuls, each the same size as the forward one: \(dX = dY\,W^\top\), to continue backpropagation, and \(dW = X^\top dY\), the weight gradient. So backward is twice the forward cost, and the total is three forward passes:</p>
+
+  <div class="eq-box">
+  \[ \underbrace{2N}_{\text{forward}} + \underbrace{2N}_{dX = dY\,W^\top} + \underbrace{2N}_{dW = X^\top dY} = 6N \ \text{FLOPs per token} \quad\Longrightarrow\quad C \approx 6\,N\,D \]
+  <div class="eq-label">The factor 3 is one forward matmul plus two backward matmuls per weight matrix</div>
+  </div>
+
+  <p>This is Kaplan et al.'s accounting ("Accounting for the backwards pass (approximately twice the compute as the forwards pass), we then define the estimated non-embedding compute as \(C \approx 6N\) floating point operators per training token") <a href="https://arxiv.org/abs/2001.08361">[§2.1]</a>, and PaLM's ("6N matmul FLOPs per token seen (2N for forward and 4N for backward)") <a href="https://arxiv.org/abs/2204.02311">[Appendix B]</a>. Only matmul weights produce FLOPs here. The embedding lookup costs nothing; norms, SiLU, softmax and RoPE cost \(O(d)\) per token per layer, about 0.01% for norms. If you use activation recomputation, the hardware executes an extra forward pass (about \(8N\) in total), but by PaLM's definition MFU counts only the \(6N\) of <em>model</em> FLOPs, so recomputation lowers hardware efficiency without changing MFU's numerator <a href="https://arxiv.org/abs/2204.02311">[§4.1]</a>.</p>
+
+  <h3 id="attn-flops">The attention term, and when it matters</h3>
+  <p>Weights do not account for the attention-score matmuls. For one token attending to \(T\) keys, \(QK^\top\) computes a length-\(d_h\) dot product per head per key, \(2\,n_h d_h T = 2dT\) FLOPs, and multiplying the weights by \(V\) costs the same. Over \(L\) layers:</p>
+
+  \[ F_{\text{attn}} = 4LTd \ \ \text{(every token counted against all } T \text{ keys)} \qquad\text{or}\qquad 2LTd \ \ \text{(causal: the average token sees } T/2 \text{ keys)} \]
+
+  <p>Different sources use different conventions for the same quantity. Kaplan writes \(C_{\text{fwd}} \approx 2N + 2\,n_{\text{layer}} n_{\text{ctx}} d_{\text{model}}\) (Eq. 2.2, the causal count). PaLM writes \(6N + 12LHQT\) per training token (App. B, the full count, \(3 \times 4LTd\)). Megatron-LM's per-token training count is \(72Lh^2 + 12Lsh + 6Vh\) <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, App. A, Eq. 7]</a>: the first term is \(6 \times 12Lh^2\), the second is the attention term, the third is the LM head (\(3 \times 2Vh\)). Setting attention equal to the linear layers gives the rule of thumb</p>
+
+  <div class="eq-box">
+  \[ 4LTd = 2N \approx 24Ld^2 \;\Longrightarrow\; T \approx 6d \ \ \text{(full count)}, \qquad T \approx 12d \ \ \text{(causal count)} \]
+  <div class="eq-label">Kaplan drops the attention term when \(d_{\text{model}} > n_{\text{ctx}}/12\), which is the causal form of the same inequality</div>
+  </div>
+
+  <p>For Llama-3-8B the exact numbers use the matmul weights \(N_{mm} = 32 \times 218{,}103{,}808 + 525{,}336{,}576 = 7{,}504{,}658{,}432\) (blocks plus LM head, no embedding table, no norms), so the linear layers cost \(2N_{mm} = 15{,}009{,}316{,}864\) FLOPs per token:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Context \(T\)</th><th class="num">Attention, full count \(4LTd\)</th><th class="num">Share of forward</th><th class="num">Attention, causal \(2LTd\)</th><th class="num">Share of forward</th></tr></thead>
+    <tbody>
+      <tr><td>8,192</td><td class="num">4.29 GFLOPs</td><td class="num">22.2%</td><td class="num">2.15 GFLOPs</td><td class="num">12.5%</td></tr>
+      <tr><td>131,072</td><td class="num">68.7 GFLOPs</td><td class="num">82.1%</td><td class="num">34.4 GFLOPs</td><td class="num">69.6%</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Share = attention / (attention + 15.01 GFLOPs). Example: \(4 \cdot 32 \cdot 8192 \cdot 4096 = 4.295 \times 10^9\), and \(4.295 / (15.009 + 4.295) = 22.2\%\).</p>
+
+  <p><strong>So at what length do attention FLOPs rival the MLP FLOPs?</strong> The MLPs cost \(2 \cdot L \cdot 3\,d\,\dff = 11.27\) GFLOPs per token. Setting \(4LTd\) equal to \(2L \cdot 3\,d\,\dff\) gives \(T = 1.5\,\dff = 21{,}504\) tokens (full count) or \(3\,\dff = 43{,}008\) (causal count). Against <em>all</em> the linear layers, \(T^\ast = N_{mm}/(2Ld) = 28{,}628\) (full) or 57{,}256 (causal), close to the \(6d = 24{,}576\) and \(12d = 49{,}152\) of the rule of thumb. The honest answer is "somewhere between 20K and 60K tokens for an 8B model, depending on the counting convention." An 8K pre-training run therefore spends 12.5% to 22% of its forward FLOPs on attention scores, and a 128K run spends 70% to 82%. That is why Llama 3 trains at 8K for most of pre-training and adds context in stages at the end: "We do not train on long sequences earlier because the compute in self-attention layers grows quadratically in the sequence length," and for the 405B the long-context stage used about 800B tokens, roughly 5% of its 15.6T <a href="https://arxiv.org/abs/2407.21783">[Llama Team 2024, §3.4.2]</a>.</p>
+  <p>Three caveats. FLOPs are not time: attention kernels have lower arithmetic intensity than large GEMMs and run at lower utilization (page 16). Sliding-window and sparse attention change the \(T\) factor (page 09). And the causal count is what a FlashAttention-style kernel really executes, since it skips fully masked blocks.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A jet has at most a few hundred constituents, and \(T\) never approached \(6d\) for typical widths, so attention scores were a rounding error next to the MLPs and \(6N\) per example was a fine estimate. In a long-context LLM the sequence is 30 times longer than the model is wide, and the quadratic term is the main cost. The same block, in a different regime.</p>
+  </aside>
+
+  <h3 id="which-n">Which N? The embedding convention</h3>
+  <p>For Llama-3-8B there are three defensible values of \(N\): the total, 8,030,261,248; the count that drops only the input table, 7,504,924,672; and the "non-embedding" count that drops both vocabulary matrices, 6,979,588,096. At \(D = 15\text{T}\), \(6ND\) is \(7.23\), \(6.75\) or \(6.28 \times 10^{23}\) FLOPs: a 7% to 13% spread. The FLOP-correct choice is the matmul weights (this count less the 266,240 norm gains), plus attention. Kaplan defines \(N\) as "the number of model parameters, excluding all vocabulary and positional embeddings" because the scaling laws are cleaner <a href="https://arxiv.org/abs/2001.08361">[§1.3, §3.2]</a>; Chinchilla uses totals. Pearce and Song argue that much of the gap between the two papers' compute-optimal exponents (0.73 versus 0.50) comes from Kaplan's non-embedding convention at small scale <a href="https://arxiv.org/abs/2406.12907">[Pearce &amp; Song 2024]</a>. In an interview, say which \(N\) you are using. Page 13 returns to this.</p>
+
+  <h3 id="gpu-hours">Worked numbers: tokens to GPU-hours</h3>
+  <p><strong>Step 1, compute.</strong> For Llama-3-8B on about 15T tokens (the Llama 3 paper: "a corpus of about 15T multilingual tokens"): \(C = 6 \times 8.030 \times 10^9 \times 15 \times 10^{12} = 7.23 \times 10^{23}\) FLOPs.</p>
+  <p><strong>Step 2, hardware.</strong> An H100 SXM has a peak of 1,979 BF16 TFLOP/s <em>with sparsity</em> per NVIDIA's <a href="https://www.nvidia.com/en-us/data-center/h100/">datasheet</a>, so the dense peak is half of that, about 989 TFLOP/s. Model FLOPs utilization <span class="zh">模型算力利用率</span> is observed model-FLOP throughput divided by peak <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al. 2022, §4.1]</a>. Llama 3 405B reports 430 TFLOP/s per GPU at 43% MFU on 8,192 GPUs, and 38% at 380 TFLOP/s in its long-context configuration <a href="https://arxiv.org/abs/2407.21783">[Table 4]</a>, consistent with a 989 TFLOP/s denominator (430/989 = 43.5%). Using the sparse 1,979 figure by mistake halves every MFU you compute.</p>
+  <p><strong>Step 3, time.</strong> At a stated MFU of 40%:</p>
+  \[ \frac{7.227 \times 10^{23}}{0.40 \times 989 \times 10^{12}\ \text{FLOP/s}} = 1.83 \times 10^{9}\ \text{GPU-s} = 507{,}474\ \text{GPU-hours} \]
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>MFU</th><th class="num">GPU-hours</th><th class="num">Days on 1,024 H100s</th><th class="num">Days on 16,384 H100s</th></tr></thead>
+    <tbody>
+      <tr><td>30%</td><td class="num">676,631</td><td class="num">27.5</td><td class="num">1.72</td></tr>
+      <tr class="hl"><td>40%</td><td class="num">507,474</td><td class="num">20.6</td><td class="num">1.29</td></tr>
+      <tr><td>50%</td><td class="num">405,979</td><td class="num">16.5</td><td class="num">1.03</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>Cross-checks against public numbers.</strong> (a) Llama 3 405B: \(6 \times 405 \times 10^9 \times 15.6 \times 10^{12} = 3.79 \times 10^{25}\), matching the paper's "\(3.8 \times 10^{25}\) FLOPs" <a href="https://arxiv.org/abs/2407.21783">[§1]</a>. (b) Llama 1 65B: 380 tokens/s/GPU on 2,048 A100s <a href="https://arxiv.org/abs/2302.13971">[§2.4]</a> means \(6 \times 65.2 \times 10^9 \times 380 = 148.7\) TFLOP/s per GPU, 47.6% of the A100's 312 TFLOP/s peak (the figure PaLM's appendix uses), and \(1.4 \times 10^{12} / (380 \times 2048) = 20.8\) days, matching "approximately 21 days." (c) Llama 3 8B: the model card lists 1.3M H100-hours for pre-training ("over 15 trillion tokens"). That implies \(7.23 \times 10^{23} / (1.3 \times 10^6 \times 3600) = 154\) TFLOP/s per GPU, or 15.6% of peak. The card reports only GPU-hours (I found no MFU or breakdown in it), so a 40% assumption predicts 2.6 times fewer hours than were reported. Either the small model ran at much lower utilization than the 405B (whose 30.84M hours in the 3.1 card imply 34.6% by the same arithmetic), or the hours include overheads, and the card does not say which. The lesson for an interview: state your MFU assumption, know that 30% to 45% is what large dense runs achieve, and expect lower for small models.</p>
+  <p>The more accurate per-token count (matmuls plus causal attention at \(T = 8192\)) is 51.47 GFLOPs against \(6N = 48.18\) GFLOPs, 6.8% higher: the omitted attention term outweighs the input embedding table that \(6N\) counts but does not use.</p>
+
+  <h3 id="act-mem">Activation memory (preview of page 15)</h3>
+  <p>Backpropagation needs what the forward pass computed. Per layer, the stored tensors are the inputs of each matmul, the norm inputs, the gated FFN intermediates, and (with naive attention) the attention probabilities. Korthikanti et al. count, for a GPT-style block with 16-bit activations, dropout masks included, <span class="zh">激活值</span></p>
+
+  \[ \text{activation memory per layer} = s\,b\,h\left(34 + 5\,\frac{a\,s}{h}\right) \ \text{bytes} \]
+
+  <p>with \(s\) the sequence length, \(b\) the micro-batch, \(h\) the hidden size and \(a\) the number of heads <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, Eq. 1]</a>. The first term scales with \(B \cdot T \cdot d\) per layer. The second is the attention matrices, which scale with \(T^2\) if the score matrix is materialized. With Llama-3-8B's shapes at \(b = 1\), \(s = 8192\): the factor is \(34 + 5 \cdot 32 \cdot 8192/4096 = 354\), so one layer stores \(354 \times 8192 \times 4096 = 11.9\) GB (11.1 GiB) and 32 layers store 354 GiB for a <em>single</em> sequence, 90% of it from the \(T^2\) term. A kernel that never stores the score matrix (FlashAttention, page 16) leaves the 34 term: 1.06 GiB per layer, 34 GiB in total. Full recomputation keeps only each layer's input, \(2sbh\) = 64 MiB per layer. Treat the constants as GPT-2-style: SwiGLU stores a wider intermediate, GQA stores smaller keys and values, and there is no dropout, so Llama's constant differs from 34. The scaling does not. ZeRO/FSDP, tensor and sequence parallelism, and recomputation policies are page 15.</p>
+</section>
+
+<section>
+  <h2 id="minimal-gpt">A complete minimal GPT</h2>
+
+  <p>This is the reference solution of the drill (about 100 lines with the RMSNorm and SwiGLU above). Positions use a learned absolute table here. Page 05 replaces it with RoPE inside attention, and page 06 adds the KV cache for generation: this forward pass is the training and prefill path. Attention uses <code>F.scaled_dot_product_attention</code> with <code>is_causal=True</code> (page 03), and KV heads are expanded with <code>repeat_interleave</code> (page 07 shows the mapping and the <code>enable_gqa</code> alternative).</p>
+
+<pre><code class="language-python">import math, torch, torch.nn as nn, torch.nn.functional as F
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads=None, head_dim=None, bias=False):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        self.head_dim = d_model // n_heads if head_dim is None else head_dim
+        self.wq = nn.Linear(d_model, n_heads * self.head_dim, bias=bias)
+        self.wk = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bias)
+        self.wv = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bias)
+        self.wo = nn.Linear(n_heads * self.head_dim, d_model, bias=bias)
+
+    def forward(self, x):                                                       # x: (B, T, d)
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)      # (B, n_h, T, d_h)
+        k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)   # (B, n_kv, T, d_h)
+        v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        g = self.n_heads // self.n_kv_heads
+        k, v = k.repeat_interleave(g, dim=1), v.repeat_interleave(g, dim=1)         # (B, n_h, T, d_h)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)                 # (B, n_h, T, d_h)
+        return self.wo(y.transpose(1, 2).reshape(B, T, self.n_heads * self.head_dim))
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        d, eps, bias = cfg["d_model"], cfg.get("norm_eps", 1e-5), cfg.get("bias", False)
+        self.attn_norm = RMSNorm(d, eps)
+        self.attn = CausalSelfAttention(d, cfg["n_heads"], cfg.get("n_kv_heads"), cfg.get("head_dim"), bias)
+        self.ffn_norm = RMSNorm(d, eps)
+        self.ffn = SwiGLU(d, cfg["d_ff"], bias)
+
+    def forward(self, x):
+        x = x + self.attn(self.attn_norm(x))        # each sublayer ADDS to the residual stream
+        return x + self.ffn(self.ffn_norm(x))
+</code></pre>
+
+<pre><code class="language-python">class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        d, V, L = cfg["d_model"], cfg["vocab_size"], cfg["n_layers"]
+        self.tok_emb = nn.Embedding(V, d)
+        max_len = cfg.get("max_seq_len", 0)                                     # learned positions; 0 = none (RoPE, page 05)
+        self.pos_emb = nn.Embedding(max_len, d) if max_len > 0 else None
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(L)])
+        self.final_norm = RMSNorm(d, cfg.get("norm_eps", 1e-5))
+        self.lm_head = nn.Linear(d, V, bias=False)
+        for m in self.modules():                                                # N(0, 0.02^2) everywhere, zero biases
+            if isinstance(m, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if getattr(m, "bias", None) is not None:
+                    nn.init.zeros_(m.bias)
+        for blk in self.blocks:                                                 # GPT-2 residual scaling, N = 2L writes
+            for w in (blk.attn.wo.weight, blk.ffn.w2.weight):
+                nn.init.normal_(w, mean=0.0, std=0.02 / math.sqrt(2 * L))
+        if cfg.get("tie_embeddings", False):
+            self.lm_head.weight = self.tok_emb.weight                           # one shared (V, d) Parameter
+
+    def forward(self, idx, targets=None):                                       # idx: (B, T) int64
+        B, T = idx.shape
+        x = self.tok_emb(idx)                                                   # (B, T, d)
+        if self.pos_emb is not None:
+            x = x + self.pos_emb(torch.arange(T, device=idx.device))
+        for blk in self.blocks:
+            x = blk(x)
+        logits = self.lm_head(self.final_norm(x))                               # (B, T, V)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+def count_params(cfg):
+    d, nh, V, L, dff = cfg["d_model"], cfg["n_heads"], cfg["vocab_size"], cfg["n_layers"], cfg["d_ff"]
+    nkv, dh = cfg.get("n_kv_heads") or nh, cfg.get("head_dim") or d // nh
+    attn = d * nh * dh + 2 * d * nkv * dh + nh * dh * d
+    mlp = 3 * d * dff
+    if cfg.get("bias", False):
+        attn += nh * dh + 2 * nkv * dh + d
+        mlp += 2 * dff + d
+    emb = V * d * (1 if cfg.get("tie_embeddings", False) else 2)
+    return emb + cfg.get("max_seq_len", 0) * d + L * (attn + mlp + 2 * d) + d
+</code></pre>
+
+  <p>The closed form and the module must agree for every config, and you can test that on the real Llama-3-8B shape without allocating 32 GB by building the module on the <code>meta</code> device:</p>
+
+<pre><code class="language-python">llama3_8b = dict(vocab_size=128256, d_model=4096, n_layers=32, n_heads=32, n_kv_heads=8, d_ff=14336)
+with torch.device("meta"):                                   # shapes only, no memory
+    model = GPT(llama3_8b)
+assert sum(p.numel() for p in model.parameters()) == count_params(llama3_8b) == 8_030_261_248
+</code></pre>
+
+  <p>Details worth defending out loud: the <code>view(B, T, n_heads, head_dim).transpose(1, 2)</code> layout puts heads before time so the batched matmul runs per head; <code>lm_head.weight = tok_emb.weight</code> makes <code>parameters()</code> count the shared tensor once, so tying removes exactly \(Vd\) parameters; and <code>is_causal=True</code> builds the lower-triangular \(T \times T\) mask, which is only correct when queries and keys cover the same positions (cached decoding needs the end-aligned mask of page 07). The drill in <code>exercises/drills/transformer.py</code> asks you to write all of this against the tests.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Pre-norm means you can drop the warm-up."</strong> Xiong et al. showed warm-up can be removed on their translation and BERT tasks, and no more. Llama 1 warms up for 2,000 steps and Llama 3 405B for 8,000. The benefit of warm-up has also been attributed to variance in Adam's early adaptive learning rates, not only to the gradient scale at initialization.</li>
+    <li><strong>"SwiGLU means \(d_{ff} = \tfrac83 d\)."</strong> That is the value that <em>matches</em> the parameters of a 4d two-matrix MLP. PaLM used SwiGLU with \(4d\), and Llama 3 uses \(3.5d\) (14,336 at \(d = 4096\)). Read \(d_{ff}\) from the config, never from a rule.</li>
+    <li><strong>"6ND counts everything."</strong> It omits the attention-score matmuls (the term that grows with \(T\), 12% to 22% of forward FLOPs at 8K for Llama-3-8B and about 70% to 82% at 128K), and if you plug in the total parameter count it includes the input embedding table, which costs no FLOPs (the LM head matmul is real and does belong in \(N\)). Say which \(N\) and which \(T\) you assume.</li>
+    <li><strong>"RMSNorm is faster because it does fewer FLOPs."</strong> Norm FLOPs are about 0.01% of a block either way. The saving is one fewer reduction pass over memory and half the norm parameters, and it measured at 7% in a Transformer-base, not 2x.</li>
+    <li><strong>"Biases are dropped to save parameters."</strong> They are 0.017% of Llama-3-8B. The key bias is exactly redundant (it adds the same constant to every score, and softmax cancels it), the value bias folds into the output projection, and the case for dropping the rest is simplicity and PaLM's stability claim. Qwen2 kept QKV biases.</li>
+    <li><strong>"Large models never tie embeddings."</strong> Gemma 2 27B and PaLM 540B tie. Ties are common when the embedding matrix is a fifth or more of the parameters (small models with 128K to 256K vocabularies) and rarer above roughly 8B, but it is a tendency.</li>
+    <li><strong>"An 8B model has 8.00B parameters, and embeddings are negligible."</strong> Llama-3-8B has 8.03B, and 13.1% of that is the two vocabulary matrices. The \(12Ld^2\) shortcut undershoots its non-embedding count by 7.7% because GQA and the 3.5d SwiGLU change the coefficients.</li>
+    <li><strong>"MFU is achieved FLOP/s over the H100's 1,979 TFLOP/s."</strong> 1,979 is the with-sparsity figure. Dense BF16 peak is about 989, and MFU counts model FLOPs (\(6N\) plus attention), not the recomputation a checkpointed run actually executes.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Walk through a decoder-only forward pass with shapes. Where do the parameters live, and where do tokens interact?</summary>
+    <div class="answer">
+      <p>Token ids \((B, T)\) index the embedding table, giving \((B, T, d)\) (plus a learned position table if there is one). Each of \(L\) blocks maps \((B, T, d) \to (B, T, d)\): \(h = x + \text{Attn}(\text{Norm}(x))\), then \(x' = h + \text{FFN}(\text{Norm}(h))\). A final norm and the LM head give logits \((B, T, V)\). For training, the targets are the input ids shifted left by one position, and the loss is cross-entropy averaged over \(B \cdot T\) positions.</p>
+      <p>Parameters: \(Vd\) in the embedding, about \(13d^2\) per layer in Llama-3-8B (attention \(2.5d^2\), FFN \(10.5d^2\)), and \(Vd\) in an untied head. Tokens exchange information only in attention. Embedding, FFN, norms and the head all act on each position separately.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What loss should a freshly initialized LLM report at step 0, and what does a deviation tell you?</summary>
+    <div class="answer">
+      <p>With \(\mathcal N(0, 0.02^2)\) weights and a final norm, the logits are small and nearly random, so the predicted distribution is close to uniform and the loss is close to \(\ln V\): 11.76 nats for \(V = 128{,}256\), 10.82 for GPT-2's 50,257. If the initial loss is far <em>above</em> \(\ln V\), the logits are too large: a missing final norm, a wrong tie, or a bad init scale. If it is far <em>below</em> and falls to near zero within a few steps, suspect leakage: the causal mask is missing or the targets were not shifted by one, so the model can copy the answer from its input.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is the residual stream, and why do residual connections make deep transformers trainable?</summary>
+    <div class="answer">
+      <p>The residual stream is the \(d\)-dimensional vector each token carries through the network. Every sublayer reads a normalized copy and adds its output, so after \(L\) blocks the state is the embedding plus \(2L\) additive writes: \(x^{(L)} = x^{(0)} + \sum_j f_j(\cdot)\). Differentiating gives \(\partial x_L / \partial x_l = I + \partial(\sum F)/\partial x_l\), so a gradient term reaches every layer without passing through any weights, and it "does not vanish even when the weights are arbitrarily small" (He et al.). Anything multiplicative on the skip path, such as scaling, gating or dropout, breaks this, which is why Pre-LN keeps norms off the path.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why do modern LLMs drop linear biases, and why is there no dropout in pre-training?</summary>
+    <div class="answer">
+      <p><strong>Biases.</strong> Not for the parameter count: biases on every projection would add 1,376,256 parameters to Llama-3-8B, 0.017%. A key bias adds the same \(q_t \cdot b_K\) to every score of a query, which softmax cancels, and a value bias adds \(b_V\) to the attention output because the weights sum to 1, which \(W_o\) can absorb. PaLM reported "increased training stability for large models" without biases; the rest is simplicity. Qwen2 kept QKV biases and Qwen3 removed them.</p>
+      <p><strong>Dropout.</strong> It fights overfitting, and with a trillion-token, roughly single-epoch corpus there is none: the training loss estimates the validation loss. PaLM used no dropout in pre-training (0.1 in fine-tuning), Shazeer found none superior, and Vaswani's dropout mattered (24.6 versus 25.8 BLEU without it) in a setup that makes on the order of 20 passes over 4.5M sentence pairs (my estimate). The exception is data-constrained, multi-epoch training.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Count the parameters of Llama-3-8B from its config.</summary>
+    <div class="answer">
+      <p>Config: \(L = 32\), \(d = 4096\), \(n_h = 32\), \(n_{kv} = 8\), \(d_h = 128\) (so \(n_{kv}d_h = 1024\)), \(d_{ff} = 14{,}336\), \(V = 128{,}256\), untied, no biases.</p>
+      <p><strong>Embedding:</strong> \(Vd = 525{,}336{,}576\), and the LM head is the same again. <strong>Per layer:</strong> \(W_q\) and \(W_o\) are \(4096^2 = 16{,}777{,}216\) each, \(W_k\) and \(W_v\) are \(4096 \times 1024 = 4{,}194{,}304\) each, so attention is 41,943,040. The FFN has three matrices of \(4096 \times 14{,}336 = 58{,}720{,}256\), so 176,160,768. Two RMSNorm gains add 8,192. Per layer: 218,112,000, and times 32: 6,979,584,000. <strong>Final norm:</strong> 4,096.</p>
+      <p><strong>Total:</strong> \(2 \times 525{,}336{,}576 + 6{,}979{,}584{,}000 + 4{,}096 = 8{,}030{,}261{,}248\). Quick check: attention plus FFN is exactly \(13d^2\) per layer, so \(N \approx 13Ld^2 + 2Vd = 8.03 \times 10^9\). Things worth saying: the MLPs are 70.2% of the parameters, the two vocabulary matrices are 13.1%, and tying would give 7.505B.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive "training costs about 6N FLOPs per token." Where does the factor 3 come from?</summary>
+    <div class="answer">
+      <p>A weight matrix \(W \in \R^{d_{in} \times d_{out}}\) applied to a token does \(d_{in}d_{out}\) multiply-adds, which is \(2\,d_{in}d_{out}\) FLOPs, so the forward pass is 2 FLOPs per weight: \(2N\) per token over all matmul weights. For \(Y = XW\) the backward pass computes \(dX = dY\,W^\top\), needed to keep backpropagating, and \(dW = X^\top dY\), the weight gradient. Each is the same size as the forward matmul, so backward is \(4N\). Forward plus backward is \(6N\), i.e. three matmuls of forward size per weight, hence the 3. Multiplying by \(D\) tokens gives \(C \approx 6ND\).</p>
+      <p>What it leaves out: the attention-score matmuls (\(\approx 4LTd\) forward per token, causal half of that), a few \(O(d)\) elementwise ops, and, if you use activation checkpointing, one extra forward pass (\(8N\) executed, but MFU counts \(6N\)). Embedding lookups cost nothing, so the right \(N\) is the matmul weights. For Llama-3-8B, \(6 \times 8.03 \times 10^9 \times 15 \times 10^{12} = 7.2 \times 10^{23}\). Sanity check: Llama 3 405B, \(6 \times 405\text{B} \times 15.6\text{T} = 3.79 \times 10^{25}\), matches the paper's \(3.8 \times 10^{25}\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why pre-norm instead of post-norm?</summary>
+    <div class="answer">
+      <p>Post-LN, \(y = \text{LN}(x + F(x))\), puts a normalization on the residual path at every layer, so there is no clean identity route for gradients. Pre-LN, \(y = x + F(\text{LN}(x))\), leaves the path untouched. Xiong et al. show the consequence at initialization: the last-layer FFN weight gradient is \(O(d\sqrt{\ln d})\) for Post-LN, independent of depth, and \(O(d\sqrt{\ln d / L})\) for Pre-LN, and per-layer gradients grow toward the output in Post-LN but stay roughly equal across layers in Pre-LN. Large gradients near the output make a big early learning rate unsafe, hence Post-LN's warm-up dependence: on IWSLT14, Post-LN without warm-up reached 8.45 BLEU against about 34 with it, while Pre-LN without warm-up reached about 34. On BERT, Pre-LN was about 40% faster.</p>
+      <p>Costs: the stream norm grows with depth (linearly at init), so deep layers contribute less (Sun et al. find many deep layers of Pre-LN LLMs prunable), a final norm is mandatory, and warm-up is still used in practice. Variants (Gemma 2's post-norms, OLMo 2's output norms) add norms on the branch while keeping the bus clean.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> RMSNorm versus LayerNorm: what is dropped, and why does it still work?</summary>
+    <div class="answer">
+      <p>LayerNorm computes \((x - \mu)/\sqrt{\sigma^2 + \epsilon} \odot \gamma + \beta\). RMSNorm computes \(x / \sqrt{\text{mean}(x^2) + \epsilon} \odot g\). It drops the mean subtraction (re-centering) and the bias \(\beta\), so it has \(d\) parameters instead of \(2d\) and one fewer reduction. Since \(\sigma^2 = \text{mean}(x^2) - \mu^2\), LayerNorm equals RMSNorm of the centered vector, and they coincide when \(\mu = 0\).</p>
+      <p>It still works because the valuable property is re-scaling invariance, \(\text{RMS}(\alpha x) = \alpha\,\text{RMS}(x)\), which RMSNorm keeps, while re-centering removes only the all-ones direction, which the following linear layer can learn to ignore (my reasoning; the evidence is empirical). Zhang and Sennrich: 26.8 vs 26.6 BLEU on WMT14 with a 6.9% faster Transformer-base. OLMo 2 saw no difference against its prior norm. Implementation details: \(\epsilon\) goes inside the square root (Llama 3 uses \(10^{-5}\)), statistics are computed in float32, the result is cast back, then multiplied by the gain. The speed gain is memory traffic, not FLOPs (norms are about 0.01% of a block's FLOPs).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why SwiGLU, and why is d<sub>ff</sub> about 8/3 of d instead of 4d?</summary>
+    <div class="answer">
+      <p>SwiGLU replaces \(\sigma(xW_1)W_2\) by \((\text{SiLU}(xW_1) \odot xW_3)W_2\). In Shazeer's compute-matched T5-base experiments it lowered held-out log-perplexity from 1.997 (ReLU) to 1.944 at 65K steps and from 1.677 to 1.636 at 524K, several times the run-to-run noise, and the activation-free bilinear variant already beat GELU, so the multiplicative gate is what helps. There is no established mechanism ("divine benevolence").</p>
+      <p>It has three matrices instead of two, so to keep parameters constant the width must satisfy \(3 \cdot d \cdot d_{ff} = 2 \cdot d \cdot 4d\), giving \(d_{ff} = \tfrac83 d\) (T5-base: 3072 to 2048). Llama 1 uses exactly this ("\(\tfrac23 4d\)"), rounded up to a hardware-friendly multiple (OLMo 2's 7B: 11,008). It is a matching rule, not a law: PaLM used SwiGLU with \(4d\) (12\(d^2\) MLP weights) and Llama 3 uses \(3.5d\) (14,336 = the reference code's \(\tfrac23 \cdot 4d\), times 1.3, rounded up to a multiple of 1024), i.e. 10.5\(d^2\), 31% more than the classical MLP.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Estimate how long it takes to train a 7B model on 2T tokens on 1,024 H100s at 40% MFU.</summary>
+    <div class="answer">
+      <p>Compute: \(C = 6ND = 6 \times 7 \times 10^9 \times 2 \times 10^{12} = 8.4 \times 10^{22}\) FLOPs. Cluster throughput at 40% MFU with the dense BF16 peak of about 989 TFLOP/s: \(1024 \times 0.4 \times 989 \times 10^{12} = 4.05 \times 10^{17}\) FLOP/s. Time: \(8.4 \times 10^{22} / 4.05 \times 10^{17} = 2.07 \times 10^5\) s = 57.6 hours, about 2.4 days.</p>
+      <p>Sanity check in tokens: \(4.05 \times 10^{17} / (6 \times 7 \times 10^9) = 9.6\) million tokens/s, about 9.4K tokens/s per GPU, plausible for a 7B on H100s. What I would add: attention adds roughly 8% to 16% at 4K to 8K context for a 7B (\(2LTd\) against \(2N\)), so I would quote about 2.6 to 2.8 days; real runs lose more to restarts and slow nodes; and 40% is a large-cluster number, since Llama 3's 8B run implies about 16% from its model card.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> At what sequence length do attention FLOPs rival the MLP FLOPs for an 8B model?</summary>
+    <div class="answer">
+      <p>Per token, forward, one layer: attention scores plus the weighted sum cost \(4Td\) (each token against all \(T\) keys, \(2dT\) for \(QK^\top\) and \(2dT\) for \(AV\)), or \(2Td\) for causal attention where the average token sees \(T/2\) keys. The MLP costs \(2 \cdot 3\,d\,d_{ff}\). For Llama-3-8B (\(d = 4096\), \(d_{ff} = 14{,}336\)) equating them gives \(T = 1.5\,d_{ff} = 21{,}504\) (full count) or \(3\,d_{ff} = 43{,}008\) (causal count). Against <em>all</em> linear layers (\(2N_{mm} = 15.0\) GFLOPs) the crossover is \(T = N_{mm}/(2Ld) = 28{,}628\) (full) or 57,256 (causal); the generic rule is \(T \approx 6d\) or \(12d\).</p>
+      <p>So the honest answer is "roughly 20K to 60K tokens, depending on the convention". At 8K attention is 12.5% (causal) to 22% of forward FLOPs; at 128K it is 70% to 82%, which is why long context is trained only in a late stage. Caveat: FLOPs are not time, since attention kernels run at lower utilization than GEMMs.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why do big models untie the input and output embeddings?</summary>
+    <div class="answer">
+      <p>First, honesty: labs rarely publish the ablation, and it is a tendency, not a rule (Gemma 2 27B and PaLM 540B tie; Qwen2 unties at 7B and Qwen3 at 8B). The standard reasons: (1) tying saves \(Vd\) parameters and no FLOPs, and that saving shrinks with scale: 6.5% of Llama-3-8B (525M of 8.03B) and 4.3% of Gemma 2 27B, against 31% of GPT-2 small and 21% of Llama 3.2 1B, where it pays. (2) The two matrices do different jobs. Input rows must keep the early stream well scaled (OLMo 2 found that decaying the embeddings inflates early-layer gradients), while output rows are class weights whose norm sets the logit scale. A tied matrix serves both, and the patches in tied models show the strain: Vaswani's \(\sqrt{d}\) embedding multiplier, PaLM's \(\mathcal N(0,1)\) embeddings with logits scaled by \(1/\sqrt{d}\). (3) With pipeline parallelism, tying forces a cross-stage gradient synchronization (unverified here).</p>
+      <p>The case for tying, from Press and Wolf: the input matrix only updates rows of tokens present, the output matrix updates every row every step, so tied embeddings get the richer output-side gradient, and rare tokens benefit. Rule of thumb: tie when the embedding matrix is more than about a fifth of the parameters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: a colleague proposes doubling the vocabulary of a 1B-class model from 128,256 to 256,512 tokens. Quantify the cost and decide whether to tie.</summary>
+    <div class="answer">
+      <p>Take Llama-3.2-1B's shape: \(L = 16\), \(d = 2048\), \(d_{ff} = 8192\), 32 heads with 8 KV heads of dimension 64. The non-embedding parameters are 973,146,112. One embedding matrix is \(128{,}256 \times 2048 = 262{,}668{,}288\) now and 525,336,576 after doubling.</p>
+      <ul>
+        <li><strong>Parameters, tied:</strong> 1,235,814,400 \(\to\) 1,498,482,688 (+21.3%), and the embedding share goes from 21.3% to 35.1%. <strong>Untied:</strong> 1,498,482,688 \(\to\) 2,023,819,264 (+35.1%). Tying saves 525M parameters, about 8.4 GB at roughly 16 bytes per parameter for mixed-precision Adam (page 15).</li>
+        <li><strong>FLOPs:</strong> the LM head costs \(2dV\) per token whether tied or not. Forward FLOPs per token rise from 2.471 to 2.997 GFLOPs (+21.3%), and the head grows from 21.3% to 35.1% of them. The fp32 logits for \(B = 1\), \(T = 8192\) double from 4.2 GB to 8.4 GB.</li>
+        <li><strong>Benefit:</strong> fewer tokens per document. Cost per <em>character</em> is cost per token divided by characters per token, so the doubling pays off in training FLOPs only if compression improves by more than 21% (for example from Llama 3's 3.94 characters per token to about 4.78). <span class="unverified" title="My judgment about diminishing returns from a 128K to 256K vocabulary; I did not measure it.">Going from 128K to 256K usually buys far less than that</span>, apart from coverage of specific languages or scripts. Rarely seen rows also get few updates (Press and Wolf's argument).</li>
+      </ul>
+      <p>Recommendation: keep 128K unless a target language needs the coverage, and if you go to 256K, tie, since embeddings would otherwise be over half the model. Also account for inference: a bigger vocabulary makes the per-token LM head and sampling heavier, though fewer tokens are generated (page 02 covers the tokenizer side).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> State Xiong et al.'s gradient result, explain why large recipes still warm up, and say what the "curse of depth" adds.</summary>
+    <div class="answer">
+      <p>At initialization (mean-field analysis, single head, zero-initialized \(W_Q, W_K\), ReLU FFN), the hidden state entering each LayerNorm in Post-LN has a depth-independent scale, so the gradient of the last FFN weight is \(O(d\sqrt{\ln d})\) whatever \(L\) is, and gradients grow toward the output. In Pre-LN the stream norm grows about linearly with depth (\((1 + l/2)d \le \E\|x_l\|^2 \le (1 + 3l/2)d\)), so the final LayerNorm divides gradients by about \(\sqrt{L}\), giving \(O(d\sqrt{\ln d / L})\), roughly equal across layers. Post-LN's near-output parameters therefore see gradients too large for the learning rate that is fine elsewhere, and warm-up shrinks the step early.</p>
+      <p>Large recipes still warm up (Llama 1: 2,000 steps, Llama 3 405B: 8,000) because gradient scale at step 0 is not the only reason: Adam's early second-moment estimates are noisy (Xiong et al. cite Liu et al.'s RAdam argument), and the theory's assumptions are simplified. The curse of depth is the same mechanism read at the other end: Pre-LN's growing stream variance makes each deep block's Jacobian close to the identity, so deep layers add little (pruning Llama 2, Qwen3 and DeepSeek layers costs little MMLU). Sun et al. propose LayerNorm Scaling, multiplying each LN output by \(1/\sqrt{\ell}\). That is one group's fix; Gemma 2 and OLMo 2 pursue stability with extra norms on the branch outputs instead.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Your run reports 52% MFU on H100s. List everything that could make that number wrong.</summary>
+    <div class="answer">
+      <p>MFU \(= (\text{tokens/s per GPU} \times \text{model FLOPs per token}) / \text{peak}\). Each factor has traps.</p>
+      <ul>
+        <li><strong>Peak.</strong> Dense BF16 is about 989 TFLOP/s; 1,979 is the with-sparsity figure (and for FP8 the dense peak is 1,979, with 3,958 for sparsity). Using the wrong one is a factor of 2 either way. For reference, Llama 3 405B reports 430 TFLOP/s = 43% on 8,192 H100s and PaLM 46.2% on TPUs, so 52% on H100s deserves an audit (Megatron-LM reported 54.2% on A100s, so it is not impossible <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, abstract]</a>).</li>
+        <li><strong>Numerator.</strong> Model FLOPs (\(6N\) plus attention), not hardware FLOPs. Counting recomputed forward passes inflates it: with full recomputation by \(8/6 = 1.33\), turning a real 39% into 52%. PaLM's 46.2% MFU corresponds to 57.8% hardware utilization for this reason.</li>
+        <li><strong>Attention convention.</strong> Counting the full \(T \times T\) score matrix instead of the causal half overstates the numerator, and by a lot at long context (82% versus 70% attention share at 128K for an 8B model).</li>
+        <li><strong>The parameter count.</strong> Using total \(N\) (including the input embedding table) rather than matmul weights adds 7% for Llama-3-8B and more for small models.</li>
+        <li><strong>Tokens.</strong> Padding or masked tokens counted as useful, or packing that repeats tokens.</li>
+      </ul>
+      <p>The check is to rebuild the number from first principles, as in the Llama 1 65B cross-check: 380 tokens/s/GPU \(\times\) \(6 \times 65.2\text{B}\) = 148.7 TFLOP/s = 47.6% of an A100's 312.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Derive why GPT-2 scales residual output projections by 1/√(2L). Is it still needed?</summary>
+    <div class="answer">
+      <p>Each block adds two residual writes, so the stream is \(x^{(L)} = x^{(0)} + \sum_{j=1}^{2L} f_j\). If the writes are roughly independent with zero mean and variance \(\sigma_w^2\), then \(\text{Var}(x^{(L)}) \approx \sigma_e^2 + 2L\sigma_w^2\), which grows linearly in depth (Xiong et al.'s Lemma 2 shows the same linear growth of \(\E\|x_l\|^2\) at standard initialization). The output projection's weight standard deviation scales each write's std linearly, so multiplying it by \(1/\sqrt{2L}\) divides \(\sigma_w^2\) by \(2L\) and leaves the total \(O(1)\) independent of depth. GPT-2 writes it as \(1/\sqrt{N}\) with \(N\) the number of residual layers, and nanoGPT implements \(N = 2\cdot n_{\text{layer}}\).</p>
+      <p>Is it needed? It only shapes the stream at step 0. Sun et al. show that Pre-LN with scaled init still develops large deep-layer output variance during training (about 175 in the final layer of their 130M-parameter runs), because scaled init only acts at initialization. OLMo 2 removed depth-scaled init and got fewer gradient spikes (spike score 0.40 to 0.03), but its old baseline was a more aggressive per-layer scheme than GPT-2's, so the result does not settle GPT-2's constant. Practical answer: \(\mathcal N(0, 0.02^2)\) with a \(1/\sqrt{2L}\) output-projection scale is a safe default, \(\mu\)P (page 14) is the principled width-and-depth answer, and always verify with the \(\ln V\) initial loss and a depth-vs-gradient-norm plot.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>A GPT from scratch, with exact counting.</strong> Implement <code>RMSNorm</code>, <code>SwiGLU</code>, <code>CausalSelfAttention</code> (GQA, using <code>F.scaled_dot_product_attention</code>), a pre-norm <code>Block</code> and a <code>GPT</code> with a <code>tie_embeddings</code> flag, learned positions and the GPT-2-style initialization. Then write the closed-form <code>count_params(cfg)</code> and check it against <code>sum(p.numel())</code> for tied and untied, biased and unbiased configs, and against 8,030,261,248 for the Llama-3-8B config (the test builds that model on the <code>meta</code> device). Finish with <code>train_flops</code> (6ND), <code>forward_flops_per_token</code> and <code>attention_flop_fraction</code>. An interviewer would expect the four modules in 20 to 25 minutes and <code>count_params</code> in another 10; the full drill is a 35 to 40 minute exercise. <span class="ex-path">exercises/drills/transformer.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_transformer.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/1706.03762">Vaswani et al. (2017). Attention Is All You Need.</a> <span class="why">Why read it: the Post-LN block, the \(d_{ff} = 4d\) FFN, tied embeddings with the \(\sqrt{d}\) multiplier, and the dropout ablation (§3.1-3.4, §5.4, Table 3).</span></li>
+    <li><a href="https://arxiv.org/abs/2002.04745">Xiong et al. (2020). On Layer Normalization in the Transformer Architecture.</a> <span class="why">Why read it: the mean-field argument for why Post-LN needs warm-up and Pre-LN does not; Theorem 1, Lemma 2 and the IWSLT/BERT experiments.</span></li>
+    <li><a href="https://arxiv.org/abs/1910.07467">Zhang &amp; Sennrich (2019). Root Mean Square Layer Normalization.</a> <span class="why">Why read it: short and complete. The re-scaling-invariance hypothesis, Eq. 4, and the honest speed table (7% to 64%).</span></li>
+    <li><a href="https://arxiv.org/abs/2002.05202">Shazeer (2020). GLU Variants Improve Transformer.</a> <span class="why">Why read it: three pages with the definitive table for SwiGLU, GEGLU and friends, and the 2/3 width matching. Also the source of "no dropout in pre-training".</span></li>
+    <li><a href="https://arxiv.org/abs/1608.05859">Press &amp; Wolf (2016). Using the Output Embedding to Improve Language Models.</a> <span class="why">Why read it: the gradient argument for weight tying and the parameter-versus-perplexity numbers.</span></li>
+    <li><a href="https://arxiv.org/abs/2001.08361">Kaplan et al. (2020). Scaling Laws for Neural Language Models.</a> <span class="why">Why read it: §2.1 and Table 1 are the origin of \(N \approx 12Ld^2\), \(C_{\text{fwd}} \approx 2N + 2LT d\) and \(C \approx 6N\) per token.</span></li>
+    <li><a href="https://arxiv.org/abs/2302.13971">Touvron et al. (2023). LLaMA: Open and Efficient Foundation Language Models.</a> <span class="why">Why read it: §2.2 lists pre-norm, RMSNorm, SwiGLU with \(\tfrac23 4d\) and RoPE in one paragraph, and §2.4 gives a throughput number you can check against 6N.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">Why read it: Table 3 (the config used on this page), Table 4 (MFU by configuration) and §3.4 (warm-up, long-context stage).</span></li>
+    <li><a href="https://arxiv.org/abs/2204.02311">Chowdhery et al. (2022). PaLM: Scaling Language Modeling with Pathways.</a> <span class="why">Why read it: the source of no-bias, shared embeddings, no-dropout pre-training, and the definition of MFU with the \(6N + 12LHQT\) formula (Appendix B).</span></li>
+    <li><a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">Radford et al. (2019). Language Models are Unsupervised Multitask Learners (GPT-2).</a> <span class="why">Why read it: the move to Pre-LN, the final norm and the \(1/\sqrt{N}\) residual initialization, in one paragraph (§2.3).</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Block (pre-norm):</strong> \(h = x + \text{Attn}(\RMSNorm(x))\), \(x' = h + \text{FFN}(\RMSNorm(h))\); after \(L\) blocks: final norm, then logits \(= \RMSNorm(x^{(L)})W_U\). Initial loss \(\approx \ln V\) (11.76 for \(V = 128{,}256\)).</li>
+      <li><strong>Post-LN vs Pre-LN:</strong> \(\text{LN}(x + F(x))\) vs \(x + F(\text{LN}(x))\). Xiong Thm. 1: last-layer gradient \(O(d\sqrt{\ln d})\) vs \(O(d\sqrt{\ln d / L})\). Pre-LN: no norm on the residual path, stream norm grows with depth, needs a final norm. Warm-up is still used (Llama 1: 2,000 steps; Llama 3 405B: 8,000).</li>
+      <li><strong>RMSNorm:</strong> \(x/\sqrt{\text{mean}(x^2) + \epsilon} \odot g\). Drops mean and bias. \(\epsilon\) inside the root, float32 statistics. 26.8 vs 26.6 BLEU, 6.9% faster (Transformer-base). Quality about equal.</li>
+      <li><strong>SwiGLU:</strong> \((\text{SiLU}(xW_1) \odot xW_3)W_2\). \(d_{ff} = \tfrac83 d\) matches a 4d MLP. Llama-3-8B: 14,336 (\(3.5d\), from \(\tfrac23 \cdot 4d \times 1.3\), rounded up to a multiple of 1024); PaLM used \(4d\). Shazeer: 1.944 vs 1.997 log-ppl.</li>
+      <li><strong>Parameters:</strong> \(N = Vd\,(\times 2\ \text{untied}) + L(2d\,n_h d_h + 2d\,n_{kv}d_h + 3d\,d_{ff} + 2d) + d\). Llama-3-8B \(= 8{,}030{,}261{,}248\): MLP 70.2%, attention 16.7%, embeddings 13.1%, per layer \(13d^2 + 2d\). GPT-2 small \(= 124{,}439{,}808\) (tied). Classic \(N \approx 12Ld^2\).</li>
+      <li><strong>Tie</strong> when the embedding matrix is more than about 20% of the parameters (GPT-2 31%, Gemma 2 2B 22.6%, Llama 3.2 1B 21%); Llama 3 8B is untied (6.5% per matrix). Gemma 2 27B and PaLM tie anyway.</li>
+      <li><strong>Small choices:</strong> no biases (key bias cancels in softmax, value bias folds into \(W_o\), PaLM stability); no dropout in single-epoch pre-training; init \(\mathcal N(0, 0.02^2)\), residual output projections scaled by \(1/\sqrt{2L}\) (GPT-2, nanoGPT; OLMo 2 dropped it).</li>
+      <li><strong>FLOPs:</strong> forward \(2N_{mm}\), backward \(4N_{mm}\), \(C \approx 6ND\). Attention adds \(4LTd\) (full) or \(2LTd\) (causal) per token, forward. Crossover with linear layers at \(T \approx 6d\) or \(12d\): Llama-3-8B 28.6K / 57.3K (MLP alone: 21.5K / 43.0K). Attention share at 8K: 22% / 12.5%; at 128K: 82% / 70%.</li>
+      <li><strong>Time:</strong> Llama-3-8B, 15T tokens: \(7.23 \times 10^{23}\) FLOPs; at 40% MFU on H100 (989 TFLOP/s dense) 507K GPU-hours = 20.6 days on 1,024 GPUs. A 7B on 2T tokens, 1,024 H100s, 40%: 57.6 hours.</li>
+      <li><strong>Cross-checks:</strong> 405B \(6ND = 3.79 \times 10^{25}\) vs the paper's \(3.8 \times 10^{25}\); Llama 1 65B: 380 tok/s/GPU \(\Rightarrow\) 148.7 TFLOP/s = 47.6% of an A100; Llama 3 8B model card: 1.3M H100-hours \(\Rightarrow\) 15.6% implied MFU.</li>
+      <li><strong>Activation memory per layer</strong> (GPT-style, 16-bit): \(sbh(34 + 5as/h)\) bytes. Llama-3-8B shapes at \(s = 8192\), \(b = 1\): factor 354, 11.1 GiB per layer with naive attention, 1.06 GiB without the \(T^2\) term.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

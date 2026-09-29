@@ -1,3 +1,5 @@
+import ast
+import inspect
 import math
 
 import pytest
@@ -56,6 +58,22 @@ def test_ce_custom_ignore_index(impl):
     labels[1, 3] = 99
     ref = F.cross_entropy(logits.reshape(-1, 6), labels.reshape(-1), ignore_index=99)
     torch.testing.assert_close(impl.lm_cross_entropy(logits, labels, ignore_index=99), ref, atol=1e-6, rtol=1e-6)
+
+
+def test_ce_is_hand_written(impl):
+    """The drill forbids the built-in losses and log-softmax/logsumexp: scan the module source
+    (docstrings and comments are not code, so they are ignored)."""
+    impl.lm_cross_entropy(torch.zeros(1, 1, 2), torch.zeros(1, 1, dtype=torch.long))   # stubs raise here
+    banned = {"cross_entropy", "nll_loss", "log_softmax", "logsumexp"}
+    used = set()
+    for node in ast.walk(ast.parse(inspect.getsource(impl))):
+        if isinstance(node, ast.Attribute) and node.attr in banned:
+            used.add(node.attr)
+        elif isinstance(node, ast.Name) and node.id in banned:
+            used.add(node.id)
+        elif isinstance(node, ast.ImportFrom):
+            used |= {a.name for a in node.names if a.name in banned}
+    assert not used, f"forbidden built-ins used: {sorted(used)}"
 
 
 def test_ce_uniform_logits_give_log_v(impl):
@@ -147,13 +165,18 @@ def test_bits_per_byte_worked_example(impl):
 
 
 def test_bits_per_byte_is_tokenizer_independent(impl):
-    # same text, same total information, cut into 1000 tokens (A) or 2000 tokens (B)
+    # One text of 4000 bytes to which the model assigns 2000 nats in total. Tokenizer A cuts it into
+    # 1000 tokens (2.0 nats/token), tokenizer B into 2000 tokens (1.0 nats/token).
     n_bytes = 4000
-    total = 2000.0                                   # nats assigned to the whole text
-    a = impl.bits_per_byte(total, n_bytes)           # A: 2.0 nats/token
-    b = impl.bits_per_byte(total, n_bytes)           # B: 1.0 nats/token
-    assert a == pytest.approx(b)
-    assert impl.perplexity(total / 1000) != pytest.approx(impl.perplexity(total / 2000))   # per-token PPL differs
+    per_token = {}
+    for n_tokens, mean_nll in [(1000, 2.0), (2000, 1.0)]:
+        total = mean_nll * n_tokens                  # what the model assigns to the whole text
+        per_token[n_tokens] = impl.perplexity(mean_nll)
+        assert impl.bits_per_byte(total, n_bytes) == pytest.approx(0.7213475, abs=1e-6)
+    assert per_token[1000] == pytest.approx(math.exp(2.0)) and per_token[2000] == pytest.approx(math.e)
+    assert per_token[1000] / per_token[2000] == pytest.approx(math.e)     # per-token PPL differs by e
+    # bits per byte scales with total information per byte: doubling both leaves it unchanged
+    assert impl.bits_per_byte(2 * 2000.0, 2 * n_bytes) == pytest.approx(impl.bits_per_byte(2000.0, n_bytes))
 
 
 def test_bits_per_byte_rejects_empty_text(impl):

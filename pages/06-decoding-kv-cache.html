@@ -58,29 +58,28 @@
     <li><strong>Prefill</strong> <span class="zh">预填充</span>: one forward pass over all \(P\) tokens at once. This is the same computation as a training forward pass with a causal mask, so it is parallel over positions. Only the last position's logits \(z_P \in \R^V\) are needed. As a side effect, the pass stores every layer's keys and values for all \(P\) tokens: the <strong>KV cache</strong> <span class="zh">键值缓存</span> (see <a href="#kv-cache">The KV cache</a>).</li>
     <li><strong>Choose</strong> \(x_{P+1}\) from \(\softmax(z_P)\) with a decoding strategy (<a href="#sampling">next section</a>).</li>
     <li><strong>Decode step</strong>: feed only \(x_{P+1}\) through the model, reading all earlier positions from the cache. This gives \(z_{P+1}\), from which \(x_{P+2}\) is chosen. Repeat.</li>
-    <li><strong>Stop</strong> at an end-of-sequence id, a stop string, or the length limit. Chat models emit a dedicated end-of-turn token, and engines accept a set of stop ids: the shipped <code>generation_config.json</code> of Qwen2.5-7B-Instruct lists two (151645 and 151643) <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/generation_config.json">[Qwen2.5-7B-Instruct config]</a>.</li>
+    <li><strong>Stop</strong> at an end-of-sequence id, a stop string, or the length limit. Chat models emit a dedicated end-of-turn token, so engines accept a set of stop ids (the Qwen2.5-7B-Instruct generation config lists two <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/generation_config.json">[config]</a>).</li>
   </ol>
 
 <pre><code class="language-python">@torch.no_grad()
 def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
-    """prompt_ids: (1, P) LongTensor. pick(logits) -> (1,) token id, e.g. argmax or a sampler."""
-    cache = model.new_cache()                       # empty KV cache: one (K, V) pair per layer
-    logits = model(prompt_ids, cache)[:, -1]        # PREFILL: P tokens in parallel; logits: (1, V)
+    """prompt_ids: (1, P) LongTensor; pick(logits) -> (1,) token id (argmax, a sampler, ...)."""
+    cache = model.new_cache()                      # empty KV cache, one (K, V) pair per layer
+    logits = model(prompt_ids, cache)[:, -1]       # PREFILL: P tokens in parallel, logits (1, V)
     out = []
     for _ in range(max_new_tokens):
-        tok = pick(logits)                          # (1,)
+        tok = pick(logits)                         # (1,)
         out.append(tok.item())
         if tok.item() == eos_id:
             break
-        logits = model(tok[:, None], cache)[:, -1]  # DECODE: one token in; the cache grows by one entry
+        logits = model(tok[:, None], cache)[:, -1] # DECODE: 1 token in, cache grows by 1
     return out
 </code></pre>
 
-  <p>Three properties of this loop drive the rest of the page.</p>
+  <p>Two properties of this loop drive the rest of the page.</p>
   <ul>
     <li><strong>It is sequential in time.</strong> \(n\) new tokens need \(n\) forward passes, because each input depends on the previous choice. Training escapes this with teacher forcing, which feeds all positions in parallel. Decoding cannot, and that single fact produces the performance story in <a href="#performance">Prefill vs decode</a>.</li>
-    <li><strong>Only the last position's logits are used.</strong> Everything before it is context, and the cache lets us read it instead of recomputing it.</li>
-    <li><strong>The model consumes its own outputs.</strong> Training always conditions on true prefixes. At inference, a sampled token becomes context for every later step, so the decoding rule shapes the inputs the model sees, and a bad early token can derail the rest of the text.</li>
+      <li><strong>The model consumes its own outputs.</strong> Training always conditions on true prefixes. At inference a sampled token becomes context for every later step, so the decoding rule shapes the inputs the model sees.</li>
   </ul>
 
   <figure class="fig">
@@ -143,7 +142,7 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   <p>At each step the model returns logits \(z \in \R^V\), and its distribution is \(p = \softmax(z)\). A <strong>decoding strategy</strong> maps \(p\) to one token. Everything below acts on the last position's logits only and is cheap next to the forward pass (\(V\) is about 128K for Llama 3).</p>
 
   <h3 id="greedy">Greedy decoding and why it degenerates</h3>
-  <p><strong>Greedy decoding</strong> takes \(x_t = \argmax_i z_i\). It is deterministic and needs no random numbers, and it is the standard choice for benchmarks. For open-ended generation it is bad, and the effect is large. Holtzman et al. generated 5,000 passages of up to 200 tokens with GPT-2 Large under different decoders and measured the result <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Tab. 1]</a>:</p>
+  <p><strong>Greedy decoding</strong> takes \(x_t = \argmax_i z_i\). It is deterministic, needs no random numbers, and is the usual choice for many benchmarks. For open-ended generation it is bad, and the effect is large. Holtzman et al. generated 5,000 passages of up to 200 tokens with GPT-2 Large under different decoders and measured the result <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Tab. 1]</a>:</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Decoder (GPT-2 Large)</th><th class="num">Perplexity</th><th class="num">Repetition %</th><th class="num">HUSE (higher is better)</th></tr></thead>
@@ -159,22 +158,22 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   </table></div>
   <p class="small muted">Perplexity is measured by the generating model on its own output. "Repetition %" is the share of generations that end in a repeated loop. HUSE combines human judgments with a statistical discriminator.</p>
 
-  <p>Two mechanisms explain the greedy row. First, repetition feeds itself: the probability the model assigns to a phrase increases with each repetition already in the context, "creating a positive feedback loop" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 4]</a>. Once greedy picks a repeat, nothing pulls it back out. Second, human text is not high-probability text. Its per-token probability is much lower than that of decoded text (perplexity 12.4 versus 1.5), because people avoid stating the obvious, while a likelihood-trained model's argmax is the most generic continuation <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, §4.3]</a>. So the aim is not "the most probable text". It is text with the statistics of human text, and that requires randomness with a controlled tail.</p>
-  <p>Instruction-tuned models are far less prone to this, but long generations can still loop. The DeepSeek-R1 model card recommends a temperature of 0.5 to 0.7 (0.6 recommended) "to prevent endless repetitions or incoherent outputs" <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1">[DeepSeek-R1 model card]</a>.</p>
+  <p>Two mechanisms explain the greedy row. First, repetition feeds itself: the probability of a phrase rises with each repetition already in the context, "creating a positive feedback loop" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 4]</a>, and greedy never leaves the loop. Second, human text is not high-probability text: its per-token probability is far lower than that of decoded text (perplexity 12.4 versus 1.5), because people avoid stating the obvious, while a likelihood-trained model's argmax is the most generic continuation <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, §4.3]</a>. The aim is therefore text with the statistics of human text, which needs randomness with a controlled tail.</p>
+  <p>Post-trained models are less prone to this, but long generations can still loop: the DeepSeek-R1 model card recommends a temperature of 0.5 to 0.7 (0.6 recommended) "to prevent endless repetitions or incoherent outputs" <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1">[DeepSeek-R1 model card]</a>.</p>
 
   <h3 id="temperature">Temperature</h3>
   <p><strong>Temperature</strong> <span class="zh">温度</span> \(\tau\) rescales the logits before the softmax. This is the Boltzmann distribution from statistical physics with energies \(-z_i\), and it is applied to language models as in Holtzman et al. (their Eq. 4):</p>
   <div class="eq-box">
   \[ p_i(\tau) = \frac{\exp(z_i/\tau)}{\sum_j \exp(z_j/\tau)} \;\propto\; p_i^{\,1/\tau} \]
-  <div class="eq-label">\(\tau &lt; 1\) sharpens the distribution, \(\tau &gt; 1\) flattens it, \(\tau = 1\) is the model's own distribution</div>
+  <div class="eq-label">Low temperature sharpens, high temperature flattens, temperature 1 is the model's own distribution</div>
   </div>
   <p>Limits: with \(\Delta_i = z_{\max} - z_i \gt 0\) we have \(p_i / p_{\max} = e^{-\Delta_i/\tau}\), which goes to 0 as \(\tau \to 0^+\), so the distribution collapses onto the argmax (uniform over ties). As \(\tau \to \infty\) every ratio goes to 1 and the distribution becomes uniform, \(1/V\). Entropy rises monotonically with \(\tau\). Because temperature raises probabilities to the power \(1/\tau\), \(\tau = 0.5\) squares them: \([0.5, 0.3, 0.15, 0.05]\) becomes \([0.685, 0.247, 0.062, 0.007]\).</p>
-  <p>The formula divides by \(\tau\), so APIs define \(\tau = 0\) as greedy. vLLM's sampler, for instance, switches to argmax below \(10^{-5}\) <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/sampler.py">[vLLM sampler.py]</a>. Temperature is the only knob that reshapes the whole distribution. The next three methods cut it instead. One more point matters later for RL (<a href="22-rl-foundations.html">page 22</a>): the policy you actually sample from is \(\softmax(z/\tau)\), so a policy-gradient loss must compute log-probabilities with the same \(\tau\).</p>
+  <p>The formula divides by \(\tau\), so APIs define \(\tau = 0\) as greedy (vLLM switches to argmax below \(10^{-5}\) <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/sampler.py">[sampler.py]</a>). Temperature reshapes the whole distribution; the next three methods cut it instead. For RL (<a href="22-rl-foundations.html">page 22</a>): the policy you sample from is \(\softmax(z/\tau)\), so a policy-gradient loss must compute log-probabilities with the same \(\tau\).</p>
 
   <h3 id="truncation">Cutting the tail: top-k, top-p, min-p</h3>
-  <p>Sampling from the full softmax fails for a specific reason. With \(V \approx 128\text{K}\), the tail holds tens of thousands of tokens that each have tiny probability but together carry real mass, so they are "over-represented in the aggregate" and a sample regularly lands in incoherent territory <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, §1]</a>. Lowering \(\tau\) shrinks the tail but costs diversity: sampling at \(\tau &lt; 0.9\) already sharply increases repetition (their Fig. 9). <strong>Truncation</strong> methods zero the tail explicitly and renormalize the rest.</p>
+  <p>Sampling from the full softmax fails for a specific reason. With \(V \approx 128\text{K}\), the tail holds tens of thousands of tokens that each have tiny probability but together carry real mass, so they are "over-represented in the aggregate" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, §1]</a>. Lowering \(\tau\) shrinks the tail but costs diversity (sampling at \(\tau &lt; 0.9\) already sharply increases repetition, their Fig. 9). <strong>Truncation</strong> methods zero the tail explicitly and renormalize.</p>
   <ul>
-    <li><strong>Top-k</strong> keeps the \(k\) largest probabilities. Fan et al. used \(k = 10\) for story generation <a href="https://arxiv.org/abs/1805.04833">[Fan et al. 2018, §5.4]</a>. The flaw is that one \(k\) must serve every context: a flat distribution over hundreds of reasonable words needs a large \(k\), a peaked one needs \(k = 1\) <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 5]</a>.</li>
+    <li><strong>Top-k</strong> keeps the \(k\) largest probabilities. Fan et al. used \(k = 10\) for story generation <a href="https://arxiv.org/abs/1805.04833">[Fan et al. 2018, §5.4]</a>. The flaw is that one \(k\) must serve every context: a flat distribution over hundreds of reasonable words needs a large \(k\), a peaked one a small \(k\) <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 5]</a>.</li>
     <li><strong>Top-p</strong>, or <strong>nucleus sampling</strong> <span class="zh">核采样</span>, keeps the smallest set \(V^{(p)}\) of top tokens whose total probability is at least \(p\), then renormalizes: \(P'(x) = P(x) / \sum_{v \in V^{(p)}} P(v)\) for \(x \in V^{(p)}\) <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Eqs. 2-3]</a>. The set grows when the model is unsure and shrinks to one token when it is confident.</li>
     <li><strong>Min-p</strong> keeps every token with \(p_i \ge p_{\text{base}} \cdot p_{\max}\), then renormalizes <a href="https://arxiv.org/abs/2407.01082">[Nguyen et al. 2024, §3.1]</a>. The threshold scales with the top token's probability. In logit terms, after temperature it keeps every token within \(\tau \ln(1/p_{\text{base}})\) of the top raw logit, and it needs a maximum, not a sort.</li>
   </ul>
@@ -184,10 +183,10 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
     <dl>
       <dt>Problem</dt><dd>Pure sampling draws from the unreliable tail. Top-k uses one fixed cutoff for both flat and peaked distributions.</dd>
       <dt>Idea</dt><dd>Keep the smallest set of most likely tokens whose mass reaches \(p\), renormalize, sample.</dd>
-      <dt>Why it works</dt><dd>The candidate count adapts to the model's confidence: one token when \(p_{\max} \ge p\), hundreds when the distribution is flat. The dropped tail is the part whose aggregate mass causes incoherence.</dd>
+      <dt>Why it works</dt><dd>The candidate count adapts to confidence: one token when \(p_{\max} \ge p\), hundreds when the distribution is flat.</dd>
       <dt>Evidence</dt><dd>GPT-2 Large, \(p = 0.95\): perplexity 13.13 against 12.38 for human text, 0.36% repetition, and the best HUSE of the decoders tested (0.97) <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Tab. 1]</a>.</dd>
-      <dt>Cost</dt><dd>\(p\) is a mass, so when temperature flattens the distribution the nucleus grows and admits junk <a href="https://arxiv.org/abs/2407.01082">[Nguyen et al. 2024, §2]</a>. It needs a sort per step and one more hyperparameter.</dd>
-      <dt>Used by</dt><dd>Implemented in Hugging Face Transformers, vLLM and llama.cpp. Typical values are 0.9 to 0.95. Qwen2.5-7B-Instruct ships \(\tau = 0.7\), top-p 0.8, top-k 20 <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/generation_config.json">[Qwen2.5-7B-Instruct config]</a>.</dd>
+      <dt>Cost</dt><dd>\(p\) is a mass, so when temperature flattens the distribution the nucleus grows and admits junk <a href="https://arxiv.org/abs/2407.01082">[Nguyen et al. 2024, §2]</a>. It needs a sort per step.</dd>
+      <dt>Used by</dt><dd>Hugging Face Transformers, vLLM, llama.cpp. Typical \(p\) is 0.9 to 0.95. Qwen2.5-7B-Instruct ships \(\tau = 0.7\), top-p 0.8, top-k 20 <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/generation_config.json">[config]</a>.</dd>
     </dl>
   </div>
 
@@ -196,14 +195,14 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
     <dl>
       <dt>Problem</dt><dd>At high temperature the distribution is flat, so a fixed mass \(p\) admits many low-quality tokens.</dd>
       <dt>Idea</dt><dd>Threshold relative to the top token: keep \(p_i \ge p_{\text{base}} \cdot p_{\max}\).</dd>
-      <dt>Why it works</dt><dd>A confident model (\(p_{\max} = 0.9\)) gets an aggressive cut (threshold 0.09 at \(p_{\text{base}} = 0.1\)), while an uncertain one (\(p_{\max} = 0.3\)) keeps many tokens (threshold 0.03). The rule is a ratio test, so it does not change when an earlier filter renormalizes the distribution.</dd>
-      <dt>Evidence</dt><dd>Contested. Nguyen et al. report gains at high temperature (their main results span 0.7 to 3.0) on GPQA, GSM8K chain-of-thought and creative writing, mainly with Mistral-7B <a href="https://arxiv.org/abs/2407.01082">[Nguyen et al. 2024, §5]</a>. An independent re-analysis finds no advantage over top-p or top-k once the hyperparameter budgets are equalized, and reports flaws in the original human evaluation and adoption claims <a href="https://arxiv.org/abs/2506.13681">[Schaeffer et al. 2025, §2-5]</a> (a preprint, as of September 2026). The original authors ran a new human evaluation in response, which the critique says shows no improvement either.</dd>
-      <dt>Cost</dt><dd>Small changes matter: with a peaked distribution \(p_{\text{base}} = 0.1\) can drop far more than 10% of the mass (their example: probabilities 80, 7, 3, 2, 1%, where top-p 0.9 keeps three tokens and min-p 0.1 keeps one <a href="https://arxiv.org/abs/2407.01082">[App. A.4]</a>). The authors also advise against stacking several truncation methods, because of double normalization (§3.4).</dd>
-      <dt>Used by</dt><dd>Implemented in Hugging Face Transformers, vLLM and llama.cpp. Suggested \(p_{\text{base}}\) is 0.05 to 0.1.</dd>
+      <dt>Why it works</dt><dd>A confident model (\(p_{\max} = 0.9\)) gets an aggressive cut (threshold 0.09 at \(p_{\text{base}} = 0.1\)), an uncertain one (\(p_{\max} = 0.3\)) a permissive one (0.03). It is a ratio test, so earlier renormalization does not change it.</dd>
+      <dt>Evidence</dt><dd>Contested. Nguyen et al. report gains at high temperature (main results span 0.7 to 3.0) on GPQA, GSM8K chain-of-thought and creative writing, mainly with Mistral-7B <a href="https://arxiv.org/abs/2407.01082">[Nguyen et al. 2024, §5]</a>. An independent re-analysis finds no advantage over top-p or top-k once hyperparameter budgets are equalized, and flags problems in the original human evaluation <a href="https://arxiv.org/abs/2506.13681">[Schaeffer et al. 2025, §2-5]</a> (a preprint, as of September 2026).</dd>
+      <dt>Cost</dt><dd>On a peaked distribution \(p_{\text{base}} = 0.1\) can drop far more than 10% of the mass (probabilities 80, 7, 3, 2, 1%: top-p 0.9 keeps three tokens, min-p 0.1 keeps one <a href="https://arxiv.org/abs/2407.01082">[App. A.4]</a>). The authors advise against stacking truncation methods (§3.4).</dd>
+      <dt>Used by</dt><dd>Hugging Face Transformers, vLLM, llama.cpp. Suggested \(p_{\text{base}}\): 0.05 to 0.1.</dd>
     </dl>
   </div>
 
-  <p>A practical rule: pick one truncation method plus a temperature. Use greedy or \(\tau \le 0.3\) for tasks with a checkable answer, \(\tau \approx 0.6\) to 1.0 with top-p or min-p for chat and writing, and \(\tau = 1\) without truncation when you need samples that match the model's own distribution (for example RL rollouts, <a href="24-rlvr-reasoning.html">page 24</a>). Figure 2 traces a full pipeline on made-up logits.</p>
+  <p>A practical rule: one truncation method plus a temperature. Greedy or \(\tau \le 0.3\) for tasks with a checkable answer; \(\tau \approx 0.6\) to 1.0 with top-p or min-p for chat and writing; \(\tau = 1\) untruncated when samples must follow the model's own distribution (RL rollouts, <a href="24-rlvr-reasoning.html">page 24</a>). Figure 2 traces a pipeline on made-up logits.</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 338" role="img" aria-labelledby="fig-06-2-title">
@@ -330,7 +329,7 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   </figure>
 
   <h3 id="order">Order of operations</h3>
-  <p>The methods do not commute, and libraries disagree. I checked the source of each (as of September 2026):</p>
+  <p>The methods do not commute, and libraries disagree. Each row below was checked against the library's source (as of September 2026):</p>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Library</th><th>Order when sampling</th></tr></thead>
     <tbody>
@@ -342,32 +341,32 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   <p>Three consequences follow, and all three are interview material.</p>
   <ol>
     <li><strong>Temperature before or after truncation.</strong> Top-k is unaffected by \(\tau\) (dividing by a positive number preserves rank order). Top-p and min-p are not. With temperature first, raising \(\tau\) enlarges their candidate sets. With temperature last, the candidate set is fixed and \(\tau\) only changes how you sample inside it. On the Figure 2 logits with top-k 5, top-p 0.9 and min-p 0.2, Hugging Face's order keeps 2 tokens at \(\tau = 0.5\) and 5 at \(\tau = 2\), while llama.cpp's order keeps 4 in both cases.</li>
-    <li><strong>Top-p depends on what ran before it; min-p does not.</strong> Each Hugging Face warper takes a softmax of the surviving logits, so top-p's cumulative mass is relative to the survivors. With probabilities \([0.4, 0.3, 0.2, 0.1]\), top-p 0.5 alone keeps two tokens. After top-k 2 the survivors renormalize to \([0.571, 0.429]\), and top-p 0.5 keeps one. Min-p compares \(p_i / p_{\max}\), which renormalization leaves unchanged.</li>
-    <li><strong>Min-p before top-p is at least as aggressive as after it.</strong> If min-p first removes mass \(1 - M\), the renormalized top-p threshold \(p\) equals \(pM\) in original units, which is lower, so the prefix is shorter. A quick simulation on 5,000 random logit vectors never gave a larger set for the vLLM order, and gave a strictly smaller one in 3,360 of them.</li>
+    <li><strong>Top-p depends on what ran before it; min-p does not.</strong> Each Hugging Face warper takes a softmax of the surviving logits, so top-p's mass is relative to the survivors. With probabilities \([0.4, 0.3, 0.2, 0.1]\), top-p 0.5 alone keeps two tokens; after top-k 2 the survivors are \([0.571, 0.429]\) and it keeps one. Min-p's ratio \(p_i / p_{\max}\) is unchanged by renormalization.</li>
+    <li><strong>Min-p before top-p (vLLM) keeps no more tokens than after it (Hugging Face).</strong> If min-p first leaves mass \(M \le 1\), the renormalized top-p threshold \(p\) equals \(pM\) in original units, which is lower, so the prefix is shorter. Random logit vectors confirm it: 5,000 trials, never larger, strictly smaller in 3,360.</li>
   </ol>
-  <p>The upshot is practical: when you compare numbers across frameworks, or reproduce a paper's setup, check the order and the defaults. The min-p paper's own two human studies applied temperature after and before truncation respectively <a href="https://arxiv.org/abs/2506.13681">[Schaeffer et al. 2025, §2.4]</a>.</p>
+  <p>When you compare numbers across frameworks or reproduce a paper, check the order and the defaults. (The min-p paper's two human studies applied temperature after and before truncation respectively <a href="https://arxiv.org/abs/2506.13681">[Schaeffer et al. 2025, §2.4]</a>.)</p>
 
   <h3 id="penalties">Repetition, frequency and presence penalties</h3>
-  <p>Penalties attack repetition by editing logits based on what has already been generated. The <strong>repetition penalty</strong> <span class="zh">重复惩罚</span> of CTRL divides the temperature by a factor \(\theta\) for tokens already in the generated set \(g\): \(p_i \propto \exp\big(z_i / (\tau \cdot I(i \in g))\big)\) with \(I = \theta\) inside \(g\) and 1 outside, and they found \(\theta \approx 1.2\) a good balance with greedy decoding <a href="https://arxiv.org/abs/1909.05858">[Keskar et al. 2019, §4.1]</a>. Dividing a <em>negative</em> logit by \(\theta \gt 1\) would raise it, so Hugging Face multiplies negative logits and divides positive ones, applies the penalty once per distinct token, and includes the prompt by default for decoder-only models <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py">[logits_process.py]</a>.</p>
+  <p>Penalties attack repetition by editing logits according to what has been generated. CTRL's <strong>repetition penalty</strong> divides the temperature by \(\theta\) for tokens already in the generated set \(g\): \(p_i \propto \exp\big(z_i / (\tau \cdot I(i \in g))\big)\), with \(I = \theta\) inside \(g\) and 1 outside, and \(\theta \approx 1.2\) worked well with greedy decoding <a href="https://arxiv.org/abs/1909.05858">[Keskar et al. 2019, §4.1]</a>. Dividing a <em>negative</em> logit by \(\theta \gt 1\) would raise it, so Hugging Face multiplies negative logits and divides positive ones, applies the penalty once per distinct token, and includes the prompt by default <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py">[logits_process.py]</a>.</p>
   <p><strong>Frequency and presence penalties</strong> are additive. With \(c_j\) the number of times token \(j\) appeared in the output so far:</p>
   \[ z_j \leftarrow z_j - \alpha_{\text{freq}}\, c_j - \alpha_{\text{pres}}\, \mathbf{1}[c_j \gt 0] \]
-  <p>vLLM implements exactly this, noting that it follows the OpenAI API definition <a href="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/utils.py">[vLLM layers/utils.py]</a>. Subtracting from a logit multiplies the probability by \(e^{-\alpha c_j}\). The frequency term grows with each repeat, while the presence term is a one-time charge for using a token at all.</p>
-  <p>All penalties share one flaw: they cannot tell harmful repetition from necessary repetition. Variable names, closing brackets, digits and quoted text must repeat, so heavy penalties damage code, JSON and math. Modern post-trained models need them less, and shipped defaults are mild (Qwen2.5-7B-Instruct uses a repetition penalty of 1.05).</p>
+  <p>vLLM implements exactly this and notes that it follows the OpenAI API definition <a href="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/utils.py">[layers/utils.py]</a>. Subtracting from a logit multiplies the probability by \(e^{-\alpha c_j}\): the frequency term grows with each repeat, the presence term is a one-time charge.</p>
+  <p>All penalties share one flaw: they cannot tell harmful repetition from necessary repetition. Identifiers, brackets, digits and quotes must repeat, so heavy penalties damage code, JSON and math. Shipped defaults are mild (Qwen2.5-7B-Instruct: repetition penalty 1.05).</p>
 
   <p>The whole sampler fits in a screen. This is the core of the drill in <code>exercises/solutions/sampling.py</code>:</p>
 <pre><code class="language-python">import torch
 import torch.nn.functional as F
 
-def top_k_filter(z, k):                                   # z: (..., V) logits
-    kth = torch.topk(z, k, dim=-1).values[..., -1:]       # k-th largest logit per row
-    return z.masked_fill(z &lt; kth, float("-inf"))          # ties with the k-th value survive
+def top_k_filter(z, k):                                # z: (..., V) logits
+    kth = torch.topk(z, k, dim=-1).values[..., -1:]    # k-th largest logit per row
+    return z.masked_fill(z &lt; kth, float("-inf"))       # ties with the k-th value survive
 
 def top_p_filter(z, p):
     probs = z.softmax(-1)
     sp, order = probs.sort(dim=-1, descending=True, stable=True)
-    before = F.pad(sp.cumsum(-1)[..., :-1], (1, 0))       # probability mass strictly before each token
+    before = F.pad(sp.cumsum(-1)[..., :-1], (1, 0))    # mass strictly before each token
     drop = torch.zeros_like(probs, dtype=torch.bool).scatter(-1, order, before &gt;= p)
-    return z.masked_fill(drop, float("-inf"))             # keep a token only while the mass so far is &lt; p
+    return z.masked_fill(drop, float("-inf"))          # keep a token while mass so far &lt; p
 
 def min_p_filter(z, p_min):
     probs = z.softmax(-1)
@@ -375,11 +374,11 @@ def min_p_filter(z, p_min):
 
 def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
     if temperature == 0:
-        return z.argmax(-1)                               # greedy
-    z = z / temperature                                   # 1) temperature first (Hugging Face order)
-    if top_k: z = top_k_filter(z, top_k)                  # 2) each filter renormalizes over survivors
-    if top_p: z = top_p_filter(z, top_p)                  # 3)
-    if min_p: z = min_p_filter(z, min_p)                  # 4)
+        return z.argmax(-1)                            # greedy
+    z = z / temperature                                # 1) temperature first (HF order)
+    if top_k: z = top_k_filter(z, top_k)               # 2) each filter renormalizes
+    if top_p: z = top_p_filter(z, top_p)               # 3) over the survivors
+    if min_p: z = min_p_filter(z, min_p)               # 4)
     probs = z.softmax(-1)
     ids = torch.multinomial(probs.reshape(-1, probs.size(-1)), 1, generator=gen)
     return ids.reshape(probs.shape[:-1])
@@ -388,28 +387,28 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 
 <section>
   <h2 id="beam-search">Beam search, and why chat models rarely use it</h2>
-  <p><strong>Beam search</strong> <span class="zh">束搜索</span> is a deterministic search for a high-probability <em>sequence</em>. It keeps \(b\) partial hypotheses (the beam). At each step it expands every hypothesis by all \(V\) tokens, scores each candidate by its cumulative log-probability \(\sum_t \log p(x_t \mid x_{\lt t})\), and keeps the best \(b\) of the \(bV\) candidates. Hypotheses that end in EOS are set aside as finished. It costs \(b\) times the compute and \(b\) times the KV cache per request, and each step must reorder the cache so that every surviving hypothesis points at its parent's entries.</p>
-  <p>Because every extra token adds a negative log-probability, raw scores favor short outputs. GNMT's fix divides by a length penalty, \(s(Y,X) = \log P(Y \mid X) / lp(Y) + cp(X;Y)\) with \(lp(Y) = (5 + |Y|)^\alpha / 6^\alpha\), where \(\alpha \in [0.6, 0.7]\) was usually best on their development sets and \(cp\) is an NMT-specific coverage penalty. On WMT'14 En-Fr, tuning both terms raised BLEU from 30.3 (pure log-probability) to 31.4 <a href="https://arxiv.org/abs/1609.08144">[Wu et al. 2016, §7, Tab. 2]</a>.</p>
-  <p><strong>Where it works.</strong> In translation, summarization and speech recognition the input nearly determines the output, so the mode of the distribution is what you want. GNMT used beams of 8 to 12 hypotheses, and Shazeer's translation experiments used beam 4 with \(\alpha = 0.6\) <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §4.2]</a>.</p>
-  <p><strong>Why it fails for chat and open-ended text</strong>, in order of importance:</p>
+  <p><strong>Beam search</strong> <span class="zh">束搜索</span> is a deterministic search for a high-probability <em>sequence</em>. It keeps \(b\) partial hypotheses (the beam), expands each by all \(V\) tokens, scores every candidate by its cumulative log-probability \(\sum_t \log p(x_t \mid x_{\lt t})\), and keeps the best \(b\) of the \(bV\) candidates. Hypotheses that end in EOS are set aside as finished. It costs \(b\) times the compute and KV cache per request, and each step must reorder the cache so every survivor points at its parent's entries.</p>
+  <p>Every extra token adds a negative log-probability, so raw scores favor short outputs. GNMT divides by a length penalty: \(s(Y,X) = \log P(Y \mid X) / lp(Y) + cp(X;Y)\) with \(lp(Y) = (5 + |Y|)^\alpha / 6^\alpha\), plus a coverage penalty \(cp\) specific to attention-based translation. \(\alpha \in [0.6, 0.7]\) was usually best on development sets, and tuning both terms raised WMT'14 En-Fr BLEU from 30.3 to 31.4 <a href="https://arxiv.org/abs/1609.08144">[Wu et al. 2016, §7, Tab. 2]</a>.</p>
+  <p><strong>Where it works.</strong> In translation, summarization and speech recognition the input nearly determines the output, so the mode is what you want. GNMT kept 8 to 12 hypotheses, and Shazeer used beam 4 with \(\alpha = 0.6\) <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §4.2]</a>.</p>
+  <p><strong>Why it fails for chat and open-ended text:</strong></p>
   <ol>
-    <li><strong>Mode-seeking output is bland and loops.</strong> In Table 1 above, beam search with \(b = 16\) has perplexity 1.48 (human text: 12.38) and 28.94% looped generations. With \(b = 32\), GPT-2 Large loops on an institution's name, and for \(b \ge 64\) both GPT-2 Large and XL "prefer to stop generating immediately after the given context" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 1]</a>. Fan et al. saw the same: beam output is "short and generic" <a href="https://arxiv.org/abs/1805.04833">[Fan et al. 2018, §5.4]</a>.</li>
-    <li><strong>The beam search curse.</strong> Larger beams find higher-probability outputs that are <em>worse</em> translations. Koehn and Knowles found the optimal beam between 4 and about 30 (30 to 50 with length normalization), with quality falling beyond it, mainly because outputs get shorter <a href="https://arxiv.org/abs/1706.03872">[Koehn and Knowles 2017, §3.6, Fig. 10]</a>. Stahlberg and Byrne then ran exact search under a Transformer model and found that for 51.8% of sentences the highest-scoring output is the <em>empty</em> string (BLEU 2.1 with exact search against 30.3 for beam 10). Beam search works only because it makes search errors <a href="https://arxiv.org/abs/1908.10090">[Stahlberg and Byrne 2019, Tab. 1]</a>. The model's probability is a poor objective, and better search makes it worse.</li>
-    <li><strong>Cost and systems friction.</strong> \(b\) sequences per request multiply memory traffic and complicate continuous batching. PagedAttention shares prompt blocks across beams, saving 37.6% to 55.2% of KV memory for beam width 2 to 6 on their Alpaca trace <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §6.3]</a>, but the compute multiplier remains.</li>
+    <li><strong>Mode-seeking output is bland and loops.</strong> With \(b = 16\), GPT-2 Large has perplexity 1.48 (human text: 12.38) and 28.94% looped generations (table above). At \(b = 32\) it loops on an institution's name, and for \(b \ge 64\) it "prefer[s] to stop generating immediately after the given context" <a href="https://arxiv.org/abs/1904.09751">[Holtzman et al. 2019, Fig. 1]</a>. Fan et al. also found beam output "short and generic" <a href="https://arxiv.org/abs/1805.04833">[Fan et al. 2018, §5.4]</a>.</li>
+    <li><strong>The beam search curse.</strong> Larger beams find higher-probability outputs that are <em>worse</em> translations: Koehn and Knowles found optima between beams of 4 and about 30 (30 to 50 with length normalization) and falling quality beyond, mainly from shorter outputs <a href="https://arxiv.org/abs/1706.03872">[Koehn and Knowles 2017, §3.6, Fig. 10]</a>. Stahlberg and Byrne ran exact search and found that for 51.8% of sentences the highest-scoring output is the <em>empty</em> string (BLEU 2.1, against 30.3 for beam 10). Beam search works only because it makes search errors <a href="https://arxiv.org/abs/1908.10090">[Stahlberg and Byrne 2019, Tab. 1]</a>. The model's probability is a poor objective, and better search makes it worse.</li>
+    <li><strong>Cost.</strong> \(b\) sequences per request multiply memory traffic and complicate batching. PagedAttention shares prompt blocks across beams (37.6% to 55.2% of KV memory saved for beam width 2 to 6 on their Alpaca trace <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §6.3]</a>), but the compute multiplier stays.</li>
   </ol>
-  <p>In current practice, open-ended and reasoning models are sampled, often several times, with the answers filtered or aggregated (<a href="24-rlvr-reasoning.html">page 24</a>), rather than beam-searched.</p>
+  <p>In current practice, open-ended and reasoning models are sampled, often several times, and the samples filtered or aggregated (<a href="24-rlvr-reasoning.html">page 24</a>), rather than beam-searched.</p>
 </section>
 
 <section>
   <h2 id="determinism">Reproducibility: seeds and nondeterministic GPUs</h2>
-  <p>There are two separate sources of randomness. <strong>Sampling</strong> randomness is controlled by a seed: the same logits and the same generator state give the same token. Serving engines keep a generator per seeded request (vLLM passes per-request generators to its sampler). <strong>Numerical</strong> randomness is subtler, and it is why "temperature 0" is not a reproducibility guarantee.</p>
+  <p>There are two sources of randomness. <strong>Sampling</strong> randomness is controlled by a seed: the same logits and generator state give the same token (serving engines keep a generator per seeded request). <strong>Numerical</strong> randomness is why "temperature 0" is not a reproducibility guarantee:</p>
   <ul>
-    <li>Floating-point addition is not associative: \((a+b)+c \ne a+(b+c)\) after rounding, and bf16 keeps only about three decimal digits.</li>
-    <li>GPU kernels choose a reduction order from the input shape (tile sizes, split-K, split-KV attention). The same request lands in different batches on different runs, so its logits differ in the last bits.</li>
-    <li>When the top two logits are closer than that rounding noise (two synonyms, say), the argmax flips. The new token changes the context, and the two continuations then diverge for the rest of the text.</li>
+    <li>Floating-point addition is not associative, and bf16 keeps only about three decimal digits.</li>
+    <li>GPU kernels pick a reduction order from the input shape (tiling, split-K, split-KV attention), and a server batches the same request with different neighbors each time, so its logits differ in the last bits.</li>
+    <li>When the top two logits are closer than that noise, the argmax flips, the context changes, and the two continuations diverge.</li>
   </ul>
-  <p>The Thinking Machines analysis argues that the usual explanation (concurrent atomic adds) is not the main cause, since a typical LLM forward pass contains no atomic adds and a fixed batch gives deterministic output. The cause is a lack of <em>batch invariance</em>: results depend on batch size, which varies with server load. Their test sent one prompt 1,000 times at temperature 0 to Qwen3-235B and got 80 unique completions. With batch-invariant kernels all 1,000 were identical, at some cost in speed <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">[He and Thinking Machines Lab 2025]</a>.</p>
-  <p>PyTorch's own documentation adds that results are not guaranteed to reproduce across releases, commits or platforms, or between CPU and GPU, even with identical seeds. <code>torch.use_deterministic_algorithms(True)</code> removes nondeterministic PyTorch ops <a href="https://docs.pytorch.org/docs/stable/notes/randomness.html">[PyTorch reproducibility notes]</a>, but it does not control how a serving engine composes batches. This matters for evaluation, for debugging, and for RL, where the trainer and the inference engine can disagree on log-probabilities (<a href="25-rl-systems-agentic.html">page 25</a>). Even speculative decoding, whose guarantee is about the output <em>distribution</em>, is not bitwise reproducible: Chen et al. note that "a single token deviating due to numerics could result in two sequences diverging wildly" <a href="https://arxiv.org/abs/2302.01318">[Chen et al. 2023, §Evaluation]</a>.</p>
+  <p>The Thinking Machines analysis argues the usual culprit, concurrent atomic adds, is not the main cause: a typical LLM forward pass contains no atomic adds, and a fixed batch gives deterministic output. The cause is missing <em>batch invariance</em>: results depend on batch size, which varies with server load. Sending one prompt 1,000 times at temperature 0 to Qwen3-235B gave 80 unique completions. With batch-invariant kernels all 1,000 were identical, at some cost in speed <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">[He and Thinking Machines Lab 2025]</a>.</p>
+  <p>PyTorch documents no bitwise reproducibility across releases, platforms, or CPU versus GPU even with identical seeds, and <code>torch.use_deterministic_algorithms(True)</code> removes nondeterministic PyTorch ops but not batch-composition effects <a href="https://docs.pytorch.org/docs/stable/notes/randomness.html">[PyTorch notes]</a>. This matters for evals, debugging, and RL, where the trainer and the inference engine can disagree on log-probabilities (<a href="25-rl-systems-agentic.html">page 25</a>). Even speculative decoding guarantees only the output <em>distribution</em>: "a single token deviating due to numerics could result in two sequences diverging wildly" <a href="https://arxiv.org/abs/2302.01318">[Chen et al. 2023, §Evaluation]</a>.</p>
 </section>
 
 <section>
@@ -418,11 +417,11 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <h3 id="kv-derivation">Why the cache is exact</h3>
   <p>In layer \(\ell\), token \(t\) contributes a query, key and value (row vectors, per head): \(q_t = x_t W^Q\), \(k_t = x_t W^K\), \(v_t = x_t W^V\), and its attention output is</p>
   \[ o_t = \sum_{j \le t} \softmax_j\!\left(\frac{q_t \cdot k_j}{\sqrt{d_h}}\right) v_j . \]
-  <p>Causal masking means the hidden state of token \(j\) at every layer depends only on tokens \(1..j\). By induction over layers, \(k_j^{(\ell)}\) and \(v_j^{(\ell)}\) for \(j \lt t\) do not change when token \(t\) is appended. So we compute each key and value once and store it. The <strong>KV cache</strong> <span class="zh">键值缓存</span> is therefore <em>exact</em>, not an approximation. A bidirectional encoder, like the one in your tagger, has no such cache: adding one input changes every position's representation.</p>
+  <p>Causal masking means the hidden state of token \(j\) at every layer depends only on tokens \(1..j\). By induction over layers, \(k_j^{(\ell)}\) and \(v_j^{(\ell)}\) for \(j \lt t\) do not change when token \(t\) is appended, so each key and value is computed once and stored. The <strong>KV cache</strong> is therefore <em>exact</em>, not an approximation. A bidirectional encoder like your tagger's has no such cache: adding one input changes every representation.</p>
 
   <h3 id="kv-contents">What is stored, and what is not</h3>
-  <p>Per layer and per KV head the cache holds \(K\) and \(V\) after the linear projections. Keys are stored <em>after</em> RoPE (<a href="05-positional-encoding.html#rope">page 05</a>): the rotation of a key depends only on that key's own position, so it can be applied once at write time, while each new query is rotated at its own position when used. Not stored: queries (used once and discarded), attention scores, FFN activations, and earlier tokens' hidden states, none of which later tokens need.</p>
-  <p>Why cache \(K, V\) rather than the layer input \(x_j\)? Caching \(x_j\) (\(d\) numbers per layer) would force us to redo the \(K\) and \(V\) projections for every past token at every step, roughly \(2\,t\,d \cdot 2 n_{kv} d_h\) FLOPs per layer. The cache trades memory for compute. DeepSeek's MLA caches a compressed latent, which changes that trade (<a href="07-kv-efficient-attention.html#mla">page 07</a>).</p>
+  <p>Per layer and per KV head the cache holds \(K\) and \(V\) after the linear projections. Keys are stored <em>after</em> RoPE (<a href="05-positional-encoding.html#rope">page 05</a>): a key's rotation depends only on its own position, so it is applied once at write time, and each query is rotated at its own position when used. Not stored: queries (used once), scores, FFN activations and earlier hidden states, none of which later tokens need.</p>
+  <p>Why \(K, V\) rather than the layer input \(x_j\)? Caching \(x_j\) (\(d\) numbers per layer) would force us to redo the \(K\) and \(V\) projections of every past token at every step, about \(2\,t\,d \cdot 2 n_{kv} d_h\) FLOPs per layer. The cache trades memory for compute, and MLA caches a compressed latent to change that trade (<a href="07-kv-efficient-attention.html#mla">page 07</a>).</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-06-3-title">
@@ -487,19 +486,19 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <text x="558.0" y="252" class="s-small">read all t columns</text>
 <text x="545" y="362" text-anchor="middle" class="s-small">then concatenate heads, × W<tspan baseline-shift="super" font-size="9">O</tspan> → 1 × 4096</text>
 </svg>
-    <figcaption><b>Figure 3.</b> One decode step in one layer, with Llama-3-8B shapes. The new token adds one column to the K cache and one to the V cache (yellow) and contributes a single query. That query attends over all \(t\) cached columns, so the step reads the whole cache while computing only one token's worth of projections. The 32 query heads share the 8 KV heads in groups of 4.</figcaption>
+    <figcaption><b>Figure 3.</b> One decode step in one layer, with Llama-3-8B shapes. The new token adds one column to the K cache and one to the V cache (yellow) and contributes a single query. That query attends over all \(t\) cached columns, so the step reads the whole cache while computing only one token's projections. Each column is one cached token, and the 32 query heads share the 8 KV heads in groups of 4.</figcaption>
   </figure>
 
   <h3 id="kv-size">How big is it</h3>
   <div class="eq-box">
   \[ \text{KV bytes per token} = 2 \cdot L \cdot n_{kv} \cdot d_h \cdot b \]
-  <div class="eq-label">2 for K and V; \(b\) = bytes per element (2 for bf16). Page 07 derives the MQA, GQA and MLA variants.</div>
+  <div class="eq-label">2 for K and V; b = bytes per element (2 for bf16)</div>
   </div>
-  <p>Llama-3-8B (\(L = 32\), \(n_{kv} = 8\), \(d_h = 128\), bf16): \(2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) B = <strong>128 KiB per token</strong>. At 32K tokens (a valid length for Llama 3.1, not the 8K base model) that is \(128 \text{ KiB} \times 32{,}768 = 4\) GiB per sequence, and 16 GiB at 128K. A batch of 32 sequences at 4K tokens is \(32 \times 4096 \times 128 \text{ KiB} = 16\) GiB. For comparison, OPT-13B costs \(2 \cdot 5120 \cdot 40 \cdot 2 = 819{,}200\) B per token (the vLLM paper writes 800 KB), or 1.6 GB for a 2,048-token sequence <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §3]</a>.</p>
+  <p>Llama-3-8B (\(L = 32\), \(n_{kv} = 8\), \(d_h = 128\), bf16): \(2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) B = <strong>128 KiB per token</strong>. At 32K tokens (valid for Llama 3.1, not the 8K base model) that is \(128 \text{ KiB} \times 32{,}768 = 4\) GiB per sequence, and 16 GiB at 128K. A batch of 32 sequences at 4K tokens is also 16 GiB. For comparison, OPT-13B costs \(2 \cdot 5120 \cdot 40 \cdot 2 = 819{,}200\) B per token, or about 1.6 GiB for 2,048 tokens <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, §3]</a>. Page 07 derives the MQA, GQA and MLA variants.</p>
 
   <h3 id="kv-cost">Per-step cost with and without it</h3>
-  <p>Let \(N_{\text{mm}}\) be the parameters that take part in matmuls (7.50B for Llama-3-8B: the layers plus the output head, without the embedding lookup). Without a cache, producing the token after \(t\) tokens re-runs the forward pass over all \(t\) tokens: about \(2 N_{\text{mm}}\, t\) matmul FLOPs. With a cache it processes one token: \(2 N_{\text{mm}}\) FLOPs plus attention over the cache, \(4 L\, n_h d_h\, t\) FLOPs. Summed over a generation, the cache turns the weight-matmul work from quadratic in length to linear. Example: prompt \(P = 2048\), \(n = 256\) new tokens. Without a cache the loop pushes \(\sum_{i=0}^{255} (2048 + i) = 556{,}928\) token-positions through the network. With one it pushes \(2048 + 255 = 2{,}303\), a factor of 242.</p>
-  <p>Attention itself is still quadratic in total (each step touches \(t\) entries), but in FLOPs it is minor: at \(t = 2048\) it is \(4 \cdot 32 \cdot 128 \cdot 2048 \cdot 32 = 1.07\) GFLOP per new token against 15.0 GFLOP for the weights. What the cache does <em>not</em> remove is the bytes: every step reads the whole cache. That is the subject of <a href="#performance">the next section</a>.</p>
+  <p>Let \(N_{\text{mm}}\) be the parameters that take part in matmuls (7.50B for Llama-3-8B: the layers plus the output head, not the embedding lookup). Without a cache, producing the token after \(t\) tokens re-runs the pass over all \(t\): about \(2 N_{\text{mm}}\, t\) FLOPs. With a cache it processes one token: \(2 N_{\text{mm}}\) FLOPs plus \(4 L\, n_h d_h\, t\) for attention over the cache. So the cache turns weight-matmul work from quadratic to linear in length. Example: prompt \(P = 2048\), \(n = 256\) new tokens. Without a cache the loop pushes \(\sum_{i=0}^{255} (2048 + i) = 556{,}928\) token-positions through the network. With one it pushes \(2048 + 255 = 2{,}303\), 242 times fewer.</p>
+  <p>Attention stays quadratic in total but is minor in FLOPs: \(4 \cdot 32 \cdot 128 \cdot 2048 \cdot 32 = 1.07\) GFLOP per new token at \(t = 2048\), against 15.0 GFLOP for the weights. What the cache does <em>not</em> remove is the bytes: every step reads all of it (<a href="#performance">next section</a>).</p>
 
   <div class="decision">
     <div class="decision-title">KV cache</div>
@@ -507,50 +506,52 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
       <dt>Problem</dt><dd>Naive decoding re-runs the whole prefix through every layer for every new token.</dd>
       <dt>Idea</dt><dd>Store each layer's keys and values once. Each step computes only the new token's \(q, k, v\), appends \(k, v\), and attends over the stored columns.</dd>
       <dt>Why it works</dt><dd>Causal masking makes earlier keys and values independent of later tokens, so the cache is exact.</dd>
-      <dt>Evidence</dt><dd>242 times fewer token-positions in the example above. Shazeer's incremental-attention analysis shows the total arithmetic stays \(\Theta(b n d^2)\) across \(n\) steps <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.4.1]</a>.</dd>
-      <dt>Cost</dt><dd>Memory of \(2 L\, n_{kv}\, d_h\, b\) bytes per token per sequence, reread in full at every step, so it limits both batch size (capacity) and speed (bandwidth). Sequences of unknown length also fragment memory.</dd>
-      <dt>Used by</dt><dd>Every autoregressive inference stack. Hugging Face has a dynamic cache (<code>torch.cat</code> each step) and a static one (preallocated, written with <code>index_copy_</code>) <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/cache_utils.py">[cache_utils.py]</a>. vLLM pages it (below).</dd>
+      <dt>Evidence</dt><dd>242 times fewer token-positions in the example above. Shazeer's analysis shows total arithmetic stays \(\Theta(b n d^2)\) across \(n\) incremental steps <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.4.1]</a>.</dd>
+      <dt>Cost</dt><dd>\(2 L\, n_{kv}\, d_h\, b\) bytes per token per sequence, reread in full every step, so it limits both batch size (capacity) and speed (bandwidth). Sequences of unknown length also fragment memory.</dd>
+      <dt>Used by</dt><dd>Every autoregressive inference stack. Hugging Face has a dynamic cache (<code>torch.cat</code> each step) and a static one (preallocated, <code>index_copy_</code>) <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/cache_utils.py">[cache_utils.py]</a>. vLLM pages it (below).</dd>
     </dl>
   </div>
 
   <h3 id="kv-impl">Implementation: preallocate, do not concatenate</h3>
-  <p>The simplest cache appends with <code>torch.cat</code> at every step. That allocates a new tensor and copies all \(t\) existing entries, so each step moves the cache bytes twice more (read old, write new) on top of the attention read, and repeated reallocation fragments memory. The alternative is to allocate \((B, n_{kv}, S_{\max}, d_h)\) once per layer, write the new entries in place, and hand attention a view of the filled prefix. Tensor shapes then stay fixed, which graph capture (CUDA graphs, <code>torch.compile</code>) requires. This is the drill in <code>exercises/solutions/kv_cache.py</code>:</p>
+  <p>The simplest cache appends with <code>torch.cat</code> at every step. That allocates a new tensor and copies all \(t\) entries (two extra passes over the cache on top of the attention read) and fragments memory. Instead, allocate \((B, n_{kv}, S_{\max}, d_h)\) once per layer, write in place, and give attention a view of the filled prefix. Shapes stay fixed, as graph capture (CUDA graphs, <code>torch.compile</code>) requires. This is the drill in <code>exercises/solutions/kv_cache.py</code>:</p>
 <pre><code class="language-python">class KVCache:
-    def __init__(self, n_layers, batch, n_kv, max_len, d_h, dtype=torch.bfloat16, device="cuda"):
-        shape = (batch, n_kv, max_len, d_h)                       # allocated once, never resized
+    def __init__(self, n_layers, batch, n_kv, max_len, d_h,
+                 dtype=torch.bfloat16, device="cuda"):
+        shape = (batch, n_kv, max_len, d_h)            # allocated once, never resized
         self.k = [torch.zeros(shape, dtype=dtype, device=device) for _ in range(n_layers)]
         self.v = [torch.zeros(shape, dtype=dtype, device=device) for _ in range(n_layers)]
-        self.n = [0] * n_layers                                   # cached positions per layer
+        self.n = [0] * n_layers                        # cached positions per layer
 
-    def update(self, layer, k_new, v_new):                        # (B, n_kv, T, d_h); K already has RoPE
+    def update(self, layer, k_new, v_new):             # (B, n_kv, T, d_h); K already has RoPE
         s, T = self.n[layer], k_new.shape[2]
-        self.k[layer][:, :, s:s + T] = k_new                      # in-place write: O(T) bytes moved
+        self.k[layer][:, :, s:s + T] = k_new           # in-place write: O(T) bytes moved
         self.v[layer][:, :, s:s + T] = v_new
         self.n[layer] = s + T
         return self.k[layer][:, :, :s + T], self.v[layer][:, :, :s + T]   # views, no copy
 </code></pre>
-  <p>Preallocation has its own problem: reserving \(S_{\max}\) slots per sequence wastes memory when actual lengths vary. The vLLM paper measured that in earlier serving systems only 20.4% to 38.2% of KV-cache memory held actual token states <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, Fig. 2]</a>. That waste is what PagedAttention removes (<a href="#serving">Serving teasers</a>).</p>
+  <p>Preallocation reserves \(S_{\max}\) per sequence, which wastes memory when lengths vary: the vLLM paper measured only 20.4% to 38.2% of KV memory holding token states in earlier systems <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, Fig. 2]</a>. PagedAttention removes that waste (<a href="#serving">Serving teasers</a>).</p>
 </section>
 
 <section>
   <h2 id="performance">Prefill vs decode: the performance model</h2>
-  <p>Hardware assumption for all numbers below: one H100 SXM, with 80 GB of HBM3 and 3.35 TB/s of bandwidth, and 1,979 TFLOPS of BF16 tensor-core throughput "with sparsity" on NVIDIA's page <a href="https://www.nvidia.com/en-us/data-center/h100/">[NVIDIA H100]</a>. Dense throughput is half the sparse figure, 989.5 TFLOP/s; the same factor of two appears in the H100 NVL numbers of a recent profiling study (835 dense, 1,671 sparse) <a href="https://arxiv.org/abs/2609.12923">[Siavashi et al. 2026, §2.1]</a>. Model: Llama-3-8B in bf16.</p>
+  <p>Assumptions for every number below: one H100 SXM with 3.35 TB/s of HBM3 bandwidth and 1,979 TFLOPS of BF16 tensor-core throughput "with sparsity" on NVIDIA's page <a href="https://www.nvidia.com/en-us/data-center/h100/">[NVIDIA H100]</a>. Dense throughput is half of that, 989.5 TFLOP/s (the H100 NVL figures in a recent profiling study show the same factor of two, 835 dense and 1,671 sparse <a href="https://arxiv.org/abs/2609.12923">[Siavashi et al. 2026, §2.1]</a>). Model: Llama-3-8B in bf16.</p>
 
   <h3 id="intensity">Arithmetic intensity: why the two phases differ</h3>
-  <p><strong>Arithmetic intensity</strong> <span class="zh">算术强度</span> is FLOPs performed per byte moved from memory. A kernel is <strong>memory-bound</strong> <span class="zh">访存受限</span> when its intensity is below the hardware's ridge point, and <strong>compute-bound</strong> <span class="zh">计算受限</span> above it. For an H100 the ridge is \(989.5 \text{ TFLOP/s} \,/\, 3.35 \text{ TB/s} \approx 295\) FLOPs per byte. Consider one weight matmul \(y = xW\) with \(x\) of shape \(m \times d_{\text{in}}\) and \(W\) of shape \(d_{\text{in}} \times d_{\text{out}}\) in bf16:</p>
+  <p><strong>Arithmetic intensity</strong> <span class="zh">算术强度</span> is FLOPs performed per byte moved from memory. A kernel is <strong>memory-bound</strong> <span class="zh">访存受限</span> below the hardware's ridge point and <strong>compute-bound</strong> <span class="zh">计算受限</span> above it. For an H100 the ridge is \(989.5 \text{ TFLOP/s} \,/\, 3.35 \text{ TB/s} \approx 295\) FLOPs per byte. For one weight matmul \(y = xW\) with \(x\) of shape \(m \times d_{\text{in}}\) in bf16:</p>
   \[ \frac{\text{FLOPs}}{\text{bytes}} \approx \frac{2\, m\, d_{\text{in}} d_{\text{out}}}{2\, d_{\text{in}} d_{\text{out}}} = m \quad \text{(weights dominate the bytes when } m \ll d\text{)} \]
-  <p>The intensity equals the number of tokens \(m\) sharing one read of the weights. In <strong>prefill</strong>, \(m\) is the prompt length, thousands of tokens, far above 295: compute-bound. In <strong>decode</strong>, \(m\) is the batch size, and at batch 1 the intensity is about 1 FLOP per byte: 0.3% of the ridge. The tensor cores idle while HBM streams the weights, so the step time is set by bytes, not FLOPs. Pope et al. state the same thing in their model: at small batch and short context the time to load weights dominates, and at large batch and long context the time to load the KV cache dominates <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §2]</a>.</p>
+  <p>The intensity is the number of tokens \(m\) sharing one read of the weights. In <strong>prefill</strong>, \(m\) is the prompt length, thousands, far above 295: compute-bound. In <strong>decode</strong>, \(m\) is the batch size, and at batch 1 the intensity is about 1 FLOP per byte, 0.3% of the ridge. The tensor cores idle while HBM streams the weights, so step time is set by bytes, not FLOPs. Pope et al. make the same point: at small batch and short context the time to load weights dominates, and at large batch and long context the time to load the KV cache dominates <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §2]</a>.</p>
 
   <h3 id="decode-time">Decode: time per token is bytes over bandwidth</h3>
   <div class="eq-box">
   \[ t_{\text{step}} \;\gtrsim\; \max\!\left( \underbrace{\frac{W + B\,\bar S\,\kappa}{\text{BW}}}_{\text{memory time}},\ \underbrace{\frac{2 N_{\text{mm}} B + 4 L n_h d_h\, B \bar S}{\text{peak FLOP/s}}}_{\text{compute time}} \right) \]
-  <div class="eq-label">\(W\) weight bytes, \(\kappa\) KV bytes per token, \(\bar S\) mean context length, \(B\) batch size. A roofline lower bound: real kernels reach a fraction of it.</div>
+  <div class="eq-label">Roofline lower bound on decode step time</div>
   </div>
-  <p><strong>Weights.</strong> From the config: per layer, attention has \(4096 \cdot 4096 \cdot 2 + 4096 \cdot 1024 \cdot 2 = 41{,}943{,}040\) parameters and the SwiGLU FFN has \(3 \cdot 4096 \cdot 14336 = 176{,}160{,}768\), plus 8,192 norm weights, for 218,112,000 per layer. Times 32 layers, plus the embedding and the untied output head (\(128{,}256 \cdot 4096 = 525{,}336{,}576\) each) and a final norm: \(N = 8{,}030{,}261{,}248\). In bf16 that is <strong>16.06 GB</strong>.</p>
-  <p><strong>Batch 1.</strong> Each step must read every weight once: \(16.06 \text{ GB} / 3.35 \text{ TB/s} = 4.79\) ms, so at most <strong>208 tokens per second</strong>. Adding the KV cache of a 4K-token context (0.54 GB) gives 4.95 ms and 202 tokens/s. The bound depends slightly on what you count: the embedding table is a lookup, not a stream, so excluding it gives 15.0 GB, 4.48 ms and 223 tokens/s. The compute time is \(2 N_{\text{mm}} / 989.5\text{ TFLOP/s} = 0.015\) ms, so the model uses 0.3% of peak FLOP/s. Real engines reach a fraction of the bound. A profiling preprint measured 5.27 ms per token for Llama-3-8B at batch 1 and a 2,048-token context on an H100 NVL with vLLM and FlashAttention-3, against a roofline of 4.19 ms for that GPU's 3.9 TB/s, about 80% <a href="https://arxiv.org/abs/2609.12923">[Siavashi et al. 2026, §5]</a>. It is one measurement on a different SKU, so treat it as a sanity check, and expect roughly 150 to 180 tokens/s on an SXM part.</p>
+  <p class="small muted">\(W\): weight bytes; \(\kappa\): KV bytes per token; \(\bar S\): mean context length; \(B\): batch size; \(N_{\text{mm}}\): parameters that take part in matmuls. Real kernels reach a fraction of this bound.</p>
+  <p><strong>Weights.</strong> Per layer, attention has \(4096 \cdot 4096 \cdot 2 + 4096 \cdot 1024 \cdot 2 = 41{,}943{,}040\) parameters, the SwiGLU FFN has \(3 \cdot 4096 \cdot 14336 = 176{,}160{,}768\), and the norms add 8,192: 218,112,000 per layer. Times 32 layers, plus the embedding and the untied output head (\(128{,}256 \cdot 4096 = 525{,}336{,}576\) each) and a final norm: \(N = 8{,}030{,}261{,}248\). In bf16 that is <strong>16.06 GB</strong>.</p>
+  <p><strong>Batch 1.</strong> Each step reads every weight once: \(16.06 \text{ GB} / 3.35 \text{ TB/s} = 4.79\) ms, so at most <strong>208 tokens per second</strong>. Adding the KV cache of a 4K context (0.54 GB) gives 4.95 ms and 202 tokens/s. Excluding the embedding table (a lookup, not a stream) gives 15.0 GB, 4.48 ms and 223 tokens/s, so the bound moves about 7% with what you count. Compute time is \(2 N_{\text{mm}} / 989.5\text{ TFLOP/s} = 0.015\) ms: 0.3% of peak. Real engines reach a fraction of the bound. A profiling preprint measured 5.27 ms per token for Llama-3-8B at batch 1 and a 2,048-token context on an H100 NVL (vLLM, FlashAttention-3), against a 4.19 ms roofline for that GPU's 3.9 TB/s: about 80% <a href="https://arxiv.org/abs/2609.12923">[Siavashi et al. 2026, §5]</a>. It is one measurement on a different SKU, so use it as a sanity check. <span class="unverified" title="My estimate: 70 to 85% of the 208 tokens/s roofline, extrapolated from the single H100 NVL profile above; not measured on an SXM part">Expect roughly 150 to 180 tokens/s on an SXM part.</span></p>
 
   <h3 id="batching">Batching: weights are shared, caches are not</h3>
-  <p>With batch \(B\), one read of the weights serves \(B\) tokens, so the weight term \(W\) is amortized. Each sequence has its own cache, so the KV term grows linearly with \(B\). Take 4K-token contexts. The capacity limit is what fits in HBM: with 90% of 80 GB usable (vLLM's current default <code>gpu_memory_utilization</code> is 0.92 <a href="https://github.com/vllm-project/vllm/blob/main/vllm/config/cache.py">[cache.py]</a>), \((72 - 16.06) \text{ GB} / 0.537 \text{ GB} = 104\) sequences.</p>
+  <p>With batch \(B\), one read of the weights serves \(B\) tokens, so \(W\) is amortized. Each sequence has its own cache, so the KV term grows linearly with \(B\). Take 4K-token contexts. Capacity is the limit on \(B\): with 90% of 80 GB usable (vLLM's current default <code>gpu_memory_utilization</code> is 0.92 <a href="https://github.com/vllm-project/vllm/blob/main/vllm/config/cache.py">[cache.py]</a>), \((72 - 16.06) \text{ GB} / 0.537 \text{ GB} = 104\) sequences.</p>
 
   <div class="table-wrap"><table class="data">
     <thead><tr><th class="num">Batch B</th><th class="num">KV cache (GB)</th><th class="num">Bytes read / step (GB)</th><th class="num">Step time (ms)</th><th class="num">Per user (tok/s)</th><th class="num">Total (tok/s)</th><th class="num">Compute time (ms)</th></tr></thead>
@@ -562,7 +563,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
       <tr><td class="num">104</td><td class="num">55.83</td><td class="num">71.90</td><td class="num">21.46</td><td class="num">47</td><td class="num">4,846</td><td class="num">1.80</td></tr>
     </tbody>
   </table></div>
-  <p class="small muted">Llama-3-8B, bf16 weights and KV, 4,096-token contexts, H100 SXM (3.35 TB/s, 989.5 TFLOP/s). Step time is memory time \((16.06 \text{ GB} + B \cdot 0.537 \text{ GB}) / 3.35 \text{ TB/s}\), which exceeds compute time in every row. Roofline lower bounds, not measurements.</p>
+  <p class="small muted">Llama-3-8B, bf16 weights and KV, 4,096-token contexts, H100 SXM. Step time is memory time \((16.06 \text{ GB} + B \cdot 0.537 \text{ GB}) / 3.35 \text{ TB/s}\), which exceeds compute time in every row. Roofline lower bounds, not measurements.</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 340" role="img" aria-labelledby="fig-06-4-title">
@@ -621,61 +622,60 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
     <figcaption><b>Figure 4.</b> Where the bytes go at 4K context. The weight slice (blue) is fixed at 4.79 ms. The KV slice (green) grows by 0.16 ms per sequence. Throughput rises 16 times from \(B = 1\) to \(B = 32\) while each user's speed halves, and the growing KV slice is why the curve flattens.</figcaption>
   </figure>
 
-  <p>Read the table three ways.</p>
   <ul>
-    <li><strong>Latency versus throughput.</strong> From \(B = 1\) to \(B = 32\), total throughput rises 16 times while per-user speed falls by half (202 to 101 tokens/s). Batching trades individual latency for aggregate throughput, and the first steps of the trade are nearly free: going from 1 to 8 sequences adds 23% to the step time and gives 6.5 times the throughput, because the KV slice is still small next to the weight slice.</li>
-    <li><strong>The ceiling is the KV cache.</strong> As \(B \to \infty\), the weight term vanishes and throughput approaches \(\text{BW} / (\bar S \kappa) = 3.35 \text{ TB/s} / 0.537 \text{ GB} = 6{,}240\) tokens/s per GPU at 4K context. This is Shazeer's \(n/d\) term made numeric: attention re-reads a per-sequence cache that no batching can share <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.4.1]</a>.</li>
-    <li><strong>It never becomes compute-bound at this context.</strong> Compute time stays below 2 ms against 21 ms of memory time, and MFU is only 8% at \(B = 104\). For a large batch, per-sequence intensity is \((2 N_{\text{mm}} + 4 L n_h d_h \bar S) / (\kappa \bar S) = 4 + 2N_{\text{mm}} / (\kappa \bar S)\). The 4 is \(n_h / n_{kv}\), page 07's attention intensity. That crosses the 295 ridge only when \(\bar S \lesssim 390\) tokens. Above that, GQA-8 decode stays memory-bound at any batch size.</li>
+    <li><strong>Latency versus throughput.</strong> From \(B = 1\) to \(B = 32\), total throughput rises 16 times while per-user speed halves (202 to 101 tokens/s). The first steps of the trade are nearly free: going from 1 to 8 sequences adds 23% to the step time and gives 6.5 times the throughput, because the KV slice is still small next to the weight slice.</li>
+    <li><strong>The ceiling is the KV cache.</strong> As \(B \to \infty\) the weight term vanishes and throughput approaches \(\text{BW} / (\bar S \kappa) = 3.35 \text{ TB/s} / 0.537 \text{ GB} = 6{,}240\) tokens/s per GPU at 4K context. This is Shazeer's \(n/d\) term made numeric: attention re-reads a per-sequence cache that no batching can share <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §2.4.1]</a>.</li>
+    <li><strong>It never becomes compute-bound at this context.</strong> Compute time stays below 2 ms against 21 ms of memory time (MFU 8% at \(B = 104\)). At large batch the whole model's intensity is \((2 N_{\text{mm}} + 4 L n_h d_h \bar S) / (\kappa \bar S) = 4 + 2N_{\text{mm}} / (\kappa \bar S)\). The 4 is \(n_h / n_{kv}\), page 07's attention intensity. This crosses the 295 ridge only when \(\bar S \lesssim 390\) tokens, so above that GQA-8 decode stays memory-bound at any batch size.</li>
   </ul>
-  <p>The same effect appears in PaLM 540B with multi-query attention (a tiny KV cache): decode reached 33% MFU at batch 512 and only 14% at batch 64, while prefill reached 76% at batch 512 and 43% at batch 1 on the same hardware <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, Tab. 2]</a>. The levers to raise the ceiling are architectural (fewer or smaller KV heads, <a href="07-kv-efficient-attention.html">page 07</a>), numeric (KV quantization) and systemic (<a href="17-inference-serving.html">page 17</a>).</p>
+  <p>PaLM 540B with multi-query attention (a tiny KV cache) shows the same gap between phases: decode reached 33% MFU at batch 512 and 14% at batch 64, while prefill reached 76% at batch 512 and 43% at batch 1 <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, Tab. 2]</a>. The levers that raise the ceiling are architectural (fewer or smaller KV heads, <a href="07-kv-efficient-attention.html">page 07</a>), numeric (KV quantization) and systemic (<a href="17-inference-serving.html">page 17</a>).</p>
 
   <h3 id="prefill-time">Prefill: the compute-bound side</h3>
-  <p>A forward pass over \(T\) tokens costs about \(2 N T\) FLOPs (each parameter does one multiply-add per token) <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §2]</a>. For \(T = 2048\): \(2 \times 8.03 \times 10^9 \times 2048 = 3.29 \times 10^{13}\) FLOPs. At 100% of peak that is \(3.29 \times 10^{13} / 989.5 \times 10^{12} = 33.2\) ms. Nobody reaches peak, and 50% MFU (model FLOPs utilization) is a fair planning number, giving <strong>66.5 ms</strong>, or 30,800 prompt tokens per second, about 150 times the token rate of one decode stream. The weights are still read once, 4.8 ms, which is small against 33 ms, so the pass is compute-bound. Pope et al. report prefill MFU between 43% and 76% on PaLM (Tab. 2).</p>
-  <p>The rule \(2NT\) is a good estimate here, and a slight overestimate. Counting exactly (no FLOPs for the embedding lookup, the output head on the last position only, causal attention over half the score matrix) gives \(2.97 \times 10^{13}\) FLOPs, 10% less. At long contexts the quadratic attention term matters: at \(T = 32{,}768\), attention is 38% of the FLOPs and the total is \(7.4 \times 10^{14}\) (0.75 s at peak, 1.5 s at 50% MFU), 40% more than \(2NT\) predicts.</p>
+  <p>A forward pass over \(T\) tokens costs about \(2 N T\) FLOPs <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §2]</a>. For \(T = 2048\): \(2 \times 8.03 \times 10^9 \times 2048 = 3.29 \times 10^{13}\) FLOPs. At 100% of peak that is \(3.29 \times 10^{13} / 989.5 \times 10^{12} = 33.2\) ms. Nobody reaches peak, and 50% MFU (model FLOPs utilization) is a fair planning number: <strong>66.5 ms</strong>, or 30,800 prompt tokens per second, about 150 times the rate of one decode stream. The weights are still read once (4.8 ms, small against 33 ms), so the pass is compute-bound. Pope et al. report prefill MFU of 43% to 76% on PaLM (Tab. 2).</p>
+  <p>The rule \(2NT\) is a slight overestimate. Counting exactly (no FLOPs for the embedding lookup, the output head on the last position only, causal attention over half the score matrix) gives \(2.97 \times 10^{13}\), 10% less. At long contexts the quadratic attention term matters: at \(T = 32{,}768\) attention is 38% of the FLOPs and the total is \(7.4 \times 10^{14}\) (0.75 s at peak, 1.5 s at 50% MFU), 40% more than \(2NT\).</p>
 
   <h3 id="metrics">Metrics and the trade-off</h3>
-  <p>Serving is judged on four numbers, defined the way NVIDIA's benchmarking tools define them <a href="https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/">[NVIDIA benchmarking guide]</a>:</p>
+  <p>Serving is judged on four numbers, defined as in NVIDIA's benchmarking tools <a href="https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/">[NVIDIA benchmarking guide]</a>:</p>
   <ul>
-    <li><strong>Time to first token</strong> (TTFT, <span class="zh">首 token 延迟</span>): request arrival to the first output token. It includes queueing, prefill and network. For the 2,048-token prompt on an idle H100 it is about 70 ms, and it grows linearly (then quadratically) with prompt length.</li>
-    <li><strong>Time per output token</strong> (TPOT, also called inter-token latency): \((\text{e2e latency} - \text{TTFT}) / (\text{output tokens} - 1)\). At batch 1 it is one decode step.</li>
+    <li><strong>Time to first token</strong> (TTFT, <span class="zh">首 token 延迟</span>): request arrival to the first output token, including queueing, prefill and network. For the 2,048-token prompt on an idle H100 it is about 70 ms, growing linearly (then quadratically) with prompt length.</li>
+    <li><strong>Time per output token</strong> (TPOT, also inter-token latency): \((\text{e2e latency} - \text{TTFT}) / (\text{output tokens} - 1)\). At batch 1 it is one decode step.</li>
     <li><strong>End-to-end latency</strong> \(= \text{TTFT} + (n-1)\cdot\text{TPOT}\).</li>
     <li><strong>Throughput</strong>: output tokens per second across all requests.</li>
   </ul>
-  <p>Batch size moves TPOT and throughput in opposite directions (Table above). Pope et al. show the same trade on PaLM: cost per token is lowest at batches above about 512, while shrinking the batch improves latency at a higher cost per token <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §4.4]</a>. A long prefill also stalls the decode steps that share its GPU, which spikes TPOT for everyone else. Chunked prefill and disaggregating prefill from decode address that (<a href="17-inference-serving.html">page 17</a>).</p>
+  <p>Batch size moves TPOT and throughput in opposite directions (table above). Pope et al. show the same trade on PaLM: cost per token is lowest at batches above about 512, while smaller batches cut latency at a higher cost per token <a href="https://arxiv.org/abs/2211.05102">[Pope et al. 2022, §4.4]</a>. A long prefill also stalls the decode steps that share its GPU and spikes TPOT for everyone else; chunked prefill and disaggregating prefill from decode address that (<a href="17-inference-serving.html">page 17</a>).</p>
 </section>
 
 <section>
   <h2 id="serving">Serving teasers</h2>
   <p>One paragraph each. <a href="17-inference-serving.html">Page 17</a> treats them properly.</p>
-  <p><strong>Continuous batching</strong> <span class="zh">连续批处理</span>. A static batch runs until its longest sequence finishes, so short requests wait and the GPU idles. Orca schedules at the granularity of a single model iteration: finished sequences leave and waiting requests join at every step, and batching is applied only to a selected set of operations ("selective batching") so that sequences at different positions can share a step <a href="https://www.usenix.org/conference/osdi22/presentation/yu">[Yu et al. 2022, OSDI]</a>. Orca reported 36.9 times the throughput of FasterTransformer at the same latency on GPT-3 175B. Every modern engine schedules this way.</p>
-  <p><strong>PagedAttention.</strong> Contiguous per-sequence reservations waste most of the cache (20.4% to 38.2% useful, above). PagedAttention splits each sequence's cache into fixed-size blocks (16 tokens by default) allocated on demand, and a per-sequence block table maps logical positions to physical blocks, exactly like virtual memory. Waste is limited to the last partial block, blocks can be shared across sequences with copy-on-write, and vLLM reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency. The price is a slower attention kernel: 20% to 26% higher kernel latency than FasterTransformer's <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, Abstract, §7.1]</a>.</p>
-  <p><strong>Prefix caching</strong> <span class="zh">前缀缓存</span>. A token's keys and values depend only on the tokens before it, so two requests that start with the same tokens (a system prompt, few-shot examples, earlier chat turns) can share those cache entries and skip that part of prefill. SGLang's RadixAttention keeps cached prefixes in a radix tree with LRU eviction. The system reports up to 6.4 times higher throughput on its workloads (the gain combines several optimizations), with cache hit rates of 50% to 99% across its benchmarks. Its Chatbot Arena deployment saw hit rates of 52.4% and 74.1% on two models and a 1.7 times lower first-token latency for Vicuna-33B <a href="https://arxiv.org/abs/2312.07104">[Zheng et al. 2023, §3, §6]</a>. It helps TTFT and capacity, not the per-token decode cost.</p>
+  <p><strong>Continuous batching</strong> <span class="zh">连续批处理</span>. A static batch runs until its longest sequence finishes, so short requests wait and the GPU idles. Orca schedules per model iteration: finished sequences leave and waiting requests join at every step, with batching applied only to a selected set of operations ("selective batching") so that sequences at different positions can share a step <a href="https://www.usenix.org/conference/osdi22/presentation/yu">[Yu et al. 2022, OSDI]</a>. It reported 36.9 times the throughput of FasterTransformer at the same latency on GPT-3 175B.</p>
+  <p><strong>PagedAttention.</strong> Contiguous per-sequence reservations waste most of the cache (20.4% to 38.2% useful, above). PagedAttention splits each sequence's cache into fixed-size blocks (16 tokens by default) allocated on demand, with a per-sequence block table mapping logical positions to physical blocks, like virtual memory. Waste is limited to the last partial block, blocks can be shared with copy-on-write, and vLLM reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency. The price is a slower attention kernel: 20% to 26% higher latency than FasterTransformer's <a href="https://arxiv.org/abs/2309.06180">[Kwon et al. 2023, Abstract, §7.1]</a>.</p>
+  <p><strong>Prefix caching</strong> <span class="zh">前缀缓存</span>. A token's keys and values depend only on the tokens before it, so requests that share a prefix (system prompt, few-shot examples, earlier chat turns) can share those cache entries and skip that part of prefill. SGLang's RadixAttention keeps cached prefixes in a radix tree with LRU eviction and reports up to 6.4 times higher throughput on its workloads (the gain combines several optimizations). In its Chatbot Arena deployment, hit rates were 52.4% and 74.1% on two models, with 1.7 times lower first-token latency for Vicuna-33B <a href="https://arxiv.org/abs/2312.07104">[Zheng et al. 2023, §3, §6]</a>. It helps TTFT and capacity, not per-token decode cost.</p>
 
   <div class="decision">
     <div class="decision-title">Speculative decoding</div>
     <dl>
       <dt>Problem</dt><dd>Decode is memory-bound: each step reads all weights and the whole cache to produce one token, and steps are sequential.</dd>
-      <dt>Idea</dt><dd>A cheap draft distribution \(q\) proposes \(\gamma\) tokens. The target model scores all \(\gamma + 1\) positions in one forward pass. Accept draft token \(x\) with probability \(\min(1, p(x)/q(x))\). At the first rejection, resample from \(\text{norm}(\max(0, p - q))\) and discard the rest. If all are accepted, sample one bonus token from the target.</dd>
+      <dt>Idea</dt><dd>A cheap draft distribution \(q\) proposes \(\gamma\) tokens. The target scores all \(\gamma + 1\) positions in one forward pass. Accept draft token \(x\) with probability \(\min(1, p(x)/q(x))\). At the first rejection, resample from \(\text{norm}(\max(0, p - q))\) and discard the rest. If all are accepted, sample a bonus token from the target.</dd>
       <dt>Why it works</dt><dd>Scoring \(\gamma + 1\) tokens is one pass with intensity \(\gamma + 1\) FLOPs per byte, still far below the 295 ridge, so it costs about one decode step while yielding several tokens. Exactness: \(P(x) = q(x)\min(1, p/q) + (1-\alpha)\cdot\text{norm}(\max(0,p-q))(x) = p(x)\), where \(\alpha = \sum_x \min(p, q)\) is the acceptance rate.</dd>
-      <dt>Evidence</dt><dd>2.3 to 3.4 times faster on T5-XXL at batch 1 with the best draft (T5-small), with identical outputs <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al. 2022, Tab. 2]</a>. Chinchilla 70B: 1.92 to 2.46 times on XSum and HumanEval <a href="https://arxiv.org/abs/2302.01318">[Chen et al. 2023, Tab. 1]</a>.</dd>
-      <dt>Cost</dt><dd>Wasted compute on rejected tokens, a draft model to host, and shrinking gains as the batch grows and decode approaches compute-bound. The distribution is preserved, but the bits are not identical to plain decoding.</dd>
-      <dt>Used by</dt><dd>Both original papers (Google and DeepMind). Variants that drop the separate draft model, and deployment details, are on page 17.</dd>
+      <dt>Evidence</dt><dd>2.3 to 3.4 times faster on T5-XXL at batch 1 with the best draft (T5-small), identical outputs <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al. 2022, Tab. 2]</a>. Chinchilla 70B: 1.92 to 2.46 times on XSum and HumanEval <a href="https://arxiv.org/abs/2302.01318">[Chen et al. 2023, Tab. 1]</a>.</dd>
+      <dt>Cost</dt><dd>Wasted compute on rejected tokens, a draft model to host, and shrinking gains as the batch grows and decode nears compute-bound. The distribution is preserved, but the bits are not identical to plain decoding.</dd>
+      <dt>Used by</dt><dd>Both original papers (Google, DeepMind). Draft-free variants and deployment details: page 17.</dd>
     </dl>
   </div>
-  <p>The expected number of tokens per target pass is \((1 - \alpha^{\gamma+1}) / (1 - \alpha)\), and the wall-clock speedup is that divided by \(1 + \gamma c\), where \(c\) is the draft-to-target cost ratio <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al. 2022, Eq. 1, Thm. 3.8]</a>. With \(\alpha = 0.8\), \(\gamma = 4\) and \(c = 0.05\), that is 3.36 tokens per pass and a 2.8 times speedup. In a memory-bound decoder \(c\) is close to the ratio of bytes read, so a draft with 1/16 of the target's weights has \(c \approx 0.06\).</p>
+  <p>Expected tokens per target pass: \((1 - \alpha^{\gamma+1}) / (1 - \alpha)\). Wall-clock speedup: that divided by \(1 + \gamma c\), with \(c\) the draft-to-target cost ratio <a href="https://arxiv.org/abs/2211.17192">[Leviathan et al. 2022, Eq. 1, Thm. 3.8]</a>. With \(\alpha = 0.8\), \(\gamma = 4\), \(c = 0.05\): 3.36 tokens per pass and a 2.8 times speedup. In a memory-bound decoder \(c\) is close to the ratio of bytes read, so a draft with 1/16 of the target's weights has \(c \approx 0.06\).</p>
 </section>
 
 <section id="pitfalls">
   <h2>Common misconceptions</h2>
   <ul>
-    <li><strong>"Temperature 0 gives the same output on every run."</strong> Not on GPUs. Kernel reduction order depends on the batch, logits differ in the last bits, near-ties flip the argmax, and the text diverges from there.</li>
-    <li><strong>"Top-p 0.9 keeps 90% of the tokens" or "removes 10% of tokens".</strong> It keeps the smallest set holding at least 90% of the <em>probability mass</em>. That set can be one token or thousands, depending on the distribution.</li>
-    <li><strong>"Top-k, top-p and min-p compose in any order."</strong> Order and renormalization matter, and Hugging Face, vLLM and llama.cpp differ (temperature first in the first two, last in llama.cpp). The min-p authors also warn against stacking truncations.</li>
-    <li><strong>"The KV cache is an approximation that skips attention."</strong> It is exact. It removes the recomputation of earlier tokens' projections and FFNs. Attention still reads every cached key and value at every step.</li>
-    <li><strong>"A bigger batch fixes memory-bound decoding."</strong> It amortizes the weight reads only. Each sequence's KV cache is its own, so the per-sequence bytes stay, and throughput saturates near \(\text{BW}/(\bar S \kappa)\).</li>
-    <li><strong>"Beam search finds the best answer, so wider is better."</strong> Model probability is a poor objective. Wider beams give shorter outputs and lower BLEU, and exact search returns the empty string for half the sentences in one study.</li>
-    <li><strong>"Decode is slow because it needs many FLOPs."</strong> It needs few. At batch 1 an H100 uses 0.3% of its FLOP/s while streaming 16 GB of weights each step.</li>
-    <li><strong>"Speculative decoding is an approximation, like using a smaller model."</strong> With the correct accept and resample rule the output distribution equals the target's exactly. What it does not promise is bitwise-identical text.</li>
+    <li><strong>"Temperature 0 gives the same output on every run."</strong> Not on GPUs. Kernel reduction order depends on the batch, near-tie logits flip the argmax, and the text diverges from there.</li>
+    <li><strong>"Top-p 0.9 keeps 90% of the tokens."</strong> It keeps the smallest set holding at least 90% of the probability <em>mass</em>: one token or thousands.</li>
+    <li><strong>"Top-k, top-p and min-p compose in any order."</strong> Order and renormalization matter, and libraries differ: temperature comes first in Hugging Face and vLLM, last in llama.cpp.</li>
+    <li><strong>"The KV cache is an approximation that skips attention."</strong> It is exact. It skips recomputing earlier tokens' projections and FFNs, while attention still reads every cached key and value at every step.</li>
+    <li><strong>"A bigger batch fixes memory-bound decoding."</strong> It amortizes the weight reads only. Each sequence's KV cache is its own, so throughput saturates near \(\text{BW}/(\bar S \kappa)\).</li>
+    <li><strong>"Beam search finds the best answer, so wider is better."</strong> Model probability is a poor objective: wider beams give shorter outputs, and exact search returns the empty string for about half the sentences in one study.</li>
+    <li><strong>"Decode is slow because it needs many FLOPs."</strong> It needs few: at batch 1 an H100 uses 0.3% of its FLOP/s while streaming 16 GB of weights.</li>
+    <li><strong>"Speculative decoding is an approximation."</strong> With the correct accept and resample rule the output distribution equals the target's exactly. It does not promise bitwise-identical text.</li>
   </ul>
 </section>
 
@@ -685,126 +685,126 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> Walk through the generation loop. How does the first step differ from the rest?</summary>
     <div class="answer">
-      <p>Tokenize the prompt. <strong>Prefill:</strong> one forward pass over all \(P\) prompt tokens in parallel with a causal mask. It writes every layer's keys and values into the KV cache and produces logits for the last position, from which the first token is chosen. Then repeat <strong>decode steps</strong>: feed the newest token only, compute its \(q, k, v\), append \(k, v\) to the cache, attend over the cache, get logits, choose the next token. Stop on EOS, a stop string or the length limit.</p>
-      <p>The first step processes \(P\) tokens per weight read (compute-bound) and determines time to first token. Every later step processes one token per sequence (memory-bound) and determines time per output token.</p>
+      <p>Tokenize the prompt. <strong>Prefill:</strong> one parallel forward pass over all \(P\) prompt tokens with a causal mask. It fills the KV cache and gives the last position's logits, from which the first token is chosen. Then repeat <strong>decode steps</strong>: feed only the newest token, compute its \(q, k, v\), append \(k, v\) to the cache, attend over the cache, get logits, choose. Stop on EOS, a stop string or the length limit.</p>
+      <p>Prefill has \(P\) tokens per weight read (compute-bound) and sets time to first token. Each decode step has one token per sequence (memory-bound) and sets time per output token.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> <span>What does temperature do? What happens as \(\tau \to 0\) and \(\tau \to \infty\)?</span></summary>
     <div class="answer">
-      <p>It divides the logits by \(\tau\) before the softmax, so \(p_i \propto \exp(z_i/\tau) \propto p_i^{1/\tau}\). For \(\tau &lt; 1\) the distribution sharpens, for \(\tau &gt; 1\) it flattens. As \(\tau \to 0^+\), \(p_i/p_{\max} = e^{-(z_{\max}-z_i)/\tau} \to 0\) for every non-maximal token, so the limit is greedy (uniform over exact ties). As \(\tau \to \infty\) all ratios tend to 1 and the distribution is uniform over the vocabulary. Entropy increases monotonically with \(\tau\). Implementations treat \(\tau = 0\) as an explicit greedy branch because the formula divides by zero.</p>
+      <p>It divides the logits by \(\tau\) before the softmax, so \(p_i \propto \exp(z_i/\tau) \propto p_i^{1/\tau}\): sharper for \(\tau \lt 1\), flatter for \(\tau \gt 1\). As \(\tau \to 0^+\), \(p_i/p_{\max} = e^{-(z_{\max}-z_i)/\tau} \to 0\) for every non-maximal token, so the limit is greedy (uniform over exact ties). As \(\tau \to \infty\) all ratios tend to 1 and the distribution is uniform. Entropy rises monotonically with \(\tau\). Implementations special-case \(\tau = 0\) as greedy because the formula divides by zero.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> What exactly is stored in the KV cache, and how big is it for Llama-3-8B at 32K tokens?</summary>
     <div class="answer">
-      <p>For every layer, every KV head and every past token: the key (after projection and after RoPE) and the value. Queries, scores, FFN activations and hidden states are not stored. It is exact because causal masking makes earlier keys and values independent of later tokens.</p>
-      <p>Size per token \(= 2 L\, n_{kv}\, d_h\, b = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) B = 128 KiB. At 32,768 tokens: \(128 \text{ KiB} \times 32{,}768 = 4\) GiB per sequence. (With 32 MHA-style KV heads it would be 16 GiB.) Note the base Llama-3-8B has an 8K window; 32K needs Llama 3.1.</p>
+      <p>For every layer, KV head and past token: the key (after projection and RoPE) and the value. Not stored: queries, scores, FFN activations, hidden states. It is exact because causal masking makes earlier keys and values independent of later tokens.</p>
+      <p>Size per token \(= 2 L\, n_{kv}\, d_h\, b = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) B = 128 KiB. At 32,768 tokens that is \(128 \text{ KiB} \times 32{,}768 = 4\) GiB per sequence (16 GiB with 32 KV heads). The base Llama-3-8B has an 8K window, so 32K needs Llama 3.1.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> Why does greedy decoding repeat itself?</summary>
     <div class="answer">
-      <p>Two effects. (1) Repetition is self-reinforcing: the more often a phrase appears in the context, the higher the probability the model assigns to continuing it (Holtzman et al., Fig. 4), and greedy always follows the highest probability, so once it enters a loop it cannot leave. (2) Likelihood-trained models put their highest probability on generic, predictable continuations, but human text is not the most probable text (per-token probability of human text is far lower; perplexity 12.4 versus 1.5 for greedy output in Holtzman's Table 1). In their GPT-2 Large experiment, 73.66% of greedy generations ended in a loop. Sampling with truncation (top-p, min-p) injects controlled randomness to escape it.</p>
+      <p>Two effects. Repetition is self-reinforcing: the more often a phrase is in the context, the more probable its continuation (Holtzman et al., Fig. 4), and greedy always follows the highest probability, so a loop is absorbing. And likelihood-trained models put their highest probability on generic continuations, while human text is not the most probable text (perplexity 12.4 versus 1.5 for greedy output). On GPT-2 Large, 73.66% of greedy generations ended in a loop. Truncated sampling (top-p, min-p) adds controlled randomness to escape.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Explain temperature, top-k, top-p and min-p. When would you use each?</summary>
     <div class="answer">
-      <p><strong>Temperature</strong> raises probabilities to the power \(1/\tau\) and renormalizes: a global knob for randomness. <strong>Top-k</strong> keeps the \(k\) most likely tokens: simple, but a fixed \(k\) is too large when the model is confident and too small when many continuations are valid. <strong>Top-p</strong> keeps the smallest set with cumulative mass \(\ge p\): the set size adapts to confidence. <strong>Min-p</strong> keeps tokens with \(p_i \ge p_{\text{base}} p_{\max}\): the threshold scales with the top token's probability, needs no sort, and is meant to be robust at high temperature.</p>
-      <p>Usage: greedy or \(\tau \le 0.3\) for tasks with a checkable answer; \(\tau \approx 0.6\) to 1 with top-p 0.9 to 0.95, or min-p 0.05 to 0.1, for chat and creative writing; \(\tau = 1\) untruncated when you need samples from the model's own distribution (RL rollouts). Use one truncation method, not all. Be honest about evidence: nucleus sampling is well supported (Holtzman), while min-p's advantage is disputed by an independent re-analysis.</p>
+      <p><strong>Temperature</strong> raises probabilities to the power \(1/\tau\): a global randomness knob. <strong>Top-k</strong> keeps the \(k\) most likely tokens: simple, but one \(k\) is too large when the model is sure and too small when many continuations are valid. <strong>Top-p</strong> keeps the smallest set with mass \(\ge p\), so its size adapts to confidence. <strong>Min-p</strong> keeps \(p_i \ge p_{\text{base}} p_{\max}\): the threshold scales with the top token and needs no sort.</p>
+      <p>Usage: greedy or \(\tau \le 0.3\) for checkable answers; \(\tau \approx 0.6\) to 1 with top-p 0.9 to 0.95 or min-p 0.05 to 0.1 for chat and writing; \(\tau = 1\) untruncated for RL rollouts. Use one truncation method. Nucleus sampling is well supported (Holtzman); min-p's advantage is disputed by an independent re-analysis.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Why is beam search rare for chatbots even though it finds higher-probability sequences?</summary>
     <div class="answer">
-      <p>Because probability is not quality for open-ended text. Mode-seeking output is generic and repetitive: with \(b = 16\), GPT-2 Large has perplexity 1.48 against 12.38 for human text and 28.94% looped outputs. Larger beams make it worse (the "beam search curse"): Koehn and Knowles saw BLEU fall beyond beams of 4 to 50 because outputs get shorter, and Stahlberg and Byrne showed that exact search picks the empty output for 51.8% of sentences, so beam search only works thanks to its search errors. Length normalization (GNMT's \(lp = (5+|Y|)^\alpha/6^\alpha\)) helps but does not fix the model bias.</p>
-      <p>Beam search is still right when the output is nearly determined by the input (translation, summarization, ASR) and you want the mode. For chat it also costs \(b\) times the compute and KV cache, and it complicates batching. Sampling plus selection is used instead.</p>
+      <p>Probability is not quality for open-ended text. Mode-seeking output is generic and loops: with \(b = 16\), GPT-2 Large has perplexity 1.48 (human text: 12.38) and 28.94% looped outputs. Bigger beams get worse, the "beam search curse": BLEU falls beyond beams of 4 to 50 as outputs shorten, and exact search returns the empty output for 51.8% of sentences (Stahlberg and Byrne), so beam search works only thanks to its search errors. Length normalization helps but does not fix the bias.</p>
+      <p>It remains right when the input nearly determines the output (translation, summarization, ASR). For chat it also costs \(b\) times the compute and KV cache and complicates batching, so sampling plus selection is used.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Does it matter whether temperature is applied before or after top-p (or min-p)?</summary>
     <div class="answer">
-      <p>Yes for top-p and min-p, no for top-k. Top-k depends only on rank order, which \(\tau \gt 0\) preserves. Top-p's cumulative mass and min-p's ratio \(p_i/p_{\max}\) are computed from the probabilities, which temperature changes. With temperature first (Hugging Face, vLLM), higher \(\tau\) flattens the distribution and enlarges the nucleus, so \(\tau\) and \(p\) interact. With temperature last (llama.cpp default), the candidate set is independent of \(\tau\). On the toy logits of Figure 2 with top-k 5, top-p 0.9, min-p 0.2, Hugging Face's order keeps 2 tokens at \(\tau = 0.5\) and 5 at \(\tau = 2\); llama.cpp's keeps 4 in both cases.</p>
-      <p>Also mention renormalization: each Hugging Face filter takes a softmax over survivors, so top-p after top-k sees renormalized mass (top-p 0.5 on \([0.4,0.3,0.2,0.1]\) keeps two tokens, but after top-k 2 it keeps one). Min-p is a ratio test and is unaffected. Always check the order and defaults (Hugging Face silently applies top-k 50 when unset).</p>
+      <p>Yes for top-p and min-p, no for top-k. Top-k depends only on rank order, which \(\tau \gt 0\) preserves. Top-p's mass and min-p's ratio come from probabilities, which temperature changes. With temperature first (Hugging Face, vLLM), higher \(\tau\) flattens the distribution and enlarges the nucleus. With temperature last (llama.cpp default), the candidate set does not depend on \(\tau\). On Figure 2's logits with top-k 5, top-p 0.9, min-p 0.2, Hugging Face's order keeps 2 tokens at \(\tau = 0.5\) and 5 at \(\tau = 2\), and llama.cpp's keeps 4 both times.</p>
+      <p>Also renormalization: after top-k 2 on \([0.4,0.3,0.2,0.1]\), top-p 0.5 keeps one token instead of two, while min-p is a ratio test and is unaffected. Check order and defaults (Hugging Face silently applies top-k 50 when unset).</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Why is decoding memory-bandwidth-bound while prefill is compute-bound?</summary>
     <div class="answer">
-      <p>For a weight matmul, FLOPs per byte of weights read \(\approx m\), the number of tokens sharing that read (bf16: \(2md_{\text{in}}d_{\text{out}}\) FLOPs over \(2d_{\text{in}}d_{\text{out}}\) bytes). Prefill has \(m\) equal to the prompt length, in the thousands, far above the H100's ridge of about 295 FLOPs/byte (989.5 TFLOP/s over 3.35 TB/s): compute-bound. Decode has \(m = B\), and at batch 1 that is about 1 FLOP/byte: the tensor cores wait while HBM streams 16 GB of weights.</p>
-      <p>Attention makes it worse. Each sequence's KV cache is read once per step and used for only \(n_h/n_{kv}\) FLOPs per byte (4 for Llama-3-8B), whatever the batch size. So step time is about (weight bytes + KV bytes) over bandwidth.</p>
+      <p>For a weight matmul, FLOPs per weight byte \(\approx m\), the number of tokens sharing that read. Prefill has \(m\) equal to the prompt length, thousands, far above the H100's ridge of about 295 FLOPs/byte (989.5 TFLOP/s over 3.35 TB/s): compute-bound. Decode has \(m = B\), about 1 at batch 1: the tensor cores wait while HBM streams 16 GB of weights.</p>
+      <p>Attention is worse. Each sequence's KV cache is read once per step for only \(n_h/n_{kv}\) FLOPs per byte (4 for Llama-3-8B), whatever the batch. So step time is about (weight bytes + KV bytes) over bandwidth.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Estimate tokens per second for an 8B model at batch 1 on an H100.</summary>
     <div class="answer">
-      <p>Decode is bandwidth-bound, so tokens/s \(\approx\) bandwidth / bytes read per token. Weights: 8.03B parameters in bf16 is 16.06 GB. H100 SXM bandwidth is 3.35 TB/s. Time per token \(\ge 16.06 / 3350 = 4.79\) ms, so at most about 208 tokens/s. Add the KV cache (0.54 GB at 4K context) and it is 4.95 ms, about 202 tokens/s.</p>
-      <p>Reality is 70 to 85% of that, so quote 150 to 180 tokens/s. One profile of Llama-3-8B on an H100 NVL measured 5.27 ms per token against a 4.19 ms bound. Sanity check: FP8 weights halve the bytes and so roughly double the bound. State the assumptions: bf16, batch 1, weights dominate, no speculation.</p>
+      <p>Decode is bandwidth-bound, so tokens/s \(\approx\) bandwidth over bytes read per token. Weights: 8.03B parameters in bf16 is 16.06 GB. H100 SXM bandwidth is 3.35 TB/s. So a token takes at least \(16.06 / 3350 = 4.79\) ms, at most about 208 tokens/s. With a 4K-token KV cache (0.54 GB): 4.95 ms, about 202 tokens/s.</p>
+      <p>Reality is lower: <span class="unverified" title="My estimate: 70 to 85% of the roofline, extrapolated from one H100 NVL profile">quote roughly 150 to 180 tokens/s</span> (one profile measured 5.27 ms against a 4.19 ms bound on an H100 NVL). FP8 weights roughly double the bound. State the assumptions: bf16, batch 1, weights dominate, no speculation.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> How does increasing the batch size affect latency and throughput during decode?</summary>
     <div class="answer">
-      <p>One weight read now serves \(B\) tokens, so throughput rises almost linearly while the weight term dominates. Latency per token rises slowly, because each sequence adds its own KV bytes. For Llama-3-8B at 4K context on an H100: \(B = 1\) gives 4.95 ms per step (202 tokens/s); \(B = 32\) gives 9.92 ms per step, 3,225 tokens/s total (16 times) but 101 tokens/s per user (half); \(B = 104\) fills the GPU at 21.5 ms and 4,846 tokens/s.</p>
-      <p>Throughput saturates at \(\text{BW}/(\bar S\kappa) \approx 6{,}240\) tokens/s because the KV bytes scale with \(B\) too. Attention's intensity is only \(n_h/n_{kv}\) regardless of batch, and for contexts above about 390 tokens the whole step stays memory-bound. Batch size is limited by KV capacity (104 here), and by any TPOT target.</p>
+      <p>One weight read now serves \(B\) tokens, so throughput rises almost linearly while the weight term dominates, and per-token latency rises slowly as each sequence adds KV bytes. Llama-3-8B, 4K context, H100: \(B = 1\) gives 4.95 ms per step and 202 tokens/s. \(B = 32\) gives 9.92 ms, 3,225 tokens/s total (16 times) but 101 per user (half). \(B = 104\) fills the GPU: 21.5 ms, 4,846 tokens/s.</p>
+      <p>Throughput saturates at \(\text{BW}/(\bar S\kappa) \approx 6{,}240\) tokens/s because KV bytes scale with \(B\) too, and above about 390 tokens of context the whole step stays memory-bound. Batch is capped by KV capacity (104 here) and by any TPOT target.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Why can two runs with the same seed and temperature 0 give different outputs on GPUs?</summary>
     <div class="answer">
-      <p>Temperature 0 removes sampling randomness, but the logits themselves are not bit-identical. Floating-point addition is not associative, and GPU kernels pick reduction orders (tiling, split-K, split-KV) from the input shape. In a server the same request is batched with different neighbors each time, so its shapes and therefore its rounding change. When the top two logits are within that noise, argmax flips, and autoregression amplifies a single different token into a different text.</p>
-      <p>The Thinking Machines analysis argues the culprit is missing batch invariance in kernels, not atomic adds: their test gave 80 distinct completions out of 1,000 identical requests on Qwen3-235B, and 1 with batch-invariant kernels, at a speed cost. PyTorch also documents no bitwise guarantee across releases, platforms or CPU versus GPU. Consequences: flaky evals and a trainer-versus-rollout log-probability mismatch in RL.</p>
+      <p>Temperature 0 removes sampling randomness, but the logits are not bit-identical. Floating-point addition is not associative, and GPU kernels choose reduction orders (tiling, split-K, split-KV) from input shapes. A server batches the same request with different neighbors each time, so shapes and rounding change. When the top two logits are within that noise the argmax flips, and autoregression turns one different token into a different text.</p>
+      <p>The Thinking Machines analysis blames missing batch invariance rather than atomic adds: 1,000 identical requests to Qwen3-235B gave 80 distinct completions, and 1 with batch-invariant kernels, at a speed cost. Consequences: flaky evals, and a trainer versus rollout log-probability mismatch in RL.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Compare the per-step cost of decoding with and without a KV cache.</summary>
     <div class="answer">
-      <p>Without a cache, each new token re-runs the network over the whole prefix of length \(t\): \(\approx 2N_{\text{mm}}\, t\) FLOPs, so a whole generation costs \(O(n^2)\) in weight-matmul FLOPs. With a cache, a step processes one token: \(2N_{\text{mm}}\) FLOPs plus \(4Ln_hd_h\,t\) for attention over the cache, so the weight work is \(O(n)\) overall. Example: prompt 2,048 plus 256 new tokens. Token-positions processed: 556,928 without the cache against 2,303 with it, a factor of 242.</p>
-      <p>The cost moves to memory: \(2Ln_{kv}d_hb\) bytes per token (128 KiB for Llama-3-8B), all of it read every step. At \(t = 2048\) attention is only 1.07 GFLOP against 15 GFLOP for the weights, but at large batch and long context the bytes dominate.</p>
+      <p>Without a cache each new token re-runs the network over a prefix of length \(t\): \(\approx 2N_{\text{mm}}\, t\) FLOPs, so a generation costs \(O(n^2)\) in weight-matmul FLOPs. With a cache a step costs \(2N_{\text{mm}}\) plus \(4Ln_hd_h\,t\) for attention, so the weight work is \(O(n)\). Prompt 2,048 plus 256 new tokens: 556,928 token-positions without the cache against 2,303 with it, 242 times fewer.</p>
+      <p>The cost moves to memory: \(2Ln_{kv}d_hb\) bytes per token (128 KiB for Llama-3-8B), all read every step. At \(t = 2048\) attention is 1.07 GFLOP against 15 GFLOP for the weights, but at large batch and long context the bytes dominate.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> How does speculative decoding speed up generation without changing the output distribution?</summary>
     <div class="answer">
-      <p>Decode is memory-bound, so scoring \(\gamma + 1\) tokens in one pass costs about the same as scoring one: the weights and cache are read once, and intensity only rises to \(\gamma + 1\) FLOPs/byte. A cheap draft \(q\) proposes \(\gamma\) tokens; the target computes \(p\) at all \(\gamma+1\) positions in one pass. Accept draft token \(x\) with probability \(\min(1, p(x)/q(x))\); at the first rejection resample from \(\text{norm}(\max(0, p-q))\) and stop; if all are accepted, take a free bonus token from the target.</p>
-      <p>Exactness: the chance of emitting \(x\) is \(q(x)\min(1, p/q) + (1-\alpha)\,\text{norm}(\max(0,p-q))(x) = \min(p,q) + (p - \min(p,q)) = p(x)\), with \(\alpha = \sum_x \min(p,q)\). Toy check: \(p = (0.6, 0.3, 0.1)\), \(q = (0.4, 0.4, 0.2)\) gives \(\alpha = 0.8\), residual \((1, 0, 0)\), and token 0 is emitted with probability \(0.4 + 0.2 = 0.6\). Expected tokens per pass \(= (1-\alpha^{\gamma+1})/(1-\alpha)\); speedup divides that by \(1+\gamma c\). Top-k, top-p and temperature are folded into \(p\) and \(q\) before the test. Caveats: wasted FLOPs on rejections, gains shrink as batch grows, and the guarantee is distributional, not bitwise.</p>
+      <p>Decode is memory-bound, so scoring \(\gamma + 1\) tokens in one pass costs about the same as scoring one: weights and cache are read once and intensity only rises to \(\gamma + 1\) FLOPs/byte. A cheap draft \(q\) proposes \(\gamma\) tokens and the target computes \(p\) at all \(\gamma+1\) positions in one pass. Accept draft token \(x\) with probability \(\min(1, p(x)/q(x))\). At the first rejection, resample from \(\text{norm}(\max(0, p-q))\) and stop. If all are accepted, take a bonus token from the target.</p>
+      <p>Exactness: the probability of emitting \(x\) is \(q(x)\min(1, p/q) + (1-\alpha)\,\text{norm}(\max(0,p-q))(x) = \min(p,q) + (p - \min(p,q)) = p(x)\), with \(\alpha = \sum_x \min(p,q)\). Check: \(p = (0.6, 0.3, 0.1)\), \(q = (0.4, 0.4, 0.2)\) gives \(\alpha = 0.8\), residual \((1, 0, 0)\), and token 0 is emitted with probability \(0.4 + 0.2 = 0.6\). Tokens per pass \(= (1-\alpha^{\gamma+1})/(1-\alpha)\); the speedup divides that by \(1+\gamma c\). Temperature and truncation are folded into \(p\) and \(q\) first. The guarantee is distributional, not bitwise, and gains shrink as batch grows.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> Design question: serve Llama-3-8B chat on one H100 with 4K contexts and a 20 ms TPOT target. What batch size, and what limits you?</summary>
     <div class="answer">
-      <p>Step time must be at most 20 ms. With \(t_{\text{step}} = (16.06 + 0.537 B)\text{ GB} / 3.35\text{ TB/s}\), we need \(B \le (67.0 - 16.06)/0.537 \approx 94\). That gives about \(94/0.020 = 4{,}700\) tokens/s. Capacity allows 104 sequences at 90% memory use, so here the TPOT target binds first. With a 30 ms target, \(B\) would be 157 and capacity (104) would bind instead.</p>
-      <p>Levers, in order of cost: (1) shrink the KV term: FP8 KV halves the KV slice, shorter or sliding-window contexts, prefix caching so shared prompts are stored once; (2) continuous batching plus PagedAttention to avoid fragmentation and keep the batch full; (3) speculative decoding to gain tokens per step at low batch; (4) chunked prefill so long prompts do not spike TPOT; (5) a second GPU with tensor parallelism if the target is still missed, at the price of communication. Say what you would measure: TTFT and TPOT percentiles at your real length distribution, since the mean context, not the maximum, sets the KV traffic.</p>
+      <p>Step time must be at most 20 ms. With \(t_{\text{step}} = (16.06 + 0.537 B)\text{ GB} / 3.35\text{ TB/s}\), we need \(B \le (67.0 - 16.06)/0.537 \approx 94\), about \(94/0.020 = 4{,}700\) tokens/s. Capacity allows 104 sequences at 90% memory use, so the TPOT target binds first. With a 30 ms target \(B\) would be 157 and capacity (104) would bind instead.</p>
+      <p>Levers, roughly by cost: (1) shrink the KV term with FP8 KV, shorter or sliding-window contexts, and prefix caching; (2) continuous batching plus PagedAttention to keep the batch full without fragmentation; (3) speculative decoding for more tokens per step at low batch; (4) chunked prefill so long prompts do not spike TPOT; (5) tensor parallelism on more GPUs, at a communication cost. Measure TTFT and TPOT percentiles on your real length distribution: the mean context sets the KV traffic.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> How would you implement a KV cache, and what are the failure modes of concatenation, preallocation and paging?</summary>
     <div class="answer">
-      <p><strong>Concatenation</strong> (<code>torch.cat</code> per step, as in Hugging Face's dynamic cache): trivial, but each step allocates a new tensor and copies all \(t\) entries, adding roughly two extra passes over the cache to the attention read, and it fragments memory as shapes change every step. <strong>Preallocation</strong> \((B, n_{kv}, S_{\max}, d_h)\) per layer with in-place writes: \(O(1)\) bytes per step, static shapes for CUDA graphs and <code>torch.compile</code>, and the attention kernel gets a view of the filled prefix. Its failure mode is internal waste: you reserve \(S_{\max}\) per sequence, and vLLM measured only 20.4% to 38.2% of reserved cache holding real tokens in earlier systems.</p>
-      <p><strong>Paging</strong> (PagedAttention): fixed-size blocks (16 tokens by default) plus a block table per sequence. Waste is confined to the last block, blocks are shareable with copy-on-write (parallel sampling, beam search, common prefixes), at the price of an indirection in the attention kernel (20% to 26% slower kernel in vLLM's measurement) and more complex scheduling and eviction. Details to state: store keys after RoPE, keep per-layer lengths (or one length updated after the last layer), and check capacity before writing so an overflow cannot leave a half-written cache.</p>
+      <p><strong>Concatenation</strong> (<code>torch.cat</code> per step, as in Hugging Face's dynamic cache) is trivial, but each step allocates a new tensor and copies all \(t\) entries, and it fragments memory. <strong>Preallocation</strong> of \((B, n_{kv}, S_{\max}, d_h)\) per layer with in-place writes moves \(O(1)\) bytes per step, keeps shapes static for CUDA graphs and <code>torch.compile</code>, and gives the kernel a view of the filled prefix. Its failure mode is internal waste: reserving \(S_{\max}\) per sequence, vLLM measured only 20.4% to 38.2% of memory holding real tokens in earlier systems.</p>
+      <p><strong>Paging</strong> uses fixed-size blocks (16 tokens by default) and a block table per sequence. Waste is confined to the last block and blocks can be shared with copy-on-write, at the price of an indirection in the attention kernel (20% to 26% slower in vLLM's measurement) and more complex scheduling. Also state: store keys after RoPE, keep per-layer lengths, and check capacity before writing so an overflow cannot leave a half-written cache.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> What do repetition, frequency and presence penalties do to the logits, and when do they backfire?</summary>
     <div class="answer">
-      <p>With \(c_j\) the number of times token \(j\) has occurred: <strong>frequency</strong> subtracts \(\alpha_f c_j\), so probability is multiplied by \(e^{-\alpha_f c_j}\) and each repeat costs more; <strong>presence</strong> subtracts \(\alpha_p\) once if \(c_j \gt 0\), discouraging any reuse; both are additive in logit space and scale-free. The <strong>repetition penalty</strong> of CTRL is multiplicative: logits of tokens already seen are divided by \(\theta\) (around 1.2). Because dividing a negative logit by \(\theta \gt 1\) would increase it, implementations such as Hugging Face's multiply negative logits and divide positive ones, apply it once per distinct token, and include the prompt by default. vLLM counts only generated tokens for frequency and presence.</p>
-      <p>They backfire because they cannot separate harmful repetition from required repetition: identifiers, brackets, digits, quoted text, names, and repeated tags in JSON or code. Heavy penalties therefore corrupt structured output and can push the model toward rare, wrong tokens. Repetition is better treated at its source (better data and post-training, sampling with truncation), and shipped defaults are mild, for example 1.05 for Qwen2.5-7B-Instruct.</p>
+      <p>With \(c_j\) the number of occurrences of token \(j\): <strong>frequency</strong> subtracts \(\alpha_f c_j\), multiplying the probability by \(e^{-\alpha_f c_j}\), so each repeat costs more. <strong>Presence</strong> subtracts \(\alpha_p\) once if \(c_j \gt 0\). CTRL's <strong>repetition penalty</strong> is multiplicative: seen tokens' logits are divided by \(\theta\) (around 1.2). Because dividing a negative logit by \(\theta \gt 1\) would raise it, Hugging Face multiplies negative logits and divides positive ones, applies it once per distinct token, and includes the prompt by default. vLLM counts only generated tokens for frequency and presence.</p>
+      <p>They backfire because they cannot separate harmful repetition from required repetition: identifiers, brackets, digits, quoted text, repeated tags in JSON or code. Heavy penalties corrupt structured output. Shipped defaults are mild (1.05 for Qwen2.5-7B-Instruct), and repetition is better fixed at its source with data, post-training and truncated sampling.</p>
     </div>
   </details>
 </section>
@@ -812,10 +812,10 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <section id="exercises">
   <h2>Hands-on</h2>
   <div class="exercise">
-    <p><strong>Sampling from logits.</strong> Implement <code>apply_temperature</code>, <code>top_k_filter</code>, <code>top_p_filter</code>, <code>min_p_filter</code> and a <code>sample</code> function that chains them in Hugging Face's order with an explicit <code>torch.Generator</code>. The stub documents tie handling and edge cases (\(p = 1\), \(k \ge V\), \(\tau = 0\)). Tests check hand-built distributions, renormalization between stages, and empirical frequencies from a fixed seed. Aim to finish in 25 to 30 minutes. <span class="ex-path">exercises/drills/sampling.py</span></p>
+    <p><strong>Sampling from logits.</strong> Implement <code>apply_temperature</code>, <code>top_k_filter</code>, <code>top_p_filter</code>, <code>min_p_filter</code> and a <code>sample</code> function that chains them in Hugging Face's order with an explicit <code>torch.Generator</code>. The stub documents tie handling and edge cases (\(p = 1\), \(k \ge V\), \(\tau = 0\)). Tests check hand-built distributions, renormalization between stages, and empirical frequencies from a fixed seed. An interviewer would expect this in 25 to 30 minutes. <span class="ex-path">exercises/drills/sampling.py</span></p>
   </div>
   <div class="exercise">
-    <p><strong>KV cache and incremental attention.</strong> Implement a preallocated <code>KVCache</code> (in-place <code>append</code>, view-returning <code>get</code>, per-layer <code>length</code>), <code>attend_with_cache</code> (append, then grouped-query causal attention with the end-aligned mask, for prefill chunks and single-token decode alike), and <code>generate_greedy</code> with correct off-by-one bookkeeping (n tokens need n model calls). The test compares cached generation with recomputing the full sequence every step. Expect 30 to 40 minutes. <span class="ex-path">exercises/drills/kv_cache.py</span></p>
+    <p><strong>KV cache and incremental attention.</strong> Implement a preallocated <code>KVCache</code> (in-place <code>append</code>, view-returning <code>get</code>, per-layer <code>length</code>), <code>attend_with_cache</code> (append, then grouped-query causal attention with the end-aligned mask, for prefill chunks and single-token decode alike), and <code>generate_greedy</code> with correct off-by-one bookkeeping (n tokens need n model calls). The test compares cached generation with recomputing the full sequence every step. An interviewer would expect this in 30 to 40 minutes. <span class="ex-path">exercises/drills/kv_cache.py</span></p>
   </div>
   <p class="small muted">Run <code>pytest exercises/tests/test_sampling.py exercises/tests/test_kv_cache.py</code>; add <code>--solutions</code> to check the reference implementations.</p>
 </section>
@@ -823,16 +823,16 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <section id="papers">
   <h2>Primary sources</h2>
   <ol class="papers">
-    <li><a href="https://arxiv.org/abs/1904.09751">Holtzman et al. (2019). The Curious Case of Neural Text Degeneration.</a> <span class="why">Why read it: nucleus sampling, and the cleanest evidence for why likelihood-maximizing decoding fails on open-ended text (Tab. 1, Figs. 4 and 5).</span></li>
-    <li><a href="https://arxiv.org/abs/2407.01082">Nguyen et al. (2024). Turning Up the Heat: Min-p Sampling.</a> and <a href="https://arxiv.org/abs/2506.13681">Schaeffer et al. (2025). Min-p, Max Exaggeration.</a> <span class="why">Why read it: the method, and an independent critique of its evidence. Read both to practice judging a sampling claim.</span></li>
+    <li><a href="https://arxiv.org/abs/1904.09751">Holtzman et al. (2019). The Curious Case of Neural Text Degeneration.</a> <span class="why">Why read it: nucleus sampling, and the cleanest evidence that likelihood-maximizing decoding fails on open-ended text (Tab. 1, Figs. 4 and 5).</span></li>
+    <li><a href="https://arxiv.org/abs/2407.01082">Nguyen et al. (2024). Turning Up the Heat: Min-p Sampling</a> and <a href="https://arxiv.org/abs/2506.13681">Schaeffer et al. (2025). Min-p, Max Exaggeration.</a> <span class="why">Why read it: a method and an independent critique of its evidence. Read both to practice judging a sampling claim.</span></li>
     <li><a href="https://arxiv.org/abs/1909.05858">Keskar et al. (2019). CTRL.</a> <span class="why">Why read it: §4.1 defines the repetition penalty that Hugging Face still implements.</span></li>
     <li><a href="https://arxiv.org/abs/1911.02150">Shazeer (2019). Fast Transformer Decoding: One Write-Head is All You Need.</a> <span class="why">Why read it: §2.4 is the memory-to-arithmetic analysis of incremental decoding, worth reproducing by hand.</span></li>
-    <li><a href="https://arxiv.org/abs/2211.05102">Pope et al. (2022). Efficiently Scaling Transformer Inference.</a> <span class="why">Why read it: the prefill and decode cost model, the memory-time terms, and latency versus cost on PaLM.</span></li>
+    <li><a href="https://arxiv.org/abs/2211.05102">Pope et al. (2022). Efficiently Scaling Transformer Inference.</a> <span class="why">Why read it: the prefill and decode cost model and latency versus cost on PaLM.</span></li>
     <li><a href="https://arxiv.org/abs/2309.06180">Kwon et al. (2023). Efficient Memory Management for LLM Serving with PagedAttention.</a> <span class="why">Why read it: quantifies KV-cache waste (§3, Fig. 2) and the block-table design that removes it.</span></li>
-    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al. (2022). Orca.</a> and <a href="https://arxiv.org/abs/2312.07104">Zheng et al. (2023). SGLang.</a> <span class="why">Why read it: iteration-level scheduling (continuous batching) and RadixAttention prefix caching.</span></li>
-    <li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al. (2022). Fast Inference from Transformers via Speculative Decoding.</a> and <a href="https://arxiv.org/abs/2302.01318">Chen et al. (2023). Accelerating LLM Decoding with Speculative Sampling.</a> <span class="why">Why read it: the accept and resample rule with its proof (Leviathan App. A.1, Chen Thm. 1) and the speedup analysis.</span></li>
+    <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al. (2022). Orca</a> and <a href="https://arxiv.org/abs/2312.07104">Zheng et al. (2023). SGLang.</a> <span class="why">Why read it: iteration-level scheduling (continuous batching) and RadixAttention prefix caching.</span></li>
+    <li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al. (2022). Fast Inference from Transformers via Speculative Decoding</a> and <a href="https://arxiv.org/abs/2302.01318">Chen et al. (2023). Accelerating LLM Decoding with Speculative Sampling.</a> <span class="why">Why read it: the accept and resample rule with its proof (Leviathan App. A.1, Chen Thm. 1) and the speedup analysis.</span></li>
     <li><a href="https://arxiv.org/abs/1908.10090">Stahlberg and Byrne (2019). On NMT Search Errors and Model Errors: Cat Got Your Tongue?</a> with <a href="https://arxiv.org/abs/1706.03872">Koehn and Knowles (2017)</a>. <span class="why">Why read it: the beam search curse, explained by exact search returning the empty output.</span></li>
-    <li><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">He and Thinking Machines Lab (2025). Defeating Nondeterminism in LLM Inference.</a> <span class="why">Why read it: the best current explanation of why temperature 0 is not deterministic, and what batch invariance costs.</span></li>
+    <li><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">He and Thinking Machines Lab (2025). Defeating Nondeterminism in LLM Inference.</a> <span class="why">Why read it: the clearest current account of why temperature 0 is not deterministic, and what batch invariance costs.</span></li>
   </ol>
 </section>
 
@@ -840,18 +840,18 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <h2>Cheat sheet</h2>
   <div class="cheatsheet">
     <ul>
-      <li>Loop: prefill (\(P\) tokens, parallel, fills the cache) then decode (1 token per step). \(n\) new tokens need \(n\) forward passes.</li>
+      <li>Loop: prefill (\(P\) tokens in parallel, fills the cache), then decode (1 token per step). \(n\) new tokens need \(n\) forward passes.</li>
       <li>Temperature: \(p_i \propto \exp(z_i/\tau) \propto p_i^{1/\tau}\). \(\tau \to 0\): greedy. \(\tau \to \infty\): uniform. \(\tau = 0\) means greedy in APIs.</li>
       <li>Top-k: keep \(k\) largest. Top-p: smallest set with mass \(\ge p\) (0.9 to 0.95). Min-p: keep \(p_i \ge p_{\text{base}}\,p_{\max}\) (0.05 to 0.1). All renormalize. Order matters: Hugging Face is temperature, top-k, top-p, min-p; llama.cpp puts temperature last; unset Hugging Face top-k defaults to 50.</li>
-      <li>Greedy on GPT-2 Large: 73.66% looped, perplexity 1.50 (human 12.38). Nucleus 0.95: 0.36% looped, perplexity 13.13.</li>
-      <li>Penalties: repetition (divide positive, multiply negative logits, \(\theta \approx 1.2\)); frequency \(-\alpha_f c_j\); presence \(-\alpha_p \mathbf{1}[c_j>0]\). They hurt code and structured output.</li>
-      <li>Beam search: keep \(b\) best cumulative log-probs; normalize by \(lp = (5+|Y|)^\alpha/6^\alpha\). Good for translation. Bland, looping and cursed at large \(b\) for open-ended text.</li>
-      <li>Temperature 0 is not deterministic on GPUs: non-associative floats, shape-dependent reductions, batch variance, argmax flips, divergence.</li>
-      <li>KV cache is exact (causal). Bytes per token \(= 2 L n_{kv} d_h b\): Llama-3-8B 128 KiB, so 4 GiB at 32K, 16 GiB at 128K. Store K after RoPE. Preallocate, do not concatenate.</li>
-      <li>Weight matmul intensity \(\approx m\) tokens per read. H100 ridge \(= 989.5/3.35 \approx 295\) FLOPs/byte. Decode at \(B=1\): about 1.</li>
-      <li>Llama-3-8B on H100: weights 16.06 GB, so 4.79 ms and about 208 tokens/s at \(B=1\) (about 202 with a 4K cache). Prefill 2,048 tokens: \(2NT = 3.29\times10^{13}\) FLOPs, 33 ms at peak, 66 ms at 50% MFU.</li>
-      <li>Batching: \(t_{\text{step}} \approx (W + B\bar S\kappa)/\text{BW}\). At 4K: \(B = 32\) gives 3,225 tokens/s at 101 per user. Ceiling \(\text{BW}/(\bar S\kappa) = 6{,}240\) tokens/s. Large-batch intensity \(= 4 + 2N_{\text{mm}}/(\kappa\bar S)\), memory-bound above about 390 tokens.</li>
-      <li>TTFT (queue + prefill), TPOT \(= (\text{e2e} - \text{TTFT})/(n-1)\). Serving: continuous batching (per-iteration scheduling), PagedAttention (16-token blocks), prefix caching (radix tree), speculative decoding (accept \(\min(1,p/q)\), resample \(\text{norm}(\max(0,p-q))\)).</li>
+      <li>GPT-2 Large: greedy 73.66% looped, perplexity 1.50 (human 12.38). Nucleus 0.95: 0.36% looped, perplexity 13.13.</li>
+      <li>Penalties: repetition (divide positive, multiply negative logits, \(\theta \approx 1.2\)); frequency \(-\alpha_f c_j\); presence \(-\alpha_p \mathbf{1}[c_j \gt 0]\). They hurt code and structured output.</li>
+      <li>Beam search: keep the \(b\) best cumulative log-probs; normalize by \((5+|Y|)^\alpha/6^\alpha\). Good for translation; bland, looping and cursed at large \(b\) for open-ended text.</li>
+      <li>Temperature 0 is not deterministic on GPUs: non-associative floats, shape-dependent reductions, batch variance, argmax flips.</li>
+      <li>The KV cache is exact (causal). Bytes per token \(= 2 L n_{kv} d_h b\): Llama-3-8B 128 KiB, so 4 GiB at 32K and 16 GiB at 128K. Store K after RoPE. Preallocate, do not concatenate.</li>
+      <li>Weight-matmul intensity \(\approx m\) tokens per read. H100 ridge \(= 989.5/3.35 \approx 295\) FLOPs/byte. Decode at \(B = 1\): about 1.</li>
+      <li>Llama-3-8B on H100: weights 16.06 GB, so 4.79 ms and about 208 tokens/s at \(B = 1\) (202 with a 4K cache). Prefill of 2,048 tokens: \(2NT = 3.29\times10^{13}\) FLOPs, 33 ms at peak, 66 ms at 50% MFU.</li>
+      <li>Batching: \(t_{\text{step}} \approx (W + B\bar S\kappa)/\text{BW}\). At 4K, \(B = 32\) gives 3,225 tokens/s at 101 per user. Ceiling \(\text{BW}/(\bar S\kappa) = 6{,}240\) tokens/s. Memory-bound at any batch above about 390 tokens of context.</li>
+      <li>TTFT = queue + prefill. TPOT \(= (\text{e2e} - \text{TTFT})/(n-1)\). Serving: continuous batching, PagedAttention (16-token blocks), prefix caching, speculative decoding (accept \(\min(1,p/q)\), resample \(\text{norm}(\max(0,p-q))\)).</li>
     </ul>
   </div>
 </section>

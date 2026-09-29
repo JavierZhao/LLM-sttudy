@@ -45,9 +45,11 @@ def lm_cross_entropy(logits: Tensor, labels: Tensor, ignore_index: int = IGNORE_
         A 0-dim tensor: sum of -log softmax(logits)[label] over positions whose label is not
         ``ignore_index``, divided by the number of such positions. The result must support
         ``backward()``. If every label is ignored, return a 0-dim zero tensor (still
-        connected to ``logits`` so that ``backward()`` works and gives zero gradients).
+        connected to ``logits`` so that ``backward()`` works and gives zero gradients). The
+        result has the dtype of ``logits``.
     Constraints:
-        Do not call ``F.cross_entropy``, ``F.nll_loss``, ``F.log_softmax`` or ``torch.log_softmax``.
+        Do not use ``F.cross_entropy``, ``F.nll_loss``, ``F.log_softmax``, ``Tensor.log_softmax``
+        or ``torch.logsumexp`` (a test scans the module source for these names).
         Write the log-softmax yourself so that it is numerically stable for logits of magnitude
         1e4 (no overflow in exp, no underflow to log(0)).
     """

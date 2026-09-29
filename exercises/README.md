@@ -24,6 +24,7 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 
 | Page | Drill | File |
 |---|---|---|
+| 01 | Language-modeling loss and metrics (hand-written log-softmax, perplexity, bits per byte) | `drills/lm_loss.py` |
 | 03 | Attention from scratch: stable softmax, end-aligned causal mask, SDPA, multi-head attention | `drills/attention.py` |
 | 07 | GQA with a KV cache; MHA→GQA mean-pool conversion | `drills/gqa.py` |
 | 07 | MLA: decompressed forward and absorbed decode; KV bytes per token | `drills/mla.py` |

@@ -157,6 +157,11 @@ This is interview prep: a confidently wrong fact is worse than no fact.
 - Prefer primary sources: papers, official tech reports, official model cards or
   config.json, official blogs for models without papers. Secondary blogs are only for
   "further reading".
+- Releases after many models' training data that the coordinator has confirmed exist (use
+  them where relevant, and still verify any detail you cite): Gemma 4 technical report
+  (arXiv 2607.02770, 2026), DiffusionGemma (2608.00146, Jul 2026; diffusion LM fine-tuned from
+  Gemma 4 26B A4B), LLaDA 2.0 (2512.15745), FlashAttention-4 (Zadouri et al., MLSys 2026),
+  EAGLE-3, Gemma 4 multi-token-prediction drafters (Google blog, 2026). Search for others.
 - Today is late September 2026. For fast-moving topics (latest model releases, newest RL
   variants), search for developments after your training data and say "as of <month
   year>". Do not present a model as the latest without checking.

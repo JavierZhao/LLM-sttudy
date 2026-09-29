@@ -67,9 +67,9 @@ VI (26–33) → VII (34–37).
 | I | 01–06 | done: written, fact-checked, audited (RoPE, memory math) |
 | 2 | 08–15 | done: written, fact-checked; 09, 13, 15 audited by coordinator |
 | 3 | 16–21 | done: written, fact-checked; 21 (DPO) audited by coordinator |
-| 4 | 22–25 | 22, 23, 25 done (22 audited); 24 in fact-check |
-| 5 | 26–28 | drafts done; fact-checks running |
-| 6 | 29, 30, 34 | writers running |
+| 4 | 22–25 | done: written, fact-checked; 22 (PPO) and 24 (GRPO) audited by coordinator |
+| 5 | 26–28 | done: written, fact-checked; 28 extended to V4.1-Flash (Sep 2026) |
+| 6 | 29, 30, 34 | 34 in fact-check; 29, 30 being written |
 | VI/VII | 31–33, 35–37 | briefs ready |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),

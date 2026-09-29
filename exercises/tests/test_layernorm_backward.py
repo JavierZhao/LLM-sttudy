@@ -226,6 +226,10 @@ def test_low_precision_uses_float32_statistics(impl):
     assert (dg - gr.grad).abs().max() < 1e-3 * gr.grad.abs().max()
     assert (db - br.grad).abs().max() < 1e-3 * br.grad.abs().max()
     assert (dx.float() - xr.grad).abs().max() < 2e-2 * xr.grad.abs().max()
+    gb, bb = g.to(torch.bfloat16), b.to(torch.bfloat16)   # bf16 parameters: dg and db come back in g.dtype
+    _, cache_b = impl.layernorm_forward(x, gb, bb, 1e-5)
+    _, dg_b, db_b = impl.layernorm_backward(dy, cache_b)
+    assert dg_b.dtype == torch.bfloat16 and db_b.dtype == torch.bfloat16
     yr, cache = impl.rmsnorm_forward(x, g, 1e-6)
     assert yr.dtype == torch.bfloat16
     assert (yr.float() - _rms_ref(x.float(), g, 1e-6)).abs().max() < 5e-2 * yr.float().abs().max()

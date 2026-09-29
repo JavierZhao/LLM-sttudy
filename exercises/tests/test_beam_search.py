@@ -115,6 +115,19 @@ def test_greedy_is_not_optimal_but_beam_two_is(impl):
     assert best[0] == [B, EOS] and best[1] > greedy[0][1]
 
 
+def test_low_ranked_eos_extensions_are_still_recorded(impl):
+    # Every live hypothesis's EOS extension is a finished hypothesis, whatever its rank among the
+    # candidates. Here (ids: 0 BOS, 1 a, 2 EOS) "a" always beats EOS as the next token, so with beam 1
+    # the EOS extension is never in the top 1, yet the empty output [EOS] (log .4 = -0.92) beats every
+    # other finished hypothesis: aEOS -1.43, aaEOS -1.94 and the truncated aaa -1.53 (and also at alpha 1).
+    fn = table_model([[0, .6, .4], [0, .6, .4], [0, .6, .4]])
+    for alpha in (0.0, 1.0):
+        res = impl.beam_search(fn, 0, 2, beam=1, max_len=3, length_penalty=alpha)
+        assert [t for t, _ in res] == [[2]]
+        assert res[0][1] == pytest.approx(math.log(.4))
+        assert_same(res, impl.exhaustive_search(fn, 0, 2, 3, alpha, top_n=1))
+
+
 def test_first_step_eos_is_the_empty_hypothesis(impl):
     fn = table_model(TOY)
     res = impl.beam_search(fn, BOS, EOS, beam=8, max_len=3, length_penalty=0.0)

@@ -71,7 +71,6 @@ VI (26–33) → VII (34–37).
 | 5 | 26–28 | drafts done; fact-checks running |
 | 6 | 29, 30, 34 | writers running |
 | VI/VII | 31–33, 35–37 | briefs ready |
-| VII | 34–37 | briefs ready |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),
 02 (4 errors: digit grouping, Unigram unk, vocab-extension count, byte-level claim),

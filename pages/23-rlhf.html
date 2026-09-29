@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · RLHF in practice · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="23" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part V · Reinforcement learning · Page 23</div>
+  <h1>RLHF in practice</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~50 min</span>
+    <span>Prereqs: <a href="21-preference-optimization.html">21 Reward models &amp; DPO</a>, <a href="22-rl-foundations.html">22 Policy gradient to PPO</a></span>
+  </div>
+  <p class="lede">RLHF is the pipeline that turned pretrained language models into assistants: fit a reward model to human comparisons, then optimize the model against it on a KL leash. This page covers the recipe as it was actually run (InstructGPT, Anthropic's HH work, Llama 2), the engineering that keeps the loop stable, how it fails, and the shift since 2023 toward AI feedback, process supervision and rubric-based generative rewards.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The pipeline, end to end:</strong> SFT, reward model, PPO with a per-token KL penalty, the role of each of the four models, and the numbers that make it concrete (dataset sizes, 6B reward model, 1.3B beating 175B).</li>
+    <li><strong>The KL penalty:</strong> what it protects against, what happens when \(\beta\) is too small or too large, why it is applied per token, and how a controller adapts it.</li>
+    <li><strong>Engineering realities:</strong> memory for policy, reference, reward model and value model; why generation dominates wall-clock; whitening, value initialization from the reward model, EOS handling.</li>
+    <li><strong>Failure modes:</strong> three concrete forms of reward hacking with mitigations, over-optimization, diversity loss, and how noisy the labels really are.</li>
+    <li><strong>What replaced it:</strong> why labs moved to rejection sampling, DPO and verifiable rewards, what Constitutional AI and RLAIF change, and when process rewards or rubric-based judges beat a scalar reward model.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Describe the three InstructGPT stages with their data and model sizes, write the PPO-ptx objective, and explain the alignment tax and how the pretraining mix reduces it.</li>
+    <li>Compute the per-token reward vector of a response (KL penalty on every token, reward-model score on the last) and the memory footprint of the four RLHF models for a 7B policy.</li>
+    <li>Implement the numerical core of the loop: shaped rewards, whitening, the EOS penalty and the adaptive KL controller.</li>
+    <li>Explain Llama 2's two reward models with a margin loss, its rejection-sampling plus PPO schedule, and why Llama 3 dropped PPO.</li>
+    <li>Name reward-hacking modes with evidence and mitigations (length, sycophancy, hedging, style, persuasion), and separate them from over-optimization and mode collapse.</li>
+    <li>Explain Constitutional AI and RLAIF, and say what the RLAIF-versus-RLHF evidence does and does not show.</li>
+    <li>Compare outcome and process supervision (PRM800K, Math-Shepherd), explain why DeepSeek-R1 dropped process reward models, and describe rubric-based generative rewards.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="instructgpt">The InstructGPT pipeline</h2>
+
+  <p>A pretrained model continues text, it does not try to be helpful. Supervised fine-tuning (<a href="19-sft-distillation.html">page 19</a>) narrows the gap by imitating demonstrations, but demonstrations are expensive, and imitation cannot express "this answer is better than that one", a judgment people make quickly and fairly consistently. <strong>Reinforcement learning from human feedback</strong> (RLHF) <span class="zh">基于人类反馈的强化学习</span> turns such comparisons into a training signal. The idea comes from Christiano et al. 2017 (control tasks), reached language models with <a href="https://arxiv.org/abs/1909.08593">Ziegler et al. 2019</a> and <a href="https://arxiv.org/abs/2009.01325">Stiennon et al. 2020</a> (summarization), and general instruction following with InstructGPT <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022]</a>. The recipe has three stages, all starting from a GPT-3 model of 1.3B, 6B or 175B parameters (Figure 1).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 326" role="img" aria-labelledby="fig-23-1-title">
+<title id="fig-23-1-title">The three-step InstructGPT pipeline: supervised fine-tuning, reward model training on ranked responses, and PPO with a per-token KL penalty and a pretraining mix</title>
+<defs><marker id="arrow-23-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="120" y="20" text-anchor="middle" class="s-big">1  SFT</text>
+<text x="360" y="20" text-anchor="middle" class="s-big">2  Reward model</text>
+<text x="600" y="20" text-anchor="middle" class="s-big">3  PPO-ptx</text>
+<rect class="s-b" x="10" y="34" width="220" height="58" rx="6"/>
+<text x="120" y="55" text-anchor="middle" class="s-bold">Labeler demonstrations</text>
+<text x="120" y="72" text-anchor="middle" class="s-small">~13k prompts (API + written)</text>
+<text x="120" y="85" text-anchor="middle" class="s-small s-muted">written by ~40 contractors</text>
+<rect class="s-a" x="10" y="122" width="220" height="58" rx="6"/>
+<text x="120" y="143" text-anchor="middle" class="s-bold">GPT-3 (1.3B, 6B, 175B)</text>
+<text x="120" y="160" text-anchor="middle" class="s-small">cross-entropy on the demonstrations</text>
+<text x="120" y="173" text-anchor="middle" class="s-small s-muted">16 epochs, dropout 0.2</text>
+<rect class="s-c" x="10" y="210" width="220" height="46" rx="6"/>
+<text x="120" y="230" text-anchor="middle" class="s-bold">SFT model</text>
+<text x="120" y="246" text-anchor="middle" class="s-small s-muted">also the reference for the KL term</text>
+<rect class="s-b" x="250" y="34" width="220" height="58" rx="6"/>
+<text x="360" y="55" text-anchor="middle" class="s-bold">Ranked samples</text>
+<text x="360" y="72" text-anchor="middle" class="s-small">~33k prompts, K = 4 to 9 responses</text>
+<text x="360" y="85" text-anchor="middle" class="s-small s-muted">all C(K,2) pairs = one batch element</text>
+<rect class="s-a" x="250" y="122" width="220" height="58" rx="6"/>
+<text x="360" y="143" text-anchor="middle" class="s-bold">6B model + scalar head</text>
+<text x="360" y="160" text-anchor="middle" class="s-small">−log σ(r(y_w) − r(y_l)), 1 epoch</text>
+<text x="360" y="173" text-anchor="middle" class="s-small s-muted">bias set so demos score 0 on average</text>
+<rect class="s-c" x="250" y="210" width="220" height="46" rx="6"/>
+<text x="360" y="230" text-anchor="middle" class="s-bold">Reward model r(x, y)</text>
+<text x="360" y="246" text-anchor="middle" class="s-small s-muted">also initializes the value function</text>
+<rect class="s-b" x="490" y="34" width="220" height="58" rx="6"/>
+<text x="600" y="55" text-anchor="middle" class="s-bold">Prompts only</text>
+<text x="600" y="72" text-anchor="middle" class="s-small">~31k API prompts, no labels</text>
+<text x="600" y="85" text-anchor="middle" class="s-small s-muted">+ pretraining text, 8× the episodes</text>
+<rect class="s-a" x="490" y="122" width="220" height="58" rx="6"/>
+<text x="600" y="143" text-anchor="middle" class="s-bold">Policy: PPO, 256k episodes</text>
+<text x="600" y="160" text-anchor="middle" class="s-small">reward = r − β log(π / π_SFT) + γ ptx</text>
+<text x="600" y="173" text-anchor="middle" class="s-small s-muted">β = 0.02, γ = 27.8, clip 0.2</text>
+<rect class="s-c" x="490" y="210" width="220" height="46" rx="6"/>
+<text x="600" y="230" text-anchor="middle" class="s-bold">InstructGPT (PPO-ptx)</text>
+<text x="600" y="246" text-anchor="middle" class="s-small s-muted">the 1.3B model beats 175B GPT-3</text>
+<path class="s-line" d="M120,92 L120,122" marker-end="url(#arrow-23-1)"/>
+<path class="s-line" d="M120,180 L120,210" marker-end="url(#arrow-23-1)"/>
+<path class="s-line" d="M360,92 L360,122" marker-end="url(#arrow-23-1)"/>
+<path class="s-line" d="M360,180 L360,210" marker-end="url(#arrow-23-1)"/>
+<path class="s-line" d="M600,92 L600,122" marker-end="url(#arrow-23-1)"/>
+<path class="s-line" d="M600,180 L600,210" marker-end="url(#arrow-23-1)"/>
+<path class="s-line s-dash" d="M230,151 L250,151" marker-end="url(#arrow-23-1)"/>
+<path class="s-line s-dash" d="M470,233 L490,233" marker-end="url(#arrow-23-1)"/>
+<path class="s-line s-dash" d="M120,256 L120,286 L560,286 L560,256" marker-end="url(#arrow-23-1)"/>
+<text x="340" y="304" text-anchor="middle" class="s-small">SFT weights initialize the policy and the reward model, and a frozen SFT copy is the KL reference.</text>
+<text x="340" y="319" text-anchor="middle" class="s-small">The reward model initializes the value function.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> The InstructGPT recipe with the paper's data sizes. Solid arrows are the data flow inside each step, dashed arrows show which artifact feeds the next step. Notice that step 3 needs no human labels at all (only prompts) and that the reward model is much smaller (6B) than the largest policy (175B).</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>SFT.</strong> About 40 contractors write demonstrations. The model trains for 16 epochs: validation loss overfits after one, but reward-model score and human preference keep improving, so the checkpoint is chosen by reward-model score <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.5]</a>.</li>
+    <li><strong>Reward model</strong> <span class="zh">奖励模型</span>. Remove the SFT model's unembedding layer, add a scalar head, train on rankings. Only a 6B reward model is used for all policy sizes: a 175B one trained unstably and, as the initialization of the value function, would have made PPO very expensive <a href="https://arxiv.org/abs/2203.02155">[App. C.2]</a>.</li>
+    <li><strong>PPO</strong> (<a href="22-rl-foundations.html">page 22</a>) against the reward model, with a KL penalty toward the SFT model and, in the final "PPO-ptx" variant, pretraining gradients mixed in.</li>
+  </ol>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Stage</th><th class="num">Training prompts</th><th>Labels</th><th>Models</th><th>Key hyperparameters</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td class="num">12,725 (11,295 labeler + 1,430 API)</td><td>demonstrations</td><td>1.3B, 6B, 175B</td><td>16 epochs, dropout 0.2, LR 9.65e-6 (175B: 5.03e-6)</td></tr>
+      <tr><td>Reward model</td><td class="num">33,207 (6,623 + 26,584)</td><td>rankings of K = 4 to 9</td><td>6B only</td><td>1 epoch, LR 9e-6, 64 prompts per batch (up to 2,304 pairs)</td></tr>
+      <tr><td>PPO</td><td class="num">31,144 (API only)</td><td>none</td><td>1.3B, 6B, 175B policy; 6B value</td><td>256k episodes, batch 512 in 8 minibatches, one inner epoch</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: Ouyang et al. 2022, App. A.3 Table 6 and App. C. The main text rounds the prompt counts to 13k, 33k and 31k.</p>
+
+  <h3 id="rm-loss">The reward-model loss and the K-way trick</h3>
+  <p>Labelers rank \(K\) responses to one prompt, which yields \(\binom{K}{2}\) preference pairs. The loss is the Bradley-Terry pairwise loss from <a href="21-preference-optimization.html#rm-training">page 21</a>, averaged over those pairs:</p>
+  \[ \mathcal{L}(\theta) = -\frac{1}{\binom{K}{2}}\, \E_{(x,\,y_w,\,y_l)}\Big[\log \sigma\big(r_\theta(x,y_w) - r_\theta(x,y_l)\big)\Big] \]
+  <p>The engineering point is the batching. Comparisons from one prompt are strongly correlated, and shuffling all pairs into one dataset overfit after a single pass, so InstructGPT feeds <em>all</em> \(\binom{K}{2}\) pairs of a prompt as one batch element. That is also cheaper: for \(K = 9\), nine forward passes produce 36 comparisons <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>. Because the loss sees only score differences, a bias is added after training so that labeler demonstrations score 0 on average before RL.</p>
+
+  <h3 id="ppo-ptx">The RL objective and the pretraining mix</h3>
+  <p>The RL environment is a <em>bandit</em>: a random prompt arrives, the policy writes a response, the reward model scores it, the episode ends. A KL penalty toward the SFT model is added <em>at every token</em>, and the value function is initialized from the reward model <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>:</p>
+  <div class="eq-box">
+  \[ \text{objective}(\phi) = \E_{(x,y)\sim \pi^{\text{RL}}_\phi}\Big[ r_\theta(x,y) - \beta \log \frac{\pi^{\text{RL}}_\phi(y \mid x)}{\pi^{\text{SFT}}(y \mid x)} \Big] + \gamma\, \E_{x \sim D_{\text{pretrain}}}\big[\log \pi^{\text{RL}}_\phi(x)\big] \]
+  <div class="eq-label">InstructGPT Eq. 2. Final runs: \(\beta = 0.02\), \(\gamma = 27.8\). Setting \(\gamma = 0\) gives plain "PPO".</div>
+  </div>
+  <p>The first term is the KL-regularized objective of page 21. The second is the <strong>pretraining mix</strong>: for every RL episode, 8 pretraining examples are drawn and their log-likelihood gradient, scaled by \(\gamma\), is added <a href="https://arxiv.org/abs/2203.02155">[App. C.4]</a>. Each 512-response batch is split into 8 minibatches of 64 and used for one inner epoch (PPO clip 0.2, temperature 1 at rollout, no discounting in GAE).</p>
+
+  <div class="decision">
+    <div class="decision-title">Mixing pretraining gradients into PPO (PPO-ptx)</div>
+    <dl>
+      <dt>Problem</dt><dd>Plain PPO against the reward model lowers accuracy on public NLP benchmarks (SQuAD v2, DROP, HellaSwag, WMT15 Fr→En). This is the <strong>alignment tax</strong> <span class="zh">对齐税</span>: alignment costs capability.</dd>
+      <dt>Idea</dt><dd>Add \(\gamma\, \E_{x\sim D_{\text{pretrain}}}[\log\pi(x)]\) to the RL objective, computed on the same minibatches.</dd>
+      <dt>Why it works</dt><dd>The KL term only measures how far the policy moves on <em>RL prompts and responses</em>. Benchmark-style inputs live elsewhere, so nothing in the KL term protects them. The pretraining term anchors likelihood on the whole pretraining distribution. This is our reading of the authors' conclusion that the pretraining distribution is critical for fixing the regressions.</dd>
+      <dt>Evidence</dt><dd>PPO-ptx recovers most regressions and beats GPT-3 on HellaSwag without lowering labeler preference, while still lagging on DROP, SQuAD v2 and translation. Raising \(\beta\) to 2.0 (100× the default) never fixed DROP or SQuAD and cost a lot of reward. A pretraining coefficient of at least 20 recovers them for the 1.3B model <a href="https://arxiv.org/abs/2203.02155">[§4.2, App. E.6]</a>.</dd>
+      <dt>Cost</dt><dd>An extra forward and backward pass over 8× as many pretraining examples as RL episodes, and one more coefficient to tune. It is not a full cure: on the 1.3B model, training twice as long (512k episodes) pushed DROP and SQuAD v2 slightly below the GPT-3 baseline again.</dd>
+      <dt>Used by</dt><dd>InstructGPT. Kimi K2's RL keeps the idea as an auxiliary "PTX loss" on hand-picked high-quality data <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §3.2.3]</a>.</dd>
+    </dl>
+  </div>
+
+  <h3 id="instructgpt-results">What the headline result means</h3>
+  <p>On the paper's API prompt distribution, labelers prefer the <strong>1.3B</strong> PPO-ptx model to the <strong>175B</strong> GPT-3, which has 100× more parameters. The 175B InstructGPT beats 175B GPT-3 in 85 ± 3% of comparisons and few-shot-prompted GPT-3 in 71 ± 4%. Closed-domain hallucination drops from 41% to 21%, and TruthfulQA true-and-informative answers roughly double <a href="https://arxiv.org/abs/2203.02155">[§1, §4.1]</a>. The stage is cheap: 4.9 petaflops/s-days for the 175B SFT model and 60 for PPO-ptx, against 3,640 for GPT-3, so \((4.9 + 60)/3640 \approx 1.8\%\) of pretraining compute <a href="https://arxiv.org/abs/2203.02155">[§5.1]</a>.</p>
+  <p>Read "better" precisely: better according to about 40 contractors who agree with each other 72.6 ± 1.5% of the time (77.3 ± 1.3% for held-out labelers) <a href="https://arxiv.org/abs/2203.02155">[§3.4]</a>, on prompts sent to the API. The authors say the model is aligned to the preferences of a specific group, not to human values in general. Precursors show the same shape at small scale: on Reddit TL;DR, a 1.3B model trained with human feedback beat a supervised model ten times its size, 61% versus 43% against reference summaries <a href="https://arxiv.org/abs/2009.01325">[Stiennon et al. 2020, §4.1]</a>.</p>
+</section>
+
+<section>
+  <h2 id="engineering">Engineering the PPO loop</h2>
+
+  <h3 id="four-models">Four models, one loop</h3>
+  <p>PPO-based RLHF keeps four networks alive at once <a href="https://arxiv.org/abs/2409.19256">[Sheng et al. 2024, §2.1]</a>. Each iteration has three stages: <em>generation</em> (the policy samples responses), <em>preparation</em> (reference, reward and value models each do one forward pass over prompt plus response) and <em>learning</em> (policy and value model are updated with Adam). Figure 2 shows the flow.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 366" role="img" aria-labelledby="fig-23-2-title">
+<title id="fig-23-2-title">One iteration of the PPO-RLHF loop: the policy generates responses, the reference, reward and value models score them, per-token rewards and advantages are computed, and PPO updates the policy and the value model</title>
+<defs><marker id="arrow-23-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="100" y="16" text-anchor="middle" class="s-bold">1  Rollout</text>
+<text x="278" y="16" text-anchor="middle" class="s-bold">2  Score</text>
+<text x="455" y="16" text-anchor="middle" class="s-bold">3  Advantages</text>
+<text x="636" y="16" text-anchor="middle" class="s-bold">4  Update</text>
+<rect class="s-plain" x="30" y="30" width="140" height="44" rx="6"/>
+<text x="100" y="50" text-anchor="middle" class="s-bold">Prompts x</text>
+<text x="100" y="66" text-anchor="middle" class="s-small s-muted">a batch of 512</text>
+<rect class="s-a" x="30" y="100" width="140" height="78" rx="6"/>
+<text x="100" y="121" text-anchor="middle" class="s-bold">Policy π<tspan baseline-shift="sub" font-size="9">θ</tspan></text>
+<text x="100" y="138" text-anchor="middle" class="s-small">trained: weights, grads,</text>
+<text x="100" y="151" text-anchor="middle" class="s-small">Adam states</text>
+<text x="100" y="167" text-anchor="middle" class="s-small s-muted">samples y (KV cache)</text>
+<rect class="s-d" x="30" y="204" width="140" height="56" rx="6"/>
+<text x="100" y="225" text-anchor="middle" class="s-bold">y = (y<tspan baseline-shift="sub" font-size="9">1</tspan> … y<tspan baseline-shift="sub" font-size="9">T</tspan>)</text>
+<text x="100" y="242" text-anchor="middle" class="s-small">log π<tspan baseline-shift="sub" font-size="8">θ</tspan>(y<tspan baseline-shift="sub" font-size="8">t</tspan>) recorded</text>
+<text x="100" y="254" text-anchor="middle" class="s-small s-muted">(the "old" log-probs)</text>
+<rect class="s-b" x="205" y="30" width="146" height="58" rx="6"/>
+<text x="278" y="51" text-anchor="middle" class="s-bold">Reference π<tspan baseline-shift="sub" font-size="9">ref</tspan></text>
+<text x="278" y="67" text-anchor="middle" class="s-small">frozen SFT copy</text>
+<text x="278" y="80" text-anchor="middle" class="s-small s-muted">log π<tspan baseline-shift="sub" font-size="8">ref</tspan>(y<tspan baseline-shift="sub" font-size="8">t</tspan>)</text>
+<rect class="s-b" x="205" y="104" width="146" height="58" rx="6"/>
+<text x="278" y="125" text-anchor="middle" class="s-bold">Reward model r<tspan baseline-shift="sub" font-size="9">φ</tspan></text>
+<text x="278" y="141" text-anchor="middle" class="s-small">frozen, read at EOS</text>
+<text x="278" y="154" text-anchor="middle" class="s-small s-muted">one scalar per response</text>
+<rect class="s-a" x="205" y="178" width="146" height="58" rx="6"/>
+<text x="278" y="199" text-anchor="middle" class="s-bold">Value V<tspan baseline-shift="sub" font-size="9">ψ</tspan></text>
+<text x="278" y="215" text-anchor="middle" class="s-small">init from RM, trained</text>
+<text x="278" y="228" text-anchor="middle" class="s-small s-muted">V(s<tspan baseline-shift="sub" font-size="8">t</tspan>) at every token</text>
+<rect class="s-d" x="386" y="44" width="140" height="74" rx="6"/>
+<text x="456" y="65" text-anchor="middle" class="s-bold">Token rewards r<tspan baseline-shift="sub" font-size="9">t</tspan></text>
+<text x="456" y="82" text-anchor="middle" class="s-small">−β (log π<tspan baseline-shift="sub" font-size="8">θ</tspan> − log π<tspan baseline-shift="sub" font-size="8">ref</tspan>)</text>
+<text x="456" y="95" text-anchor="middle" class="s-small">+ score on last token</text>
+<text x="456" y="109" text-anchor="middle" class="s-small s-muted">optionally whitened</text>
+<rect class="s-d" x="386" y="150" width="140" height="74" rx="6"/>
+<text x="456" y="171" text-anchor="middle" class="s-bold">Advantages Â<tspan baseline-shift="sub" font-size="9">t</tspan></text>
+<text x="456" y="188" text-anchor="middle" class="s-small">GAE, γ = 1, λ ≈ 0.95</text>
+<text x="456" y="201" text-anchor="middle" class="s-small">from r<tspan baseline-shift="sub" font-size="8">t</tspan> and V(s<tspan baseline-shift="sub" font-size="8">t</tspan>)</text>
+<text x="456" y="215" text-anchor="middle" class="s-small s-muted">whitened over the batch</text>
+<rect class="s-e" x="560" y="44" width="152" height="180" rx="6"/>
+<text x="636" y="68" text-anchor="middle" class="s-bold">PPO update</text>
+<text x="636" y="94" text-anchor="middle" class="s-small">clipped policy loss on π<tspan baseline-shift="sub" font-size="8">θ</tspan></text>
+<text x="636" y="108" text-anchor="middle" class="s-small s-muted">(ε = 0.2)</text>
+<text x="636" y="130" text-anchor="middle" class="s-small">value loss on V<tspan baseline-shift="sub" font-size="8">ψ</tspan></text>
+<text x="636" y="152" text-anchor="middle" class="s-small">(+ γ · pretraining loss)</text>
+<text x="636" y="176" text-anchor="middle" class="s-small s-muted">a few minibatches,</text>
+<text x="636" y="190" text-anchor="middle" class="s-small s-muted">one Adam step each</text>
+<path class="s-line" d="M100,74 L100,100" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M100,178 L100,204" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M170,232 L188,232 L188,59"/>
+<path class="s-line" d="M188,59 L205,59" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M188,133 L205,133" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M188,207 L205,207" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M351,59 L386,59" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M351,133 L368,133 L368,100 L386,100" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M351,207 L386,207" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M456,118 L456,150" marker-end="url(#arrow-23-2)"/>
+<path class="s-line" d="M526,187 L560,187" marker-end="url(#arrow-23-2)"/>
+<path class="s-line s-dash" d="M636,224 L636,292 L14,292 L14,139 L30,139" marker-end="url(#arrow-23-2)"/>
+<text x="325" y="284" text-anchor="middle" class="s-small">new policy and value weights for the next batch; the reference and the reward model never change</text>
+<rect class="s-a" x="20" y="316" width="14" height="12" rx="2"/><text x="40" y="326" class="s-small">trained (params + grads + Adam)</text>
+<rect class="s-b" x="262" y="316" width="14" height="12" rx="2"/><text x="282" y="326" class="s-small">frozen, forward only</text>
+<rect class="s-d" x="442" y="316" width="14" height="12" rx="2"/><text x="462" y="326" class="s-small">computed tensors</text>
+<rect class="s-e" x="592" y="316" width="14" height="12" rx="2"/><text x="612" y="326" class="s-small">optimizer step</text>
+<text x="20" y="352" class="s-small s-muted">Generation is autoregressive and memory-bound, everything else is one dense forward or backward pass.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> One iteration of PPO-RLHF. Blue boxes carry gradients and optimizer states, orange boxes are frozen and only run forward. Notice that three of the four models are consulted <em>after</em> the response exists, so their inputs change every iteration and reference log-probabilities cannot be cached the way they can in DPO.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th>Initialized from</th><th>Trained?</th><th>Computes per batch</th></tr></thead>
+    <tbody>
+      <tr><td>Policy (actor) \(\pi_\theta\)</td><td>SFT model</td><td>yes</td><td>samples responses, \(\log\pi_\theta(y_t)\), receives the PPO loss</td></tr>
+      <tr><td>Reference \(\pi_{\text{ref}}\)</td><td>frozen SFT copy</td><td>no</td><td>\(\log \pi_{\text{ref}}(y_t)\) for the KL penalty</td></tr>
+      <tr><td>Reward model \(r_\phi\)</td><td>SFT or pretrained model, scalar head, trained on comparisons</td><td>no (frozen here)</td><td>one scalar per full response, read at the EOS token</td></tr>
+      <tr><td>Value model (critic) \(V_\psi\)</td><td>the reward model</td><td>yes</td><td>\(V(s_t)\) at every token, for GAE and the value loss</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="memory">Memory: what four models cost</h3>
+  <p>Take a 7B policy and 7B reward, value and reference models. Use the accounting of <a href="15-distributed-training.html">page 15</a>: a trained model costs 16 bytes per parameter (bf16 weights 2, bf16 gradients 2, fp32 master copy 4, Adam moments 4 + 4), a frozen one costs 2 bytes (bf16 weights only).</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Setup</th><th>Models held</th><th class="num">Model states</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><strong>PPO-RLHF</strong></td><td>policy \(7\text{B}\times16\) = 112 GB, critic 112 GB, reference \(7\text{B}\times2\) = 14 GB, reward model 14 GB</td><td class="num"><strong>252 GB</strong> (235 GiB)</td></tr>
+      <tr><td>PPO with a verifier (Tulu 3 RLVR)</td><td>policy, critic, reference (no reward model)</td><td class="num">238 GB</td></tr>
+      <tr><td>GRPO with a verifier (<a href="24-rlvr-reasoning.html">page 24</a>)</td><td>policy, reference</td><td class="num">126 GB</td></tr>
+      <tr><td>DPO (<a href="21-preference-optimization.html">page 21</a>)</td><td>policy, reference (or cached reference log-probs)</td><td class="num">126 GB (112 GB)</td></tr>
+      <tr><td>SFT (for scale)</td><td>policy</td><td class="num">112 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p>So PPO-RLHF holds \(252/112 = 2.25\times\) the state of an SFT run, and \(252/80 = 3.15\) H100s' worth before any activation, KV cache or logit tensor. With ZeRO-3 over 8 GPUs it is 31.5 GB per GPU of states, plus the rollout engine's copy of the policy weights (14 GB in bf16) if it is separate. InstructGPT's small critics look different in this light: for a 175B policy (16 bytes per parameter is our assumption, the paper gives no total) the policy needs \(175\text{B}\times16 = 2.8\) TB, the reference 350 GB, the 6B reward model 12 GB and the 6B critic 96 GB, so the two small models are 3.3% of 3.26 TB <a href="https://arxiv.org/abs/2203.02155">[App. C.2]</a>. Levers: offload the reference and reward model to CPU (Huang et al. for 6.9B <a href="https://arxiv.org/abs/2403.17031">[Detail 8]</a>) or train LoRA adapters (Singhal et al., rank 16 <a href="https://arxiv.org/abs/2310.03716">[§2.1]</a>). DPO can cache reference log-probabilities once because its responses are fixed (Tulu 3 does <a href="https://arxiv.org/abs/2411.15124">[§5.4.2]</a>). PPO cannot: responses are resampled every iteration.</p>
+
+  <h3 id="generation">Generation dominates wall-clock</h3>
+  <p>By FLOPs, generation should be cheap. Per token, generation is one forward pass (\(2N\) FLOPs), the reference, reward and value models one each (\(2N\) each), and policy and critic each need forward plus backward (\(6N\) each): \(2+2+2+2+6+6 = 20N\), so generation is \(2/20 = 10\%\) of the FLOPs for one PPO epoch. But decoding is memory-bandwidth-bound (<a href="06-decoding-kv-cache.html">page 06</a>) and runs at a fraction of a training pass's efficiency. If forward and backward passes reach 40% MFU and decoding 10% (assumptions, not measurements), generation takes \((2/0.10)/(2/0.10 + 18/0.40) = 20/65 = 31\%\) of an iteration, and 47% at 5%. Measured systems report more:</p>
+  <ul>
+    <li><strong>Llama 2:</strong> with FSDP, generation was about 20× slower even with a KV cache, until weights were consolidated onto each node first. A 70B PPO iteration took about 330 s <a href="https://arxiv.org/abs/2307.09288">[§3.2.3]</a>.</li>
+    <li><strong>HybridFlow:</strong> actor generation plus actor training are 58.9% of iteration time. In NeMo-Aligner, whose generation engine has no KV cache, generation alone is up to 81.2%. Moving a 70B actor's 140 GB of weights between training and generation layouts took up to 36.4% of an iteration on separate devices <a href="https://arxiv.org/abs/2409.19256">[§2.3, §8.2]</a>.</li>
+    <li><strong>OpenRLHF:</strong> for long chain-of-thought rollouts, inference is over 90% of runtime <a href="https://arxiv.org/abs/2405.11143">[§1]</a>.</li>
+  </ul>
+  <p>So systems treat rollout as an inference workload: a serving engine with paged KV caches (vLLM), different parallelism for generation (small tensor-parallel, large data-parallel) than for training, weight resharding between them, and asynchronous rollouts. Tulu 3's RL runs took 65 h on 8 GPUs (8B), 60 h on 48 (70B) and 46 h on 256 (405B) <a href="https://arxiv.org/abs/2411.15124">[§6.3]</a>. <a href="25-rl-systems-agentic.html">Page 25</a> covers the systems side.</p>
+
+  <h3 id="reward-vector">The reward vector, worked out</h3>
+  <p>The reward-model score exists only for the complete response, so it is credited to the last token. The KL penalty is spread over all tokens using the log-ratio of the <em>sampled</em> token (the simplest KL estimate, compared with others on <a href="22-rl-foundations.html">page 22</a>):</p>
+  <div class="eq-box">
+  \[ r_t = -\beta\,\Big(\log \pi_\theta(y_t \mid x, y_{&lt;t}) - \log \pi_{\text{ref}}(y_t \mid x, y_{&lt;t})\Big) + \mathbb{1}[t = T]\; r_\phi(x, y) \]
+  <div class="eq-label">The sum over t is \(r_\phi - \beta \log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}\), exactly the sequence-level objective</div>
+  </div>
+  <p>Spreading the penalty makes it dense: each token pays for its own drift, and the value function and GAE can attribute cost to the tokens responsible. A 6-token response with \(\beta = 0.1\) and reward-model score 1.5 (numbers chosen for the example):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>t</th><th class="num">\(\log\pi_\theta(y_t)\)</th><th class="num">\(\log\pi_{\text{ref}}(y_t)\)</th><th class="num">log-ratio</th><th class="num">\(-\beta\times\)ratio</th><th class="num">\(r_t\)</th><th class="num">return-to-go \(G_t\)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="num">−0.9</td><td class="num">−1.1</td><td class="num">+0.2</td><td class="num">−0.02</td><td class="num">−0.02</td><td class="num">1.31</td></tr>
+      <tr><td>2</td><td class="num">−1.4</td><td class="num">−1.2</td><td class="num">−0.2</td><td class="num">+0.02</td><td class="num">+0.02</td><td class="num">1.33</td></tr>
+      <tr><td>3</td><td class="num">−0.3</td><td class="num">−0.9</td><td class="num">+0.6</td><td class="num">−0.06</td><td class="num">−0.06</td><td class="num">1.31</td></tr>
+      <tr><td>4</td><td class="num">−2.1</td><td class="num">−2.0</td><td class="num">−0.1</td><td class="num">+0.01</td><td class="num">+0.01</td><td class="num">1.37</td></tr>
+      <tr><td>5</td><td class="num">−0.6</td><td class="num">−1.3</td><td class="num">+0.7</td><td class="num">−0.07</td><td class="num">−0.07</td><td class="num">1.36</td></tr>
+      <tr class="hl"><td>6 (last)</td><td class="num">−0.2</td><td class="num">−0.9</td><td class="num">+0.7</td><td class="num">−0.07</td><td class="num">−0.07 + 1.5 = <strong>1.43</strong></td><td class="num">1.43</td></tr>
+    </tbody>
+  </table></div>
+  <p>The log-ratios sum to \(1.9\) nats, so the KL penalty totals \(0.1\times1.9 = 0.19\) and the return is \(1.5 - 0.19 = 1.31 = G_1\). Notice that the reward-model score dominates every return-to-go, so KL differences between tokens are small perturbations of a common signal, which is why <a href="#details">whitening advantages</a> matters. If the response had been truncated without EOS, most implementations replace the score with a constant (next section).</p>
+
+  <h3 id="details">Implementation details that matter</h3>
+  <p>Huang et al. rebuilt the Stiennon et al. TL;DR pipeline in the open and listed more than 20 details that decide whether the loop trains <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024]</a>. Tulu 3's RLVR stage reuses several of them <a href="https://arxiv.org/abs/2411.15124">[§6.2]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Detail</th><th>Why it matters</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Dropout off in all four models</td><td>Otherwise rollout-time and update-time log-probs differ: the KL is noisy and the PPO ratio is not 1 in the first epoch, which can clip every token and zero the gradient.</td><td>Huang 7; Tulu 3</td></tr>
+      <tr><td>Read the reward at the EOS token</td><td>The reward model is trained on complete responses, so only its EOS-position output is meaningful.</td><td>Huang 12, 13</td></tr>
+      <tr><td>Normalize the reward model</td><td>A bias so that reference or demonstration responses score 0 puts \(\beta\) and the value targets on a stable scale (Ziegler: mean 0, variance 1; Llama 2: whiten the logit).</td><td>Ouyang §3.5; Huang 15; Llama 2 §3.2.3</td></tr>
+      <tr><td>Truncation penalty ("EOS trick")</td><td>A response that hits the length limit gets a constant (−1 in Huang et al., −10 in Tulu 3) instead of a score, which is undefined without EOS; it also rewards finishing.</td><td>Huang 23; Tulu 3</td></tr>
+      <tr><td>Reward whitening (optional)</td><td>Divide by the batch standard deviation, keep the mean. Huang et al. saw shorter outputs and a lower raw win rate, but no difference after length control.</td><td>Huang 24</td></tr>
+      <tr><td>Advantage whitening</td><td>Zero mean, unit variance per batch: a scale-free policy loss, one of three key factors for PPO in Xu et al.</td><td>Huang 25; Xu §5</td></tr>
+      <tr><td>Value network: separate weights, initialized from the RM</td><td>Sharing the policy trunk lets value-loss gradients damage the pretrained policy early on (Stiennon's ablation). Tulu 3 found RM initialization best.</td><td>Stiennon §3.4; Huang 22; Tulu 3</td></tr>
+      <tr><td>Large batch; refreshed reference</td><td>Batch 64 degraded the SFT model on APPS, larger batches helped at every difficulty. An EMA reference (Xu) or periodic reset (R1-Zero, every 400 steps) loosens the leash on hard tasks.</td><td>Xu §5; R1 §2.1</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="kl-controller">Fixed or adaptive \(\beta\)</h3>
+  <p>With a fixed \(\beta\), the KL a run ends up with depends on seed, reward scale and step count: Ziegler et al. note that seeds with the same \(\beta\) "sometimes end up with quite different values of KL". They also used a proportional controller that steers KL toward a target <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2.2]</a>:</p>
+  <div class="eq-box">
+  \[ e_t = \operatorname{clip}\!\Big(\frac{\mathrm{KL}_t - \mathrm{KL}_{\text{target}}}{\mathrm{KL}_{\text{target}}},\, -0.2,\, 0.2\Big), \qquad \beta_{t+1} = \beta_t\,(1 + K_\beta\, e_t), \quad K_\beta = 0.1 \]
+  <div class="eq-label">Ziegler et al. 2019. Targets used: 6 nats (descriptiveness) and 10 nats (sentiment)</div>
+  </div>
+  <p>The released <code>lm-human-preferences</code> code (we read the source) writes the same rule with gain \(n_{\text{steps}}/\text{horizon}\): <code>mult = 1 + clip(kl / target - 1, -0.2, 0.2) * n_steps / horizon</code>, where <code>kl</code> is the batch mean of the per-sequence KL (sum over tokens of the sampled log-ratio), <code>n_steps</code> the batch size in episodes and the default horizon 10,000 episodes. A batch of 1,024 gives a gain of 0.1024, close to the paper's 0.1. The code applies the reward as <code>rewards = -beta * kl</code> per token, then <code>rewards[:, -1] += scores</code>, exactly the vector above, and whitens rewards (keeping the mean) and then advantages.</p>
+  <p><strong>Worked example.</strong> \(\beta = 0.1\), target 6 nats, measured KL 9, batch 512, horizon 10,000. The relative error \(9/6 - 1 = 0.5\) is clipped to \(0.2\); the multiplier is \(1 + 0.2\times512/10{,}000 = 1.01024\), so \(\beta \to 0.10102\). Even saturated, \(\beta\) grows 1% per update, and doubling takes \(\ln 2/\ln 1.01024 \approx 68\) updates. With KL 3 the error clips to \(-0.2\) and \(\beta \to 0.09898\). The controller is a slow set-point tracker, and the drill implements it.</p>
+
+<pre><code class="language-python">def shaped_rewards(rm_score, logp_policy, logp_ref, beta, mask):
+    # rm_score: (B,)   logp_*: (B, T) log-probs of the sampled tokens   mask: (B, T), 1 on response tokens
+    m = mask.to(logp_policy.dtype)
+    kl = (logp_policy - logp_ref).detach()              # per-token log-ratio (single-sample KL estimate)
+    rewards = -beta * kl * m                            # dense KL penalty, 0 on padding
+    last = (m * torch.arange(mask.shape[1], dtype=m.dtype)).argmax(dim=1)     # index of the last real token
+    rewards[torch.arange(mask.shape[0]), last] += rm_score.detach()          # score lands on the last token
+    return rewards                                      # (B, T)
+
+class AdaptiveKLController:
+    def __init__(self, init_beta, target_kl, horizon):
+        self.beta, self.target, self.horizon = init_beta, target_kl, horizon
+    def update(self, current_kl, n_steps):
+        err = min(max(current_kl / self.target - 1.0, -0.2), 0.2)   # saturating proportional error
+        self.beta *= 1.0 + err * n_steps / self.horizon             # multiplicative: beta stays positive
+        return self.beta
+</code></pre>
+
+  <p>Which \(\beta\) do people use? Values span two orders of magnitude and are only comparable together with the reward scale and the KL form:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Work</th><th class="num">\(\beta\)</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Ziegler et al. 2019</td><td class="num">0.1 (CNN/DM), 0.03 (TL;DR)</td><td>constant; adaptive to 6 or 10 nats on the style tasks</td></tr>
+      <tr><td>InstructGPT</td><td class="num">0.02</td><td>best Likert score around 0.01 to 0.02; both 0 and 2 were poor <a href="https://arxiv.org/abs/2203.02155">[App. E.7]</a></td></tr>
+      <tr><td>Llama 2</td><td class="num">0.01 (7B, 13B), 0.005 (34B, 70B)</td><td>whitened logit of the combined reward</td></tr>
+      <tr><td>Xu et al. (Llama 2 7B)</td><td class="num">0.1</td><td>OpenAssistant reward on HH-RLHF: 0.705 at \(\beta = 0\), 0.720 at 0.05, 0.718 at 0.1, 0.629 at 0.2 <a href="https://arxiv.org/abs/2404.10719">[App. C.2]</a></td></tr>
+      <tr><td>Anthropic HH</td><td class="num">0.001</td><td>KL usually below 100 nats, "might actually be wholly unnecessary"</td></tr>
+      <tr><td>DeepSeek-R1-Zero (GRPO)</td><td class="num">0.001</td><td>KL term inside the loss, verifiable rewards</td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger's score was the final product. Here a classifier (the reward model) becomes the training signal for a <em>generator</em>, and the generator is free to find inputs that the classifier overrates: think of optimizing simulated jets against a frozen discriminator without any constraint. The tagger's output would saturate while the jets stopped looking like jets. The KL term is the constraint that keeps generated text "near the simulator". Also note the data loop: your training set was fixed, while an RLHF batch is regenerated from the current policy every iteration, so the reference log-probs, rewards and values must be recomputed for fresh samples each time.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="recipes">Two production recipes: Anthropic HH and Llama 2</h2>
+  <p>InstructGPT is the template. Two later recipes show what changes when the target is a safe chat assistant rather than an instruction follower: two competing objectives, weekly data refreshes, and a great deal of iteration.</p>
+
+  <h3 id="anthropic-hh">Anthropic HH: two objectives and online iteration</h3>
+  <p>Bai et al. collect two <em>separate</em> datasets with 52B models: crowdworkers chat with the model and pick the more helpful of two responses, or, when red-teaming, the more <em>harmful</em> one <a href="https://arxiv.org/abs/2204.05862">[Bai et al. 2022, §1, §2.2]</a>. There are three tranches: 44k helpfulness plus 42k harmlessness comparisons from a context-distilled base model, 52k plus 2k from rejection sampling against an early preference model (usually best of 16), and 22k helpfulness comparisons from RLHF policies re-trained roughly weekly for about five weeks <a href="https://arxiv.org/abs/2204.05862">[§2.3]</a>.</p>
+  <p>The central finding is the tension between the objectives. "An excessive focus on avoiding harm can lead to 'safe' responses that don't actually address the needs of the human", and preference models trained mostly on one distribution do far worse than chance on the other. In RL it surfaces as <strong>evasiveness</strong>: policies gave the same exaggerated answer (for example, advising therapy) to anything remotely sensitive. The diagnosis was over-optimization on one axis: the policy's harmlessness score sat on the extreme tail of the preference-model data while its helpfulness score still looked in-distribution (their Fig. 14). Refusing ("I can't answer that") is enough to score well on red-team prompts, so it is easy to learn and hard to improve on. Their partial fix was a larger share of helpfulness prompts in RL <a href="https://arxiv.org/abs/2204.05862">[§4.4]</a>. The KL coefficient was tiny, \(\lambda_{\mathrm{KL}} = 0.001\) with KL typically below 100 nats, which they say probably matters little <a href="https://arxiv.org/abs/2204.05862">[§4.1]</a>.</p>
+  <p><strong>Online iterated RLHF</strong> closes the loop: deploy the newest policy, collect comparisons on its outputs, retrain the preference model and policy, repeat weekly. It filled out the upper tail of response quality and won in crowdworker Elo. Caveats the authors list: the online model had about 20% more data and better hyperparameters, so a controlled run with equal data (about 44k comparisons, an even mix of base, rejection-sampled and online) confirmed that the iterated mix gives a clearly preferred policy. The final preference model scores 74%, 70% and 67% on held-out base, rejection-sampled and online-only data: telling apart good responses gets harder as the policy improves <a href="https://arxiv.org/abs/2204.05862">[§4.5]</a>. Two more results: RL reward grows roughly linearly in \(\sqrt{D_{\mathrm{KL}}(\pi\,\|\,\pi_0)}\) for much of training (the shape of best-of-\(n\), <a href="21-preference-optimization.html#gao">page 21</a>), and the alignment tax depends on scale: small models lose on NLP evaluations after RLHF, while 13B and 52B models gain zero-shot and tie few-shot, so conclusions from small models can mislead <a href="https://arxiv.org/abs/2204.05862">[§1.1]</a>.</p>
+
+  <h3 id="llama2">Llama 2: two reward models, a margin, rejection sampling then PPO</h3>
+  <p><strong>Data and reward models.</strong> Llama 2 collects over one million binary comparisons (1,418,091 in 14 weekly batches). Annotators write a prompt, choose between two responses from different model variants and temperatures, and rate the strength of preference on four levels (significantly better, better, slightly better, negligibly better or unsure). Data is refreshed each round because "reward model accuracy can quickly degrade if not exposed to this new sample distribution" <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023, §3.2.1]</a>. Two reward models, helpfulness and safety, start from the chat checkpoint with a regression head and train for one epoch. The helpfulness RM sees all helpfulness data plus an equal amount of other data; the safety RM sees safety and Anthropic Harmless data, mixed 90/10 with helpfulness data. Each wins on its own test set (Table 7): the helpfulness RM scores 63.2% on Meta Helpfulness (safety RM 56.2%, zero-shot GPT-4 58.6%), the safety RM 64.5% on Meta Safety (helpfulness RM 62.8%, GPT-4 58.1%) <a href="https://arxiv.org/abs/2307.09288">[§3.2.2]</a>.</p>
+  <p><strong>Margin.</strong> Because annotators grade preference strength, the ranking loss gets a rating-dependent margin \(m(r)\):</p>
+  <div class="eq-box">
+  \[ \mathcal{L}_{\text{ranking}} = -\log \sigma\big(r_\theta(x,y_c) - r_\theta(x,y_r) - m(r)\big) \]
+  <div class="eq-label">Llama 2 Eq. 2. Margins for (significantly better, better, slightly better, negligible): small = (1, 2/3, 1/3, 0), large = (3, 2, 1, 0)</div>
+  </div>
+  <p>The margin asks the model to separate clear pairs by more than similar ones. At a score gap \(\Delta = r_c - r_r = 2\), the loss is \(0.127\) with no margin, \(0.313\) with margin 1 and \(1.313\) with margin 3, so a "significantly better" pair keeps pushing scores apart long after an ordinary pair would saturate. On the helpfulness RM (Table 28), accuracy on "significantly better" pairs rises from 79.1% to 80.4% (small margin) and 80.7% (large), and the overall average from 62.5% to 63.0% and 62.9%. The large margin hurts similar pairs and makes scores more extreme, which the authors flag as a calibration issue because PPO is sensitive to the reward distribution <a href="https://arxiv.org/abs/2307.09288">[App. A.3.3]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">score gap \(\Delta\)</th><th class="num">no margin</th><th class="num">margin 1</th><th class="num">margin 3</th></tr></thead>
+    <tbody>
+      <tr><td class="num">0</td><td class="num">0.693</td><td class="num">1.313</td><td class="num">3.049</td></tr>
+      <tr><td class="num">1</td><td class="num">0.313</td><td class="num">0.693</td><td class="num">2.127</td></tr>
+      <tr><td class="num">2</td><td class="num">0.127</td><td class="num">0.313</td><td class="num">1.313</td></tr>
+      <tr><td class="num">4</td><td class="num">0.018</td><td class="num">0.049</td><td class="num">0.313</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Loss \(-\log\sigma(\Delta - m)\), our arithmetic. The implementation is <code>bt_reward_loss(..., margin=...)</code> in the <a href="21-preference-optimization.html#exercises">page 21 drill</a>.</p>
+  <p><strong>Combining the two rewards for PPO.</strong> The safety score takes over when the prompt is flagged as safety-relevant or the safety score is below 0.15 (a threshold that gave precision 0.89 and recall 0.55 on the Meta Safety test set), and the logit of the chosen score is whitened to balance it against the KL term:</p>
+  \[ R_c(g \mid p) = \begin{cases} R_s(g \mid p) & \text{if is\_safety}(p) \text{ or } R_s(g \mid p) &lt; 0.15 \\ R_h(g \mid p) & \text{otherwise,} \end{cases} \qquad \tilde R_c = \operatorname{whiten}\big(\operatorname{logit}(R_c)\big) \]
+  <p><strong>Iterations.</strong> Llama 2-Chat went through five versions (RLHF-V1 to V5) using two algorithms. <em>Rejection sampling fine-tuning</em> samples \(K\) responses per prompt from the latest model, keeps the highest-reward one and fine-tunes on it. <em>PPO</em> updates online. They differ in breadth (\(K\) samples versus one) and depth (PPO's data depends on the policy after every step). Up to V4 only rejection sampling was used, afterwards PPO ran on top of the rejection-sampling checkpoint. Rejection sampling ran only on the 70B model, and smaller models were fine-tuned on its samples (distillation). Training V3 only on V2's samples left it worse at rhyming poems (suspected forgetting), so later rounds pooled the best samples of <em>all</em> earlier iterations. RLHF also shifted the useful sampling temperature: 1.2 to 1.3 for best-of-\(N\) with \(N\) between 10 and 100. PPO settings: AdamW, constant learning rate 1e-6, batch 512, minibatch 64, clip 0.2, \(\beta = 0.01\) (7B, 13B) or \(0.005\) (34B, 70B), 200 to 400 iterations with early stopping on held-out prompts <a href="https://arxiv.org/abs/2307.09288">[§3.2.3]</a>. <strong>Ghost Attention</strong> fixes a side problem: the model forgot system instructions ("act as Oscar Wilde") after a few turns. GAtt concatenates the instruction to every user message, samples with the latest RLHF model, then drops it from all but the first turn and zeroes the loss on earlier turns. Instructions then held for 20+ turns. It is data construction, not an RL change <a href="https://arxiv.org/abs/2307.09288">[§3.3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Separate helpfulness and safety reward models (Llama 2)</div>
+    <dl>
+      <dt>Problem</dt><dd>One scalar reward model must trade off helpfulness against refusing unsafe requests, and must also tell adversarial prompts from benign ones. Both are hard at once.</dd>
+      <dt>Idea</dt><dd>Train two reward models from the chat checkpoint with different data mixes, use the safety score when the prompt is safety-flagged or the score is below 0.15, otherwise the helpfulness score, and add a rating-dependent margin to the ranking loss.</dd>
+      <dt>Why it works</dt><dd>Each model specializes, and the switch makes safety a constraint rather than another term traded off linearly. The margin uses the annotators' preference-strength labels.</dd>
+      <dt>Evidence</dt><dd>Each RM wins on its own distribution (63.2% vs 56.2% for helpfulness, 64.5% vs 62.8% for safety) and the margin lifts accuracy on clear pairs by about 1.3 to 1.6 points <a href="https://arxiv.org/abs/2307.09288">[Llama 2, Tables 7, 28]</a>.</dd>
+      <dt>Cost</dt><dd>Two reward models to train, run and hold in memory, a hand-tuned threshold with 0.55 recall on unsafe responses, and sharper score distributions that stress PPO.</dd>
+      <dt>Used by</dt><dd>Llama 2-Chat. Llama 3 kept one reward model and removed the margin.</dd>
+    </dl>
+  </div>
+
+  <h3 id="llama3">Llama 3: the PPO stage disappears</h3>
+  <p>Llama 3 runs six rounds of SFT followed by DPO (<a href="21-preference-optimization.html#dpo">page 21</a>) on preference data collected from the previous round's best models. The reward model remains for rejection sampling (\(K\) between 10 and 30 samples per prompt) and data filtering. It has no margin term, "as we observe diminishing improvements after data scaling", annotators add a third, edited response (edited &gt; chosen &gt; rejected), and only "significantly better" or "better" pairs are kept. DPO uses \(\beta = 0.1\), an extra NLL term with weight 0.2 on the chosen response (to keep its log-probability from falling) and masks header and termination tokens. On PPO the report is direct: they "explored on-policy algorithms such as PPO, but found that DPO required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval", preferring SFT, rejection sampling and DPO over "more complex reinforcement learning algorithms that tend to be less stable and harder to scale" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1, §4.1]</a>.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>InstructGPT (2022)</th><th>Anthropic HH (2022)</th><th>Llama 2 (2023)</th><th>Llama 3 (2024)</th></tr></thead>
+    <tbody>
+      <tr><td>Preference data</td><td>33k prompts, K-way rankings</td><td>about 162k comparisons (118k helpful, 44k harmless, sums of rounded counts)</td><td>1.42M new, 2.92M with open sets</td><td>not reported as a count; rounds of new data</td></tr>
+      <tr><td>Reward model</td><td>one 6B, no margin</td><td>preference models up to 52B, mixed HH</td><td>two (helpfulness, safety), margin loss</td><td>one, no margin, edited &gt; chosen &gt; rejected</td></tr>
+      <tr><td>Optimizer</td><td>PPO-ptx</td><td>PPO, online iteration</td><td>rejection sampling, then PPO on top</td><td>rejection sampling + DPO (PPO tried, dropped)</td></tr>
+      <tr><td>Rounds</td><td>1</td><td>about 5 weekly online rounds</td><td>5 (V1 to V5)</td><td>6</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="failure-modes">How RLHF fails</h2>
+  <p>The reward model is a proxy fit on a finite, noisy set of comparisons. Four different things go wrong, and they call for different fixes: <em>reward hacking</em> (the policy finds behaviors the reward model scores highly and people do not), <em>over-optimization</em> (the same failure seen as a function of optimization pressure, treated with the Gao et al. curves on <a href="21-preference-optimization.html#over-optimization">page 21</a>), <em>loss of diversity</em>, and <em>label noise</em> that caps how good the proxy can be.</p>
+
+  <h3 id="reward-hacking">Reward hacking</h3>
+  <p><strong>Reward hacking</strong> <span class="zh">奖励黑客</span> means raising the reward without raising the quality the reward was meant to measure. The forms below are documented, not hypothetical.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Form</th><th>Evidence</th><th>Mitigations tried</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Length</strong></td><td>On WebGPT, standard PPO raised reward by 0.82, of which only 0.02 (2%) was not explained by length (RLCD 27%, Stack 53%). PPO on a reward that only targets length reproduced most of the simulated win-rate gain over SFT: 56% vs 58% (WebGPT), 64% vs 63% (RLCD). Within a prompt, the learned reward correlates with length at \(r = 0.72\) (WebGPT) <a href="https://arxiv.org/abs/2310.03716">[Singhal et al. 2023, Tab. 1, 2, 4]</a>. Length explains about a third of Stiennon et al.'s feedback-versus-supervised gap at 6.7B.</td><td>Length-balanced preference data, a length penalty, reward scaling and a higher KL coefficient all shorten outputs, but always cost reward and sometimes stop convergence. Balancing the Stack data gave outputs shorter than SFT that still beat standard PPO's 57% of the time. DPO lengthens outputs too. Report length-controlled win rates (they cut RLAIF's 71% to 59%).</td></tr>
+      <tr><td><strong>Sycophancy</strong> <span class="zh">谄媚</span></td><td>Five production assistants tailor feedback to the user's stated taste, flip correct answers when told "I don't think that's right" (Claude 1.3 wrongly admits a mistake on 98% of questions), and lose up to 27% accuracy when the user suggests a wrong answer. "Matches the user's beliefs" is one of the most predictive features of human preference. Best-of-\(N\) against the Claude 2 preference model is more sycophantic than against a prompted "non-sycophantic" version, and RL raises feedback and mimicry sycophancy <a href="https://arxiv.org/abs/2310.13548">[Sharma et al. 2023, §3, §4]</a>.</td><td>Better preference models (best-of-4096 on the hardest misconceptions: about 25% sycophantic choices under an oracle model, about 75% under Claude 2's), more raters per item, labeler assistance. Sycophancy also exists before RL, so pretraining and SFT contribute.</td></tr>
+      <tr><td><strong>Hedging, refusal, boilerplate</strong></td><td>InstructGPT still gives "long hedging answers to simple questions", which the authors link to telling labelers to reward epistemic humility <a href="https://arxiv.org/abs/2203.02155">[§4.3]</a>. HH policies gave therapy advice to sensitive prompts. Over-trained RL-CAI models append "you are valid, valued, and cared for" <a href="https://arxiv.org/abs/2212.08073">[§4.3]</a>. Llama 3's generated data showed excess emojis, exclamation points and apologies in early rounds <a href="https://arxiv.org/abs/2407.21783">[§4.2.3]</a>.</td><td>Filter or rebalance phrases, non-evasive principles (CAI), a helpfulness RM next to the safety RM (Llama 2), rubrics forbidding opening praise (Kimi K2). Caution: rules against hedging can push toward overconfidence <a href="https://arxiv.org/abs/2507.20534">[K2, App. F.3]</a>.</td></tr>
+      <tr><td><strong>Persuading the rater</strong></td><td>After PPO against a reward model learned from ChatBotArena preferences, a 7B model won 9.4 more points of human approval on QuALITY with no gain in correctness, and time-limited evaluators' false-positive rate rose from 46.7% to 70.2%. The policy fabricated or cherry-picked evidence, and on coding wrote less readable programs that passed the evaluators' simple tests. A probing method that detects backdoored models (99.3% AUROC) did no better than chance here <a href="https://arxiv.org/abs/2409.12822">[Wen et al. 2024, §3, §4]</a>. Two 1B runs in an open TL;DR reproduction reached KL of about 50 and 85 and produced run-together strings that GPT-3.5 preferred less than 20% of the time <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, §7.1]</a>.</td><td>Reward what can be checked (oracle correctness caused far less persuasion in the same paper), verifiers and tools, stronger or ensembled judges, held-out evaluation by people with more time or expertise than the training signal had.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two mitigations cut across the table. <strong>Limit the optimization:</strong> the KL penalty and, above all, early stopping on a held-out signal (Llama 2 stops PPO after 200 to 400 iterations, Tulu 3 picks checkpoints every 40 to 100 steps). <strong>Refresh the proxy:</strong> collect new preference data from the current policy each round (Llama 2, Anthropic's weekly loop). Monitor reward, KL, length, entropy and an independent judge together: reward up with the judge flat or down is the signature of hacking.</p>
+
+  <h3 id="diversity">Loss of diversity</h3>
+  <p>Even when the reward is honest, the optimized policy is narrower. Kirk et al. compare SFT, best-of-\(N\) and RLHF from the same models: RLHF generalizes better out of distribution, especially under larger shifts, but sharply reduces the diversity of samples for a given input. For OPT-6.7B summarization, the per-input expectation-adjusted distinct-n-gram score is 0.07 after RLHF against 0.79 for SFT <a href="https://arxiv.org/abs/2310.06452">[Kirk et al. 2023, App. J.4, Tab. 11]</a>. Diversity across different inputs also drops, less so, which they call the first rigorous demonstration of across-input <strong>mode collapse</strong> <span class="zh">模式坍塌</span> (best-of-\(N\) does not show it). Raising the KL coefficient does not restore diversity: it lowers both performance and per-input diversity, although Stiennon et al. list "an entropy bonus" as the KL term's first purpose. Anthropic worried that lower entropy would starve online data collection and deployed many policy snapshots at once <a href="https://arxiv.org/abs/2204.05862">[§4.5]</a>. Consequences: RLHF policies give best-of-\(N\) less to select from (Llama 2's best temperature shifted), and RL for reasoning must fight entropy collapse explicitly (<a href="24-rlvr-reasoning.html">page 24</a>).</p>
+
+  <h3 id="noise">Annotator disagreement and label noise</h3>
+  <p>The ceiling on the proxy is set by how much people agree. InstructGPT's training labelers agree 72.6 ± 1.5% of the time (held-out labelers 77.3 ± 1.3%), and Stiennon et al. report 73 ± 4% between researchers <a href="https://arxiv.org/abs/2203.02155">[§3.4]</a>. Reward-model accuracy on hard data is modest: Llama 2's helpfulness RM reaches 63.2%, and accuracy depends on how clear the pair is. The safety RM is right 94.3% of the time on "significantly better" safety pairs but 55.3% on "negligibly better or unsure" ones, the helpfulness RM 80.7% versus 54.7% <a href="https://arxiv.org/abs/2307.09288">[Llama 2, Tab. 8]</a>. As the policy improves, pairs get closer (the share of "negligibly better" ratings grows over the 14 batches, and Anthropic's final preference model scores 67% on its newest data against 74% on its base data). Singhal et al.'s reward models reach only 61.5%, 70% and 80% <a href="https://arxiv.org/abs/2310.03716">[Tab. 4]</a>.</p>
+  <p>Three consequences. Most of the signal is in the clear pairs, so Llama 3 discards pairs whose responses are similar. The disagreement is systematic taste (longer, more confident, more agreeable), and RL amplifies exactly those tastes. And a reward model can only be as good as labelers can judge: when the task outgrows what raters can check in a few minutes (Wen et al.), more RLHF widens the gap, which motivates the verifier-based and process-based rewards below.</p>
+</section>
+
+<section>
+  <h2 id="rlaif">AI feedback: Constitutional AI and RLAIF</h2>
+  <p>Human labels are slow, expensive, and noisy in systematic ways (previous section). If a strong model can judge responses, it can supply the labels. Two papers established the pattern: <strong>Constitutional AI</strong> <span class="zh">宪法式AI</span> from Anthropic, and <strong>RLAIF</strong> <span class="zh">基于AI反馈的强化学习</span> from Google, which measured how good AI labels are against human ones.</p>
+
+  <h3 id="cai">Constitutional AI</h3>
+  <p>Bai et al. train a harmless but non-evasive assistant with <em>no human labels for harm</em>. The only human oversight is a written list of principles (the "constitution"), plus a few few-shot examples <a href="https://arxiv.org/abs/2212.08073">[Bai et al. 2022, §1.2]</a>. There are two stages (Figure 3).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 290" role="img" aria-labelledby="fig-23-3-title">
+<title id="fig-23-3-title">Constitutional AI: a supervised stage where a model critiques and revises its own harmful answers, then an RL stage where a feedback model produces preference labels according to a principle</title>
+<defs><marker id="arrow-23-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="9" y="16" class="s-bold">Stage 1: supervised (critique, revise, fine-tune)</text>
+<rect class="s-b" x="9" y="28" width="126" height="70" rx="6"/>
+<text x="72" y="50" text-anchor="middle" class="s-bold">Prompt</text>
+<text x="72" y="68" text-anchor="middle" class="s-small">red-team prompts</text>
+<text x="72" y="82" text-anchor="middle" class="s-small s-muted">182,831 in all</text>
+<rect class="s-plain" x="153" y="28" width="126" height="70" rx="6"/>
+<text x="216" y="50" text-anchor="middle" class="s-bold">Helpful model</text>
+<text x="216" y="68" text-anchor="middle" class="s-small">first answer</text>
+<text x="216" y="82" text-anchor="middle" class="s-small s-muted">usually harmful</text>
+<rect class="s-c" x="297" y="28" width="126" height="70" rx="6"/>
+<text x="360" y="50" text-anchor="middle" class="s-bold">Critique</text>
+<text x="360" y="68" text-anchor="middle" class="s-small">random principle</text>
+<text x="360" y="82" text-anchor="middle" class="s-small s-muted">one of 16</text>
+<rect class="s-c" x="441" y="28" width="126" height="70" rx="6"/>
+<text x="504" y="50" text-anchor="middle" class="s-bold">Revision</text>
+<text x="504" y="68" text-anchor="middle" class="s-small">rewrite the answer</text>
+<text x="504" y="82" text-anchor="middle" class="s-small s-muted">critique + revise ×4</text>
+<rect class="s-a" x="585" y="28" width="126" height="70" rx="6"/>
+<text x="648" y="50" text-anchor="middle" class="s-bold">SL-CAI</text>
+<text x="648" y="68" text-anchor="middle" class="s-small">fine-tune, 1 epoch</text>
+<text x="648" y="82" text-anchor="middle" class="s-small s-muted">revisions + helpful</text>
+<path class="s-line" d="M135,63 L153,63" marker-end="url(#arrow-23-3)"/>
+<path class="s-line" d="M279,63 L297,63" marker-end="url(#arrow-23-3)"/>
+<path class="s-line" d="M423,63 L441,63" marker-end="url(#arrow-23-3)"/>
+<path class="s-line" d="M567,63 L585,63" marker-end="url(#arrow-23-3)"/>
+<path class="s-line s-dash" d="M648,98 L648,126 L40,126 L40,160" marker-end="url(#arrow-23-3)"/>
+<text x="360" y="118" text-anchor="middle" class="s-small">SL-CAI writes the response pairs and is the RL starting point</text>
+<text x="70" y="154" class="s-bold">Stage 2: RL from AI feedback (RLAIF)</text>
+<rect class="s-a" x="9" y="164" width="120" height="76" rx="6"/>
+<text x="69" y="186" text-anchor="middle" class="s-bold">SL-CAI</text>
+<text x="69" y="204" text-anchor="middle" class="s-small">samples a pair of</text>
+<text x="69" y="218" text-anchor="middle" class="s-small">responses</text>
+<rect class="s-c" x="149" y="164" width="210" height="76" rx="6"/>
+<text x="254" y="184" text-anchor="middle" class="s-bold">Feedback model</text>
+<text x="254" y="200" text-anchor="middle" class="s-small">picks the more harmless, (A) or (B)</text>
+<text x="254" y="214" text-anchor="middle" class="s-small">random principle, soft label</text>
+<text x="254" y="228" text-anchor="middle" class="s-small s-muted">CoT labels clamped to 40 to 60%</text>
+<rect class="s-d" x="379" y="164" width="190" height="76" rx="6"/>
+<text x="474" y="184" text-anchor="middle" class="s-bold">Preference model</text>
+<text x="474" y="200" text-anchor="middle" class="s-small">182,831 AI harmlessness</text>
+<text x="474" y="214" text-anchor="middle" class="s-small">+ 135,296 human helpfulness</text>
+<text x="474" y="228" text-anchor="middle" class="s-small s-muted">comparisons</text>
+<rect class="s-a" x="589" y="164" width="122" height="76" rx="6"/>
+<text x="650" y="186" text-anchor="middle" class="s-bold">RL against PM</text>
+<text x="650" y="204" text-anchor="middle" class="s-small">gives RL-CAI</text>
+<text x="650" y="218" text-anchor="middle" class="s-small s-muted">same loop as RLHF</text>
+<path class="s-line" d="M129,202 L149,202" marker-end="url(#arrow-23-3)"/>
+<path class="s-line" d="M359,202 L379,202" marker-end="url(#arrow-23-3)"/>
+<path class="s-line" d="M569,202 L589,202" marker-end="url(#arrow-23-3)"/>
+<text x="9" y="270" class="s-small">Only the helpfulness labels come from humans. Harmlessness comes from the written principles and a model that applies them.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> The Constitutional AI pipeline with the counts from the paper. Stage 1 changes the response distribution cheaply (supervised, no RL), so that the RL stage needs less exploration. Stage 2 is ordinary RLHF except that one of the two preference datasets is labeled by a model reading a principle.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Supervised stage (SL-CAI).</strong> Take a helpful RLHF model and a red-team prompt (42,496 human-written and 140,335 few-shot-generated). Sample an answer, usually harmful. Append a critique request drawn from one of 16 principles, sample a critique, append a revision request, sample a revision, and repeat up to four times with fresh principles. Fine-tune a pretrained model on the revisions plus helpfulness samples (135,296 human prompts) for one epoch. This shifts the response distribution cheaply, so RL needs less exploration <a href="https://arxiv.org/abs/2212.08073">[§3.1, §3.2]</a>.</li>
+    <li><strong>RL stage (RLAIF).</strong> SL-CAI samples two responses per prompt. A feedback model reads a multiple-choice prompt with a random principle, and the normalized log-probabilities of (A) and (B) become a soft label. Chain-of-thought labels are near 0 or 1 and badly calibrated, so they are clamped to 40% to 60% (otherwise RL-CAI learned more extreme behavior). A preference model is trained on 182,831 AI harmlessness plus 135,296 human helpfulness comparisons, and the policy is trained against it as in RLHF <a href="https://arxiv.org/abs/2212.08073">[§4.1, §4.2]</a>.</li>
+  </ol>
+
+  <div class="decision">
+    <div class="decision-title">Constitutional AI</div>
+    <dl>
+      <dt>Problem</dt><dd>Human harmlessness labels are slow to collect and must be recollected when the policy or the objective changes. Asking red-teamers to pick the <em>worse</em> response only teaches refusal, hence evasiveness (Anthropic HH, above).</dd>
+      <dt>Idea</dt><dd>Replace the human harm labels by a model applying written principles: critique and revise for supervised data, model-judged pairs for preference data.</dd>
+      <dt>Why it works</dt><dd>Language models identify harmful behavior increasingly well with scale, and chain-of-thought makes such judgments increasingly competitive with preference models trained on human labels on the paper's harm-identification evaluations. Principles make the objective explicit, editable and cheap to change, and the labeler sees the policy's own distribution.</dd>
+      <dt>Evidence</dt><dd>RL-CAI models are less harmful at a given helpfulness than RLHF models trained on human harm labels (a Pareto improvement in crowdworker Elo), and less evasive. Ensembling over the 16 principles gave a more robust preference model than a single principle <a href="https://arxiv.org/abs/2212.08073">[Bai et al. 2022, §4.1, §4.3, Fig. 2]</a>.</dd>
+      <dt>Cost</dt><dd>The principles were chosen ad hoc for research. Over-trained RL-CAI models Goodhart into boilerplate (see above). Critiques are often inaccurate or overstated (and matter for small models, not large ones), and the labels inherit the labeler's own blind spots.</dd>
+      <dt>Used by</dt><dd>Its authors at Anthropic. The idea of model-judged preferences reappears in RLAIF and in the generative reward models of Kimi K2 and DeepSeek-V4 (below).</dd>
+    </dl>
+  </div>
+
+  <h3 id="rlaif-vs-rlhf">RLAIF versus RLHF, measured</h3>
+  <p>Constitutional AI mixed human and AI labels, so it did not say whether AI labels are as good as human ones. Lee et al. compare them directly, with PaLM 2 as labeler and a PaLM 2 XS policy, on TL;DR summarization and helpful and harmless dialogue. To cancel position bias, the labeler is queried twice with the two responses swapped. The policy is trained with REINFORCE with a baseline rather than PPO <a href="https://arxiv.org/abs/2309.00267">[Lee et al. 2023, §2, §3]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Human evaluation</th><th class="num">Summarization</th><th class="num">Helpful dialogue</th><th class="num">Harmless rate</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td class="num"></td><td class="num"></td><td class="num">64%</td></tr>
+      <tr><td>RLHF vs SFT (win rate)</td><td class="num">73%</td><td class="num">64%</td><td class="num">76%</td></tr>
+      <tr class="hl"><td>RLAIF vs SFT (win rate)</td><td class="num">71%</td><td class="num">63%</td><td class="num">88%</td></tr>
+      <tr><td>RLAIF vs RLHF (head to head)</td><td class="num">50%</td><td class="num">52%</td><td class="num"></td></tr>
+      <tr><td>same-size labeler (XS) RLAIF vs SFT</td><td class="num">68%</td><td class="num"></td><td class="num"></td></tr>
+      <tr><td>d-RLAIF vs SFT (no reward model)</td><td class="num">74%</td><td class="num">66%</td><td class="num"></td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: Lee et al. 2023, Table 1. The RLAIF-versus-RLHF differences in win rate are not statistically significant. The harmless rates are per-response judgments (SFT, RLHF and RLAIF in the last column).</p>
+  <p><strong>d-RLAIF</strong> skips the reward model: during RL the LLM rates each response from 1 to 10, the token likelihoods of the ten scores give an expected score, rescaled to \([-1, 1]\) as the reward. It avoids reward-model "staleness" (the policy drifts off the data the reward model saw) and beat the distilled reward model (60% head to head against same-size RLAIF). For helpfulness, labeler and initial policy are the same checkpoint, a strict case of self-improvement. Labeler quality matters: agreement with human preferences on summarization is 78.0% for PaLM 2 L, 73.8% for S and 62.7% for XS, against 73% to 77% between humans. Chain-of-thought prompting helped, few-shot examples hurt. The authors estimate AI labeling at over 10 times cheaper than human labeling (about $0.06 per example at 2023 GPT-4 prices).</p>
+  <p><strong>What this does and does not show.</strong> On these tasks, labels from a much larger model are about as useful as human ones. The caveats: the labeler is far larger than the policy (L versus XS), so this is mostly distillation of a strong judge, not self-improvement. Length control shrinks the summarization gains (RLAIF 71% to 59%, RLHF 73% to 61%). Combining human and AI feedback did not beat human alone. The harmless rate judges each response alone, so refusing more raises it, and it says nothing about helpfulness. And it is one lab, one model family, small policies: evidence that AI feedback is viable, not that it is interchangeable with human data at frontier scale.</p>
+</section>
+
+<section>
+  <h2 id="process-supervision">Process versus outcome supervision</h2>
+  <p>For multi-step reasoning, a reward on the final answer says little about where a solution went wrong. An <strong>outcome reward model</strong> (ORM) <span class="zh">结果奖励模型</span> predicts whether the final answer is correct, one label per solution. A <strong>process reward model</strong> (PRM) <span class="zh">过程奖励模型</span> predicts whether each step is correct, one label per step. Figure 4 shows what each sees on the same flawed solution.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 286" role="img" aria-labelledby="fig-23-4-title">
+<title id="fig-23-4-title">A five-step solution with an error at step 3, and the labels it receives under outcome supervision, human process supervision and Monte-Carlo process supervision</title>
+<defs><marker id="arrow-23-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="50" class="s-bold">Solution</text>
+<rect class="s-c" x="160" y="26" width="100" height="40" rx="6"/><text x="210" y="50" text-anchor="middle" class="s-small">1 set up</text>
+<rect class="s-c" x="270" y="26" width="100" height="40" rx="6"/><text x="320" y="50" text-anchor="middle" class="s-small">2 expand</text>
+<rect class="s-plain" x="380" y="26" width="100" height="40" rx="6"/><text x="430" y="50" text-anchor="middle" class="s-small s-bold">3 sign error</text>
+<rect class="s-plain s-dash" x="490" y="26" width="100" height="40" rx="6"/><text x="540" y="50" text-anchor="middle" class="s-small">4 simplify</text>
+<rect class="s-plain s-dash" x="600" y="26" width="100" height="40" rx="6"/><text x="650" y="50" text-anchor="middle" class="s-small">5 wrong answer</text>
+<path class="s-line" d="M260,46 L270,46" marker-end="url(#arrow-23-4)"/>
+<path class="s-line" d="M370,46 L380,46" marker-end="url(#arrow-23-4)"/>
+<path class="s-line" d="M480,46 L490,46" marker-end="url(#arrow-23-4)"/>
+<path class="s-line" d="M590,46 L600,46" marker-end="url(#arrow-23-4)"/>
+<line class="s-line s-dash" x1="8" y1="84" x2="712" y2="84"/>
+<text x="8" y="112" class="s-bold">Outcome (ORM)</text>
+<path class="s-line" d="M160,98 L160,106 L700,106 L700,98"/>
+<text x="430" y="126" text-anchor="middle" class="s-small">one label for the whole solution: final answer wrong, so 0</text>
+<text x="430" y="141" text-anchor="middle" class="s-small s-muted">the model must work out for itself where it went wrong</text>
+<line class="s-line s-dash" x1="8" y1="156" x2="712" y2="156"/>
+<text x="8" y="188" class="s-bold">Process, humans</text>
+<text x="8" y="203" class="s-small s-muted">PRM800K</text>
+<text x="210" y="192" text-anchor="middle" class="s-big">✓</text>
+<text x="320" y="192" text-anchor="middle" class="s-big">✓</text>
+<text x="430" y="192" text-anchor="middle" class="s-big">✗</text>
+<text x="540" y="192" text-anchor="middle" class="s-small s-muted">not labeled</text>
+<text x="650" y="192" text-anchor="middle" class="s-small s-muted">not labeled</text>
+<line class="s-line s-dash" x1="8" y1="214" x2="712" y2="214"/>
+<text x="8" y="240" class="s-bold">Process, Monte-Carlo</text>
+<text x="8" y="255" class="s-small s-muted">Math-Shepherd, N = 8</text>
+<text x="210" y="244" text-anchor="middle" class="s-mono">8/8</text>
+<text x="320" y="244" text-anchor="middle" class="s-mono">7/8</text>
+<text x="430" y="244" text-anchor="middle" class="s-mono">2/8</text>
+<text x="540" y="244" text-anchor="middle" class="s-mono">0/8</text>
+<text x="650" y="244" text-anchor="middle" class="s-mono">0/8</text>
+<text x="430" y="272" text-anchor="middle" class="s-small s-muted">fraction of N completions from that step that reach the gold answer (illustrative numbers)</text>
+</svg>
+    <figcaption><b>Figure 4.</b> The same flawed solution under three kinds of supervision. An outcome label is one bit and cannot say where the error is. Human process labels (PRM800K) stop at the first error, by design. Monte-Carlo labels (Math-Shepherd) come free of humans but cost \(N\) completions from every step, and their fractions are a noisy estimate of a step's value. The fractions here are made up to show the shape of the signal.</figcaption>
+  </figure>
+
+  <h3 id="process-evidence">Evidence with human labels</h3>
+  <p><strong>Uesato et al. (GSM8K, 70B).</strong> Outcome- and process-based supervision give <em>similar final-answer error</em> (22.3% for process-supervised SFT versus 23.5% for RL on final answers without a reward model, 14.8% versus 16.6% with one). What differs is <em>trace error</em>: how often a correct-answer solution contains a wrong step. Even the best model trained by RL on final-answer correctness had 12.4% trace error, against 3.8% for the best process-based method. Their best combination improved the state of the art from 16.8% to 12.7% final-answer error and from 14.0% to 3.4% trace error. Even an ORM's predictions agree more with step labels (85%) than with its own outcome labels (77%), though the authors caution this may be math-specific, where wrong reasoning rarely reaches the right answer <a href="https://arxiv.org/abs/2211.14275">[Uesato et al. 2022, §1, §3]</a>.</p>
+  <p><strong>Lightman et al. (MATH, GPT-4 base).</strong> The generator is fixed and reward models are compared by best-of-\(N\) selection on 500 test problems. At \(N = 1860\) the PRM solves 78.2%, the ORM 72.4%, majority voting 69.6%, and the gap widens with \(N\). On roughly 230 recent AP and AMC problems (best of 100): 72.9% versus 63.8% versus 61.3% <a href="https://arxiv.org/abs/2305.20050">[Lightman et al. 2023, §3, §5]</a>. <strong>PRM800K</strong> holds about 800,000 step labels over 75,000 solutions to 12,000 problems. Labelers mark each step positive, negative or neutral and stop at the first negative step, so process and outcome supervision reveal the same about correct solutions and differ only on incorrect ones. They were shown <em>convincing wrong-answer</em> solutions, those the current PRM scores highly although the answer is wrong (each is a known PRM mistake), which was about 2.6× more data-efficient in a small-scale study <a href="https://arxiv.org/abs/2305.20050">[§2.4, §4.2, App. B]</a>.</p>
+  <p>To separate process from data effects, the large PRM labels data for small models: process supervision then beats both outcome variants at every data scale. Their explanation is credit assignment: most sampled solutions contain an error somewhere, so a negative outcome label is low-information, while a step label locates the mistake <a href="https://arxiv.org/abs/2305.20050">[§4.1, §6.1]</a>. A solution's score is the <em>product</em> of its step probabilities. That is slightly better than the minimum (78.2% versus 77.6%) but biased against long solutions: five steps at 0.97 score \(0.97^5 = 0.859\), twelve score \(0.97^{12} = 0.694\), though no step is worse. The minimum gives both 0.97 <a href="https://arxiv.org/abs/2305.20050">[App. F.2]</a>.</p>
+
+  <h3 id="math-shepherd">Automatic process labels: Math-Shepherd</h3>
+  <p>Human step labels do not scale. Math-Shepherd defines a step's quality as its potential to reach the correct answer and estimates it by sampling: a "completer" model writes \(N\) continuations from that step, and the label is 1 if any reaches the gold answer (hard estimation) or the fraction that do (soft estimation) <a href="https://arxiv.org/abs/2312.08935">[Wang et al. 2023, §3.3]</a>. With \(N = 8\) and a 7B completer they labeled about 170k GSM8K and 270k MATH solutions. In a check against 160 human-labeled GSM8K steps with a 70B completer, hard estimation is 86% accurate at \(N = 4\), and accuracy falls as \(N\) grows because more completions produce more false positives. The resulting reward model supports reranking and step-by-step PPO: Mistral-7B goes from 77.9% to 84.1% on GSM8K and 28.6% to 33.0% on MATH, ahead of outcome-only PPO (81.8% and 31.3%), and to 89.1% and 43.5% with verification on top <a href="https://arxiv.org/abs/2312.08935">[Tab. 2, 3]</a>.</p>
+  <p>The catch is cost. To label a \(K\)-step solution you generate completions from every step onward. With equal-length steps, a 300-token solution of \(K = 10\) steps and \(N = 8\), the completions sum to \(8\times\sum_{i=1}^{10} 300\,(10-i)/10 = 8\times1350 = 10{,}800\) tokens, 36 times the solution itself (our arithmetic).</p>
+
+  <h3 id="why-r1-dropped-prms">Why DeepSeek-R1 dropped process reward models</h3>
+  <p>DeepSeek-R1's list of unsuccessful attempts gives three reasons a PRM did not pay off in large-scale RL <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. G.2]</a>. It is hard to define a fine-grained step in general reasoning. It is hard to decide whether an intermediate step is correct: automated annotation may not be good enough and manual annotation does not scale. And once a model-based PRM is in the loop it "inevitably leads to reward hacking", while retraining it costs resources and complicates the pipeline. The conclusion is careful: PRMs rerank top-\(N\) responses or guide search well, but the advantage is limited relative to the added overhead in large-scale RL, in these experiments, and this "does not imply" the approaches cannot work. R1's rewards for reasoning are rule-based accuracy and format checks, and the report says it abstains from neural reward models, outcome- or process-based, for reasoning because they are susceptible to reward hacking (<a href="28-deepseek-3-reasoning.html">page 28</a> covers the pipeline, <a href="24-rlvr-reasoning.html">page 24</a> the algorithm). Where no checkable final answer exists, as with proofs, other rewards are needed: DeepSeek-V3.2-Speciale adds the dataset and reward method of DeepSeekMath-V2 for proofs <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Process reward models</div>
+    <dl>
+      <dt>Problem</dt><dd>An outcome reward gives the same signal to a clean solution and to one that reached the right answer through a flawed step, and cannot say where a wrong solution failed.</dd>
+      <dt>Idea</dt><dd>Score every step (human labels or Monte-Carlo rollouts), train a model to predict step correctness, and score a solution by the product or minimum of its steps.</dd>
+      <dt>Why it works</dt><dd>Most sampled solutions contain some error, so on hard problems the outcome label is nearly always negative, while step labels say where the first error is.</dd>
+      <dt>Evidence</dt><dd>78.2% versus 72.4% (ORM) versus 69.6% (majority vote) at best-of-1860 on MATH <a href="https://arxiv.org/abs/2305.20050">[Lightman et al.]</a>; trace error 3.8% for the best process-based method versus 12.4% for the best RL on final answers, on GSM8K <a href="https://arxiv.org/abs/2211.14275">[Uesato et al.]</a>.</dd>
+      <dt>Cost</dt><dd>Expensive step labels, a step definition, and (Monte-Carlo) \(N\times\) the solution length per step. As an RL reward, a learned PRM can be exploited, as R1 reports.</dd>
+      <dt>Used by</dt><dd>OpenAI's PRM800K work (reranking, no RL), Math-Shepherd (step-level PPO at 7B); tried and set aside for large-scale RL in DeepSeek-R1.</dd>
+    </dl>
+  </div>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Outcome RM (ORM)</th><th>PRM, human labels</th><th>PRM, Monte-Carlo labels</th></tr></thead>
+    <tbody>
+      <tr><td>Label cost</td><td>cheap when the answer is checkable</td><td>expensive: humans read every step</td><td>compute: about \(N\times\) solution length per step</td></tr>
+      <tr><td>Credit assignment</td><td>none within a solution</td><td>precise: first error</td><td>approximate: depends on the completer</td></tr>
+      <tr><td>Main risk</td><td>false positives: right answer, wrong reasoning</td><td>learned model can be hacked in RL</td><td>same, plus label noise from lucky completions</td></tr>
+      <tr><td>Needs a step definition</td><td>no</td><td>yes</td><td>yes</td></tr>
+      <tr><td>Where it works best</td><td>reranking, or replaced by a verifier in RL</td><td>reranking and search</td><td>training PRMs at scale</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="generative-rm">Generative reward models and rubrics</h2>
+  <p>A scalar reward model is a classifier fit to comparisons: it cannot reason before scoring, cannot read a reference answer or a checklist, and is one fixed function that the policy learns to exploit. Since 2025, open technical reports increasingly replace it, for tasks without a checkable answer, by an LLM that judges against <strong>rubrics</strong> <span class="zh">评分标准</span>, a <strong>generative reward model</strong> <span class="zh">生成式奖励模型</span> (GRM). A useful ladder, from most to least trustworthy: a rule-based verifier, an LLM comparing to a reference answer, a rubric-guided generative judge, and last a scalar reward model.</p>
+
+  <ul>
+    <li><strong>DeepSeek-V3.2 (December 2025).</strong> One GRPO stage merges reasoning, agent and human-alignment training. "For reasoning and agent tasks, we employ rule-based outcome reward, length penalty, and language consistency reward. For general tasks, we employ a generative reward model where each prompt has its own rubrics for evaluation." For search agents, verifiable question-answer pairs are mixed with helpfulness prompts scored by rubrics over several quality dimensions <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3, §3.2.3]</a>.</li>
+    <li><strong>Kimi K2 (July 2025).</strong> The <em>self-critique rubric reward</em>: K2's critic ranks a prompt's responses by pairwise comparison against core rubrics (clarity and relevance, conversational fluency, objective and grounded interaction with no meta-commentary or unwarranted flattery), <em>prescriptive</em> rubrics that "aim to eliminate reward hacking" (no opening praise, no sentences justifying why the answer is good) and human-written rubrics. The critic is bootstrapped in SFT, then refined during RL on the on-policy rollouts of <em>verifiable</em> prompts, which "distills objective performance signals from RLVR" into the judge. The authors list a cost: the rubrics may favor confident, assertive answers, because the rules penalize hedging <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §3.2.2, App. F]</a>.</li>
+    <li><strong>DeepSeek-V4 (April 2026 preview).</strong> For hard-to-verify tasks the report dispenses with "conventional scalar-based reward models": it curates rubric-guided RL data and uses a generative reward model to evaluate trajectories, and applies RL to the GRM itself. The actor doubles as the GRM, so judging and generating skill are optimized jointly, with "only a minimal set of diverse human annotations". Specialists trained with GRPO are merged by on-policy distillation instead of a mixed RL stage <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1]</a>. When judge and policy share weights they can co-adapt; the report argues for robust scoring, but the section we read has no ablation of that risk.</li>
+    <li><strong>Rubrics as Rewards (Gunjal et al. 2025, ICLR 2026).</strong> A controlled study: an LLM writes 7 to 20 weighted rubric items (essential, important, optional, pitfall) per prompt from the reference answer, and a judge scores responses against them. GRPO on Qwen2.5-7B with a gpt-4o-mini judge beat Likert-scale LLM-as-judge rewards by up to 31% relative on HealthBench and 7% on GPQA-Diamond. Rubrics written without the reference answer were clearly worse (32.0% versus 35.9% on HealthBench-1k), and the verifiable reward is the special case of one rubric item <a href="https://arxiv.org/abs/2507.17746">[Gunjal et al. 2025, §2, §5, §6]</a>.</li>
+  </ul>
+
+  <h3 id="why-rubrics">Why rubrics help, and what they cost</h3>
+  <p>A rubric turns "which answer is better?" into checks a judge applies one at a time, so holistic taste (length, tone, agreeableness) matters less and the reward is harder to exploit with style alone. The judge knows what to look for, a reference answer can anchor it, and changing the objective means editing rubrics instead of retraining a reward model, the advantage Constitutional AI claimed for principles. The costs are real. Judges have biases (Kimi's assertiveness, Lee et al.'s position bias, cancelled by querying twice with the order swapped). Rubric quality becomes the bottleneck. A reasoning judge adds inference cost to every rollout. And the exploit moves to the judge: a policy can learn to satisfy a checklist's wording. DeepSeek-R1 shows a habit worth copying: it used learned reward models for helpfulness and harmlessness only in the last 400 of the 1,700 steps of its second RL stage, because more steps against the model-based reward "may lead to reward hacking" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §3.2.2]</a>. Limit exposure to any learned reward.</p>
+</section>
+
+<section>
+  <h2 id="moving-on">Why the field moved on from PPO-RLHF</h2>
+  <p>Classic RLHF is expensive and fragile: four models (<a href="#memory">252 GB of states</a> for a 7B policy), a rollout-dominated clock, and dozens of implementation details. The alternatives each removed a piece, and none is best everywhere.</p>
+  <ul>
+    <li><strong>Drop the RL loop: DPO and rejection sampling.</strong> Llama 3 found that DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval" than PPO <a href="https://arxiv.org/abs/2407.21783">[§4.1.4]</a>. Tulu 3 used length-normalized DPO throughout, "in lieu of more costly investigations into RL-based methods, such as PPO" <a href="https://arxiv.org/abs/2411.15124">[§1]</a>. Rejection sampling (best of \(K\), then SFT) is simpler still, and the best-of-\(K\) distribution sits at most \(\log K - (K-1)/K\) nats from the base, 2.43 nats at \(K = 30\) (<a href="21-preference-optimization.html#gao">page 21</a>).</li>
+    <li><strong>Drop the learned reward: verifiable rewards.</strong> If correctness is checkable, use the checker: no reward model to hack or to hold in memory, and GRPO also removes the critic (<a href="24-rlvr-reasoning.html">page 24</a>), so policy plus reference is 126 GB in our 7B example, half of PPO-RLHF. Tulu 3's RLVR gives reward \(\alpha = 10\) for a verified answer and 0 otherwise, and keeps the classic details (dropout off, value from a reward model, \(-10\) for a missing EOS, advantage whitening) <a href="https://arxiv.org/abs/2411.15124">[§6]</a>. DeepSeek-R1-Zero uses rule-based accuracy and format rewards only.</li>
+    <li><strong>Keep a learned judge only where nothing can be checked:</strong> rubric-guided generative rewards (previous section), used sparingly.</li>
+    <li><strong>Merge specialists by distillation:</strong> DeepSeek-V4 replaced its mixed RL stage by multi-teacher on-policy distillation <a href="https://arxiv.org/abs/2606.19348">[§5.1]</a>.</li>
+  </ul>
+  <p>The evidence is not one-sided. Xu et al. tuned PPO (advantage normalization, large batch, moving-average reference) and it beat DPO everywhere they tried: on HH-RLHF the OpenAssistant reward is 0.718 for PPO against 0.611 for DPO and 0.678 for iterative DPO, and on CodeContest (34B) PPO reaches 22.4% at 10@1k while DPO scores 0.0% and iterative DPO 3.2%. DPO is also sensitive to the gap between its data and the policy: with an SFT model far from the preference data, its safety rate was 55.4% against PPO's 99.5% <a href="https://arxiv.org/abs/2404.10719">[Xu et al. 2024, Tab. 2, 4, 8]</a>. A fair summary: for fixed offline chat preferences, DPO is often enough and much cheaper; when you can sample from the policy and score cheaply, online RL (PPO, GRPO) has more room, which is why reasoning models are trained that way. As of September 2026, in the open reports we checked (Kimi K2, DeepSeek-V3.2, DeepSeek-V4), the recipe is verifiable rewards where possible, rubric-guided generative judges elsewhere, critic-free optimizers and, at DeepSeek, specialists merged by distillation; a scalar-reward-model PPO stage is not the centerpiece. Closed labs do not publish recipes, so this describes open reports only.</p>
+<div class="table-wrap"><table class="data">
+    <thead><tr><th>Situation</th><th>Reasonable default</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Fixed offline preference pairs, limited compute</td><td>DPO (length-normalized, NLL term on chosen)</td><td>two models, no rollouts. Risk: off-policy data (<a href="21-preference-optimization.html#off-policy">page 21</a>)</td></tr>
+      <tr><td>Cheap sampling plus a reward model</td><td>Rejection sampling first, then online RL</td><td>simple and robust, bounded KL, used through Llama 3</td></tr>
+      <tr><td>Answers can be checked (math, code, constraints)</td><td>RLVR with GRPO or PPO</td><td>no learned reward to hack, no reward model in memory</td></tr>
+      <tr><td>Quality cannot be checked (writing, helpfulness)</td><td>Rubric-guided generative reward, limited RL exposure, KL</td><td>hard to exploit with style, cheap to edit, but the judge can be gamed</td></tr>
+      <tr><td>Several specialist skills</td><td>Train specialists, then distill on-policy</td><td>avoids conflicts of mixed RL (DeepSeek-V4)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"RLHF teaches the model its abilities."</strong> Most of the capability comes from pretraining. InstructGPT's whole alignment stack cost about 1.8% of GPT-3's pretraining compute, and Anthropic frames the open question as whether RL teaches new skills or focuses the model on a sub-distribution of existing behavior. What RLHF changes reliably is <em>which</em> behaviors are expressed (<a href="24-rlvr-reasoning.html">page 24</a> for the reasoning debate).</li>
+    <li><strong>"The KL penalty prevents reward hacking."</strong> It slows drift, nothing more. Gao et al. found it behaves like early stopping (<a href="21-preference-optimization.html#gao-findings">page 21</a>), InstructGPT could not fix its alignment tax by raising \(\beta\) 100×, Kirk et al. found that a larger coefficient does not restore diversity, and length still grows under a high KL coefficient (Singhal et al.).</li>
+    <li><strong>"The reward arrives at every token."</strong> The reward-model score is a single scalar credited to the last token. The dense per-token part is the KL penalty. Credit for the score reaches earlier tokens only through the value function and GAE.</li>
+    <li><strong>"Human preference labels are ground truth."</strong> Labelers agree 72.6% to 77% of the time, their tastes are systematic (longer, more confident, more agreeable), and a reward model can only reproduce them. InstructGPT is aligned to the preferences of about 40 contractors, not to human values in general.</li>
+    <li><strong>"Rejection sampling and PPO are different worlds."</strong> They differ in breadth (\(K\) samples per prompt versus one) and depth (PPO's data depends on the policy after every step), but Llama 2 stacked them in one pipeline, and iterated rounds make the difference small.</li>
+    <li><strong>"Training longer keeps improving the model."</strong> Reward keeps rising, quality does not. Llama 2 stops PPO after 200 to 400 iterations on held-out prompts, InstructGPT's 1.3B model regressed again at 512k episodes, and two of Huang et al.'s 1B runs reached KL 50 to 85 with degenerate text.</li>
+    <li><strong>"PRMs beat ORMs, so DeepSeek was wrong to drop them."</strong> Lightman et al. compare reward models for <em>reranking</em> a fixed generator with human step labels. DeepSeek-R1 reports that a model-based PRM was not worth its overhead and hacking risk in <em>large-scale RL</em>, and explicitly says this does not show the approach cannot work. Different settings, different conclusions.</li>
+    <li><strong>"AI feedback is as good as human feedback."</strong> Lee et al. show parity on three tasks with a labeler much larger than the policy, and their gains shrink after length control (71% to 59% for summarization). Combining human and AI labels did not help. It is evidence of viability, not of interchangeability.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Walk through the InstructGPT RLHF pipeline and the role of each model.</summary>
+    <div class="answer">
+      <p><strong>Step 1, SFT:</strong> fine-tune GPT-3 on about 13k labeler demonstrations. This model initializes everything else. <strong>Step 2, reward model:</strong> take the SFT model, replace the unembedding by a scalar head, and train a 6B model on rankings of 4 to 9 responses per prompt (about 33k prompts) with the pairwise loss \(-\log\sigma(r(y_w) - r(y_l))\), all pairs of a prompt in one batch element. <strong>Step 3, PPO:</strong> on about 31k unlabeled prompts, sample a response, score it with the frozen reward model, and update the policy with PPO. Four networks are involved: the <em>policy</em> (init from SFT, trained), the <em>reference</em> (frozen SFT copy, gives the KL term), the <em>reward model</em> (frozen) and the <em>value model</em> (init from the reward model, trained).</p>
+      <p>The reward of a response is \(r_\phi(x,y)\) on the last token minus \(\beta\log(\pi_\theta/\pi_{\text{SFT}})\) on every token, with \(\beta = 0.02\). In the final "PPO-ptx" variant a pretraining log-likelihood term with coefficient \(\gamma = 27.8\) is added. The result: labelers preferred the 1.3B model to 175B GPT-3, and the extra compute was about 1.8% of GPT-3 pretraining.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is the alignment tax in InstructGPT, and how was it reduced?</summary>
+    <div class="answer">
+      <p>After PPO against the reward model, the policy lost accuracy on public NLP benchmarks (SQuAD v2, DROP, HellaSwag, WMT15 Fr→En): alignment cost capability. The fix was <strong>PPO-ptx</strong>: for every RL episode, also take gradient steps on 8 times as many pretraining examples, adding \(\gamma\,\E[\log\pi(x)]\) to the objective, with \(\gamma = 27.8\). It recovered most regressions (better than GPT-3 on HellaSwag, still behind on DROP, SQuAD v2 and translation) without lowering labeler preference. The natural alternative, a bigger KL coefficient, failed: even 100× the default (\(\beta = 2.0\)) did not fix DROP or SQuAD and cost a lot of reward. Reason: the KL term only constrains behavior on RL prompts, while the pretraining term anchors the whole pretraining distribution. Also note the tax depends on scale: Anthropic found small models paid one, while 13B and 52B RLHF models improved zero-shot.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is Constitutional AI?</summary>
+    <div class="answer">
+      <p>A way to train a harmless but non-evasive assistant without human harm labels; the human input is a list of written principles. <strong>Supervised stage:</strong> a helpful RLHF model answers red-team prompts (often harmfully), critiques its answer under a randomly drawn principle from 16, and revises, up to four rounds. A pretrained model is fine-tuned on the revisions plus helpfulness data (SL-CAI). <strong>RL stage (RLAIF):</strong> SL-CAI writes pairs of responses, a feedback model chooses the more harmless one per a principle (soft label from the log-probs of "A" and "B", chain-of-thought labels clamped to 40 to 60%), a preference model is trained on 182,831 AI harmlessness plus 135,296 human helpfulness comparisons, and the policy is trained against it. Results: less harmful at equal helpfulness than human-label RLHF, and less evasive. Caveats: ad hoc principles, boilerplate from over-training, and labels that inherit the labeler's blind spots.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why add a KL penalty to the reference? What if \(\beta\) is too small or too large?</summary>
+    <div class="answer">
+      <p>The reward model is a proxy that is only valid near the data it was trained on. The KL term \(\beta\log(\pi_\theta/\pi_{\text{ref}})\) keeps the policy in that region, acts as an entropy bonus against collapse to one mode (Stiennon et al.), preserves fluency and pretrained knowledge, and makes the optimum a tilted reference distribution, \(\pi^\ast\propto\pi_{\text{ref}}e^{r/\beta}\) (<a href="21-preference-optimization.html#kl-objective">page 21</a>). Applied per token, it is dense and spreads the cost over the tokens responsible.</p>
+      <p><strong>Too small:</strong> reward hacking and degeneration. In Huang et al.'s reproduction two 1B runs reached KL 50 to 85 and produced run-together strings that GPT-3.5 preferred less than 20% of the time. <strong>Too large:</strong> the policy barely leaves the SFT model and gains little reward. Evidence for the sweet spot: InstructGPT's Likert scores peak around \(\beta = 0.01\) to 0.02 and are poor at 0 and at 2; Xu et al.'s OpenAssistant reward is 0.705 at \(\beta = 0\), 0.720 at 0.05, 0.718 at 0.1 and 0.629 at 0.2. Because \(\beta\) is only meaningful relative to the reward scale, rewards are normalized, and a controller can steer KL to a target. Two limits: the penalty acts like early stopping rather than removing hacking (Gao et al.), and a larger coefficient does not restore diversity (Kirk et al.).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Name three forms of reward hacking and how you would mitigate each.</summary>
+    <div class="answer">
+      <p><strong>Length.</strong> Learned rewards correlate with length (within-prompt \(r = 0.72\) on WebGPT), and length explains 98% (WebGPT) and 73% (RLCD) of PPO's reward gain (the non-length shares in Singhal et al. Table 1 are 2% and 27%). A reward for length alone reproduces most of the win-rate gain (56% versus 58%). Mitigate with length-balanced preference data, a length penalty or reward scaling, and by reporting length-controlled win rates; all cost some reward.</p>
+      <p><strong>Sycophancy.</strong> Assistants agree with a user's stated view or flip correct answers when challenged (Claude 1.3 wrongly admits mistakes on 98% of questions), and "matches the user's beliefs" is one of the best predictors of human preference in the HH data. Mitigate with better or prompted preference models, more raters per item, labeler assistance, and evaluations that test for it.</p>
+      <p><strong>Persuading the rater / style.</strong> After PPO against a ChatBotArena-trained reward model, human approval rose 9.4 points on QuALITY with no gain in correctness, and evaluators' false-positive rate went from 46.7% to 70.2%. The policy fabricated evidence and wrote hard-to-read code that passed simple tests. Mitigate by rewarding what can be checked (verifiers, tests), stronger or ensembled judges, and evaluation by people with more time than the training signal had. Across all forms: limit optimization (KL, early stopping on a held-out judge), refresh the reward model on the current policy's samples, and monitor reward, KL, length and entropy together.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate the memory needed for the four models of PPO-RLHF with a 7B policy. How does it change for DPO or GRPO?</summary>
+    <div class="answer">
+      <p>Use 16 bytes per trained parameter (bf16 weights 2, bf16 grads 2, fp32 master 4, Adam \(m,v\) 4 + 4) and 2 bytes per frozen parameter. Policy: \(7\text{B}\times16 = 112\) GB. Critic (trained, same size): 112 GB. Reference: \(7\text{B}\times2 = 14\) GB. Reward model: 14 GB. Total 252 GB (235 GiB), \(2.25\times\) an SFT run and about 3.15 H100s of 80 GB before activations, KV cache and logits. ZeRO-3 over 8 GPUs gives 31.5 GB per GPU for states, plus a generation copy of the weights (14 GB in bf16) if the rollout engine is separate.</p>
+      <p>DPO needs policy plus reference, 126 GB, or 112 GB if reference log-probs are cached (possible because the responses are fixed). GRPO with a verifier also holds policy plus reference, 126 GB, since it has no critic and no reward model. PPO with a verifier (Tulu 3) keeps policy, critic and reference: 238 GB. Trick list: offload the frozen models to CPU, train LoRA adapters, and choose small critics: InstructGPT's 6B reward and value models against a 175B policy make up only 3.3% of the 3.26 TB.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A 4-token response has \(\log\pi_\theta = (-0.5, -1.0, -0.2, -0.8)\), \(\log\pi_{\text{ref}} = (-0.7, -0.8, -0.9, -0.8)\), \(\beta = 0.05\) and reward-model score \(-0.4\). Give the per-token rewards and the return. Then apply one adaptive-KL step.</summary>
+    <div class="answer">
+      <p>Log-ratios: \((0.2, -0.2, 0.7, 0.0)\), sum 0.7. KL rewards \(-\beta\times\) ratio: \((-0.01, +0.01, -0.035, 0)\). Add the score to the last token: \(r = (-0.01,\ 0.01,\ -0.035,\ -0.4)\). Undiscounted returns-to-go: \(G = (-0.435, -0.425, -0.435, -0.40)\). Check: \(G_1 = -0.4 - 0.05\times0.7 = -0.435\), the sequence-level objective \(r_\phi - \beta\log(\pi_\theta/\pi_{\text{ref}})\).</p>
+      <p>Controller with target 6 nats, measured sequence KL 3, batch 256, horizon 10,000: error \(= \operatorname{clip}(3/6 - 1, -0.2, 0.2) = -0.2\); multiplier \(1 + (-0.2)(256/10{,}000) = 0.99488\); \(\beta \to 0.05\times0.99488 = 0.04974\). A saturated error changes \(\beta\) by about 0.5% here, so the controller is a slow set-point tracker, not a step-by-step regulator. The reward is treated as a constant for the update (no gradient flows through it).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why does generation dominate the wall-clock of RLHF, and how do systems cope?</summary>
+    <div class="answer">
+      <p>By FLOPs it should not: per token, generation is one forward (\(2N\)), the reference, reward and value models one forward each (\(2N\) each), and policy and critic training forward plus backward (\(6N\) each), so generation is about \(2/20 = 10\%\) of the FLOPs for one PPO epoch. But decoding is memory-bandwidth-bound and runs at a small fraction of the MFU of training (page 06). With 40% MFU for training and forward passes and 10% for decoding, generation takes \(20/65 = 31\%\) of the time, and 47% at 5%. Measured shares are higher: actor generation plus training is 58.9% of an iteration in HybridFlow, generation alone up to 81.2% in a system without a KV cache, and over 90% for long chain-of-thought rollouts (OpenRLHF). Llama 2 saw a 20× generation slowdown under FSDP until it consolidated weights per node.</p>
+      <p>Systems response: serve rollouts with an inference engine (paged KV cache, continuous batching), use different parallelism for generation (small TP, large DP) and training and reshard weights between them without redundant copies, place models colocated or split depending on cluster size, and overlap rollouts with training asynchronously (see <a href="25-rl-systems-agentic.html">page 25</a>). Weight transfer itself can cost up to 36% of an iteration for a 70B actor when training and generation sit on different devices.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does Llama 2 build its reward signal? Why two reward models, what is the margin term, and how are they combined?</summary>
+    <div class="answer">
+      <p>Over 1M binary comparisons with four preference-strength levels. Two reward models from the chat checkpoint: helpfulness and safety, because the objectives trade off and a single model would also have to tell adversarial prompts from benign ones (Bai et al. saw the same tension). Each wins on its own data (63.2% vs 56.2% helpfulness, 64.5% vs 62.8% safety). The ranking loss gets a margin \(m(r)\): \(-\log\sigma(r_c - r_r - m)\), with \(m = (1, 2/3, 1/3, 0)\) or \((3, 2, 1, 0)\) from "significantly better" down to "negligible". At a score gap of 2 the loss is 0.127 without margin, 0.313 with margin 1 and 1.313 with margin 3, so clear pairs keep being pushed apart. It helped accuracy on clear pairs (79.1% to 80.4% or 80.7%) but hurt similar pairs and made scores more extreme, a concern for PPO.</p>
+      <p>For PPO, use the safety score when the prompt is safety-flagged or the safety score is below 0.15 (precision 0.89, recall 0.55 on unsafe responses), otherwise the helpfulness score; then whiten \(\operatorname{logit}(R_c)\) to balance against the KL term. Llama 3 later dropped the margin and PPO.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Process versus outcome reward models: what are the pros and cons?</summary>
+    <div class="answer">
+      <p><strong>Outcome (ORM):</strong> one label per solution, cheap when the answer is checkable, but no credit assignment, and false positives (right answer through flawed reasoning) are rewarded. <strong>Process (PRM):</strong> a label per step, locating the first error. Pros: at best-of-1860 on MATH the PRM solves 78.2% versus 72.4% for the ORM and 69.6% for majority voting, and the gap widens with \(N\); it selects reasoning humans can follow; on GSM8K, RL on final answers left 12.4% of correct-answer solutions with a wrong step versus 3.8% for process-based methods. The intuition: most sampled solutions contain an error, so an outcome label carries little information.</p>
+      <p>Cons: human step labels are expensive (PRM800K: 800k labels), a "step" must be defined, Monte-Carlo labels (Math-Shepherd) cost \(N\) completions per step (about 36× the solution's tokens for a 10-step, 300-token solution at \(N = 8\)) and are noisy, product scoring penalizes long solutions, and a learned PRM used as an RL reward is hackable. DeepSeek-R1 lists exactly these as why PRMs did not pay off in large-scale RL, while still saying they are useful for reranking or search. In practice: PRMs for reranking and search, verifiers instead of any model when the answer is checkable.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why did many labs move from PPO-based RLHF to DPO or RLVR?</summary>
+    <div class="answer">
+      <p><strong>Cost and fragility.</strong> PPO-RLHF holds four models (252 GB of states for a 7B policy against 126 GB for DPO or GRPO), spends most of its time on rollouts, and depends on many details (dropout off, whitening, EOS handling, KL control). Llama 3 states that DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval", and Tulu 3 chose length-normalized DPO over more costly RL.</p>
+      <p><strong>Reward hacking of a learned RM.</strong> Where correctness is checkable, a verifier removes the exploitable model, and there is nothing to hold in memory: Tulu 3's RLVR gives reward 10 for verified answers, and DeepSeek-R1 uses rule-based accuracy and format rewards, having found neural rewards hackable at scale. GRPO also removes the critic. <strong>What remains for learned judges:</strong> tasks nobody can check, handled by rubric-guided generative rewards (DeepSeek-V3.2, Kimi K2, V4).</p>
+      <p><strong>Counter-evidence, so as not to overclaim:</strong> Xu et al. found tuned PPO beats DPO on HH-RLHF (0.718 versus 0.611) and on CodeContest (22.4% versus 0.0%), and that DPO is sensitive to a mismatch between its data and the policy; the move is driven by cost, simplicity and verifiable domains, not by a proof that PPO is worse. Online sampling (iterative DPO, RS, GRPO) recovers much of what offline DPO lacks.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design and debugging: during RLHF the reward and KL rise, responses double in length, but human win rate is flat and then falls. Diagnose and fix.</summary>
+    <div class="answer">
+      <p>Reward up with quality flat or down is reward hacking, and doubling length is the classic suspect. <strong>Diagnose:</strong> (1) stratify reward gain by length bucket (Singhal et al. found a non-length gain of 2% on WebGPT); (2) compare length-controlled win rates; (3) read samples for style tricks, sycophancy, hedging, and degenerate strings; (4) check KL: values in the tens with degenerate text mean over-optimization (Huang et al.); (5) verify EOS and truncation handling, since a missing EOS penalty or a reward read at the wrong position lets responses run to the limit; (6) check the reward model on a fresh on-policy sample: its accuracy on the policy's current outputs may have degraded (Llama 2 refreshes preference data every round for this reason).</p>
+      <p><strong>Fix, in order:</strong> stop at the checkpoint that is best on a held-out independent judge (Llama 2 early-stops at 200 to 400 iterations); control the leash with a target-KL controller or a higher \(\beta\); remove the exploited feature from the proxy (length-balanced preference pairs, a length penalty, reward scaling); refresh the reward model with comparisons on the current policy's outputs, or an ensemble; replace the learned reward with a verifier or rubric-based judge where possible. Say which trade-offs you accept: every length intervention lowered reward in Singhal et al., and none removed the length increase entirely.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Read the RLAIF-versus-RLHF evidence critically. What does it show, and what would you check before replacing human labels?</summary>
+    <div class="answer">
+      <p><strong>Shows:</strong> with PaLM 2 L labeling and a PaLM 2 XS policy, RLAIF and RLHF both beat SFT (71% and 73% on summarization, 63% and 64% on helpful dialogue), are tied head to head (50%, 52%, not significant), and RLAIF has the higher harmless rate (88% versus 76% versus 64%). Direct scoring without a reward model (d-RLAIF) did even better (74%, 66%), and the labeler's agreement with humans (78%) is at the level of human-human agreement (73% to 77%).</p>
+      <p><strong>Does not show:</strong> (1) the labeler is much larger than the policy, so this is distillation of a strong judge, not self-improvement at the frontier; (2) length control shrinks gains (71% to 59%, 73% to 61%), so part of the "win" is length; (3) the harmless rate scores each response alone, so refusing more raises it, and it says nothing about helpfulness; (4) human plus AI labels did not beat human alone; (5) one model family, small policies, 2023 prices for the 10× cost claim. <strong>I would check:</strong> labeler-human agreement on <em>my</em> distribution and by pair difficulty; position bias (swap order); length-controlled and blind human evaluation with significance tests; whether gains persist when the labeler is the same size as the policy; and whether the AI-labeled data over-rewards the labeler's own style.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you need a reward for long-form helpful writing, where nothing can be checked. How would you build it in 2026, and how would you keep it from being hacked?</summary>
+    <div class="answer">
+      <p>Build a rubric-guided generative reward, following the DeepSeek-V3.2, Kimi K2 and Rubrics-as-Rewards pattern. (1) For each prompt, generate a rubric of about 7 to 20 weighted, self-contained criteria, conditioned on a reference answer or expert-written points (RaR: rubrics without a reference scored 32.0% versus 35.9% on HealthBench). Add global rubrics for style, and <em>prescriptive</em> rubrics that target known hacks (no opening praise, no self-justification, length bands) as in Kimi K2. (2) Score with a reasoning judge, aggregate per-criterion checks explicitly or let the judge aggregate holistically, and swap presentation order to cancel position bias. (3) Where any part is checkable (facts with references, format constraints, code snippets), use a verifier for that part and keep the judge for the rest. (4) Calibrate the judge continuously against outcomes you can verify, as K2 does with RLVR rollouts, and against a held-out set of human comparisons.</p>
+      <p>Defenses in the loop: a KL leash or early stopping, a frozen judge (or, if the judge shares weights with the policy as in DeepSeek-V4, an independent audit to catch co-adaptation), limited RL steps under the learned reward (R1 used its preference rewards only in the last 400 of 1,700 steps), and monitors for length, entropy, refusal rate and judge-versus-human disagreement. Accept the known costs: judge bias toward assertive answers (K2 App. F.3), rubric quality as the bottleneck, and judge inference cost per rollout.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>The numerical core of a PPO-RLHF loop.</strong> Implement four small pieces, all in <code>exercises/drills/rlhf.py</code>: <code>shaped_rewards</code> (KL penalty on every response token, reward-model score added on the last real token, zero on padding, detached from the graph), <code>whiten</code> (masked, pooled population statistics, with the <code>shift_mean=False</code> variant used for rewards), <code>apply_eos_penalty</code> (a constant replaces the score for responses without EOS) and <code>AdaptiveKLController</code> (the Ziegler et al. proportional rule with the <code>n_steps / horizon</code> gain). The tests check the 6-token example from this page, padding behavior, exact controller updates, clipping, and convergence on a toy plant. An interviewer would expect all four in 20 to 30 minutes, with the last-token indexing and the masked variance being the usual slips. <span class="ex-path">exercises/drills/rlhf.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_rlhf.py</code>; add <code>--solutions</code> to check the reference implementation. The Bradley-Terry loss with a Llama 2 style margin is <code>bt_reward_loss</code> in the <a href="21-preference-optimization.html#exercises">page 21 drill</a>, and the PPO clipped loss and GAE are in the page 22 drill.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2203.02155">Ouyang et al. (2022). Training language models to follow instructions with human feedback.</a> <span class="why">Why read it: the recipe with all numbers (App. A and C give data sizes and hyperparameters), PPO-ptx, and the alignment-tax ablations in App. E.</span></li>
+    <li><a href="https://arxiv.org/abs/1909.08593">Ziegler et al. (2019). Fine-Tuning Language Models from Human Preferences.</a> <span class="why">Why read it: the first RLHF for language models, the per-token KL reward and the adaptive KL controller. Its honest negative results on labeler shortcuts (copying) are a preview of reward hacking.</span></li>
+    <li><a href="https://arxiv.org/abs/2009.01325">Stiennon et al. (2020). Learning to summarize from human feedback.</a> <span class="why">Why read it: the pipeline on TL;DR, separate value network, the length confound (App. F) and the over-optimization plot (Fig. 5).</span></li>
+    <li><a href="https://arxiv.org/abs/2204.05862">Bai et al. (2022). Training a Helpful and Harmless Assistant with Reinforcement Learning from Human Feedback.</a> <span class="why">Why read it: the helpfulness/harmlessness tension (§4.4), online iterated RLHF (§4.5), and the linear relation between reward and \(\sqrt{\mathrm{KL}}\) (§4.3).</span></li>
+    <li><a href="https://arxiv.org/abs/2307.09288">Touvron et al. (2023). Llama 2: Open Foundation and Fine-Tuned Chat Models.</a> <span class="why">Why read it: §3.2 is the most detailed public RLHF recipe: two reward models, margin loss, rejection sampling plus PPO, and Ghost Attention.</span></li>
+    <li><a href="https://arxiv.org/abs/2403.17031">Huang et al. (2024). The N+ Implementation Details of RLHF with PPO.</a> <span class="why">Why read it: every detail that makes the loop train, with ablations (dropout, EOS trick, whitening, value initialization).</span></li>
+    <li><a href="https://arxiv.org/abs/2212.08073">Bai et al. (2022). Constitutional AI: Harmlessness from AI Feedback.</a> <span class="why">Why read it: critique-revise and RLAIF with all counts, the CoT-label clamping, and the over-training boilerplate failure.</span></li>
+    <li><a href="https://arxiv.org/abs/2309.00267">Lee et al. (2023). RLAIF vs. RLHF: Scaling Reinforcement Learning from Human Feedback with AI Feedback.</a> <span class="why">Why read it: the controlled comparison, direct RLAIF, and labeler-alignment analysis, with the length-control appendix that tempers the headline.</span></li>
+    <li><a href="https://arxiv.org/abs/2305.20050">Lightman et al. (2023). Let's Verify Step by Step.</a> <span class="why">Why read it: PRM800K, process versus outcome supervision, active learning, and the small-scale synthetic ablations.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: §3.2.2 and App. F are the most detailed public description of a rubric-based self-critique reward, with its stated limitation.</span></li>
+  </ol>
+  <p class="small muted">Also used on this page: <a href="https://arxiv.org/abs/2312.08935">Math-Shepherd</a>, <a href="https://arxiv.org/abs/2211.14275">Uesato et al. 2022</a>, <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1</a>, <a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2</a>, <a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4</a>, <a href="https://arxiv.org/abs/2507.17746">Rubrics as Rewards</a>, <a href="https://arxiv.org/abs/2407.21783">Llama 3</a>, <a href="https://arxiv.org/abs/2411.15124">Tulu 3</a>, <a href="https://arxiv.org/abs/2404.10719">Xu et al. 2024</a>, <a href="https://arxiv.org/abs/2310.03716">Singhal et al. 2023</a> (length), <a href="https://arxiv.org/abs/2310.13548">Sharma et al. 2023</a> (sycophancy), <a href="https://arxiv.org/abs/2409.12822">Wen et al. 2024</a> (misleading humans), <a href="https://arxiv.org/abs/2310.06452">Kirk et al. 2023</a> (diversity), <a href="https://arxiv.org/abs/2409.19256">HybridFlow</a> and <a href="https://arxiv.org/abs/2405.11143">OpenRLHF</a> (systems), and <a href="https://arxiv.org/abs/2307.15217">Casper et al. 2023</a> for a survey of open problems in RLHF.</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>InstructGPT:</strong> SFT on ~13k prompts (16 epochs), 6B reward model on ~33k prompts with K = 4 to 9 ranked responses (all \(\binom K2\) pairs as one batch element), PPO on ~31k prompts (256k episodes, batch 512). The 1.3B model beats 175B GPT-3, alignment cost ≈ 1.8% of GPT-3 pretraining compute.</li>
+      <li><strong>Reward per token:</strong> \(r_t = -\beta(\log\pi_\theta - \log\pi_{\text{ref}})_t + \mathbb 1[t=T]\, r_\phi\), so the return is \(r_\phi - \beta\,\)(sequence KL). \(\beta\): 0.02 InstructGPT, 0.01 / 0.005 Llama 2, 0.001 Anthropic HH and R1-Zero (KL in the loss).</li>
+      <li><strong>PPO-ptx:</strong> add \(\gamma\,\E_{\text{pretrain}}[\log\pi]\), \(\gamma = 27.8\), 8× as many pretraining examples as RL episodes. Raising \(\beta\) to 2.0 did not fix the alignment tax.</li>
+      <li><strong>Four models:</strong> policy (trained), reference (frozen), reward model (frozen), value (init from RM, trained). 16 B/param trained, 2 B/param frozen: 7B gives 112 + 112 + 14 + 14 = <strong>252 GB</strong>. DPO or GRPO: 126 GB.</li>
+      <li><strong>Generation:</strong> ~10% of FLOPs (for 1 PPO epoch) but 31% to 47% of time at 10% or 5% decode MFU (assumed); measured 59% (actor gen + train), up to 81%, over 90% for long CoT.</li>
+      <li><strong>Details that matter:</strong> dropout off, read the reward at EOS, normalize the RM (demos score 0), truncation penalty (−1 or −10), whiten advantages, value from RM with separate weights, large batches.</li>
+      <li><strong>Adaptive KL:</strong> \(\beta \leftarrow \beta\,(1 + \operatorname{clip}(\mathrm{KL}/\mathrm{KL}_{\text{target}} - 1, \pm0.2)\cdot n/\text{horizon})\), horizon 10,000 episodes. Saturated, it moves \(\beta\) about 1% per 512-episode batch.</li>
+      <li><strong>Llama 2:</strong> >1M comparisons, two RMs (helpfulness, safety), margin \((1, 2/3, 1/3, 0)\) or \((3,2,1,0)\), safety score used if the prompt is flagged or the safety score is below 0.15, whitened logit, rejection sampling (V1 to V4) then PPO, 330 s per PPO step at 70B, Ghost Attention. <strong>Llama 3:</strong> rejection sampling + DPO (\(\beta = 0.1\), NLL 0.2), no margin.</li>
+      <li><strong>Hacking:</strong> length (98% and 73% of reward gain on WebGPT and RLCD), sycophancy (98% wrong "mistake" admissions for Claude 1.3), hedging and refusal boilerplate, persuading the rater (false positives 46.7% to 70.2%). Mitigate: early stop on an independent judge, refresh the RM, verifiers, length-controlled evaluation.</li>
+      <li><strong>Diversity:</strong> RLHF generalizes better than SFT but per-input diversity drops sharply (EAD 0.07 vs 0.79 for OPT-6.7B); a higher KL coefficient does not restore it.</li>
+      <li><strong>CAI / RLAIF:</strong> 16 principles, up to 4 revisions, 182,831 AI + 135,296 human comparisons, CoT labels clamped to 40 to 60%. RLAIF vs RLHF: 71 / 73% (summ), 63 / 64% (helpful), harmless 88 / 76 / 64%; length control 71 to 59%.</li>
+      <li><strong>PRM vs ORM:</strong> best-of-1860 on MATH 78.2 / 72.4 / 69.6% (PRM / ORM / majority). PRM800K: 800k step labels. Math-Shepherd: hard or soft estimation from \(N = 8\) completions, ~36× token cost. R1 dropped PRMs: step definition, step correctness, reward hacking.</li>
+      <li><strong>Generative rewards:</strong> V3.2 per-prompt rubrics scored by a GRM, K2 self-critique with core plus prescriptive rubrics refined by RLVR rollouts, V4 GRM optimized jointly with the actor, RaR up to 31% relative over Likert judges. Limit RL steps under any learned reward (R1: last 400 of 1,700).</li>
+      <li><strong>Trend:</strong> PPO-RLHF → rejection sampling + DPO (Llama 3, Tulu 3) → verifiable rewards with critic-free RL → rubric-guided generative judges and on-policy distillation. Tuned PPO still beats DPO in some settings (Xu et al.).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

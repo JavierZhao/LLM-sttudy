@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 · RLVR &amp; reasoning models: GRPO and successors · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="24" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part V · Reinforcement learning · Page 24</div>
+  <h1>RLVR &amp; reasoning models: GRPO and successors</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~80 min</span>
+    <span>Prereqs: <a href="22-rl-foundations.html">22 Policy gradient to PPO</a>, <a href="23-rlhf.html">23 RLHF in practice</a></span>
+  </div>
+  <p class="lede">Reasoning models such as DeepSeek-R1 are trained by sampling many long chains of thought, checking the final answers with a program, and reinforcing what passed. This page writes GRPO exactly as DeepSeekMath does, walks through R1-Zero and the R1 pipeline, treats Dr. GRPO, DAPO, GSPO and CISPO as answers to specific failures, and closes with the open debate on whether RL teaches models anything new, plus a recipe for a small run of your own.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Write the GRPO objective from memory</strong> with its exact normalizers (\(1/G\), \(1/|o_i|\)), where the KL term sits (in the loss, as the k3 estimator), and what is shared across the tokens of a response. Then say how it differs from PPO and why there is no critic.</li>
+    <li><strong>The bias analysis:</strong> length bias from \(1/|o_i|\), difficulty bias from the group std, and how Dr. GRPO and DAPO's token-level loss remove them. Expect to compute per-token gradient weights for a 100-token and a 1,000-token response.</li>
+    <li><strong>R1-Zero versus R1:</strong> what the reward was, what the cold start is for (readability, not capability), the four-stage pipeline, and what the "aha moment" does and does not show.</li>
+    <li><strong>Each fix and the failure behind it:</strong> clip-higher against entropy collapse, dynamic sampling against zero-advantage groups, GSPO against token-level importance noise in MoE models, CISPO against clipped-out rare tokens.</li>
+    <li><strong>Debate literacy and practice:</strong> pass@k evidence that RL only sharpens, the counter-evidence, and how you would design and monitor a real RLVR run.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Define RLVR, name three kinds of verifiers, and explain why verifiable rewards resist reward hacking better than a learned reward model and where they still fail.</li>
+    <li>Write the GRPO objective and advantage exactly as in DeepSeekMath, state the k3 KL estimator, and compute group advantages for a worked case under GRPO, Dr. GRPO and RLOO.</li>
+    <li>Describe R1-Zero (rewards, hyperparameters, what emerged) and the four-stage R1 pipeline, and cite what distillation versus RL showed at small scale.</li>
+    <li>Derive the length and difficulty biases of GRPO's normalization, and state each successor's precise change: Dr. GRPO, DAPO (four parts), GSPO, CISPO, RLOO, REINFORCE++, and DeepSeek-V3.2's modifications.</li>
+    <li>Explain entropy collapse through the covariance identity, and choose among the mitigations.</li>
+    <li>Argue both sides of "does RL add capability?" using pass@k, ProRL, spurious rewards and distillation evidence.</li>
+    <li>Lay out an RLVR experiment for a 7B model: data, reward, group size, learning rate, lengths, KL, what to monitor and what each failure pattern means.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="rlvr">RLVR: reinforcement learning on rewards you can check</h2>
+
+  <p><a href="23-rlhf.html">Page 23</a> covered RLHF: a reward model trained on human preferences scores each response, and PPO maximizes that score under a KL leash. <strong>Reinforcement learning with verifiable rewards</strong> <span class="zh">可验证奖励强化学习</span> (RLVR) keeps the RL machinery and replaces the learned reward model with a program. The term comes from Tülu 3, which sets the reward to a constant \(\alpha\) (they use \(\alpha = 10\)) when the answer extracted from the completion is verifiably correct and to 0 otherwise, and trains with PPO plus a KL penalty on GSM8K, MATH and instruction-following constraints <a href="https://arxiv.org/abs/2411.15124">[Lambert et al. 2024, §6]</a>. DeepSeek-R1 then showed that the same idea, run at scale on a strong base model, yields long chains of thought <span class="zh">思维链</span> with reflection and verification, without a single human-written reasoning trace <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2]</a>.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Domain</th><th>Checker</th><th>Typical failure modes</th></tr></thead>
+    <tbody>
+      <tr><td>Math with a final answer</td><td>Extract the final answer (for example from <code>\boxed{}</code>), normalize, compare with the reference; symbolic equivalence with sympy</td><td>Parser false negatives (<code>\frac{1}{2}</code> versus 0.5), lucky guesses on numeric answers. DAPO rewrites problems so that the answer is an integer, to minimize parser errors <a href="https://arxiv.org/abs/2503.14476">[DAPO, §3.5]</a></td></tr>
+      <tr><td>Code</td><td>Run the program in a sandbox against unit tests</td><td>Weak tests (false positives), special-casing the tests. R1 prompts DeepSeek-V2.5 to write test-case generators for 5,151 Codeforces and 2,504 AtCoder problems and keeps only tests validated against correct submissions <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. B.3]</a></td></tr>
+      <tr><td>Logic puzzles, code-I/O</td><td>Compare with a programmatically generated answer</td><td>Narrow puzzle distribution; the skill may not transfer</td></tr>
+      <tr><td>Instruction following</td><td>One checker per constraint template (length, keywords, format)</td><td>Checks the letter of the instruction, not its intent <a href="https://arxiv.org/abs/2411.15124">[Lambert et al. 2024, §6.1]</a></td></tr>
+      <tr><td>Format</td><td>Regular expression on tags such as <code>&lt;think&gt;...&lt;/think&gt;</code></td><td>Trivial to satisfy. R1 sums it with the accuracy reward at equal weight <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Eq. 4]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The reward function of a serious math recipe fits on one screen. The subtle parts are brace matching, normalization, and refusing credit when no boxed answer exists.</p>
+
+<pre><code class="language-python">import re
+from fractions import Fraction
+
+def extract_boxed(text):
+    """Content of the LAST \boxed{...} (brace-matched), or None."""
+    i = text.rfind("\\boxed{")
+    if i &lt; 0:
+        return None
+    i += len("\\boxed{")
+    depth, j = 1, i
+    while j &lt; len(text) and depth:
+        depth += (text[j] == "{") - (text[j] == "}")
+        j += 1
+    return text[i:j - 1] if depth == 0 else None
+
+def normalize(ans):
+    ans = ans.strip().replace(" ", "").replace("\\!", "").replace("$", "").rstrip(".")
+    ans = re.sub(r"\\d?frac\{(-?\d+)\}\{(\d+)\}", r"\1/\2", ans)   # \frac{1}{2} -> 1/2
+    try:
+        return str(Fraction(ans))          # numeric equivalence: "0.50", "1/2" and "\frac{1}{2}" agree
+    except (ValueError, ZeroDivisionError):
+        return ans
+
+def accuracy_reward(response, gold):
+    pred = extract_boxed(response)
+    return float(pred is not None and normalize(pred) == normalize(gold))
+
+def format_reward(response):               # R1-style structure check, added with equal weight in R1
+    return float(re.fullmatch(r"(?s)\s*&lt;think&gt;.+?&lt;/think&gt;\s*.+", response) is not None)
+</code></pre>
+
+  <h3 id="why-verifiable">Why verifiable rewards resist hacking, and where they do not</h3>
+  <p>A reward model is a function approximator fit to a finite set of human judgments, and an optimizer that queries it millions of times finds its blind spots (the over-optimization curves of <a href="23-rlhf.html">page 23</a>). DeepSeek-R1 therefore says it abstains from applying neural reward models, "whether outcome-based or process-based", to reasoning tasks, because they "are susceptible to reward hacking <span class="zh">奖励黑客</span> during large-scale reinforcement learning", and because retraining them costs compute and complicates the pipeline <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2.2]</a>. Their appendix shows the failure with the helpfulness reward model: the reward keeps rising while Codeforces pass@1 falls (App. B.5, Fig. 6), and the paper confines preference-based rewards to the last 400 of the 1,700 steps of the final RL stage for that reason (§3.2.2).</p>
+  <p>"Resist" does not mean "immune". Four limits to state in an interview:</p>
+  <ol>
+    <li><strong>The checker is the specification.</strong> Whatever it accepts gets optimized: a parser that accepts the first number in the response, a test suite that a hard-coded lookup table passes, a numeric-answer problem where 1 in 5 or 1 in 100 guesses succeed. Yue et al. manually read the correct chains of thought of the hardest solved problems to rule out lucky guesses for exactly this reason <a href="https://arxiv.org/abs/2504.13837">[Yue et al. 2025, §3.1]</a>.</li>
+    <li><strong>Rules produce false negatives too.</strong> Qwen3's general RL therefore adds a reward from an LLM that compares the response with a reference answer, "avoiding false negatives that can occur with purely rule-based rewards" <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.4]</a>. R1 finds LLM-versus-reference judging robust for short answers and poorly generalizing to open-ended writing <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. G.1]</a>.</li>
+    <li><strong>Only checkable domains.</strong> R1 lists writing as a task where a reliable reward is hard to build and falls back on human-annotated SFT data there <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §6]</a>. DeepSeek-V4 addresses hard-to-verify tasks with rubric-guided data and a <em>generative</em> reward model, and applies RL to the judge itself, so the actor doubles as the grader <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1]</a>.</li>
+    <li><strong>One bit per trajectory.</strong> A 20,000-token response earns a single 0 or 1. Credit assignment to individual tokens is left entirely to sampling statistics, which is why the group size \(G\) and the baseline design matter so much in what follows.</li>
+  </ol>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger had a differentiable loss on a label attached to every jet, so one forward pass gave an exact gradient. In RLVR the "label" is a scalar reward on a sequence the model sampled itself, and sampling is not differentiable. The gradient is a score-function estimate (<a href="22-rl-foundations.html">page 22</a>): unbiased but noisy. Every algorithm on this page is a way to lower that noise (group baselines), keep updates near the sampling policy (clipping), or discard samples that carry no signal (dynamic sampling).</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="grpo">GRPO, exactly</h2>
+
+  <p><strong>Group Relative Policy Optimization</strong> <span class="zh">组相对策略优化</span> was introduced in DeepSeekMath to remove PPO's critic <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §4.1]</a>. The critic is a problem for two reasons. It is a second model of the policy's size (a 7B policy under mixed-precision Adam holds about 16 bytes per parameter, so a 7B critic adds roughly \(7\times10^{9}\times16 = 112\) GB of training state, see <a href="15-distributed-training.html">page 15</a>). And it must predict, from a partial response, the outcome reward of a completion that has not happened yet. R1 argues this is especially hard for long chains of thought: because the model reflects and revises, "the content initially generated may later be revised or contradicted, which makes it even less feasible to predict the final reward based on a partial response" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. A.3]</a>. GRPO instead samples \(G\) responses to the same prompt and uses the group's average reward as the baseline.</p>
+
+  <p>For each prompt \(q\), GRPO samples \(\{o_1,\dots,o_G\}\sim\pi_{\theta_{\text{old}}}(\cdot\mid q)\), scores them with rewards \(r_1,\dots,r_G\), and forms one advantage per response:</p>
+
+  \[ \hat A_{i,t} \;=\; \hat A_i \;=\; \frac{r_i-\operatorname{mean}(r_1,\dots,r_G)}{\operatorname{std}(r_1,\dots,r_G)} \qquad\text{for every token } t \text{ of } o_i \]
+
+  <p>Then it maximizes the following objective (DeepSeekMath Eq. 3 with the KL estimator of Eq. 4; we write \(\rho_{i,t}\) for the probability ratio because \(r\) is already the reward):</p>
+
+  <div class="eq-box">
+  \[
+  \mathcal J_{\text{GRPO}}(\theta)=\E_{q,\ \{o_i\}\sim\pi_{\theta_{\text{old}}}}\!\left[\frac1G\sum_{i=1}^{G}\frac1{|o_i|}\sum_{t=1}^{|o_i|}\Big\{\min\!\big(\rho_{i,t}\,\hat A_{i},\ \clip(\rho_{i,t},\,1-\varepsilon,\,1+\varepsilon)\,\hat A_{i}\big)\;-\;\beta\,\mathbb D_{\text{KL}}\big[\pi_\theta\|\pi_{\text{ref}}\big]_{i,t}\Big\}\right]
+  \]
+  \[
+  \rho_{i,t}=\frac{\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})}{\pi_{\theta_{\text{old}}}(o_{i,t}\mid q,o_{i,\lt t})},\qquad
+  \mathbb D_{\text{KL}}\big[\pi_\theta\|\pi_{\text{ref}}\big]_{i,t}=\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-\log\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-1
+  \]
+  <div class="eq-label">GRPO as written in DeepSeekMath. The last expression is the k3 estimator, with u = log π_ref − log π_θ it equals e<sup>u</sup> − u − 1 ≥ 0</div>
+  </div>
+
+  <p>Read the formula in four pieces, because every successor on this page changes exactly one of them:</p>
+  <ol>
+    <li><strong>The advantage is shared by all tokens of a response.</strong> Nothing in GRPO says which token deserved the credit: a correct response pushes up every one of its tokens, sensible or not, and statistics over many samples average the noise out. This is REINFORCE with a per-prompt baseline.</li>
+    <li><strong>Two averages and one standard deviation.</strong> \(1/|o_i|\) averages tokens within a response, \(1/G\) averages responses within the group, and the std rescales each group. These are the three normalizers analyzed in <a href="#fixes">the section on fixes</a>.</li>
+    <li><strong>The KL is in the loss, not the reward.</strong> DeepSeekMath states the design goal plainly: instead of adding a KL penalty to the reward, GRPO "regularizes by directly adding the KL divergence between the trained policy and the reference policy to the loss, avoiding complicating the calculation of \(\hat A_{i,t}\)" <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §4.1.1]</a>. It sits inside the token sum, so it shares the \(1/|o_i|\) factor.</li>
+    <li><strong>The clip is against \(\pi_{\theta_{\text{old}}}\), not \(\pi_{\text{ref}}\).</strong> It is a per-rollout trust region (<a href="22-rl-foundations.html">page 22</a>). DeepSeekMath does a single update per exploration stage, so \(\pi_\theta=\pi_{\theta_{\text{old}}}\), every \(\rho=1\), and the clip never activates. The gradient then reduces to <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, Eq. 20]</a>:</li>
+  </ol>
+
+  \[ \nabla_\theta\mathcal J_{\text{GRPO}}=\E\!\left[\frac1G\sum_{i}\frac1{|o_i|}\sum_{t}\Big(\hat A_{i,t}+\beta\Big(\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-1\Big)\Big)\nabla_\theta\log\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})\right] \]
+
+  <p>A note on notation. The R1 paper writes the same objective at the sequence level, with \(\rho_i=\pi_\theta(o_i\mid q)/\pi_{\theta_{\text{old}}}(o_i\mid q)\) and no token sum or \(1/|o_i|\) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Eq. 1]</a>. DAPO, Dr. GRPO, GSPO and DeepSeek-V3.2 all write the token-level form above, and V3.2's statement of GRPO uses \(\hat A=R_i-\operatorname{mean}(R)\) without the std <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, Eq. 5]</a>. <span class="unverified" title="DeepSeek's RL training code is not public, and the R1 paper writes the objective at the sequence level without a 1/|o_i| factor. Which aggregation and whether std normalization were used in R1 training is therefore not confirmed by a primary source.">Which normalization the R1 run itself used is not confirmed by the paper.</span> When an interviewer says "GRPO", the safe reading is DeepSeekMath's Eq. 3.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 340" role="img" aria-labelledby="fig-24-1-title">
+<title id="fig-24-1-title">The GRPO loop: sample eight responses per prompt, verify them, normalize rewards within the group, and update the policy with a clipped loss</title>
+<defs><marker id="arrow-24-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="16" class="s-bold">1 Sample</text>
+<text x="176" y="16" class="s-bold">2 Verify, 3 Normalize within the group</text>
+<text x="548" y="16" class="s-bold">Group statistics</text>
+<rect class="s-box" x="8" y="60" width="120" height="44" rx="6"/>
+<text x="68" y="79" text-anchor="middle" class="s-bold">prompt q</text>
+<text x="68" y="95" text-anchor="middle" class="s-small s-muted">with a known answer</text>
+<rect class="s-a" x="8" y="128" width="120" height="82" rx="6"/>
+<text x="68" y="150" text-anchor="middle" class="s-bold">policy π_old</text>
+<text x="68" y="167" text-anchor="middle" class="s-small">samples G = 8</text>
+<text x="68" y="182" text-anchor="middle" class="s-small">responses, T = 1</text>
+<text x="68" y="198" text-anchor="middle" class="s-small s-muted">no critic</text>
+<path class="s-line" d="M68,104 L68,128" marker-end="url(#arrow-24-1)"/>
+<path class="s-line" d="M128,169 L168,169" marker-end="url(#arrow-24-1)"/>
+<text x="176" y="40" class="s-small s-muted">response</text>
+<text x="252" y="40" class="s-small s-muted">tokens |o_i| (illustrative)</text>
+<text x="404" y="40" class="s-small s-muted">reward r_i</text>
+<text x="472" y="40" class="s-small s-muted">A_i</text>
+<rect class="s-c" x="172" y="47" width="352" height="20" rx="3"/>
+<rect class="s-c" x="172" y="69" width="352" height="20" rx="3"/>
+<rect class="s-c" x="172" y="91" width="352" height="20" rx="3"/>
+<rect class="s-b" x="172" y="113" width="352" height="20" rx="3"/>
+<rect class="s-b" x="172" y="135" width="352" height="20" rx="3"/>
+<rect class="s-b" x="172" y="157" width="352" height="20" rx="3"/>
+<rect class="s-b" x="172" y="179" width="352" height="20" rx="3"/>
+<rect class="s-b" x="172" y="201" width="352" height="20" rx="3"/>
+<text x="180" y="62" class="s-small">o1</text>
+<text x="180" y="84" class="s-small">o2</text>
+<text x="180" y="106" class="s-small">o3</text>
+<text x="180" y="128" class="s-small">o4</text>
+<text x="180" y="150" class="s-small">o5</text>
+<text x="180" y="172" class="s-small">o6</text>
+<text x="180" y="194" class="s-small">o7</text>
+<text x="180" y="216" class="s-small">o8</text>
+<rect class="s-fill-muted" x="206" y="53" width="102" height="8" rx="2"/><text x="316" y="61" class="s-small s-muted">1,020</text>
+<rect class="s-fill-muted" x="206" y="75" width="76" height="8" rx="2"/><text x="290" y="83" class="s-small s-muted">760</text>
+<rect class="s-fill-muted" x="206" y="97" width="134" height="8" rx="2"/><text x="348" y="105" class="s-small s-muted">1,340</text>
+<rect class="s-fill-muted" x="206" y="119" width="210" height="8" rx="2"/>
+<rect class="s-fill-muted" x="206" y="141" width="165" height="8" rx="2"/>
+<rect class="s-fill-muted" x="206" y="163" width="90" height="8" rx="2"/>
+<rect class="s-fill-muted" x="206" y="185" width="240" height="8" rx="2"/>
+<rect class="s-fill-muted" x="206" y="207" width="180" height="8" rx="2"/>
+<text x="420" y="62" text-anchor="middle" class="s-mono">1</text>
+<text x="420" y="84" text-anchor="middle" class="s-mono">1</text>
+<text x="420" y="106" text-anchor="middle" class="s-mono">1</text>
+<text x="420" y="128" text-anchor="middle" class="s-mono">0</text>
+<text x="420" y="150" text-anchor="middle" class="s-mono">0</text>
+<text x="420" y="172" text-anchor="middle" class="s-mono">0</text>
+<text x="420" y="194" text-anchor="middle" class="s-mono">0</text>
+<text x="420" y="216" text-anchor="middle" class="s-mono">0</text>
+<text x="498" y="62" text-anchor="middle" class="s-mono">+1.21</text>
+<text x="498" y="84" text-anchor="middle" class="s-mono">+1.21</text>
+<text x="498" y="106" text-anchor="middle" class="s-mono">+1.21</text>
+<text x="498" y="128" text-anchor="middle" class="s-mono">−0.72</text>
+<text x="498" y="150" text-anchor="middle" class="s-mono">−0.72</text>
+<text x="498" y="172" text-anchor="middle" class="s-mono">−0.72</text>
+<text x="498" y="194" text-anchor="middle" class="s-mono">−0.72</text>
+<text x="498" y="216" text-anchor="middle" class="s-mono">−0.72</text>
+<rect class="s-d" x="548" y="47" width="164" height="112" rx="6"/>
+<text x="630" y="68" text-anchor="middle" class="s-small">mean = 3/8 = 0.375</text>
+<text x="630" y="86" text-anchor="middle" class="s-small">std = 0.518 (n−1)</text>
+<text x="630" y="112" text-anchor="middle" class="s-small s-bold">A_i = (r_i − mean) / std</text>
+<text x="630" y="130" text-anchor="middle" class="s-small s-muted">one scalar per response,</text>
+<text x="630" y="146" text-anchor="middle" class="s-small s-muted">shared by all its tokens</text>
+<path class="s-line" d="M524,103 L548,103" marker-end="url(#arrow-24-1)"/>
+<text x="548" y="182" class="s-small s-muted">All-correct or all-wrong group:</text>
+<text x="548" y="198" class="s-small s-muted">std = 0, every A_i = 0,</text>
+<text x="548" y="214" class="s-small s-muted">no gradient (dynamic sampling)</text>
+<rect class="s-e" x="172" y="252" width="540" height="76" rx="6"/>
+<text x="442" y="272" text-anchor="middle" class="s-bold">4 Update: clipped policy gradient, one loss over G × tokens</text>
+<text x="442" y="292" text-anchor="middle" class="s-small">min( ρ A_i , clip(ρ, 1 − ε_low, 1 + ε_high) A_i ) − β · k3( π_θ , π_ref ), averaged per response then over the group</text>
+<text x="442" y="310" text-anchor="middle" class="s-small s-muted">ρ = π_θ(token) / π_old(token); the KL to the reference sits in the loss, not in the reward</text>
+<path class="s-line" d="M172,290 L68,290 L68,210" marker-end="url(#arrow-24-1)"/>
+<text x="12" y="240" class="s-small s-muted">π_old ← π_θ</text>
+<path class="s-line" d="M442,221 L442,252" marker-end="url(#arrow-24-1)"/>
+</svg>
+    <figcaption><b>Figure 1.</b> One GRPO step for one prompt. The verifier turns each response into a reward, the group turns rewards into advantages, and every token of a response receives its response's advantage. Green rows are correct (3 of 8), orange rows wrong. Token counts are illustrative. The advantages use the sample std, as in verl; the worked table below gives the other conventions.</figcaption>
+  </figure>
+
+  <h3 id="grpo-vs-ppo">GRPO versus PPO, precisely</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>PPO for RLHF (pages 22 and 23)</th><th>GRPO</th></tr></thead>
+    <tbody>
+      <tr><td>Baseline</td><td>Learned per-token value \(V_\psi(s_t)\)</td><td>Mean reward of the group of responses to the same prompt: one number per prompt</td></tr>
+      <tr><td>Advantage</td><td>GAE from \(V_\psi\) and per-token rewards</td><td>\((r_i-\text{mean})/\text{std}\), one scalar per response, identical for all tokens</td></tr>
+      <tr><td>KL to reference</td><td>Per-token penalty \(-\beta\log(\pi_\theta/\pi_{\text{ref}})\) added to the reward</td><td>\(\beta\cdot\)k3 subtracted in the loss; the advantage stays clean</td></tr>
+      <tr><td>Models held</td><td>Policy, reference, critic, reward model</td><td>Policy, reference (only if \(\beta>0\)), verifier or reward model</td></tr>
+      <tr><td>Samples per prompt</td><td>Usually 1</td><td>\(G\): 8 to 16 in most open recipes, 64 in DeepSeekMath</td></tr>
+      <tr><td>Token-level credit</td><td>Yes, through GAE (\(\gamma,\lambda\))</td><td>None</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two pieces of evidence explain why the loss of token-level credit is acceptable here. First, when the only reward arrives at the end, GAE with \(\gamma=\lambda=1\) is just "return minus a learned baseline", so the real difference is how the baseline is estimated. DeepSeek's own comparison on the MATH task with DeepSeek-Coder-V2-Lite (a 16B MoE with 2.4B active parameters) found PPO with the common \(\lambda=0.95\) "considerably worse than GRPO", and with \(\lambda\) tuned to 1.0 "nearing" it <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. A.3, Fig. 4]</a>. Second, R1 argues that a KL penalty in the reward penalizes the <em>cumulative</em> KL and "may implicitly penalize the length of the response", which they did not want in a setting where longer thinking is the point (same appendix). Those are the authors' arguments; we are not aware of a controlled ablation isolating the effect.</p>
+
+  <h3 id="baseline-math">Why the group mean is a legitimate baseline</h3>
+  <p>A baseline must not depend on the action it baselines, or the gradient estimate changes. The group mean <em>includes</em> \(r_i\) itself, so it does depend on \(o_i\), but only through a constant factor. Write \(\bar r_{-i}\) for the mean of the other \(G-1\) rewards, which is independent of \(o_i\). Then</p>
+  \[ r_i-\bar r \;=\; \frac{G-1}{G}\,\big(r_i-\bar r_{-i}\big), \]
+  <p>so the group-mean advantage equals the leave-one-out advantage (RLOO, <a href="https://arxiv.org/abs/2402.14740">Ahmadian et al. 2024, §2.3</a>) times \((G-1)/G\). Its expected gradient points in the right direction, shrunk by a constant: unbiased up to scale. The std division is the part that is <em>not</em> a constant (it differs per prompt), and that is what the Dr. GRPO analysis attacks.</p>
+
+  <h3 id="worked-adv">Worked numbers: G = 8, three correct</h3>
+  <p>Take binary rewards \(r=(1,1,1,0,0,0,0,0)\). The mean is \(3/8=0.375\). The sample variance is \(\tfrac17[3(0.625)^2+5(0.375)^2]=\tfrac{1.875}{7}=0.2679\), so the sample std is \(0.5175\) (the population std, dividing by 8, is \(0.4841\)). DeepSeekMath does not say which one it uses; verl computes <code>torch.std</code>, which applies Bessel's correction <a href="https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/core_algos.py">[verl, core_algos.py]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Advantage</th><th>Formula</th><th class="num">Each correct (×3)</th><th class="num">Each wrong (×5)</th><th class="num">Σ|A| over the group</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><strong>GRPO</strong> (sample std)</td><td>\((r-0.375)/0.5175\)</td><td class="num">+1.208</td><td class="num">−0.725</td><td class="num">7.25</td></tr>
+      <tr><td>GRPO (population std)</td><td>\((r-0.375)/0.4841\)</td><td class="num">+1.291</td><td class="num">−0.775</td><td class="num">7.75</td></tr>
+      <tr><td><strong>Dr. GRPO</strong></td><td>\(r-0.375\)</td><td class="num">+0.625</td><td class="num">−0.375</td><td class="num">3.75</td></tr>
+      <tr><td><strong>RLOO</strong></td><td>\(r_i-\text{mean of the other 7}\)</td><td class="num">+5/7 = +0.714</td><td class="num">−3/7 = −0.429</td><td class="num">4.29</td></tr>
+    </tbody>
+  </table></div>
+  <p>Every column sums to zero within the group (\(3\times1.208=5\times0.725\)). RLOO is Dr. GRPO times \(8/7\), and GRPO is Dr. GRPO divided by the std. Notice the asymmetry: with 3 of 8 correct, each correct response is pushed up harder (+1.208) than each wrong one is pushed down (−0.725), because success is the rarer event. With 1 of 8 correct the numbers are \(+2.475\) and \(-0.354\) (mean 0.125, sample std \(0.3536\)); with 8 of 8, or 0 of 8, they are exactly 0.</p>
+
+<pre><code class="language-python">def grpo_loss(logp_new, logp_old, logp_ref, adv, mask, eps_low=0.2, eps_high=0.2, beta=0.0):
+    # logp_*: (B, T) log-prob of the SAMPLED tokens; adv: (B,) one scalar per response; mask: (B, T)
+    ratio = (logp_new - logp_old).exp()                                  # rho_{i,t}
+    a = adv[:, None]                                                     # shared by every token of a response
+    surr = torch.minimum(ratio * a, ratio.clamp(1 - eps_low, 1 + eps_high) * a)
+    u = logp_ref - logp_new
+    k3 = u.exp() - u - 1                                                 # >= 0; DeepSeekMath Eq. 4
+    tok = (surr - beta * k3) * mask                                      # KL enters the loss, not the reward
+    per_seq = tok.sum(-1) / mask.sum(-1)                                 # (1/|o_i|) sum_t
+    return -per_seq.mean()                                               # (1/G) sum_i; negate to minimize
+</code></pre>
+  <p class="small muted">The drill in <code>exercises/drills/grpo.py</code> adds the details this sketch skips: junk at padded positions cannot leak into the gradient, and the token-mean and constant-normalizer aggregations of the next sections are selectable.</p>
+
+  <h3 id="grpo-hparams">GRPO as published: the numbers people copy</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>DeepSeekMath-RL 7B</th><th>R1-Zero (and R1 stage 1)</th><th>DAPO (Qwen2.5-32B)</th><th>ProRL (1.5B)</th></tr></thead>
+    <tbody>
+      <tr><td>Reward</td><td>Trained reward model (rule-judged labels)</td><td>Rules: accuracy + format</td><td>Rule: +1 / −1</td><td>Rules, five domains</td></tr>
+      <tr><td>Group size \(G\)</td><td class="num">64</td><td class="num">16</td><td class="num">16</td><td class="num">16</td></tr>
+      <tr><td>Prompts per step</td><td>not stated (batch 1024)</td><td class="num">32 (batch 512)</td><td class="num">512</td><td class="num">256</td></tr>
+      <tr><td>Max response length</td><td class="num">1,024</td><td class="num">32,768, then 65,536 after step 8.2K</td><td class="num">16,384 + 4,096 soft buffer</td><td class="num">8K (16K in the last ~200 steps)</td></tr>
+      <tr><td>Learning rate</td><td class="num">1e-6</td><td class="num">3e-6</td><td class="num">1e-6 constant, 20-step warm-up</td><td class="num">2e-6</td></tr>
+      <tr><td>KL coefficient \(\beta\)</td><td class="num">0.04</td><td class="num">0.001; reference replaced every 400 steps</td><td>none</td><td>KL penalty, periodic reference reset</td></tr>
+      <tr><td>Clip range</td><td>irrelevant (one update per rollout)</td><td>\(\varepsilon=10\) in R1 stage 1 (as printed)</td><td>\(\varepsilon_{\text{low}}=0.2\), \(\varepsilon_{\text{high}}=0.28\)</td><td>0.2 / 0.4</td></tr>
+      <tr><td>Updates per rollout</td><td class="num">1</td><td class="num">16 minibatches, one epoch</td><td class="num">16</td><td class="num">4</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: <a href="https://arxiv.org/abs/2402.03300">DeepSeekMath §4.2</a>; <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1 §2.1, §3.2.1</a> (R1-Zero states learning rate, β, group size and length schedule; ε is stated only for R1's first RL stage, and a value of 10 makes the clip nearly inactive, which we report as printed); <a href="https://arxiv.org/abs/2503.14476">DAPO §4.1</a>; <a href="https://arxiv.org/abs/2505.24864">ProRL §3.2</a>. Two things to notice: GRPO was born with a <em>learned</em> reward model, and only R1 made it rule-based; and every later recipe replaced one-update-per-rollout with 4 to 16, which is what makes the clip and the off-policy issues of the later sections matter.</p>
+
+  <p>DeepSeekMath's results give the scale of the original effect: starting from DeepSeekMath-Instruct 7B and training on about 144K chain-of-thought questions drawn from the GSM8K and MATH SFT data, GRPO raised GSM8K from 82.9% to 88.2% and MATH from 46.8% to 51.7%, and the out-of-domain CMATH from 84.6% to 88.8% <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §1, §4.2]</a>. The same paper already contains the seed of the later debate: on those benchmarks RL improved Maj@K but not Pass@K, so "the improvement is attributed to boosting the correct response from TopK rather than the enhancement of fundamental capabilities" (§5.2.2).</p>
+</section>
+
+<section>
+  <h2 id="r1">DeepSeek-R1-Zero and R1</h2>
+
+  <h3 id="r1-zero">R1-Zero: RL on a base model, with nothing else</h3>
+  <p>DeepSeek-R1-Zero starts from DeepSeek-V3-Base (671B total parameters, 37B activated) and applies GRPO with no supervised fine-tuning at all, on the hypothesis that "human-defined reasoning patterns may limit model exploration" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §1]</a>. The prompt tells the model to think inside <code>&lt;think&gt;</code> tags and answer inside <code>&lt;answer&gt;</code> tags and nothing else: "we intentionally limit our constraints to this structural format, avoiding any content-specific biases" (§2.3). The reward is a rule-based accuracy reward plus a format reward "with the same weight" (§2.2). The RL prompts are about 26K math questions (answers matched against a reference, reward 1 or 0, proofs excluded), 17K algorithm-competition problems and 8K bug-fixing tasks (hidden tests), 22K multiple-choice STEM questions, and 15K logic problems (App. B.3.1). The hyperparameters are in the table above: 32 questions times 16 samples per step, learning rate 3e-6, \(\beta=0.001\), 10,400 steps (1.6 epochs), with the length cap doubled from 32,768 to 65,536 tokens at step 8.2K.</p>
+
+  <p>The headline number: AIME 2024 pass@1 rises from 15.6% to 77.9% during training, and to 86.7% with self-consistency decoding (the figure shows cons@16). Those figures come from the January 2026 version (v2) of the paper. The January 2025 version reported 71.0% pass@1 and 86.7% with majority voting over 64 samples, so quote the version you mean. The average response length "exhibits a steady increase" during training, which the authors read as the model learning "to solve reasoning tasks with more thinking time" (Fig. 1b). Note that the paper itself says that "both the performance and response length of DeepSeek-R1-Zero exhibit a significant jump at the 8.2k step", the step at which the length cap doubled, so a part of the curve is a budget effect rather than pure emergence.</p>
+
+  <div class="decision">
+    <div class="decision-title">Outcome-only, rule-based RL from a base model (R1-Zero)</div>
+    <dl>
+      <dt>Problem</dt><dd>Human-written reasoning traces are expensive and cap the model at human reasoning patterns. Learned reward models are hacked under large-scale RL.</dd>
+      <dt>Idea</dt><dd>Skip SFT. Run GRPO from the base model with a reward that only checks the final answer (plus a format check), and let the length of thinking be whatever helps.</dd>
+      <dt>Why it works</dt><dd>The base model already contains latent long-chain-of-thought behavior (Dr. GRPO finds DeepSeek-V3-Base already produces self-reflection under the R1 template). The verifier is exact, so any behavior that raises the pass rate is reinforced, and longer chains give more room to explore.</dd>
+      <dt>Evidence</dt><dd>AIME 2024 pass@1 15.6% to 77.9%; MATH-500 95.9, GPQA Diamond 75.8 <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §2.3, Table 3]</a>.</dd>
+      <dt>Cost</dt><dd>Unreadable, language-mixed outputs and weak general ability (IF-Eval 46.6). Strongly base-model dependent: RL on a 7B dense and a 16B MoE model "consistently failed to yield meaningful improvements" on AIME, while a 32B dense, a 230B MoE and the 671B MoE worked (App. G.1). About 101K H800 GPU-hours (see below).</dd>
+      <dt>Used by</dt><dd>DeepSeek-R1-Zero; open "zero" recipes on Qwen2.5 bases (SimpleRL-Zero, Oat-Zero, DAPO).</dd>
+    </dl>
+  </div>
+
+  <h3 id="aha">The "aha moment": what is claimed and what is shown</h3>
+  <p>The paper's account, as stated: R1-Zero "exhibits an 'aha moment' (Table 2), characterized by a sudden increase in the use of the word 'wait' during reflections", which "marks a distinct change in reasoning patterns and clearly shows the self-evolution process". The supporting measurements are in App. C.2: a list of reflective words chosen by three human experts (wait, mistake, however, but, retry, error, verify, wrong, evaluate, check) rises 5- to 7-fold from the start of training, and "wait" was "nearly absent during early training, showed occasional usage between steps 4000-7000, and then exhibited significant spikes after step 8000". Table 2 shows an intermediate checkpoint writing "Wait, wait. Wait. That's an aha moment I can flag here." while solving a nested-radical equation.</p>
+  <p>What this establishes is a change in the frequency of certain tokens during RL. What it does not establish is that RL <em>created</em> reflection, or that reflection causes the accuracy gain:</p>
+  <ul>
+    <li>Dr. GRPO hosted DeepSeek-V3-Base itself and found that, under the R1 template, it "generates a decent amount of self-reflections", including "Aha" and "wait", before any RL <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, §2.3]</a>.</li>
+    <li>Within R1-Zero, they compared responses with and without self-reflection on the same question and found that in nearly half the cases the reflective responses were not more accurate. They add that reflection may still help <em>exploration during training</em>, which their analysis does not test (App. F).</li>
+    <li>MiniMax observed the mechanism from the other side: reflective tokens ("However", "Recheck", "Wait", "Aha") are rare and low-probability under the base model, so under PPO-style clipping they are clipped out after the first update and cannot be reinforced further <a href="https://arxiv.org/abs/2506.13585">[MiniMax-M1, §3.1]</a>. This motivates CISPO below.</li>
+  </ul>
+  <p>A defensible position: RL selects and amplifies latent behaviors (some of which look like reflection), the visible token statistics are real, and the causal story is not settled.</p>
+
+  <h3 id="r1-pipeline">From R1-Zero to R1: the four-stage pipeline</h3>
+  <p>R1-Zero reasons well but "faces challenges such as poor readability and language mixing", and its RL was "narrowly focused on reasoning tasks, resulting in limited performance in broader areas such as writing and open-domain question answering" (§1). R1 fixes both with four stages (§3, Fig. 2):</p>
+  <ol>
+    <li><strong>Cold-start SFT.</strong> Fine-tune V3-Base on "thousands" of long chains of thought in a conversational, first-person style with reflection and verification. The data are built from R1-Zero outputs filtered for correct answers and readable format (sympy for math, repetition and language-mixing filters), rewritten by DeepSeek-V3 (including "Translate the thinking process to the same language as the question"), and passed through human annotators. The stated motivation is "primarily product-driven" (App. B.3.2).</li>
+    <li><strong>Reasoning-oriented RL.</strong> The same GRPO recipe as R1-Zero, plus a <em>language-consistency reward</em>, the fraction of target-language words in the chain of thought, added to the final reward. The authors' ablation shows "a slight degradation" in performance and better readability, and they keep it (§3.2.1, App. B.6).</li>
+    <li><strong>Rejection sampling and SFT.</strong> Sample from the stage-2 checkpoint, keep correct responses, and filter out mixed-language, long-paragraph and code-block chains of thought. Reasoning prompts that lack a rule-based check are judged by DeepSeek-V3 against the reference. The result is about 600K reasoning samples plus about 200K non-reasoning samples (writing, factual QA, translation; mostly reused from V3's SFT set). The 800K samples fine-tune <strong>DeepSeek-V3-Base</strong> again for 2 to 3 epochs (App. B.3.3, B.4.2). The RL checkpoint is only a data generator here, not the initialization.</li>
+    <li><strong>RL for all scenarios.</strong> Reasoning prompts keep rule-based rewards. General prompts use reward models: helpfulness judged on the final summary, harmlessness on the whole response. The reward sums reasoning, general and language terms. Temperature drops to 0.7 (higher values "lead to incoherent generation"), and of 1,700 steps the preference-based data are used only in the last 400 (§3.2.2).</li>
+  </ol>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 352" role="img" aria-labelledby="fig-24-2-title">
+<title id="fig-24-2-title">The DeepSeek-R1 training pipeline: R1-Zero as data source, four stages from V3-Base to R1 with AIME 2024 scores after each stage, and the distillation branch</title>
+<defs><marker id="arrow-24-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="8" y="10" width="140" height="56" rx="6"/>
+<text x="78" y="32" text-anchor="middle" class="s-bold">DeepSeek-V3-Base</text>
+<text x="78" y="50" text-anchor="middle" class="s-small s-muted">671B MoE, 37B active</text>
+<rect class="s-a" x="176" y="10" width="220" height="56" rx="6"/>
+<text x="286" y="32" text-anchor="middle" class="s-bold">Pure RL with GRPO</text>
+<text x="286" y="50" text-anchor="middle" class="s-small">accuracy + format rewards, 10,400 steps</text>
+<rect class="s-box" x="424" y="10" width="160" height="56" rx="6"/>
+<text x="504" y="32" text-anchor="middle" class="s-bold">R1-Zero</text>
+<text x="504" y="50" text-anchor="middle" class="s-small s-muted">AIME 77.9, hard to read</text>
+<path class="s-line" d="M148,38 L176,38" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M396,38 L424,38" marker-end="url(#arrow-24-2)"/>
+<path class="s-line s-dash" d="M504,66 L504,96 L72,96 L72,118" marker-end="url(#arrow-24-2)"/>
+<text x="84" y="90" class="s-small s-muted">filtered, rewritten R1-Zero samples seed the cold-start data</text>
+<rect class="s-e" x="8" y="118" width="128" height="98" rx="6"/>
+<text x="72" y="140" text-anchor="middle" class="s-bold">1 Cold-start SFT</text>
+<text x="72" y="159" text-anchor="middle" class="s-small">V3-Base + thousands</text>
+<text x="72" y="174" text-anchor="middle" class="s-small">of long-CoT examples,</text>
+<text x="72" y="189" text-anchor="middle" class="s-small">readable, first person</text>
+<rect class="s-a" x="152" y="118" width="128" height="98" rx="6"/>
+<text x="216" y="140" text-anchor="middle" class="s-bold">2 Reasoning RL</text>
+<text x="216" y="159" text-anchor="middle" class="s-small">GRPO, rule-based</text>
+<text x="216" y="174" text-anchor="middle" class="s-small">accuracy + format</text>
+<text x="216" y="189" text-anchor="middle" class="s-small">+ language reward</text>
+<rect class="s-e" x="296" y="118" width="128" height="98" rx="6"/>
+<text x="360" y="140" text-anchor="middle" class="s-bold">3 Rejection + SFT</text>
+<text x="360" y="159" text-anchor="middle" class="s-small">sample from stage 2:</text>
+<text x="360" y="174" text-anchor="middle" class="s-small">~600K reasoning +</text>
+<text x="360" y="189" text-anchor="middle" class="s-small">~200K other, SFT V3-Base</text>
+<rect class="s-a" x="440" y="118" width="128" height="98" rx="6"/>
+<text x="504" y="140" text-anchor="middle" class="s-bold">4 Final RL</text>
+<text x="504" y="159" text-anchor="middle" class="s-small">rules + reward models</text>
+<text x="504" y="174" text-anchor="middle" class="s-small">(helpful, harmless)</text>
+<text x="504" y="189" text-anchor="middle" class="s-small">1,700 steps, T = 0.7</text>
+<rect class="s-c" x="584" y="118" width="128" height="98" rx="6"/>
+<text x="648" y="140" text-anchor="middle" class="s-bold">DeepSeek-R1</text>
+<text x="648" y="159" text-anchor="middle" class="s-small">AIME 79.8</text>
+<text x="648" y="174" text-anchor="middle" class="s-small">Codeforces 2029</text>
+<text x="648" y="189" text-anchor="middle" class="s-small">IF-Eval 83.3</text>
+<path class="s-line" d="M136,167 L152,167" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M280,167 L296,167" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M424,167 L440,167" marker-end="url(#arrow-24-2)"/>
+<path class="s-line" d="M568,167 L584,167" marker-end="url(#arrow-24-2)"/>
+<text x="12" y="234" class="s-small s-mono">after 1: AIME 59.0</text>
+<text x="156" y="234" class="s-small s-mono">after 2: AIME 74.0</text>
+<text x="300" y="234" class="s-small s-mono">after 3: AIME 78.1</text>
+<text x="444" y="234" class="s-small s-mono">after 4: AIME 79.8</text>
+<path class="s-line s-dash" d="M410,216 L410,262" marker-end="url(#arrow-24-2)"/>
+<rect class="s-d" x="200" y="262" width="330" height="48" rx="6"/>
+<text x="365" y="283" text-anchor="middle" class="s-bold">Distilled students: SFT only, no RL</text>
+<text x="365" y="300" text-anchor="middle" class="s-small">Qwen2.5 1.5B, 7B, 14B, 32B and Llama 8B, 70B on the ~800K samples</text>
+<text x="8" y="334" class="s-small s-muted">Stage 3 restarts from V3-Base: the stage-2 checkpoint only generates the data. Scores are AIME 2024 pass@1 from Table 3 of the v2 paper.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> The R1 pipeline (colors: yellow SFT, blue RL, green final model). Reasoning strength is already high in R1-Zero and after stage 2, and the cold-start stage lowers it (59.0) before RL restores it: the stages mostly buy readability and general ability, as the table below quantifies.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Checkpoint</th><th class="num">AIME 2024</th><th class="num">GPQA Diamond</th><th class="num">Codeforces rating</th><th class="num">IF-Eval</th><th class="num">Arena-Hard</th><th class="num">AlpacaEval 2 LC</th></tr></thead>
+    <tbody>
+      <tr><td>R1-Zero (RL only)</td><td class="num">77.9</td><td class="num">75.8</td><td class="num">1444</td><td class="num">46.6</td><td class="num">53.6</td><td class="num">24.7</td></tr>
+      <tr><td>After stage 1 (cold-start SFT)</td><td class="num">59.0</td><td class="num">66.1</td><td class="num">1534</td><td class="num">71.7</td><td class="num">77.0</td><td class="num">50.1</td></tr>
+      <tr><td>After stage 2 (reasoning RL)</td><td class="num">74.0</td><td class="num">70.7</td><td class="num">1687</td><td class="num">72.0</td><td class="num">73.2</td><td class="num">55.8</td></tr>
+      <tr><td>After stage 3 (800K SFT)</td><td class="num">78.1</td><td class="num">71.2</td><td class="num">1746</td><td class="num">78.1</td><td class="num">75.6</td><td class="num">62.1</td></tr>
+      <tr class="hl"><td><strong>R1 (after stage 4)</strong></td><td class="num">79.8</td><td class="num">71.5</td><td class="num">2029</td><td class="num">83.3</td><td class="num">92.3</td><td class="num">87.6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek-R1 v2, Table 3 (checkpoints R1-Dev1, Dev2, Dev3 are the paper's names for the outputs of stages 1, 2 and 3). Pass@1 for AIME and GPQA, LC win-rate for AlpacaEval 2.</p>
+
+  <p>Read the table as an answer to "why did R1 need a cold start?". Not for reasoning strength: R1-Zero has AIME 77.9 and GPQA 75.8 with no SFT, and the cold-start checkpoint is <em>worse</em> on both, which the authors attribute to "the limited size of the cold-start dataset". What the cold start buys is readable, instruction-following, language-consistent behavior (IF-Eval 46.6 to 71.7, Arena-Hard 53.6 to 77.0) and a better-behaved starting policy for stage 2. The v1 paper also frames it as avoiding "the early unstable cold start phase of RL training from the base model". The final stage barely moves AIME (78.1 to 79.8) and mostly lifts the preference benchmarks (Arena-Hard 75.6 to 92.3), as the paper states. It would still be wrong to say R1 is just R1-Zero made readable: on math and GPQA the two are close (AIME 79.8 versus 77.9, GPQA 71.5 versus 75.8), but on code the extra stages matter a lot (Codeforces rating 1444 to 2029, LiveCodeBench 50.0 to 65.9).</p>
+
+  <h3 id="r1-cost">What it cost</h3>
+  <p>R1-Zero trained on 64 nodes of 8 H800 GPUs (512 GPUs) for about 198 hours: \(512\times198=101{,}376\) GPU-hours, which the paper rounds to 101K. R1 took about 80 hours on the same cluster (\(512\times80=40{,}960\approx41\)K GPU-hours), and creating the SFT data took 5K GPU-hours. The total is 147K GPU-hours <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. B.4.4, Table 7]</a>, which at the paper's assumed rental price of $2 per GPU-hour is about $294K ($202K for R1-Zero, $82K for R1, $10K for the data). DeepSeek-V3's pre-training used 2.664M H800 GPU-hours <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §1]</a>, so R1's RL amounted to \(142\text{K}/2664\text{K}\approx5.3\%\) of it. Keep that number in mind: DeepSeek-V3.2 reports an RL budget that "exceeds 10% of the pre-training cost" (see <a href="#tts">test-time scaling</a>).</p>
+
+  <h3 id="distill-vs-rl">Distillation versus RL at small scale</h3>
+  <p>R1's 800K samples were also used for plain SFT of six open models: Qwen2.5-Math-1.5B, Qwen2.5-Math-7B, Qwen2.5-14B, Qwen2.5-32B, Llama-3.1-8B and Llama-3.3-70B-Instruct, with no RL stage <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. B.4.3, Table 6]</a>. The paper then asks whether RL alone can match this, by training Qwen2.5-32B-Base with the R1-Zero recipe for over 10K steps:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Qwen2.5-32B based model</th><th class="num">AIME 2024 pass@1</th><th class="num">AIME cons@64</th><th class="num">MATH-500</th><th class="num">GPQA Diamond</th><th class="num">LiveCodeBench</th></tr></thead>
+    <tbody>
+      <tr><td>QwQ-32B-Preview</td><td class="num">50.0</td><td class="num">60.0</td><td class="num">90.6</td><td class="num">54.5</td><td class="num">41.9</td></tr>
+      <tr><td>RL only, R1-Zero recipe (&gt;10K steps)</td><td class="num">47.0</td><td class="num">60.0</td><td class="num">91.6</td><td class="num">55.0</td><td class="num">40.2</td></tr>
+      <tr class="hl"><td>Distilled from R1 (800K samples, SFT)</td><td class="num">72.6</td><td class="num">83.3</td><td class="num">94.3</td><td class="num">62.1</td><td class="num">57.2</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek-R1 v2, App. F.1, Table 16 (the RL-only row is named Qwen2.5-32B-Zero in v2 and DeepSeek-R1-Zero-Qwen-32B in v1).</p>
+  <p>The authors conclude that "distilling more powerful models into smaller ones yields excellent results, whereas smaller models relying on the large-scale RL mentioned in this paper require enormous computational power and may not even achieve the performance of distillation", while "advancing beyond the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning". Two caveats belong in the answer. The RL arm is the January 2025 recipe; DAPO later reached 50 on AIME 2024 (avg@32) from the same base with half the steps, still below 72.6, although the evaluation protocols differ. And distillation needs a teacher that RL already produced, so it moves capability rather than creating it (see <a href="#capability">the capability debate</a>).</p>
+
+  <h3 id="r1-failed">What did not work: PRMs and MCTS</h3>
+  <p>R1 reports two failed directions, "but this does not imply that these approaches are incapable of developing effective reasoning models" <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. G.2]</a>. <strong>Process reward models:</strong> (1) it is hard to define a fine-grained step in general reasoning; (2) judging whether an intermediate step is correct is itself hard, since automatic annotation is unreliable and manual annotation does not scale; (3) any model-based PRM invites reward hacking and needs retraining, complicating the pipeline. Their verdict is that a PRM is good for reranking or guided search but its advantage is limited against the overhead in large-scale RL. <strong>Monte Carlo tree search</strong> guided by a value model: (1) unlike chess, token generation has an exponentially larger search space, and capping node extensions risks local optima; (2) the value model steers each search step, and a fine-grained value model is hard to train, so the self-improvement loop stalls. Compare the critic argument for GRPO above: it is the same difficulty (a token-level value function for open-ended text) surfacing in three places. <a href="23-rlhf.html">Page 23</a> covers PRMs versus outcome reward models in more depth.</p>
+</section>
+
+<section>
+  <h2 id="fixes">Fixes and successors</h2>
+
+  <p>Every method below changes one piece of the GRPO objective, and it helps to keep the anatomy in mind: (1) how advantages are normalized (the std), (2) how the loss is averaged over tokens and responses (\(1/|o_i|\), \(1/G\)), (3) the unit and shape of the trust region (token ratio, clip bounds), (4) the KL term, and (5) which samples are used at all. A summary table closes the section.</p>
+
+  <h3 id="biases">The two biases in GRPO's normalization (Dr. GRPO)</h3>
+  <p>Dr. GRPO ("GRPO done right") starts from the GRPO gradient in the on-policy limit. Token \(t\) of response \(i\) receives weight</p>
+  \[ w_{i,t}\;=\;\frac{1}{G}\cdot\frac{\hat A_i}{|o_i|},\qquad \hat A_i=\frac{r_i-\bar r}{\operatorname{std}(r)} , \]
+  <p>times \(\nabla_\theta\log\pi_\theta(o_{i,t}\mid\cdot)\). Two normalizers appear in that weight, and each is a bias <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, §3.1]</a>:</p>
+  <ul>
+    <li><strong>Response-level length bias, from \(1/|o_i|\).</strong> For a correct response (\(\hat A_i>0\)) a shorter answer gets a larger per-token push, so the policy learns brevity <em>when it is right</em>. For a wrong response (\(\hat A_i<0\)) a longer answer gets a smaller per-token penalty, so verbosity is cheap <em>when it is wrong</em>. The net effect is that wrong answers drift longer without any reasoning benefit. They also note that popular open-source PPO implementations (TRL, OpenRLHF, verl, SimpleRL-Zero, Open-Reasoner-Zero) normalize the loss by response length in the same way (their Table 2, as of March 2025).</li>
+    <li><strong>Question-level difficulty bias, from the std.</strong> Prompts whose rewards have a small spread (almost all correct or almost all wrong) are divided by a small number and so get a larger weight. Advantage normalization is common in RL, but it is normally done over a whole batch, not per question.</li>
+  </ul>
+
+  <p><strong>Worked numbers: the length bias.</strong> Take a group of \(G=8\) with four 100-token and four 1,000-token responses (4,400 tokens in total), and give every response \(|\hat A|=1\) to isolate the normalizer. The weight on each token's \(\nabla\log\pi\) is:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Loss aggregation</th><th>Per-token weight</th><th class="num">100-token response</th><th class="num">1,000-token response</th><th class="num">Total weight per response (100 / 1,000)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Sequence-mean</strong> (GRPO, \(1/G\cdot1/|o_i|\))</td><td>\(1/(G|o_i|)\)</td><td class="num">1/800 = 1.25e-3</td><td class="num">1/8000 = 1.25e-4</td><td class="num">0.125 / 0.125</td></tr>
+      <tr><td><strong>Token-mean</strong> (DAPO, \(1/\sum|o_i|\))</td><td>\(1/4400\)</td><td class="num">2.27e-4</td><td class="num">2.27e-4</td><td class="num">0.0227 / 0.227</td></tr>
+      <tr><td><strong>Constant normalizer</strong> (Dr. GRPO, \(L_{\max}=1000\))</td><td>\(1/(G\,L_{\max})\)</td><td class="num">1.25e-4</td><td class="num">1.25e-4</td><td class="num">0.0125 / 0.125</td></tr>
+    </tbody>
+  </table></div>
+  <p>Under sequence-mean, every token of the short response is pushed 10 times harder than every token of the long one (\(1.25\times10^{-3}\) versus \(1.25\times10^{-4}\)), while both responses receive the same total weight, 0.125. Token-mean and the constant normalizer both give all tokens equal weight, so the long response gets 10 times the total weight of the short one (0.227 versus 0.0227 for token-mean). The difference between the last two is what they are normalized by: the constant does not depend on which responses happened to be in the batch, while token-mean does (and equals the constant when the batch is full of maximum-length responses). DAPO reached the same fix from the other side: under sequence-mean, "tokens within longer responses ... may have a disproportionately lower contribution to the overall loss", so for good long chains the model struggles to learn the reasoning patterns inside them, and for long low-quality chains (gibberish, repetition) the loss cannot penalize the pattern enough, which raises entropy and length unhealthily <a href="https://arxiv.org/abs/2503.14476">[DAPO, §3.3]</a>.</p>
+
+  <p><strong>Worked numbers: the difficulty bias.</strong> For \(G=8\) with \(k\) correct answers, the total advantage magnitude \(\sum_i|\hat A_i|\) is:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Correct \(k\) of 8</th><th class="num">sample std</th><th class="num">Dr. GRPO \(\sum|A|\)</th><th class="num">GRPO \(\sum|A|\)</th><th class="num">GRPO / Dr. GRPO \(=1/\text{std}\)</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1 (or 7)</td><td class="num">0.354</td><td class="num">1.75</td><td class="num">4.95</td><td class="num">2.83</td></tr>
+      <tr><td class="num">2 (or 6)</td><td class="num">0.463</td><td class="num">3.00</td><td class="num">6.48</td><td class="num">2.16</td></tr>
+      <tr><td class="num">3 (or 5)</td><td class="num">0.518</td><td class="num">3.75</td><td class="num">7.25</td><td class="num">1.93</td></tr>
+      <tr><td class="num">4</td><td class="num">0.535</td><td class="num">4.00</td><td class="num">7.48</td><td class="num">1.87</td></tr>
+      <tr><td class="num">0 or 8</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">n/a</td></tr>
+    </tbody>
+  </table></div>
+  <p>Relative to Dr. GRPO, the std multiplies the weight of a prompt solved 1 time in 8 by 2.83 and of a 50/50 prompt by 1.87, so the extreme prompts count 1.5 times more (\(2.83/1.87\)). Whether this is a bias or a useful emphasis on informative rare successes is debated. DeepSeek-V3.2 states its GRPO advantage as \(R_i-\operatorname{mean}(R)\), without the std <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>. REINFORCE++ argues from a different angle that a per-prompt std is a biased estimator (numerator and denominator are not independent) and unstable for small groups, and normalizes with the std of the whole batch instead <a href="https://arxiv.org/abs/2501.03262">[Hu et al., §3]</a>.</p>
+
+  <p><strong>The fix.</strong> Remove \(1/|o_i|\) (replace <code>mask.sum(-1)</code> by a constant such as the generation budget) and remove the std. The paper's own listing:</p>
+<pre><code class="language-python">loss = (ppo_loss * mask).sum(-1) / mask.sum(-1)      # GRPO: per-response length normalization
+loss = (ppo_loss * mask).sum(-1) / MAX_TOKENS        # Dr. GRPO: constant, no length bias
+</code></pre>
+  <p>With \(\beta=0\) these two changes recover the plain PPO objective with a Monte-Carlo return and an unbiased baseline. On Qwen2.5-Math-7B with a minimal R1-Zero-style recipe (3,000-token responses, 8 A100 GPUs), the resulting "Oat-Zero-7B" reached 43.3% on AIME 2024 in about 27 hours, and the length of <em>incorrect</em> responses stopped growing (their Fig. 1 and Fig. 5). Their honest caveat: Qwen2.5-Math models are unusually strong starting points (see <a href="#capability">the capability debate</a>). In verl the switches are explicit: <code>norm_adv_by_std_in_grpo=False</code> is "as in Dr.GRPO", and <code>loss_agg_mode</code> selects <code>token-mean</code> (the default for the policy loss), <code>seq-mean-token-mean</code> (the original GRPO) or <code>seq-mean-token-sum-norm</code> (constant normalizer) <a href="https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/core_algos.py">[verl, core_algos.py]</a>.</p>
+
+  <h3 id="dapo">DAPO: four changes that make long-CoT RL work</h3>
+  <p>ByteDance Seed started from Qwen2.5-32B and found that naive GRPO reached only 30 on AIME 2024, against 47 for DeepSeek's R1-Zero-Qwen-32B, with "entropy collapse, reward noise, and training instability" <a href="https://arxiv.org/abs/2503.14476">[DAPO, §1]</a>. DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) adds four techniques, written jointly as:</p>
+  <div class="eq-box">
+  \[ \mathcal J_{\text{DAPO}}(\theta)=\E\!\left[\frac{1}{\sum_{i=1}^{G}|o_i|}\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\min\!\big(\rho_{i,t}\hat A_{i,t},\ \clip(\rho_{i,t},\,1-\varepsilon_{\text{low}},\,1+\varepsilon_{\text{high}})\hat A_{i,t}\big)\right]\quad\text{s.t. }\ 0\lt\big|\{o_i:\ o_i\ \text{correct}\}\big|\lt G \]
+  <div class="eq-label">DAPO, Eq. 8 of the paper: token-level normalization, decoupled clip, no KL term, and only groups with mixed outcomes. The advantage keeps the group std.</div>
+  </div>
+
+  <ol>
+    <li><strong>Clip-higher</strong> (against entropy collapse). The upper clip bounds how far one update can raise a token's probability, and that bound is far tighter for rare tokens than for likely ones. With \(\varepsilon=0.2\), a token with \(\pi_{\text{old}}=0.01\) can rise to at most \(0.01\times1.2=0.012\), while one at 0.9 can rise to 1.08, that is, to certainty. The authors measured that the mean probability of up-clipped tokens is below 0.2. So the clip protects "exploitation" tokens from nothing and blocks "exploration" tokens from growing. They raise \(\varepsilon_{\text{high}}\) to 0.28 and keep \(\varepsilon_{\text{low}}=0.2\), "because increasing it will suppress the probability of these tokens to 0, resulting in the collapse of the sampling space" (§3.1). See Figure 3.</li>
+    <li><strong>Dynamic sampling</strong> (against zero-advantage groups). If all \(G\) responses are correct (or all wrong) the group's advantages are exactly 0, so it contributes no gradient, yet it still occupies batch slots. DAPO measured that the share of prompts with accuracy 1 keeps rising during training (their Fig. 3b), so the effective batch shrinks and gradient variance grows. The fix is to over-sample, drop groups with accuracy 0 or 1, and keep sampling until the batch is full of informative groups. It reached the same accuracy in fewer steps despite the extra sampling (Fig. 6).</li>
+    <li><strong>Token-level loss</strong> (against length under-weighting). The \(1/\sum_i|o_i|\) normalization of the worked table above. The authors report a small accuracy gain but healthier entropy and length dynamics (Fig. 4).</li>
+    <li><strong>Overlong reward shaping</strong> (against truncation noise). A response cut off at the length cap normally gets a punitive reward even if its reasoning was sound, which teaches the model that sound reasoning is wrong. Step one: mask the loss of truncated samples ("overlong filtering"). Step two: a soft, length-aware penalty added to the correctness reward,
+    \[ R_{\text{length}}(y)=\begin{cases}0,& |y|\le L_{\max}-L_{\text{cache}}\\[2pt] \dfrac{(L_{\max}-L_{\text{cache}})-|y|}{L_{\text{cache}}},& L_{\max}-L_{\text{cache}}\lt|y|\le L_{\max}\\[6pt] -1,& L_{\max}\lt|y|\end{cases} \]
+    with \(L_{\max}=16{,}384\) and a 4,096-token buffer, so 20,480 tokens in total. Examples: a 12,288-token response pays 0, a 14,336-token one pays \((12{,}288-14{,}336)/4096=-0.5\), and a 16,384-token one pays \(-1\).</li>
+  </ol>
+  <p>Two further choices: DAPO drops the KL term ("the model distribution can diverge significantly from the initial model" during long-CoT training, so the restriction "is not necessary"), and uses a plain \(\pm1\) rule-based reward on DAPO-Math-17K, 17K prompts whose answers were rewritten to be integers (§2.3, §2.4, §3.5).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Configuration (Qwen2.5-32B base, cumulative)</th><th class="num">AIME 2024 avg@32</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek-R1-Zero-Qwen-32B (reference)</td><td class="num">47</td></tr>
+      <tr><td>Naive GRPO</td><td class="num">30</td></tr>
+      <tr><td>+ Overlong filtering</td><td class="num">36</td></tr>
+      <tr><td>+ Clip-higher</td><td class="num">38</td></tr>
+      <tr><td>+ Soft overlong punishment</td><td class="num">41</td></tr>
+      <tr><td>+ Token-level loss</td><td class="num">42</td></tr>
+      <tr class="hl"><td><strong>+ Dynamic sampling (= DAPO)</strong></td><td class="num">50</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DAPO Table 1. DAPO reached 50 with about half the training steps of the 47-point reference (their Fig. 1). The ablation is cumulative and in one order, so each step's credit depends on that order.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 322" role="img" aria-labelledby="fig-24-3-title">
+<title id="fig-24-3-title">Clip-higher: the PPO objective as a function of the probability ratio for positive and negative advantage, with symmetric and decoupled clip bounds</title>
+<text x="190" y="18" text-anchor="middle" class="s-bold">A &gt; 0: push the token up</text>
+<text x="550" y="18" text-anchor="middle" class="s-bold">A &lt; 0: push the token down</text>
+<text x="190" y="36" text-anchor="middle" class="s-small s-muted">objective min(ρA, clip(ρ)A) with A = +1</text>
+<text x="550" y="36" text-anchor="middle" class="s-small s-muted">objective min(ρA, clip(ρ)A) with A = −1</text>
+<path class="s-line" d="M40,48 L40,228 L340,228"/>
+<path class="s-line" d="M400,48 L400,228 L700,228"/>
+<path class="s-line s-dash" d="M190,48 L190,228"/>
+<path class="s-line s-dash" d="M550,48 L550,228"/>
+<path class="s-line-a" d="M40,228 L240,108"/>
+<path class="s-line s-dash" d="M240,108 L340,108"/>
+<path class="s-line-b" d="M240,108 L260,96 L340,96"/>
+<circle class="s-fill-a" cx="190" cy="138" r="3.5"/>
+<path class="s-line-a" d="M400,108 L500,108 L700,228"/>
+<circle class="s-fill-a" cx="550" cy="138" r="3.5"/>
+<path class="s-line" d="M240,228 L240,232"/><path class="s-line" d="M262,228 L262,232"/>
+<path class="s-line" d="M500,228 L500,232"/>
+<text x="65" y="244" text-anchor="middle" class="s-small">0.5</text>
+<text x="190" y="244" text-anchor="middle" class="s-small">1.0</text>
+<text x="238" y="244" text-anchor="middle" class="s-small">1.2</text>
+<text x="266" y="244" text-anchor="middle" class="s-small">1.28</text>
+<text x="315" y="244" text-anchor="middle" class="s-small">1.5</text>
+<text x="425" y="244" text-anchor="middle" class="s-small">0.5</text>
+<text x="500" y="244" text-anchor="middle" class="s-small">0.8</text>
+<text x="550" y="244" text-anchor="middle" class="s-small">1.0</text>
+<text x="675" y="244" text-anchor="middle" class="s-small">1.5</text>
+<text x="190" y="258" text-anchor="middle" class="s-small s-muted">ratio ρ = π_θ / π_old</text>
+<text x="550" y="258" text-anchor="middle" class="s-small s-muted">ratio ρ = π_θ / π_old</text>
+<text x="34" y="213" text-anchor="end" class="s-small">0.5</text><text x="34" y="138" text-anchor="end" class="s-small">1.0</text><text x="34" y="63" text-anchor="end" class="s-small">1.5</text>
+<text x="394" y="63" text-anchor="end" class="s-small">−0.5</text><text x="394" y="138" text-anchor="end" class="s-small">−1.0</text><text x="394" y="213" text-anchor="end" class="s-small">−1.5</text>
+<text x="52" y="72" class="s-small s-tb">solid orange: ε_high = 0.28 (cap 1.28)</text>
+<text x="52" y="88" class="s-small s-muted">dashed grey: symmetric ε = 0.2 (cap 1.2)</text>
+<text x="338" y="150" text-anchor="end" class="s-small">no gradient above</text>
+<text x="338" y="166" text-anchor="end" class="s-small">the cap</text>
+<text x="408" y="150" class="s-small">clipped below 0.8:</text>
+<text x="408" y="166" class="s-small">no gradient</text>
+<text x="698" y="70" text-anchor="end" class="s-small">not clipped above: a token made</text>
+<text x="698" y="86" text-anchor="end" class="s-small">MORE likely still gets full penalty;</text>
+<text x="698" y="102" text-anchor="end" class="s-small s-muted">ε_low stays 0.2 (raising it would</text>
+<text x="698" y="118" text-anchor="end" class="s-small s-muted">drive rare tokens toward 0)</text>
+<text x="8" y="284" class="s-small">A rare token with π_old = 0.01 can rise to at most 0.012 under ε = 0.2 and 0.0128 under ε_high = 0.28.</text>
+<text x="8" y="300" class="s-small">A likely token with π_old = 0.9 is capped only by probability 1, so the upper clip mostly binds rare "exploration" tokens.</text>
+<text x="8" y="316" class="s-small s-muted">Dots mark the on-policy point ρ = 1. Curves are the per-token objective; a flat piece means zero gradient.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Left: for a positive advantage the objective grows with the ratio until the cap, then goes flat (zero gradient). DAPO moves the cap from 1.2 to 1.28. Right: for a negative advantage the objective is flat below \(1-\varepsilon_{\text{low}}\), and DAPO leaves that bound at 0.8. Only the exploration side of the trust region is widened.</figcaption>
+  </figure>
+
+  <div class="decision">
+    <div class="decision-title">DAPO's recipe (clip-higher, dynamic sampling, token-level loss, overlong shaping)</div>
+    <dl>
+      <dt>Problem</dt><dd>Naive GRPO on Qwen2.5-32B stalls at 30 AIME points: entropy collapses, zero-advantage groups pile up, long responses are under-weighted, truncation adds reward noise.</dd>
+      <dt>Idea</dt><dd>Four targeted changes plus no KL and a plain \(\pm1\) verifier reward.</dd>
+      <dt>Why it works</dt><dd>Each change repairs one mechanism: a wider upper clip keeps rare tokens learnable, filtering restores the batch's signal, token-mean weights every token equally, soft penalties stop punishing sound but long reasoning.</dd>
+      <dt>Evidence</dt><dd>30 to 50 on AIME 2024 in a cumulative ablation <a href="https://arxiv.org/abs/2503.14476">[DAPO, Table 1]</a>. Community follow-ups reuse the recipe (ProRL uses \(\varepsilon_{\text{high}}=0.4\)).</dd>
+      <dt>Cost</dt><dd>Dynamic sampling needs extra rollouts (see the zero-signal table in the dynamics section). Evidence is one model and one data set, and the ablation order matters.</dd>
+      <dt>Used by</dt><dd>DAPO, ProRL, MiniMax-M1 (dynamic sampling and length penalty), verl and most open RL libraries as options.</dd>
+    </dl>
+  </div>
+
+  <h3 id="gspo">GSPO: make the importance ratio match the reward</h3>
+  <p>Qwen's Group Sequence Policy Optimization starts from a statistical objection. Importance sampling corrects a mismatch between distributions by averaging over many samples, but GRPO applies a ratio \(\pi_\theta/\pi_{\text{old}}\) at each token position using <em>one</em> sampled token from that position's next-token distribution, so it cannot perform the correction and instead "introduces high-variance noise into the training gradients, which accumulates over long sequences and is exacerbated by the clipping mechanism" <a href="https://arxiv.org/abs/2507.18071">[Zheng et al. 2025, §3]</a>. Their principle: "the unit of the optimization objective should match the unit of reward". The reward is granted to the whole sequence, so the importance ratio and the clip should act on the whole sequence:</p>
+  <div class="eq-box">
+  \[ s_i(\theta)=\left(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\right)^{1/|y_i|}=\exp\!\Big(\frac1{|y_i|}\sum_{t=1}^{|y_i|}\log\rho_{i,t}\Big),\qquad
+  \mathcal J_{\text{GSPO}}=\E\!\left[\frac1G\sum_{i=1}^{G}\min\!\big(s_i\hat A_i,\ \clip(s_i,1-\varepsilon,1+\varepsilon)\hat A_i\big)\right] \]
+  <div class="eq-label">GSPO: the ratio is the geometric mean of the token ratios; clipping removes whole responses from the gradient</div>
+  </div>
+  <p>The length normalization (the exponent \(1/|y_i|\)) keeps \(s_i\) in a common numerical range for short and long responses and stops a few tokens from swinging the ratio. Because \(s_i\) is a geometric mean of token ratios, its natural clip range is tiny: the paper uses \(3\times10^{-4}\) (left) and \(4\times10^{-4}\) (right), against 0.2 and 0.27 for their GRPO baseline. They observe that GSPO clips about two orders of magnitude more tokens than GRPO and is still more sample-efficient, and read this as evidence that GRPO's token-level gradients are noisy. The gradients also differ: GSPO weights all tokens of a response equally by \(s_i\hat A_i/|y_i|\), whereas GRPO weights each token by its own ratio \(\rho_{i,t}\), which ranges in \((0,1+\varepsilon]\) for \(\hat A>0\) and \([1-\varepsilon,\infty)\) for \(\hat A<0\) (§4.2). A variant, GSPO-token, allows per-token advantages and is numerically identical when they are equal.</p>
+  <p><strong>The MoE motivation.</strong> In MoE models a gradient step changes which experts fire. For the 48-layer Qwen3-30B-A3B-Base, "roughly 10% of the experts activated under the new policy \(\pi_\theta\) are different from those under the old policy" for the same response after each update, which makes token ratios fluctuate wildly. Qwen's earlier fix was <strong>Routing Replay</strong>: cache the experts activated under \(\pi_{\text{old}}\) and replay them when computing \(\pi_\theta\), at the price of memory, communication and a cap on the model's effective capacity. GSPO removes the need, because "the MoE model always maintains its language modeling capability", so the sequence likelihood does not fluctuate much even when individual token routes do (§5.3). DeepSeek chose the other route: <em>Keep Routing</em> in V3.2 (see below) is essentially the same mechanism as Routing Replay, while GSPO changes the objective instead. See <a href="08-mixture-of-experts.html">page 08</a> for routing. A last GSPO claim: sequence-level likelihoods tolerate the numerical mismatch between the training and inference engines, so the inference engine's log-probabilities can be used directly without recomputation (§5.4), which matters for partial rollouts and multi-turn RL (<a href="25-rl-systems-agentic.html">page 25</a>).</p>
+  <p>Caveats: the evidence is Qwen's own, on a cold-start Qwen3-30B-A3B-Base model; GSPO keeps the group-std advantage and omits KL. As of late 2025 the same team proposed SAPO, which replaces hard clipping with a smooth temperature-controlled gate on the token ratio, \(f(\rho)=\tfrac{4}{\tau}\sigma(\tau(\rho-1))\), with a larger temperature for negative-advantage tokens (\(\tau_{\text{pos}}=1.0\), \(\tau_{\text{neg}}=1.05\)) because "negative updates tend to increase the logits of many inappropriate tokens" and are less stable <a href="https://arxiv.org/abs/2511.20347">[Gao et al. 2025]</a>. The direction of travel is consistent: hard token-level clipping is the weak point of GRPO at scale.</p>
+
+  <div class="decision">
+    <div class="decision-title">GSPO: sequence-level ratio and clipping</div>
+    <dl>
+      <dt>Problem</dt><dd>Token-level importance ratios are single-sample noise that accumulates with length, and in MoE models routing changes make them wildly unstable, so GRPO training can collapse irreversibly.</dd>
+      <dt>Idea</dt><dd>Use the length-normalized sequence likelihood ratio \(s_i\) and clip whole sequences; keep the group-normalized advantage.</dd>
+      <dt>Why it works</dt><dd>The unit of the ratio matches the unit of the reward, and the sequence likelihood is much more stable than individual token probabilities under routing changes or numerical mismatch.</dd>
+      <dt>Evidence</dt><dd>Higher training reward and benchmark scores per unit of compute than GRPO with Routing Replay on Qwen3-30B-A3B-Base (AIME'24, LiveCodeBench, Codeforces) <a href="https://arxiv.org/abs/2507.18071">[GSPO, Fig. 1]</a>; used for the Qwen3 models.</dd>
+      <dt>Cost</dt><dd>Whole-sequence clipping discards the good tokens of a slightly off-policy response (SAPO's critique). Tiny clip ranges are a new hyperparameter scale to tune. Results are from one lab.</dd>
+      <dt>Used by</dt><dd>Qwen3 (per the paper); available in verl (recommended <code>seq-mean-token-mean</code> aggregation).</dd>
+    </dl>
+  </div>
+
+  <h3 id="cispo">CISPO: clip the weight, not the update</h3>
+  <p>MiniMax-M1 met a different failure. In zero-RL runs on their hybrid-attention model, GRPO "failed to effectively promote the emergence of long CoT reasoning behaviors". Controlled ablations traced this to clipping: tokens that start reflective behavior (<em>However</em>, <em>Recheck</em>, <em>Wait</em>, <em>Aha</em>), which "often serve as 'forks' in reasoning paths", are rare and low-probability under the base model, so after one update their ratio \(\rho\) is high and they are clipped out of every later off-policy update. With 16 rounds of off-policy updates per generation batch, DAPO's larger \(\varepsilon_{\text{high}}\) was found "less effective in our setup" <a href="https://arxiv.org/abs/2506.13585">[MiniMax-M1, §3.1]</a>. Their fix starts from the REINFORCE objective with a stop-gradient importance weight and clips <em>that weight</em> rather than the update:</p>
+  <div class="eq-box">
+  \[ \mathcal J_{\text{CISPO}}(\theta)=\E\!\left[\frac1{\sum_i|o_i|}\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\sg\big(\hat\rho_{i,t}\big)\,\hat A_{i,t}\,\log\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})\right],\qquad \hat\rho_{i,t}=\clip\big(\rho_{i,t},\,1-\varepsilon^{IS}_{\text{low}},\,1+\varepsilon^{IS}_{\text{high}}\big) \]
+  <div class="eq-label">CISPO: the clipped importance weight is a constant (stop-gradient) multiplying a plain policy-gradient term, so every token keeps a gradient</div>
+  </div>
+  <p>Without clipping this is the standard policy gradient. In their experiments the lower bound was effectively removed and only \(\varepsilon^{IS}_{\text{high}}\) was tuned. The gradient is slightly biased by the cap but "preserves gradient contributions from all tokens, especially in long responses". CISPO also uses the token-level loss, group-relative advantages, dynamic sampling and a length penalty from DAPO, and no KL. On Qwen2.5-32B zero-RL with DAPO's math data it matched DAPO's AIME 2024 score with 50% of the training steps (a "2x speedup") and beat GRPO at equal steps. MiniMax-M1's whole RL run took three weeks on 512 H800 GPUs, about $0.53M of rental cost (§1). The three treatments of a token whose ratio has grown past the cap, for \(\hat A>0\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Ratio \(\rho\)</th><th class="num">0.5</th><th class="num">1.0</th><th class="num">1.2</th><th class="num">1.28</th><th class="num">1.5</th><th class="num">3.0</th></tr></thead>
+    <tbody>
+      <tr><td>PPO/GRPO clip, \(\varepsilon=0.2\): gradient weight on \(\nabla\log\pi\)</td><td class="num">0.5</td><td class="num">1</td><td class="num">1.2</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>Clip-higher, \(\varepsilon_{\text{high}}=0.28\)</td><td class="num">0.5</td><td class="num">1</td><td class="num">1.2</td><td class="num">1.28</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>CISPO with an illustrative cap \(c=1.28\): \(\min(\rho,c)\)</td><td class="num">0.5</td><td class="num">1</td><td class="num">1.2</td><td class="num">1.28</td><td class="num">1.28</td><td class="num">1.28</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">The clipped objective's gradient with respect to \(\log\pi_\theta\) is \(\rho\hat A\) inside the trust region and 0 outside; CISPO's is \(\min(\rho,c)\hat A\). The paper does not state the cap it used in the ablation, so \(c=1.28\) is only for illustration.</p>
+  <p>M1 needed more machinery when it extended the output limit from 40K to 80K tokens: negative samples grew faster than positive ones and hit the window first, so large negative gradients accumulated in the tails of sequences and produced garbled endings. Their remedies were early stopping on repetition, a combined sample-level loss with token-level normalization, and lower gradient-clip and \(\varepsilon^{IS}_{\text{high}}\) values (§5). Length changes are staged (40K, 48K, ..., 80K) using the perplexity trend and whether the 99th-percentile output length nears the window as switch signals.</p>
+
+  <div class="decision">
+    <div class="decision-title">CISPO: clip the importance weight, keep every token's gradient</div>
+    <dl>
+      <dt>Problem</dt><dd>PPO-style clipping zeroes the gradient of rare, high-ratio tokens, and those are exactly the "fork" tokens (Wait, Recheck) that start reflection.</dd>
+      <dt>Idea</dt><dd>Treat the importance weight as a clipped, stop-gradient coefficient on a REINFORCE term, so no token is dropped.</dd>
+      <dt>Why it works</dt><dd>Variance is controlled by capping the weight; the price is a small bias. With many off-policy updates per batch, keeping fork tokens alive sustains entropy and exploration.</dd>
+      <dt>Evidence</dt><dd>Matches DAPO at 50% of the steps on Qwen2.5-32B AIME 2024 <a href="https://arxiv.org/abs/2506.13585">[MiniMax-M1, Fig. 2]</a>; used to train MiniMax-M1.</dd>
+      <dt>Cost</dt><dd>Biased gradient; no trust region, so stability leans on the cap, gradient clipping and length staging. Reported by one lab.</dd>
+      <dt>Used by</dt><dd>MiniMax-M1; see <a href="32-frontier-open-models.html">page 32</a>.</dd>
+    </dl>
+  </div>
+
+  <h3 id="rloo-rpp">RLOO, REINFORCE++ and Kimi: baselines without a group std</h3>
+  <p><strong>RLOO</strong> (REINFORCE leave-one-out) uses, for sample \(i\), the mean reward of the other \(k-1\) samples as its baseline: \(\frac1k\sum_i\big[R(y_i)-\frac1{k-1}\sum_{j\ne i}R(y_j)\big]\nabla\log\pi(y_i\mid x)\). It is unbiased, needs no critic and no std, and was proposed for RLHF, where the authors also found that plain REINFORCE beat PPO by 3.2% to 20.3% in win-rate across datasets and models and that modeling partial completions is unnecessary <a href="https://arxiv.org/abs/2402.14740">[Ahmadian et al. 2024, §1, §2.3]</a>. It is the cleanest member of this family and the same argument as GRPO's, minus the std and the clip. <strong>REINFORCE++</strong> normalizes advantages across the <em>global batch</em> instead of per prompt: its \(k=1\) form puts a token-level k1 KL penalty in the reward and normalizes the resulting advantages over the batch, and its "w/ Baseline" form subtracts the group mean and then divides by the batch std, with a separate k2 KL loss <a href="https://arxiv.org/abs/2501.03262">[Hu et al., v9, §3]</a>. The authors' claims (local std is biased and unstable, global statistics converge for large batches) are theirs; the paper has been revised nine times, so cite the version.</p>
+  <p><strong>Kimi k1.5</strong> uses a variant of online policy mirror descent with the mean reward of the group as baseline and an \(\ell_2\)-style regularizer to the current policy, and no value network. Its argument against a critic is worth quoting in an interview: suppose the model has written a partial chain of thought and can continue with a correct step or with a wrong one that it later recovers from. An oracle value function would give the wrong step a lower value and penalize it, but "exploring \(z'_{t+1}\) is extremely valuable for training the model to generate long CoT"; with only the final answer as the reward, the model can learn trial and error as long as it recovers <a href="https://arxiv.org/abs/2501.12599">[Kimi k1.5, §2.3.2]</a>.</p>
+
+  <h3 id="v32">What DeepSeek changed when it scaled GRPO (V3.2)</h3>
+  <p>DeepSeek-V3.2 still uses GRPO, and describes its stabilizers precisely <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>:</p>
+  <ul>
+    <li><strong>Advantage without the std:</strong> \(\hat A_{i,t}=R_i-\operatorname{mean}(\mathbf{R})\).</li>
+    <li><strong>Unbiased KL estimate.</strong> Samples come from \(\pi_{\text{old}}\), so the k3 term is multiplied by the importance ratio \(\pi_\theta/\pi_{\text{old}}\). Without this, "when the sampled tokens have substantially lower probabilities under the current policy than the reference policy", the k3 gradient assigns "disproportionately large, unbounded weights" to raising those tokens, which is noisy. They also note that for domains such as mathematics, "applying a relatively weak KL penalty or even omitting it entirely can yield improved performance".</li>
+    <li><strong>Off-policy sequence masking.</strong> Mask (drop from the loss) any sequence with negative advantage whose average log-ratio \(\frac1{|o_i|}\sum_t\log\frac{\pi_{\text{old}}}{\pi_\theta}\) exceeds a threshold \(\delta\). Only negative sequences are masked: "the model benefits the most by learning from its own mistakes, whereas highly off-policy negative samples can be detrimental". \(\pi_{\text{old}}\) is the probability returned by the inference engine, so the measured divergence includes train-inference mismatch.</li>
+    <li><strong>Keep Routing</strong> (MoE): record the expert routes used at sampling time and force the same routes in training; "crucial for RL training stability of MoE models" and used since DeepSeek-V3-0324.</li>
+    <li><strong>Keep Sampling Mask:</strong> top-p and top-k truncation at sampling time makes \(\pi_{\text{old}}\) live on a subset of tokens, so the same mask is applied to \(\pi_\theta\) in training; combined with top-p sampling this "effectively preserves language consistency".</li>
+    <li><strong>Rewards:</strong> rule-based outcome reward, a length penalty and a language-consistency reward for reasoning and agent tasks; a generative reward model with per-prompt rubrics for general tasks.</li>
+  </ul>
+
+  <aside class="callout key">
+    <div class="callout-title">Which KL does the k3 term actually regularize?</div>
+    <p>The k3 estimator is unbiased for the <em>value</em> of \(\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})\), but the loss is differentiated, and the samples are held fixed when you do. Differentiating k3 with the samples fixed gives \(\nabla_\theta\text{k3}=-\big(\tfrac{\pi_{\text{ref}}}{\pi_\theta}-1\big)\nabla_\theta\log\pi_\theta\), whose on-policy expectation is \(-\sum_y\pi_{\text{ref}}(y)\nabla\log\pi_\theta(y)=\nabla_\theta\mathrm{KL}(\pi_{\text{ref}}\|\pi_\theta)\): the gradient of the <em>forward</em> KL, not the reverse KL that the estimate is named after. Multiplying by \(\pi_\theta/\pi_{\text{old}}\) and differentiating through that ratio, as V3.2 does, restores the reverse-KL gradient; so does the k2 estimator \(\tfrac12(\log\pi_\theta/\pi_{\text{ref}})^2\), which is why REINFORCE++ uses it as a loss. We checked all three identities numerically on a six-way categorical distribution (our derivation, not a claim from the papers). <a href="22-rl-foundations.html">Page 22</a> treats the estimator family in full.</p>
+  </aside>
+
+  <h3 id="compare">Side by side</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Advantage</th><th>Loss aggregation</th><th>Ratio and clip</th><th>KL</th><th>Distinctive move</th></tr></thead>
+    <tbody>
+      <tr><td><strong>GRPO</strong> (DeepSeekMath)</td><td>\((r-\bar r)/\text{std}\)</td><td>\(\frac1G\sum_i\frac1{|o_i|}\sum_t\)</td><td>token \(\rho\), symmetric \(\varepsilon\)</td><td>k3 in loss, \(\beta=0.04\)</td><td>group mean replaces critic</td></tr>
+      <tr><td><strong>Dr. GRPO</strong></td><td>\(r-\bar r\)</td><td>constant normalizer</td><td>token \(\rho\), symmetric</td><td>none</td><td>removes length and std biases</td></tr>
+      <tr><td><strong>DAPO</strong></td><td>\((r-\bar r)/\text{std}\)</td><td>\(1/\sum_i|o_i|\) (token-mean)</td><td>token \(\rho\), 0.2 / 0.28</td><td>none</td><td>dynamic sampling, overlong shaping</td></tr>
+      <tr><td><strong>GSPO</strong></td><td>\((r-\bar r)/\text{std}\)</td><td>\(\frac1G\sum_i\) (sequence)</td><td>sequence \(s_i\), \(3\text{e-}4\) / \(4\text{e-}4\)</td><td>omitted</td><td>no Routing Replay needed for MoE</td></tr>
+      <tr><td><strong>CISPO</strong></td><td>\((r-\bar r)/\text{std}\)</td><td>token-mean</td><td>clip a stop-gradient weight, no lower bound</td><td>none</td><td>every token keeps a gradient</td></tr>
+      <tr><td><strong>RLOO</strong></td><td>\(r_i-\) mean of the other \(k-1\)</td><td>per response</td><td>none (REINFORCE)</td><td>RLHF setting</td><td>unbiased leave-one-out baseline</td></tr>
+      <tr><td><strong>REINFORCE++</strong> w/ baseline</td><td>group mean, then batch std</td><td>PPO token objective</td><td>PPO clip</td><td>k2 loss</td><td>global batch normalization</td></tr>
+      <tr><td><strong>DeepSeek-V3.2</strong> GRPO</td><td>\(r-\bar r\)</td><td>\(\frac1G\sum_i\frac1{|o_i|}\sum_t\)</td><td>token \(\rho\) plus negative-sample masking</td><td>importance-corrected k3, often weak or none</td><td>Keep Routing, Keep Sampling Mask, length penalty</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: the papers cited in this section. "Symmetric" means one \(\varepsilon\) for both sides. DeepSeek-V4's specialists reuse V3.2's GRPO with "hyper-parameters closely aligned with our prior research" <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1]</a>, so the successors are being absorbed into GRPO as modifications rather than replacing it.</p>
+</section>
+
+<section>
+  <h2 id="dynamics">Training dynamics: entropy, length and what carries signal</h2>
+
+  <h3 id="entropy">Entropy collapse and its covariance mechanism</h3>
+  <p>Let \(H\) be the policy's average per-token entropy on its own samples. In RLVR runs without intervention, \(H\) falls quickly and the policy becomes nearly deterministic: the \(G\) samples for a prompt become near-copies, groups become uniform (zero advantage), exploration stops and the reward plateaus. DAPO saw this with naive PPO and GRPO (their Fig. 2b), and Cui et al. turned it into a quantitative law: across many runs without entropy intervention, downstream performance \(R\) is fit by \(R=-a\,e^{H}+b\), so performance is "traded from" entropy and the ceiling at exhausted entropy (\(H=0\), \(R=-a+b\)) is predictable. In their runs over 95% of the entropy drop and of the performance gain happen early in training <a href="https://arxiv.org/abs/2505.22617">[Cui et al. 2025, Fig. 1]</a> (entropy collapse <span class="zh">熵坍缩</span>).</p>
+  <p>Why does entropy fall? For a softmax policy with logits \(z\), a first-order calculation gives</p>
+  <div class="eq-box">
+  \[ H(\pi^{k+1})-H(\pi^{k})\;\approx\;-\operatorname{Cov}_{a\sim\pi^{k}(\cdot\mid s)}\!\Big(\log\pi^{k}(a\mid s),\ z^{k+1}_{s,a}-z^{k}_{s,a}\Big) \]
+  \[ \text{policy gradient: }\ \Delta z=\eta\,\pi(a\mid s)A(s,a)\ \Rightarrow\ \Delta H\approx-\eta\operatorname{Cov}\big(\log\pi,\ \pi A\big),\qquad \text{natural PG: }\ \Delta z=\eta A\ \Rightarrow\ \Delta H\approx-\eta\operatorname{Cov}\big(\log\pi,\ A\big) \]
+  <div class="eq-label">Entropy dynamics (Cui et al., Lemma 1, Proposition 1, Theorems 1 and 2; tabular softmax policy)</div>
+  </div>
+  <p>In words: an action that is already likely and has positive advantage lowers entropy (the update sharpens the distribution), while a rare action with positive advantage raises it. The authors verify empirically on Qwen2.5-7B that the covariance term tracks the measured entropy change, and that it stays mostly positive throughout training, which explains why entropy falls monotonically: after pretraining the model's confidence is roughly calibrated, so its high-probability tokens tend to be the good ones. A three-action example (natural-gradient case, \(\pi=(0.7,0.2,0.1)\), both advantage vectors have zero mean under \(\pi\), update \(z\leftarrow z+\eta A\) with \(\eta=0.1\)):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Which action is good</th><th>Advantage \(A\)</th><th class="num">\(\operatorname{Cov}(\log\pi,A)\)</th><th class="num">Predicted \(\Delta H=-\eta\operatorname{Cov}\)</th><th class="num">Exact \(\Delta H\)</th></tr></thead>
+    <tbody>
+      <tr><td>The likely action (0.7)</td><td>(+0.15, −0.35, −0.35)</td><td class="num">+0.156</td><td class="num">−0.0156</td><td class="num">−0.0157</td></tr>
+      <tr><td>The rare action (0.1)</td><td>(−0.05, −0.05, +0.45)</td><td class="num">−0.075</td><td class="num">+0.0075</td><td class="num">+0.0075</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Our computation for illustration (natural-gradient logit update; \(\log\pi=(-0.357,-1.609,-2.303)\)). The first-order prediction matches the exact change to two digits.</p>
+  <p>RLVR is a machine for the first row: correct answers are mostly the high-probability continuations, so reinforcing them sharpens the policy. The remedies act on this covariance directly or indirectly:</p>
+  <ul>
+    <li><strong>Clip-higher</strong> (DAPO) and <strong>CISPO</strong> let rare, positive-advantage tokens keep growing, which is the entropy-raising row.</li>
+    <li><strong>Clip-Cov and KL-Cov</strong> (Cui et al.) go after the cause: find the small fraction of tokens with the largest covariance and either remove them from the gradient (Clip-Cov, clip ratio \(2\times10^{-4}\)) or apply a KL penalty to them (KL-Cov, top-\(k\) fraction \(2\times10^{-3}\) for 7B and \(2\times10^{-4}\) for 32B, \(\beta=1\)). On Qwen2.5 with DAPO-Math data they report gains over GRPO of 2.0% average for 7B and 6.4% for 32B, and entropy more than 10 times higher than the plateaued baseline. They also report that clip-higher raises entropy early but later becomes unstable in their runs, and that a naive entropy bonus is ineffective (§4).</li>
+    <li><strong>Sampling temperature and the KL leash.</strong> ProRL finds that a higher rollout temperature "only delays the onset of entropy collapse", and that a KL penalty to a reference policy plus periodic hard resets of the reference (and optimizer) sustains entropy over more than 2,000 steps when starting from an already-capable checkpoint <a href="https://arxiv.org/abs/2505.24864">[ProRL, §2]</a>.</li>
+    <li><strong>Deliberate entropy control.</strong> Qwen3's reasoning RL controls entropy "to increase steadily or remain stable", which they call crucial for stability <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.2]</a>. DAPO's guidance is to monitor it: too low means no exploration, too high means over-randomness.</li>
+  </ul>
+
+  <h3 id="length">Response length: growth, overthinking and length control</h3>
+  <p>Length growth is the most-watched curve in reasoning RL and the most misread. At least four things push it up, and only the first is "reasoning": (1) longer chains genuinely help on hard problems; (2) the per-response \(1/|o_i|\) bias (Dr. GRPO) lets wrong answers grow for free; (3) a schedule that raises the length cap, as at step 8.2K in R1-Zero; (4) unproductive loops (repetition, endless "wait"). DAPO's advice is to treat length as a health indicator only in conjunction with validation accuracy, since it "does not always maintain a continuous upward trend" and can stagnate or fall for long periods <a href="https://arxiv.org/abs/2503.14476">[DAPO, §4.3]</a>.</p>
+  <p>Once length grows, cost and <strong>overthinking</strong> <span class="zh">过度思考</span> follow. Kimi k1.5 observed that response length "significantly increases during RL training", which improves accuracy but is costly and "often not preferred by humans", and added a length reward computed within each group of \(k\) samples: with \(\text{len}(i)\) the response length, \(\lambda=0.5-\dfrac{\text{len}(i)-\text{min\_len}}{\text{max\_len}-\text{min\_len}}\), the reward is \(\lambda\) for a correct response and \(\min(0,\lambda)\) for a wrong one, and zero for all if every response has the same length <a href="https://arxiv.org/abs/2501.12599">[Kimi k1.5, §2.3.3]</a>. Example: correct answers of 1,000, 2,000 and 4,000 tokens in a group whose shortest is 1,000 and longest 4,000 earn \(+0.5\), \(+0.167\) and \(-0.5\); a wrong 4,000-token answer earns \(-0.5\), a wrong 1,000-token one 0. The reward favors short-and-correct and never rewards short-and-wrong. Because it slows early learning, they train without it first and then hold it constant. Their long2short toolbox also includes model merging, shortest-rejection-sampling, DPO and a second RL phase with the penalty.</p>
+  <p>DeepSeek treats length as a dial. V3.2 uses a length penalty in its reasoning and agent rewards, and notes that its reported scores are "constrained by a length constraint reward model; upon removal of the restriction, we observe further improvement", while the experimental V3.2-Speciale was trained with a reduced length penalty on reasoning data only <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3, §4.1]</a>. DeepSeek-V4 makes the dial explicit, training one specialist per reasoning-effort mode "under divergent RL configurations" with "distinct length penalties and context windows" (below). R1 itself lists overthinking on simple questions as a remaining limitation <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, §6]</a>.</p>
+
+  <h3 id="signal">What carries signal: zero-advantage groups, filtering and curricula</h3>
+  <p>A group carries a gradient only if its outcomes are mixed. If a prompt's current pass rate is \(p\) and the group size is \(G\), the probability that the group is uninformative is \(p^{G}+(1-p)^{G}\), symmetric in \(p\leftrightarrow1-p\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Pass rate \(p\)</th><th class="num">\(G=8\): P(useless)</th><th class="num">samples per informative group</th><th class="num">\(G=16\): P(useless)</th><th class="num">samples per informative group</th><th class="num">\(G=64\): P(useless)</th><th class="num">samples per informative group</th></tr></thead>
+    <tbody>
+      <tr><td class="num">0.5</td><td class="num">0.008</td><td class="num">8.1</td><td class="num">≈0</td><td class="num">16.0</td><td class="num">≈0</td><td class="num">64.0</td></tr>
+      <tr><td class="num">0.8</td><td class="num">0.168</td><td class="num">9.6</td><td class="num">0.028</td><td class="num">16.5</td><td class="num">≈0</td><td class="num">64.0</td></tr>
+      <tr class="hl"><td class="num">0.9</td><td class="num">0.431</td><td class="num">14.0</td><td class="num">0.185</td><td class="num">19.6</td><td class="num">0.001</td><td class="num">64.1</td></tr>
+      <tr><td class="num">0.95</td><td class="num">0.663</td><td class="num">23.8</td><td class="num">0.440</td><td class="num">28.6</td><td class="num">0.038</td><td class="num">66.5</td></tr>
+      <tr><td class="num">0.99</td><td class="num">0.923</td><td class="num">103.6</td><td class="num">0.852</td><td class="num">107.7</td><td class="num">0.526</td><td class="num">134.9</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Computed as \(p^G+(1-p)^G\) and \(G/(1-p^G-(1-p)^G)\) (expected samples to obtain one informative group). Real prompts differ in \(p\), so batch-level fractions are averages over a distribution.</p>
+  <p>Two lessons. First, as the policy improves, many training prompts drift to \(p\to1\) and the useless fraction climbs, which is exactly what DAPO measured (share of accuracy-1 prompts rising over training) and why filtering matters more late in training. Second, a larger \(G\) buys a better baseline, not efficiency: at \(p=0.9\), one informative group costs 14.0 samples at \(G=8\), 19.6 at \(G=16\) and 64.1 at \(G=64\). DeepSeekMath's \(G=64\) reflects a 7B model on 1,024-token answers, not a universal optimum; most open long-CoT recipes use 8 to 16.</p>
+  <p>Ways to keep the batch informative, in order of how early they act:</p>
+  <ul>
+    <li><strong>Offline difficulty filtering.</strong> Estimate pass rates with the starting model (or an earlier run) and drop prompts that are solved always or never. MiniMax used its 40K-token model's pass rates to remove easy prompts before the 80K stage; Qwen3's reasoning-RL prompts had to be "learnable" for the cold-start model, "as challenging as possible", unused in the cold start, and diverse, which left 3,995 query-verifier pairs <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.2]</a>.</li>
+    <li><strong>Online filtering.</strong> DAPO's dynamic sampling, above: measure this step's group accuracies and refill the batch.</li>
+    <li><strong>Curricula and prioritized sampling.</strong> Kimi k1.5 starts with easier problems and moves to harder ones (curriculum), and samples prompt \(i\) with probability proportional to \(1-s_i\), where \(s_i\) is its tracked success rate (prioritized sampling), so weak spots get more attention <a href="https://arxiv.org/abs/2501.12599">[Kimi k1.5, §2.3.4]</a>.</li>
+    <li><strong>Don't trust the training reward.</strong> DAPO found the final reward on the training set "often exhibits little correlation with the accuracy on the validation set", a sign of overfitting to the prompt set (§4.3). Always hold out prompts.</li>
+  </ul>
+  <p>The flip side of filtering is a limit: prompts the model can never solve give no signal at all, so plain RLVR cannot teach what the model cannot sample. That is the bridge to the next section.</p>
+</section>
+
+<section>
+  <h2 id="capability">Does RL add capability? An open debate</h2>
+
+  <p>The question has practical weight: it decides whether extra compute should go into pretraining, RL, or distillation from a stronger teacher. The evidence below is presented as a debate, because the literature has not converged (as of September 2026 it is still active, with new work on combining distillation and RL).</p>
+
+  <h3 id="sharpening">The sharpening view</h3>
+  <p>The first hint is in DeepSeekMath itself: after GRPO, Maj@K improved but Pass@K did not, which the authors read as RL "rendering the output distribution more robust", boosting the correct response from the top-K rather than improving fundamental capability <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §5.2.2]</a>. Yue et al. made this the central experiment <a href="https://arxiv.org/abs/2504.13837">[Yue et al. 2025]</a>. They compare base and RL-trained models by <strong>pass@k for large \(k\)</strong>, up to 256 samples or more, on math, code and visual-reasoning benchmarks. The RL models are zero-RL GRPO checkpoints from SimpleRL-Zoo (Qwen2.5-7B, 14B, 32B and Llama-3.1-8B, trained on GSM8K and MATH with a correctness-only reward), plus Oat-Zero-7B and DAPO-32B. Their findings:</p>
+  <ul>
+    <li>At small \(k\) (\(k=1\), the usual accuracy) RL models win. As \(k\) grows to tens or hundreds the curves cross and the base model overtakes: for example on Minerva with the 32B model the base model is about 9 points ahead at \(k=128\). Oat-Zero and DAPO start about 30 points above their bases at \(k=1\) and are eventually passed by them.</li>
+    <li>Coverage and perplexity analyses suggest that the reasoning paths of RL models already lie inside the base model's sampling distribution, i.e. the RL model mostly re-weights them.</li>
+    <li>Six RL algorithms (PPO, GRPO, REINFORCE++, RLOO, ReMax, DAPO) behave similarly. Defining a sampling-efficiency gap \(\Delta_{SE}\) as the base model's pass@256 minus the RL model's pass@1, all remain above 40 points on their in-domain set (from 43.9 for GRPO to 42.6 for RLOO), so none comes close to exploiting the base model's coverage.</li>
+    <li>Distillation behaves differently: the pass@k curve of DeepSeek-R1-Distill-Qwen-7B sits consistently above that of its base, so distillation can extend the boundary while RL, in their runs, mostly does not.</li>
+  </ul>
+  <p>A lab-side data point points the same way. On Qwen3-8B, after off-policy distillation from a large teacher, further RL raised AIME'24 pass@1 from 55.0 to 67.6 and AIME'25 from 42.8 to 55.5 but left pass@64 exactly unchanged (90.0 and 83.3), while on-policy distillation from a stronger teacher reached 74.4 and 65.5 with pass@64 of 93.3 and 86.7, at 1,800 GPU-hours instead of 17,920 <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.7, Table 21]</a>. AIME has 30 problems, so one problem is 3.3 points and the pass@64 differences are one problem each: suggestive, not conclusive. A September 2026 study of a Qwen3-8B teacher and Qwen3-1.7B-Base student reports that on-policy distillation followed by RL beats pure OPD, pure RL and all joint schemes, with the explanation that OPD expands coverage of teacher-supported solutions and RL sharpens within that support <a href="https://arxiv.org/abs/2609.04108">[Li et al. 2026]</a>.</p>
+
+  <h3 id="expansion">Counter-evidence: prolonged RL</h3>
+  <p>ProRL argues the negative results reflect method limits, not RL's limits: (1) they concentrate on math, where models are heavily trained in pretraining and post-training, and (2) RL runs are stopped after "no more than hundreds of steps" <a href="https://arxiv.org/abs/2505.24864">[Liu et al. 2025, §1]</a>. Their recipe trains DeepSeek-R1-Distill-Qwen-1.5B (a distilled checkpoint, not a raw base) for more than 2,000 steps on 136K verifiable problems across math, code, STEM, logic puzzles and instruction following, using DAPO-style decoupled clipping (\(\varepsilon_{\text{high}}=0.4\)), dynamic sampling, temperature 1.2, a KL penalty and periodic reference resets, for about 16K GPU-hours. They report large gains in every domain (for example +54.8% on Reasoning Gym logic puzzles), success on tasks where the base model fails at every \(k\), and a higher "Creativity Index" (less overlap with the pretraining corpus) for the RL model's outputs. The improvement in pass@128 correlates negatively with the base model's own pass@128: "the weaker the start, the stronger the gain". They classify benchmarks into three regimes as training proceeds: <em>diminish</em> (breadth narrows, mostly math), <em>plateau</em>, and <em>sustained</em> gains (for example some code and puzzle tasks). So even ProRL's own evidence contains the Yue et al. effect on math.</p>
+
+  <h3 id="spurious">Spurious rewards: what RLVR on Qwen actually optimizes</h3>
+  <p>A third strand asks how much of the reward signal matters at all. On Qwen2.5-Math-7B, GRPO trained for about 300 steps improved MATH-500 by +29.1 points with ground-truth rewards, +24.1 with a reward for matching majority-vote answers that are <em>incorrect</em>, and +21.4 with rewards assigned uniformly at random (probability 0.5); a format-only reward also helped <a href="https://arxiv.org/abs/2506.10947">[Shao et al. 2025, §2]</a>. On AIME 2025, whose problems postdate the models, the gains from spurious rewards largely vanish; and on Llama-3 and OLMo-2 they yield little or nothing. Their proposed mechanism is a <strong>clipping bias</strong>: with random rewards the expected gradient is zero when clipping is removed, but with clipping the expected update raises the probability of tokens the model already favors, amplifying high-prior behaviors. In Qwen2.5-Math one such behavior is "code reasoning" (writing Python-style reasoning without executing it), whose frequency rises from 65% to over 90% under any of the rewards and correlates with accuracy (answers using it are correct 60.9% of the time). The authors stress that these rewards are analysis tools, not a training recipe, and recommend validating RLVR methods on several model families and using spurious rewards as a baseline. Dr. GRPO makes a compatible point: Qwen2.5 models answer best with no chat template (100% answering rate), and the authors hypothesize that Qwen2.5-Math was pretrained on concatenated question-answer text, so results on these models may not transfer <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, §2.2]</a>.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Claim</th><th>Main evidence</th><th>Scope and caveats</th></tr></thead>
+    <tbody>
+      <tr><td>RL mostly sharpens</td><td>Maj@K up but Pass@K flat (DeepSeekMath); base overtakes RL at large \(k\) (Yue et al.); pass@64 unchanged by RL on Qwen3-8B</td><td>Mostly math and code, hundreds of steps, Qwen and Llama bases, \(k\le256\), lucky guesses possible on numeric answers</td></tr>
+      <tr><td>Prolonged, diverse RL can expand</td><td>ProRL: gains where the base fails at every \(k\), Creativity Index up, gains largest where the start is weakest</td><td>1.5B distilled start, authors' own evaluation, math still "diminishes"</td></tr>
+      <tr><td>The reward barely matters on some models</td><td>Random and incorrect rewards recover most of the gain on Qwen2.5-Math</td><td>Model-specific (no gain on Llama-3, OLMo-2); mechanism is clipping bias amplifying priors</td></tr>
+      <tr><td>Base models already reflect</td><td>DeepSeek-V3-Base shows "aha" and "wait" before RL; reflection not tied to accuracy</td><td>Keyword-based detection; says nothing about training-time exploration benefits</td></tr>
+      <tr><td>Distillation expands the boundary</td><td>R1-Distill-Qwen-7B above its base at large \(k\); Qwen3 on-policy distillation pass@64 up</td><td>Needs a stronger teacher, which RL had to produce first</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="synth">How to hold the debate in an interview</h3>
+  <p><strong>What everyone accepts.</strong> At typical open-source scale, RLVR raises pass@1 chiefly by making already-reachable solutions more probable. That is valuable in itself: users see pass@1, and running majority voting or best-of-\(k\) at inference costs \(k\) times more, so RLVR effectively distills the group's best behavior into a single sample. R1 shows the gap it closes: AIME 2024 pass@1 79.8, majority vote over 64 samples 86.7, pass@64 90.0 <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. E.4]</a>.</p>
+  <p><strong>What is contested.</strong> Whether long, diverse, well-conditioned RL creates solution paths that had negligible base probability, and whether pass@\(k\) can even see that. Here is the measurement problem in numbers. A solution that a base model produces with probability \(q\) per sample is found by pass@256 with probability \(1-(1-q)^{256}\): 92% for \(q=10^{-2}\), 2.5% for \(q=10^{-4}\), 0.026% for \(q=10^{-6}\). Problems whose only successful chains have \(q\lesssim10^{-4}\) look "unsolvable by the base model" at \(k=256\), yet RL can raise such a \(q\) by orders of magnitude, which is a real capability gain that a \(k\le256\) test cannot separate from zero. Conversely, on numeric-answer tasks a fraction of large-\(k\) "successes" are lucky guesses, which inflates the base model's curve (Yue et al. audited samples by hand for this reason). Add pretraining confounds (Qwen's data), RL runs that are short and narrow, and contamination.</p>
+  <p><strong>What would settle it:</strong> tasks with verifiably novel skills (ProRL's out-of-distribution puzzle tasks), RL scaled far past hundreds of steps on broad data, and per-problem probability estimates beyond \(k=256\). Until then the defensible answer is "both": RL sharpens reliably, expands under some conditions, and distillation expands more cheaply when a teacher exists.</p>
+</section>
+
+<section>
+  <h2 id="tts">Test-time scaling, thinking modes and where post-training is going</h2>
+
+  <h3 id="tts-axes">Two ways to spend inference compute</h3>
+  <p><strong>Test-time scaling</strong> <span class="zh">测试时扩展</span> means buying accuracy with inference tokens. There are two axes. <em>Sequential</em> scaling makes one chain of thought longer (more exploration, verification and backtracking inside a single response). <em>Parallel</em> scaling draws several independent responses and aggregates them by majority vote, or picks with a verifier (see <a href="06-decoding-kv-cache.html">page 06</a> for sampling and <a href="18-evaluation.html">page 18</a> for pass@k). They complement each other. R1 spells this out: because non-reasoning models "lack the ability to backtrack or self-correct", drawing more independent samples from them just re-samples potentially wrong final solutions, whereas R1's long chains "still sometimes fail to be thorough or become trapped in incorrect logic paths", so sampling several chains does help: on AIME 2024 pass@1 is 79.8, majority vote over 64 samples gives 86.7 and pass@64 is 90.0 <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, App. E.4]</a>.</p>
+
+  <p><strong>Budget forcing (s1).</strong> Muennighoff et al. showed how little machinery sequential scaling needs. They fine-tune Qwen2.5-32B-Instruct on only 1,000 curated questions with reasoning traces (s1K, distilled from Gemini 2.0 Flash Thinking, 26 minutes on 16 H100 GPUs). At decode time <strong>budget forcing</strong> controls thinking length: to stop early, append the end-of-thinking delimiter (optionally "Final Answer:"); to think longer, suppress the delimiter and append "Wait", which often makes the model re-check and fix an error. On AIME 2024 s1-32B scores 50.0 without forcing and 56.7 with it (MATH-500 92.6 to 93.0, GPQA Diamond 56.6 to 59.6). The gain flattens after about six forced continuations and too many "Wait"s send the model into repetitive loops, and for their setup majority voting on the base model could not catch up with sequential scaling <a href="https://arxiv.org/abs/2501.19393">[Muennighoff et al. 2025, §3, §4.2, Table 1]</a>. What this does and does not say about RL: the <em>format</em> of long reasoning and its length control can be elicited by tiny SFT sets; RL is what makes a model use extra tokens productively without an external "Wait" injection.</p>
+
+  <h3 id="modes">Thinking budgets and hybrid modes</h3>
+  <p>Products need both a fast answer and a deep one from the same weights, with a cost dial. Three designs are documented:</p>
+  <ul>
+    <li><strong>Qwen3: thinking-mode fusion by SFT.</strong> After reasoning RL, continue SFT on a mix of thinking data (rejection-sampled from the reasoning-RL model on the cold-start queries) and non-thinking data, with <code>/think</code> and <code>/no_think</code> flags in the prompt and an empty think block for non-thinking samples. A <strong>thinking budget</strong> then falls out for free: when the chain reaches a user-set length, insert "Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n&lt;/think&gt;" and let the model answer. The authors state this ability "is not explicitly trained but emerges naturally", and show smooth accuracy growth with budget up to 32K tokens for Qwen3-235B-A22B <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §4.3, §4.7]</a>.</li>
+    <li><strong>DeepSeek-V3.1: one model, two chat templates.</strong> "One model supports both thinking mode and non-thinking mode by changing the chat template", with different assistant prefixes for each <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1">[DeepSeek-V3.1 model card]</a>. The card also says the thinking mode reaches answer quality comparable to R1-0528 while responding faster.</li>
+    <li><strong>DeepSeek-V4: reasoning effort baked into RL.</strong> Three modes, Non-think, Think High and Think Max. "For each mode, we apply distinct length penalties and context windows during RL training", producing different reasoning lengths, and Think Max also prepends an instruction to the system prompt. Evaluation context windows are 8K, 128K and 384K tokens respectively <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1, §5.3.1]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Reasoning modes in one model</div>
+    <dl>
+      <dt>Problem</dt><dd>Reasoning models spend thousands of tokens even on easy questions (overthinking), but hard problems need them. Serving two models doubles deployment cost.</dd>
+      <dt>Idea</dt><dd>Train one model that can answer without thinking or think to a chosen depth, selected by flags, chat templates or system prompts, and cap or extend the thinking length at inference.</dd>
+      <dt>Why it works</dt><dd>Training on both modes teaches the model to continue from partial reasoning, so truncating or extending the chain is in-distribution. V4 goes further and shapes the length distribution itself through mode-specific RL length penalties.</dd>
+      <dt>Evidence</dt><dd>Qwen3's smooth budget curves; V4's three modes with separate context windows.</dd>
+      <dt>Cost</dt><dd>More complex training (mixed SFT, separate specialists per mode); truncated thinking can be worse than a model trained for the shorter budget; the mode adds prompt-format surface for bugs.</dd>
+      <dt>Used by</dt><dd>Qwen3, DeepSeek-V3.1 onward, DeepSeek-V4; see <a href="30-qwen.html">page 30</a> and <a href="28-deepseek-3-reasoning.html">page 28</a>.</dd>
+    </dl>
+  </div>
+
+  <h3 id="rl-compute">RL compute as a scaling axis</h3>
+  <p>The R1-era pattern was small RL budgets and large pretraining. That ratio is moving. DeepSeek-V3.2 states that its post-training RL budget "exceeds 10% of the pre-training cost" and that it has seen "consistent performance improvements correlating with extended RL training budget" <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §1, §4.1]</a>. For scale: R1's whole RL effort was about 142K H800 GPU-hours against 2.664M for V3's pretraining, about 5.3% (computed above); MiniMax-M1's full RL run was three weeks on 512 H800 GPUs, \(512\times24\times21=258{,}048\) GPU-hours, which at their reported $0.53M implies about $2.05 per GPU-hour, consistent with the $2 rate R1 assumed. Ways RL compute gets spent: more steps (ProRL: over 2,000), longer sequences (Kimi k1.5 scaled the RL context window to 128K; MiniMax staged 40K to 80K), more prompts and domains, and more samples per prompt. Rollouts, not gradient steps, tend to dominate wall-clock time, because long-tail samples stall synchronous batches (DAPO §3.2, MiniMax §3.2); <a href="25-rl-systems-agentic.html">page 25</a> covers the systems side.</p>
+
+  <h3 id="trends">Post-training trends as of September 2026</h3>
+  <ul>
+    <li><strong>Specialists, then on-policy distillation instead of mixed RL.</strong> DeepSeek-V3.2 trained specialists per domain with large-scale RL, distilled their data into the main model, and then ran one mixed RL stage over reasoning, agent and alignment data (to avoid the forgetting of multi-stage pipelines). DeepSeek-V4 keeps the specialists (SFT then GRPO with hyperparameters "closely aligned" with prior work) but replaces the mixed RL stage entirely with <strong>multi-teacher on-policy distillation</strong>: the unified student samples its own responses and minimizes \(\sum_i w_i\,\mathrm{KL}(\pi_\theta\|\pi_{E_i})\) against more than ten expert teachers <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1]</a>. The motivation is avoiding "the performance degradation often encountered in traditional weight-merging or mixed RL techniques". They also choose <em>full-vocabulary</em> reverse KL over the common shortcut of using \(\operatorname{sg}[\log\pi_E-\log\pi_\theta]\) at the sampled token as a per-token RL advantage, because the shortcut has high gradient variance and can be unstable.</li>
+    <li><strong>OPD is RL with a dense reward.</strong> Written as a policy gradient, on-policy distillation uses the per-token advantage \(\log\pi_{\text{teacher}}-\log\pi_\theta\) in place of one outcome reward per response, which is why it plugs into RL infrastructure and why it is so much cheaper per unit of signal (Qwen3: 1,800 versus 17,920 GPU-hours for the 8B model). Qwen3 already used it for its smaller models. Order matters: the September 2026 study above finds OPD then RL beats fusing the two signals in one step <a href="https://arxiv.org/abs/2609.04108">[Li et al. 2026]</a>.</li>
+    <li><strong>GRPO survives, with patches.</strong> The frontier open recipes are GRPO plus the fixes of the previous section (V3.2's list, DAPO-style shaping, GSPO-style stability for MoE), not a replacement algorithm.</li>
+    <li><strong>Generative reward models for what rules cannot check.</strong> V4 uses rubric-guided data and a generative reward model whose weights are the actor's own, with RL applied to the judging skill as well <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.1.1]</a>.</li>
+    <li><strong>Reasoning persists across tool calls.</strong> V3.2 keeps thinking tokens across tool results and drops them at a new user message; V4 keeps all reasoning across user turns when tools are in play (details on <a href="25-rl-systems-agentic.html">page 25</a> and <a href="28-deepseek-3-reasoning.html">page 28</a>).</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="recipe">A practical recipe: an RLVR run to improve a 7B model's math accuracy</h2>
+
+  <p>This is our synthesis of the published recipes above, not a published recipe of its own. Treat every number as a starting point: the papers tuned on specific models (mostly Qwen2.5), and Qwen's behavior is not typical (<a href="#spurious">spurious rewards</a>). The reasoning column says why each choice is made, so you can change it when your situation differs.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Decision</th><th>Starting choice</th><th>Why (and source)</th></tr></thead>
+    <tbody>
+      <tr><td>Model</td><td>A 7B to 8B base or lightly SFT'd model whose pass@8 on your prompts is neither near 0 nor near 1. Repeat the run on a second model family before trusting a result.</td><td>Zero success means zero signal. R1 found pure RL from a 7B dense and a 16B MoE model failed to improve AIME <a href="https://arxiv.org/abs/2501.12948">[R1, G.1]</a>, though zero-RL on Qwen2.5-7B and Llama-3.1-8B works for standard math sets (Yue et al.). If a base stalls, start from a distilled or SFT checkpoint (ProRL). Spurious-reward results show single-family conclusions mislead.</td></tr>
+      <tr><td>Data</td><td>10K to 20K verifiable problems with parseable answers: DAPO-Math-17K (integer answers), or the MATH and GSM8K training sets (7,500 and 7,473 problems). Decontaminate against every eval set. Pre-filter with the starting model, keeping prompts with roughly \(0.1\lesssim p\lesssim0.9\) at \(G=8\) to \(16\).</td><td>Integer answers minimize parser false negatives <a href="https://arxiv.org/abs/2503.14476">[DAPO §3.5]</a>. The filter follows the zero-signal table (the thresholds are our heuristic); Qwen3 selected pairs that were "learnable" yet "as challenging as possible".</td></tr>
+      <tr><td>Reward</td><td>Binary correctness (\(+1/0\) or \(+1/-1\)) from a normalized answer match. Little or no format reward. No length reward at first. Mask truncated samples or use the soft overlong penalty.</td><td>Keep the signal clean and hard to game. Yue et al. used correctness only; R1 adds format at equal weight because it needs the tags; length rewards slow early learning (Kimi) and can be added later.</td></tr>
+      <tr><td>Algorithm</td><td>GRPO with the edits of the fixes section: token-mean or constant normalization (never per-response \(1/|o_i|\)); \(\varepsilon_{\text{low}}=0.2\), \(\varepsilon_{\text{high}}=0.28\); dynamic sampling or the pre-filter; advantage \(r-\bar r\) with or without the std.</td><td>Each edit answers a documented failure: length bias, entropy collapse, zero-advantage groups. DAPO keeps the std and V3.2 drops it, so make it an ablation, not a belief.</td></tr>
+      <tr><td>KL</td><td>\(\beta=0\) to start. If you start from an SFT checkpoint and see drift, add \(\beta\approx0.001\) with periodic reference resets.</td><td>DAPO, Dr. GRPO and Yue et al. run without KL, which also saves a 14 GB bf16 reference copy for 7B and a forward pass per step. R1 used 0.001, ProRL a KL with resets from a distilled start.</td></tr>
+      <tr><td>Group and batch</td><td>\(G=8\) to \(16\); 256 to 512 prompts per rollout. Example: 256 prompts \(\times\) 8 responses \(=\) 2,048 rollouts per step (Yue et al.'s setup) or 512 \(\times\) 16 (DAPO).</td><td>\(G\) trades baseline quality against cost (samples per informative group in the signal table). More prompts per step gives more diverse gradients.</td></tr>
+      <tr><td>Optimizer</td><td>AdamW, constant learning rate \(10^{-6}\) with about 20 rollout steps of linear warm-up; up to \(2\)-\(3\times10^{-6}\) if stable. Do not blindly keep default Adam \(\epsilon\) at very large scale.</td><td>\(10^{-6}\) appears in DeepSeekMath, DAPO and Yue et al.; 2e-6 in ProRL, 3e-6 in R1. MiniMax found the default verl setting \((\beta_2,\epsilon)=(0.999,10^{-8})\) could stop convergence when gradients ranged from \(10^{-18}\) to \(10^{-5}\), and used \(\beta_2=0.95\), \(\epsilon=10^{-15}\) (their model is far larger than 7B; our reading is that most coordinates would sit below \(\epsilon\)).</td></tr>
+      <tr><td>Updates per rollout</td><td>1 to 4 minibatches per rollout.</td><td>More minibatches make later ones more off-policy (R1 and DAPO use 16, ProRL 4). Watch the clipped fraction and the trainer-versus-sampler log-prob mismatch; V3.2 masks negative sequences that drift too far.</td></tr>
+      <tr><td>Lengths</td><td>Start with a 4K to 8K response cap. Extend in stages when the 99th-percentile length keeps hitting the cap and truncation rises. Add repetition-based early stopping.</td><td>Cost scales with length, and long caps early mostly buy rambling. MiniMax switched windows using perplexity convergence and p99 length, and halted generations after 3,000 consecutive tokens each above probability 0.99. Yue et al. used 8,192; DAPO 16K plus a 4K buffer.</td></tr>
+      <tr><td>Sampling</td><td>Temperature 1.0, top-p 1.0. If you must truncate the distribution, keep the same mask when computing \(\pi_\theta\).</td><td>R1 and DAPO sample at temperature 1 (ProRL 1.2 for entropy). V3.2's Keep Sampling Mask exists because truncation breaks the importance ratio.</td></tr>
+      <tr><td>Evaluation</td><td>Held-out prompts; avg@16 to 32 at fixed temperature; pass@\(k\) for \(k\) up to 64 to 256 on the same set; one out-of-domain set; two seeds.</td><td>Average accuracy shows the gain; pass@\(k\) shows whether you are only sharpening; out-of-domain shows overfitting. DAPO found training reward poorly correlated with validation accuracy.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="monitor">What to monitor and what each pattern means</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Metric</th><th>Healthy</th><th>Warning sign</th><th>Likely cause and first response</th></tr></thead>
+    <tbody>
+      <tr><td>Validation avg@k versus training reward</td><td>Both rise together</td><td>Training reward rises, validation flat or falling</td><td>Overfitting the prompt set or exploiting the checker: read samples, tighten the verifier, add data, stop early.</td></tr>
+      <tr><td>Fraction of zero-advantage groups</td><td>Stable</td><td>Steadily rising</td><td>Prompts too easy now: re-filter, dynamic sampling, larger \(G\), harder data.</td></tr>
+      <tr><td>Response length (mean, p99, truncation rate)</td><td>Moderate growth that tracks validation accuracy</td><td>Length explodes with no accuracy gain; or collapses to very short</td><td>Explosion: length bias or loops (switch to token-mean or constant normalization, overlong shaping, repetition stop). Collapse: format hack or length penalty too strong.</td></tr>
+      <tr><td>Policy entropy</td><td>Slow decline</td><td>Near zero within the first tens of steps; or sudden spikes</td><td>Collapse: raise \(\varepsilon_{\text{high}}\), dynamic sampling, higher temperature, Clip-Cov or KL-Cov. Spikes: instability, gibberish in long tails (DAPO's token-level loss and overlong handling).</td></tr>
+      <tr><td>Clipped-token fraction and \(|\log\pi_{\text{train}}-\log\pi_{\text{sample}}|\)</td><td>Small; mismatch near zero at the first minibatch</td><td>Large mismatch even when nothing has been updated</td><td>Train-inference mismatch (kernels, precision, MoE routing): MiniMax's FP32 LM head raised the train-inference probability correlation from about 0.9x to 0.99x. See <a href="25-rl-systems-agentic.html">page 25</a>.</td></tr>
+      <tr><td>KL to reference (if used) and gradient norm</td><td>Slowly growing, bounded</td><td>Sharp growth or gradient-norm spikes</td><td>Learning rate too high or too many off-policy updates: reduce both, mask far-off-policy negatives.</td></tr>
+      <tr><td>Samples, read by a human</td><td>Reasoning that a reader can follow</td><td>Answer-only outputs, repeated boxed answers, language mixing</td><td>Reward hacking or drift: fix the checker or add a language-consistency term (R1).</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>A budget calculation.</strong> Suppose 256 prompts \(\times\) 8 responses averaging 3,000 tokens: \(256\times8\times3000=6.14\)M generated tokens per step. Training passes cost about \(6ND\) FLOPs on those tokens (<a href="13-scaling-laws.html">page 13</a>): \(6\times7\times10^{9}\times6.14\times10^{6}\approx2.6\times10^{17}\) FLOPs per step. On 8 H100 GPUs at 40% utilization (\(8\times989\text{ TFLOP/s}\times0.4\approx3.2\times10^{15}\) FLOP/s) that is about 82 s per step, so 1,000 steps take about 23 hours of pure training compute and 6.1 billion generated tokens. In practice rollout generation is memory-bound and usually dominates wall-clock (<a href="17-inference-serving.html">page 17</a>, <a href="34-back-of-envelope.html">page 34</a>), so the budget is set by your inference throughput, not this figure. What the calculation is good for is comparing options: doubling the response cap doubles both numbers, and \(G=16\) instead of 8 does too.</p>
+  <p>Two habits separate a run you can trust from one you cannot. First, every headline claim needs the sharpening check (pass@\(k\) at large \(k\)) and, if the model is a Qwen model, a second family. Second, keep the SFT-distillation baseline in view: if a stronger teacher's traces exist, R1 and Qwen3 both found distillation cheaper per unit of capability at small scale, and one September 2026 study found distillation first and RL second to be the best ordering in its setup.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"GRPO has no baseline."</strong> It has one: the mean reward of the group. Algebraically the group-mean advantage equals the leave-one-out (RLOO) advantage times \((G-1)/G\). What GRPO lacks is a learned per-token value function, and with it any token-level credit assignment.</li>
+    <li><strong>"The KL term goes into the reward, as in RLHF."</strong> In GRPO it is subtracted in the loss, inside the token sum, as the k3 estimator. Also remember which KL it regularizes: differentiated on-policy with samples held fixed, k3's expected gradient is that of the <em>forward</em> KL, unless corrected by the importance ratio as in DeepSeek-V3.2.</li>
+    <li><strong>"The advantage says which tokens were good."</strong> Every token of a response shares one scalar. Nothing in the objective distinguishes the decisive token from filler; the model learns which is which only because the statistics differ across many samples.</li>
+    <li><strong>"Clipping keeps the policy close to the reference."</strong> The clip acts relative to \(\pi_{\text{old}}\) within one rollout. Closeness to the reference is the KL term's job. With one update per rollout, as in DeepSeekMath, \(\rho=1\) and the clip never fires.</li>
+    <li><strong>"Zero-advantage groups are harmless."</strong> They add no gradient but occupy batch slots and, under token-mean normalization, still enter the denominator. Their share grows as the policy improves (for \(p=0.9\), \(G=8\): 43% of groups), which is why DAPO filters them.</li>
+    <li><strong>"A growing response length means better reasoning."</strong> Length also grows from the \(1/|o_i|\) bias (wrong answers get cheap verbosity), from a raised length cap (R1-Zero's jump at step 8.2K), and from loops. Only length together with validation accuracy is informative.</li>
+    <li><strong>"The aha moment proves RL invents reflection."</strong> The frequency change of "wait" is measured, but base models, including DeepSeek-V3-Base, already produce "wait" and "aha", and in R1-Zero reflective responses were often no more accurate. RL amplifies; the causal story is open.</li>
+    <li><strong>"Higher pass@1 means the model learned to solve new problems."</strong> Usually it means it solves the <em>same</em> problems more reliably. Check pass@\(k\) at large \(k\), and remember that random rewards lift Qwen2.5-Math-7B's MATH-500 accuracy by 21 points.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is RLVR, and how does it differ from RLHF?</summary>
+    <div class="answer">
+      <p>RLHF optimizes a <em>learned</em> reward model trained on human preference pairs. RLVR (reinforcement learning with verifiable rewards, named in Tülu 3) replaces it with a <em>program</em>: extract and normalize the final answer and compare it with a reference, run unit tests, check a format constraint. The reward is usually binary. Consequences: there is no reward model to train or exploit (R1 explicitly avoids neural reward models on reasoning tasks because they get hacked at scale); the reward is exact but exists only for checkable domains; it is sparse, one bit per trajectory of thousands of tokens; and sampling many responses per prompt is the natural way to get a baseline. It is not immune to hacking: the checker is the specification, so parser false positives, weak tests and lucky guesses get optimized. Some recipes drop the KL leash entirely because the reward cannot drift the way a learned proxy does, and because long-chain-of-thought training is expected to move far from the initial model.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why is there no value model in GRPO, and what replaces it?</summary>
+    <div class="answer">
+      <p>PPO's critic is a second model the size of the policy and must predict, token by token, the expected final reward. With an outcome-only reward and long, self-revising chains of thought this is hard to learn (R1: content generated early "may later be revised or contradicted"), and it costs memory (a 7B critic is roughly 112 GB of training state). GRPO samples \(G\) responses per prompt and uses their mean reward as the baseline: \(\hat A_i=(r_i-\text{mean})/\text{std}\), the same scalar for every token of response \(i\). It is a valid baseline because \(r_i-\bar r=\frac{G-1}{G}(r_i-\bar r_{-i})\) and \(\bar r_{-i}\) does not depend on \(o_i\), so the gradient is unbiased up to a constant. Costs: \(G\) samples per prompt and no per-token credit. Kimi adds an argument for dropping the critic: a value function would penalize a wrong but recoverable reasoning step, and exploring such steps is exactly what long-CoT training needs.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Compute the group advantages for \(G=8\) with 3 correct answers (reward 1) under GRPO, Dr. GRPO and RLOO.</summary>
+    <div class="answer">
+      <p>Mean \(=3/8=0.375\). Sample variance \(=\tfrac17[3(0.625)^2+5(0.375)^2]=1.875/7=0.2679\), std \(=0.5175\) (population std 0.4841). <strong>GRPO:</strong> correct \(0.625/0.5175=+1.208\), wrong \(-0.375/0.5175=-0.725\) (with the population std: \(+1.291\), \(-0.775\)). <strong>Dr. GRPO</strong> (no std): \(+0.625\) and \(-0.375\). <strong>RLOO</strong> (subtract the mean of the other 7): a correct response sees baseline \(2/7\), so \(1-2/7=+5/7=+0.714\); a wrong one sees \(3/7\), so \(-3/7=-0.429\). Each set sums to zero over the group. RLOO is Dr. GRPO times \(8/7\); GRPO is Dr. GRPO divided by the std. If all 8 (or none) are correct, every advantage is 0.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why do groups where all samples are correct, or all wrong, contribute nothing? How often does that happen?</summary>
+    <div class="answer">
+      <p>If every reward in the group is equal, \(r_i-\text{mean}=0\) for all \(i\), so every advantage is 0 and the surrogate gradient vanishes (a KL term, if present, is the only remaining gradient). The std is also 0, which is why implementations add an \(\epsilon\) to the denominator. Dr. GRPO and RLOO have the same property, so it does not come from the std. The chance that a prompt with pass rate \(p\) yields a useless group is \(p^G+(1-p)^G\): for \(p=0.9\), \(G=8\) it is 43%, for \(G=16\) it is 18.5%, for \(G=64\) it is 0.1%. As training improves the policy, more prompts drift to \(p\to1\), so the fraction rises (DAPO Fig. 3b). Consequences: wasted rollouts, a smaller effective batch, noisier gradients. Remedies: dynamic sampling (drop and refill), offline difficulty filtering, larger \(G\), and continuous or partial-credit rewards that avoid exact ties.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Write the GRPO objective. How does it differ from PPO?</summary>
+    <div class="answer">
+      <p>For each prompt \(q\), sample \(\{o_i\}_{i=1}^G\sim\pi_{\text{old}}\), compute rewards, \(\hat A_i=(r_i-\text{mean}(r))/\text{std}(r)\), and maximize
+      \[ \E\Big[\tfrac1G\sum_i\tfrac1{|o_i|}\sum_t\Big\{\min\big(\rho_{i,t}\hat A_i,\ \clip(\rho_{i,t},1-\varepsilon,1+\varepsilon)\hat A_i\big)-\beta\,\mathbb D_{\text{KL}}[\pi_\theta\|\pi_{\text{ref}}]_{i,t}\Big\}\Big],\quad \rho_{i,t}=\tfrac{\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})}{\pi_{\text{old}}(o_{i,t}\mid q,o_{i,\lt t})}, \]
+      with \(\mathbb D_{\text{KL}}=\tfrac{\pi_{\text{ref}}}{\pi_\theta}-\log\tfrac{\pi_{\text{ref}}}{\pi_\theta}-1\) (the k3 estimator). Differences from PPO: (1) the baseline is the group mean, not a learned \(V(s_t)\), so no critic; (2) the advantage is one scalar per response shared by all its tokens, no GAE; (3) the KL to the reference is a loss term, not a per-token reward penalty; (4) it needs \(G\) samples per prompt; (5) the ratio, clip and \(1/|o|\) length normalization are inherited from PPO (DeepSeekMath's PPO formula already has the \(1/|o|\)). In DeepSeek's own comparison, PPO with \(\lambda=0.95\) was much worse than GRPO on MATH and with \(\lambda=1\) came close, so the baseline estimator is the main difference.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Where does the KL term go in GRPO, why the k3 estimator, and which KL does its gradient regularize?</summary>
+    <div class="answer">
+      <p>It is subtracted from the per-token objective, so it lives in the loss and shares the \(1/|o_i|\) normalizer, rather than being folded into the reward (which would enter the advantage and penalize <em>cumulative</em> KL). With \(u=\log\pi_{\text{ref}}-\log\pi_\theta\) at the sampled token, k3 \(=e^u-u-1\). It is non-negative and low-variance and, for tokens sampled from \(\pi_\theta\), its expectation is \(\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})\). The subtlety is the gradient: differentiating with the samples fixed gives \(-(\pi_{\text{ref}}/\pi_\theta-1)\nabla\log\pi_\theta\), whose expectation is the gradient of the <em>forward</em> KL. DeepSeek-V3.2 multiplies k3 by \(\pi_\theta/\pi_{\text{old}}\), which restores the reverse-KL gradient; the k2 estimator does too. In practice many reasoning recipes drop the KL (DAPO, Dr. GRPO, CISPO), R1 used \(\beta=0.001\) with the reference replaced every 400 steps, and V3.2 notes that for math a weak or absent penalty works better. Setting \(\beta=0\) also removes the reference model's memory and forward pass.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What biases does GRPO's normalization introduce, and how do Dr. GRPO and DAPO fix them?</summary>
+    <div class="answer">
+      <p>Two. <strong>Length bias</strong> from the per-response \(1/|o_i|\): token \(t\) of response \(i\) has weight \(\hat A_i/(G|o_i|)\), so among correct answers shorter ones get bigger per-token rewards, and among wrong answers longer ones get smaller per-token penalties; wrong answers drift longer for free. <strong>Difficulty bias</strong> from dividing by the group std: prompts with rare successes or rare failures (small std) are up-weighted, by about 1.5 times relative to 50/50 prompts at \(G=8\). Dr. GRPO removes both: it divides by a constant (for example the maximum generation length) instead of \(|o_i|\), and does not divide by the std. DAPO removes the length term by normalizing over all tokens in the batch (token-mean) but keeps the std. DeepSeek-V3.2 drops the std as well. Dr. GRPO reports that incorrect-response length stops inflating and reaches 43.3% AIME 2024 with a 7B model; DAPO's argument is complementary: under sequence-mean, tokens in long responses are under-weighted, so good long reasoning is learned slowly and long gibberish is penalized too little.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What happened in DeepSeek-R1-Zero, and why did R1 need a cold start?</summary>
+    <div class="answer">
+      <p>R1-Zero applied GRPO directly to DeepSeek-V3-Base with a rule-based reward (accuracy plus a format reward for <code>&lt;think&gt;</code> tags), no SFT and no neural reward model. AIME 2024 pass@1 rose from 15.6% to 77.9% (86.7% with self-consistency), response length grew through training, and reflective behavior ("wait", verification, trying alternatives) became more frequent, with the "aha moment" example. Problems: poor readability, language mixing, and weak general ability (IF-Eval 46.6). R1's four stages: (1) cold-start SFT on thousands of readable, first-person long-CoT examples; (2) reasoning RL with a language-consistency reward; (3) rejection sampling from the stage-2 model, about 600K reasoning and 200K other samples, SFT again from V3-Base; (4) a final RL stage with rules for reasoning and reward models for general helpfulness and harmlessness. The cold start is not for reasoning strength: the cold-start checkpoint scores lower on AIME (59.0) than R1-Zero (77.9). It gives a readable, instruction-following starting policy (IF-Eval 71.7), which RL then upgrades. The aha moment shows frequency changes of reflective tokens, not that RL created reflection: base models already produce them.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is entropy collapse in RLVR and how do you prevent it?</summary>
+    <div class="answer">
+      <p>Policy entropy falls to near zero within a small fraction of training: samples for a prompt become near-identical, groups become uniform (zero advantage), exploration and the reward plateau. Cui et al. fit \(R=-ae^{H}+b\), so exhausting entropy sets a predictable ceiling. The cause: to first order \(\Delta H\approx-\eta\operatorname{Cov}(\log\pi(a),A(a))\) (natural-gradient case; \(\operatorname{Cov}(\log\pi,\pi A)\) for vanilla PG), so reinforcing high-probability, high-advantage actions sharpens the distribution, and RLVR does that constantly since correct chains are usually the likely ones. Prevention: (1) clip-higher (\(\varepsilon_{\text{high}}=0.28\) versus \(\varepsilon_{\text{low}}=0.2\)) or CISPO so rare positive tokens can keep growing; (2) restrict high-covariance tokens (Clip-Cov, KL-Cov); (3) dynamic sampling and diverse prompts; (4) a KL to a periodically reset reference plus high temperature when starting from an SFT checkpoint (ProRL); (5) monitor entropy against validation accuracy, since too high is also bad. A plain entropy bonus was reported ineffective.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain clip-higher with numbers, then compute how much extra sampling dynamic sampling needs for prompts with pass rate 0.9 and \(G=16\).</summary>
+    <div class="answer">
+      <p>With \(\varepsilon=0.2\) and \(A>0\), a token can raise its probability by at most a factor 1.2 per rollout: a rare "exploration" token at \(\pi_{\text{old}}=0.01\) reaches at most 0.012, while a token at 0.9 could reach 1.08, that is, certainty. The clip therefore limits rare tokens and barely limits likely ones (DAPO measured the mean probability of up-clipped tokens below 0.2). Setting \(\varepsilon_{\text{high}}=0.28\) lets the rare token reach 0.0128 and keeps far more of them inside the trust region. \(\varepsilon_{\text{low}}\) stays 0.2, because loosening the lower bound would let negative advantages push rare tokens to probability 0 and collapse the sampling space. Dynamic sampling: the chance a group is useless is \(0.9^{16}+0.1^{16}\approx0.185\), so 81.5% of groups carry signal. To fill a batch of 512 informative groups you need about \(512/0.815\approx628\) prompts, 1.23 times the rollouts (real data is heterogeneous in \(p\), so measure it). At \(G=8\) the useless share is 43% and the multiplier 1.76, but the group costs half as many samples: informative-group cost is \(G/(1-\text{useless})\), 14.0 samples at \(G=8\) versus 19.6 at \(G=16\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What do GSPO and CISPO each change, and what problem motivated each?</summary>
+    <div class="answer">
+      <p><strong>GSPO</strong> (Qwen) replaces token-level ratios with the length-normalized sequence ratio \(s_i=(\pi_\theta(y_i)/\pi_{\text{old}}(y_i))^{1/|y_i|}\) and clips whole sequences (\(\varepsilon\approx3\text{-}4\times10^{-4}\)). Motivation: a per-token ratio is a single-sample importance weight, high-variance noise that accumulates with length, and in MoE models about 10% of the activated experts change after one update (Qwen3-30B-A3B), making token ratios unreliable. GRPO needed Routing Replay; GSPO does not, because the sequence likelihood is stable. It also tolerates train-inference numerical mismatch. <strong>CISPO</strong> (MiniMax-M1) keeps token-level updates but clips the <em>importance weight</em> (stop-gradient) instead of zeroing the update: \(\sg(\clip(\rho))\hat A\log\pi_\theta\). Motivation: rare fork tokens ("Wait", "Recheck") get a high ratio after the first update and PPO clipping removes them from later off-policy updates, so long reflection never gets reinforced. CISPO keeps every token's gradient at the cost of a small bias, and matched DAPO's AIME score in half the steps. DeepSeek's alternative for MoE is to keep the sampling-time routes (Keep Routing) and mask far-off-policy negative sequences.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compute the per-token gradient weights of a 100-token and a 1,000-token response under sequence-mean, token-mean and a constant normalizer.</summary>
+    <div class="answer">
+      <p>Take a group of \(G=8\), four responses of 100 tokens and four of 1,000 (4,400 tokens), all with \(|\hat A|=1\). The weight multiplying each token's \(\nabla\log\pi\) is: <strong>sequence-mean</strong> \(1/(G|o_i|)\): \(1/800=1.25\times10^{-3}\) for the short response and \(1/8000=1.25\times10^{-4}\) for the long one, a 10\(\times\) difference per token, with equal total weight 0.125 each. <strong>Token-mean</strong> \(1/\sum|o_i|=1/4400=2.27\times10^{-4}\) for every token, so the long response has 10\(\times\) the total weight (0.227 versus 0.0227). <strong>Constant normalizer</strong> with \(L_{\max}=1000\): \(1/(8\cdot1000)=1.25\times10^{-4}\) for every token. The lesson: sequence-mean equalizes responses and makes short responses' tokens count more (length bias); the other two equalize tokens, and only the constant does not depend on batch composition. With a two-response group of 100 and 1,000 tokens the sequence-mean ratio is again 10:1.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Does RL teach models new reasoning abilities? Argue both sides with evidence.</summary>
+    <div class="answer">
+      <p><strong>No, it sharpens.</strong> DeepSeekMath saw Maj@K improve but not Pass@K. Yue et al. compared base and zero-RL models by pass@\(k\) up to 256 or more and found RL wins at \(k=1\) but the base model overtakes at large \(k\) (about 9 points ahead on Minerva at \(k=128\) for 32B); RL reasoning paths have high likelihood under the base model; six RL algorithms all leave a sampling-efficiency gap above 40 points; distillation, by contrast, extends the boundary. Qwen3-8B: RL raised AIME'24 pass@1 by 12.6 points with pass@64 unchanged, on-policy distillation raised pass@64. Spurious rewards: random rewards lift Qwen2.5-Math-7B's MATH-500 by 21.4 points versus 29.1 for ground truth, via clipping bias amplifying priors. Dr. GRPO: base models already show "aha". <strong>Yes, under the right conditions.</strong> ProRL trains a distilled 1.5B model for over 2,000 steps on 136K problems across five domains with KL resets and clip-higher and finds success on tasks where the base fails at every \(k\), higher novelty scores, and gains largest where the start is weakest, while noting that math shows narrowing. <strong>Reconciling.</strong> Pass@256 cannot see a path whose per-sample probability is \(10^{-6}\) (found with probability 0.026%), yet RL can amplify it enormously; numeric answers inflate pass@\(k\) via guesses; published RL runs are short and math-heavy; Qwen models are atypical. My answer: RL reliably converts latent ability into pass@1, may expand with long, broad, entropy-preserving training, and distillation expands most cheaply when a teacher exists.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design an RLVR run to improve a 7B model's math accuracy. What would you monitor?</summary>
+    <div class="answer">
+      <p><strong>Setup.</strong> Start from a 7B model whose pass@8 on my prompts is well inside (0, 1); check a second family. Data: 10 to 20K math problems with parseable answers (DAPO-Math-17K, or MATH and GSM8K train), decontaminated, pre-filtered to pass rates around 0.1 to 0.9. Reward: binary answer match after normalization, no length reward at first, mask truncated samples. Algorithm: GRPO with token-mean or constant normalization, \(\varepsilon_{\text{low}}=0.2\), \(\varepsilon_{\text{high}}=0.28\), dynamic sampling, no KL (or \(\beta=0.001\) with reference resets from an SFT start), \(G=8\) to 16, 256 to 512 prompts per step, constant learning rate \(10^{-6}\) with a short warm-up, 1 to 4 minibatches per rollout, temperature 1.0, 4K to 8K response cap extended in stages. <strong>Evaluate</strong> on held-out prompts (avg@16-32), pass@\(k\) to 256, and an out-of-domain set; compare against a distillation baseline if a teacher exists. <strong>Monitor:</strong> validation versus training reward (overfitting), zero-advantage group fraction, mean and p99 response length and truncation rate, policy entropy, clipped-token fraction and the train-inference log-prob mismatch, gradient norm and KL, plus reading samples for hacks and language mixing. <strong>Responses:</strong> entropy collapse means widen \(\varepsilon_{\text{high}}\) or filter better; length explosion means check normalization and add overlong shaping; validation falling while reward rises means stop and fix the verifier or data. Budget: 256 \(\times\) 8 \(\times\) 3,000 tokens is 6.1M tokens per step and about \(2.6\times10^{17}\) training FLOPs; rollout throughput usually sets the wall-clock.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Your run's training reward keeps rising, but held-out accuracy has fallen and response length has exploded. How do you diagnose it?</summary>
+    <div class="answer">
+      <p>Separate three hypotheses and test each cheaply. (1) <strong>Checker exploitation or overfitting:</strong> read 50 high-reward samples. Look for answer-first outputs with no reasoning, multiple boxed answers where the parser takes the wrong one, guessing on multiple choice, or copying the prompt's numbers. Fix the verifier and add a held-out check on a different distribution. DAPO found training reward poorly correlated with validation accuracy, and R1 saw reward rise while Codeforces performance fell with a learned reward model. (2) <strong>Length bias or loops:</strong> if the loss is per-response length-normalized, wrong answers grow for free; compare mean length of correct versus incorrect samples (Dr. GRPO's diagnostic), look at the truncation rate and repetition, and check whether the length cap was raised. Switch to token-mean or a constant normalizer, add soft overlong shaping, repetition-based early stopping. (3) <strong>Off-policy or numerical instability:</strong> check the clipped fraction, the log-prob mismatch between sampler and trainer at the first minibatch, KL if used, gradient-norm spikes, and entropy spikes; reduce minibatches per rollout or the learning rate, mask far-off-policy negative sequences, fix precision (MiniMax's FP32 LM head), and for MoE keep the sampling routes. Also check that entropy has not collapsed (uniform groups) and that the zero-advantage fraction is not rising. A checkpoint sweep of held-out accuracy tells you where it broke; roll back to before that step with the fix applied.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compare the compute of R1's RL with V3's pretraining, say how that changed in V3.2, and explain when you would distill instead of running RL.</summary>
+    <div class="answer">
+      <p>R1-Zero used 512 H800 GPUs for about 198 hours, \(512\times198\approx101\)K GPU-hours; R1 about 41K more; SFT data creation 5K; total 147K, about $294K at $2 per GPU-hour. V3's pretraining used 2.664M H800 GPU-hours, so R1's RL was about \(142\text{K}/2664\text{K}\approx5.3\%\). DeepSeek-V3.2 reports an RL budget above 10% of its pretraining cost and steady gains with more RL, so RL compute is now a first-class scaling axis. <strong>Distill when</strong> a stronger teacher exists and you want a small model quickly: R1's 800K-sample SFT of Qwen2.5-32B reached 72.6 AIME pass@1 versus 47.0 for RL alone at more than 10K steps, and Qwen3's on-policy distillation of the 8B model beat RL on every benchmark at 1,800 versus 17,920 GPU-hours (74.4 versus 67.6 on AIME'24). Distillation can also extend pass@\(k\) coverage, while RL mostly sharpens. <strong>Run RL when</strong> there is no teacher (you are the frontier), the base model is large enough to explore (R1's 7B and 16B pure-RL attempts failed), the domain is verifiable, and you want to exceed the teacher's ceiling. The strongest recent pattern combines them: specialists trained with RL, merged by on-policy distillation (V4), or OPD followed by RL (a September 2026 study). Caveats: distillation needs teacher traces that RL had to produce first, and the RL baselines above were the early recipes; DAPO-style fixes narrow but did not close the gap on AIME (50 versus 72.6, with different evaluation protocols).</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>GRPO and its successors, at the loss level.</strong> Implement five small functions: <code>group_advantages</code> (GRPO with sample std, Dr. GRPO, and leave-one-out RLOO; uniform groups must give exactly 0, never NaN); <code>grpo_loss</code> (per-token min-clip surrogate with decoupled \(\varepsilon_{\text{low}}\) and \(\varepsilon_{\text{high}}\), the k3 KL term in the loss, and three aggregations: sequence-mean, token-mean, and the Dr. GRPO constant normalizer; padding must not leak into the value or the gradient); <code>gspo_ratio</code> and <code>gspo_loss</code> (the length-normalized sequence ratio and whole-sequence clipping); and <code>dynamic_sampling_filter</code>. The tests check hand-computed advantages (the 3-of-8 example of this page), the four clip quadrants and the clip-higher asymmetry, the per-token gradient weights of a 100-token versus a 1,000-token response, the k3 values, the geometric-mean identity, and that a uniform-reward group receives exactly zero gradient. An interviewer would expect <code>group_advantages</code> and <code>grpo_loss</code> in about 20 minutes and the remaining three in 10 to 15 more. <span class="ex-path">exercises/drills/grpo.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_grpo.py</code>; add <code>--solutions</code> to check the reference implementation. Extensions to try on your own: add a CISPO loss and check its gradient weight against the table in the fixes section; add Kimi's length reward; implement the V3.2 importance-corrected k3 and verify numerically that its expected gradient matches the reverse KL.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2402.03300">Shao et al. (2024). DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.</a> <span class="why">Why read it: §4 is the origin of GRPO (Eq. 3, 4, 20), and §5.2 already contains the Maj@K versus Pass@K observation.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.</a> <span class="why">Why read it: R1-Zero, the four-stage pipeline, hyperparameters (App. B), distillation versus RL (App. F), failures (App. G). Read the v2 (January 2026) text and note where numbers differ from v1.</span></li>
+    <li><a href="https://arxiv.org/abs/2503.14476">Yu et al. (2025). DAPO: An Open-Source LLM Reinforcement Learning System at Scale.</a> <span class="why">Why read it: the four fixes with the cumulative ablation (Table 1), full hyperparameters, and the entropy and length curves to compare with your own runs.</span></li>
+    <li><a href="https://arxiv.org/abs/2503.20783">Liu et al. (2025). Understanding R1-Zero-Like Training: A Critical Perspective.</a> <span class="why">Why read it: Dr. GRPO's bias analysis, base-model and template findings, and the evidence that "aha" appears before RL.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.18071">Zheng et al. (2025). Group Sequence Policy Optimization.</a> <span class="why">Why read it: seven pages; the cleanest argument for matching the importance ratio to the reward unit, and the MoE routing analysis.</span></li>
+    <li><a href="https://arxiv.org/abs/2506.13585">MiniMax (2025). MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention.</a> <span class="why">Why read it: CISPO (§3.1) and the practical RL engineering notes (FP32 LM head, Adam epsilon, repetition-based truncation, staged length growth).</span></li>
+    <li><a href="https://arxiv.org/abs/2505.22617">Cui et al. (2025). The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models.</a> <span class="why">Why read it: the covariance identity for entropy dynamics and the \(R=-ae^{H}+b\) law, with Clip-Cov and KL-Cov.</span></li>
+    <li><a href="https://arxiv.org/abs/2504.13837">Yue et al. (2025). Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</a> <span class="why">Why read it: the pass@k methodology and the strongest case for "RL sharpens". Pair it with ProRL (2505.24864) and Spurious Rewards (2506.10947) for the other sides.</span></li>
+    <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2</a> and <a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read it: V3.2 §3.1 lists the stabilizers used to scale GRPO (unbiased KL, off-policy masking, Keep Routing); V4 §5 shows specialists plus on-policy distillation and the three reasoning-effort modes.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.12599">Kimi Team (2025). Kimi k1.5: Scaling Reinforcement Learning with LLMs.</a> <span class="why">Why read it: the argument against value functions for long CoT, the length penalty, curriculum and prioritized sampling, partial rollouts and long2short.</span></li>
+  </ol>
+  <p class="small muted">Cited in the text and worth knowing: Tülu 3 (2411.15124, origin of the term RLVR), RLOO (2402.14740), REINFORCE++ (2501.03262), SAPO (2511.20347), s1 (2501.19393), Qwen3 (2505.09388), ProRL (2505.24864), Spurious Rewards (2506.10947), and Li et al. on combining on-policy distillation with RLVR (2609.04108).</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>RLVR:</strong> reward from a program (answer match, unit tests, format), usually binary; term from Tülu 3. No reward model to hack, but the checker is the spec. Only checkable domains; one bit per trajectory.</li>
+      <li><strong>GRPO (DeepSeekMath Eq. 3):</strong> \(\hat A_i=(r_i-\text{mean})/\text{std}\), shared by all tokens; \(\frac1G\sum_i\frac1{|o_i|}\sum_t\{\min(\rho\hat A,\clip(\rho,1\pm\varepsilon)\hat A)-\beta\,\text{k3}\}\); k3 \(=e^u-u-1\), \(u=\log\pi_{\text{ref}}-\log\pi_\theta\). KL in the loss, not the reward. No critic. Group-mean advantage \(=\frac{G-1}{G}\times\) RLOO.</li>
+      <li><strong>Worked case (\(G=8\), 3 correct):</strong> GRPO \(+1.208/-0.725\) (sample std 0.5175), Dr. GRPO \(+0.625/-0.375\), RLOO \(+0.714/-0.429\). All-correct or all-wrong: 0.</li>
+      <li><strong>Biases:</strong> \(1/|o_i|\) gives short responses' tokens 10\(\times\) the weight at 100 vs 1,000 tokens (1/800 vs 1/8000 at \(G=8\)); std up-weights extreme prompts about 1.5\(\times\). Dr. GRPO: constant normalizer, no std. DAPO: token-mean, keeps std. V3.2: no std.</li>
+      <li><strong>Useless-group probability:</strong> \(p^G+(1-p)^G\); \(p=0.9\): 43% at \(G=8\), 18.5% at \(G=16\). Cost per informative group \(G/(1-p^G-(1-p)^G)\).</li>
+      <li><strong>DAPO:</strong> \(\varepsilon_{\text{low}}=0.2\), \(\varepsilon_{\text{high}}=0.28\) (clip-higher); dynamic sampling; token-level loss; overlong shaping (\(L_{\max}=16{,}384\) + 4,096 buffer); no KL. AIME'24 30 to 50 (Qwen2.5-32B).</li>
+      <li><strong>GSPO:</strong> \(s_i=(\pi_\theta/\pi_{\text{old}})^{1/|y_i|}\), clip \(3\text{e-}4/4\text{e-}4\); about 10% of experts change per update in Qwen3-30B-A3B, so GRPO needed Routing Replay. <strong>CISPO:</strong> \(\sg(\clip(\rho))\hat A\log\pi\), all tokens keep gradients, matches DAPO in 50% of steps.</li>
+      <li><strong>V3.2 GRPO:</strong> \(\hat A=R-\text{mean}\); k3 times \(\pi_\theta/\pi_{\text{old}}\); mask negative sequences that drift; Keep Routing; Keep Sampling Mask; length penalty; RL budget above 10% of pretraining cost.</li>
+      <li><strong>R1:</strong> R1-Zero AIME'24 15.6 to 77.9 (v1: 71.0), 86.7 with voting; four stages (cold-start SFT, reasoning RL + language reward, ~600K + ~200K rejection-sampled SFT from V3-Base, final RL). Cold start buys readability, not reasoning (AIME 59.0 after it). RL cost 147K H800 GPU-hours (\(\approx\$294\)K), about 5.3% of V3 pretraining. Distilling Qwen2.5-32B: 72.6 AIME vs 47.0 for RL alone.</li>
+      <li><strong>Entropy:</strong> \(R=-ae^{H}+b\); \(\Delta H\approx-\eta\operatorname{Cov}(\log\pi,A)\). Fixes: clip-higher, CISPO, Clip-Cov and KL-Cov, dynamic sampling, KL with reference resets.</li>
+      <li><strong>Debate:</strong> Maj@K up but Pass@K flat (DeepSeekMath); base overtakes RL at large \(k\) (Yue); ProRL (2K+ steps) expands where the base is weak; random rewards give +21.4 MATH-500 points on Qwen2.5-Math-7B; distillation expands boundary. Pass@256 cannot see paths with \(q\lesssim10^{-4}\).</li>
+      <li><strong>Test-time scaling:</strong> s1 budget forcing 50.0 to 56.7 AIME'24; Qwen3 thinking budget; V3.1 template switch; V4 Non-think, Think High, Think Max via distinct RL length penalties. V4: GRPO specialists, then on-policy distillation from more than 10 teachers instead of mixed RL.</li>
+      <li><strong>Recipe:</strong> learning rate \(10^{-6}\), \(G=8\) to 16, \(\varepsilon\) 0.2/0.28, \(\beta=0\), dynamic sampling or pass-rate pre-filter, 4K to 8K cap; monitor validation vs train reward, zero-advantage fraction, length, entropy, clip fraction and train-sampler mismatch.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

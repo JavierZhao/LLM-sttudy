@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · RL foundations for LLMs: policy gradient to PPO · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="22" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part V · Reinforcement learning · Page 22</div>
+  <h1>RL foundations for LLMs: policy gradient to PPO</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~70 min</span>
+    <span>Prereqs: <a href="01-big-picture.html">01 Big picture</a>, <a href="06-decoding-kv-cache.html">06 Decoding</a>, <a href="21-preference-optimization.html">21 Preference optimization</a></span>
+  </div>
+  <p class="lede">Every RL method used to post-train language models (PPO, RLOO, GRPO and its successors) is a small variation on one estimator: sample a response, score it, and raise the log-probability of its tokens in proportion to how much better than expected it was. This page derives that estimator from scratch, then builds each piece that turns it into a stable algorithm: baselines, GAE, importance ratios, the PPO clip, and the KL penalty with its three sampling estimators.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The derivation, on a whiteboard:</strong> the log-derivative trick for a sequence policy, the token factorization, reward-to-go, and a one-line proof that a baseline leaves the gradient unbiased. Expect to be stopped at each step and asked "why".</li>
+    <li><strong>GAE and its knobs:</strong> the formula, the telescoping argument, what \(\gamma\) and \(\lambda\) each trade, and what happens in the LLM setting (\(\gamma = 1\), reward only on the last token) when responses are thousands of tokens long.</li>
+    <li><strong>PPO's clipped objective:</strong> the four cases (advantage sign times ratio region), what the gradient is in each, what the clip does <em>not</em> guarantee, and why one rollout batch can be reused for several updates at all.</li>
+    <li><strong>KL control:</strong> reward shaping versus a loss term, and k1, k2, k3 with the correct sampling distribution, bias, variance and the gradient each one produces when you call <code>.backward()</code>.</li>
+    <li><strong>Token versus sequence level:</strong> the bandit view of RLHF, what it implies for credit assignment, and where the ratio and the loss are aggregated.</li>
+    <li><strong>Implementation fluency:</strong> write <code>gae</code>, the PPO loss and the KL estimators from memory, with masks and without off-by-one errors.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Formulate LLM generation as a token-level MDP, say exactly what state, action, transition and reward are, and explain why \(\gamma = 1\) and why the sequence-level (bandit) view gives the same gradient when the reward is terminal.</li>
+    <li>Derive \(\nabla_\theta J = \E[\sum_t \nabla\log\pi_\theta(a_t|s_t)\,G_t]\) from the log-derivative trick, prove that any baseline \(b(s_t)\) is unbiased, and show why \(V(s_t)\) is a near-optimal baseline.</li>
+    <li>Compute GAE by hand for a short episode, derive its exponentially weighted form, and explain why \(\lambda&lt;1\) with a terminal reward and an untrained critic starves early tokens of signal.</li>
+    <li>Write the PPO-clip loss, draw its four cases, state what it does not enforce, and describe the value loss, value clipping and where each hyperparameter typically sits in RLHF.</li>
+    <li>Place the KL penalty in the reward or in the loss, and compare k1, k2, k3 on bias, variance, sign and gradient, including why the k3 loss descends the reverse KL.</li>
+    <li>Explain how the loss normalization and the importance ratio can be token-level or sequence-level, and what changes for the gradient.</li>
+    <li>Implement the five building blocks in <code>exercises/drills/pg.py</code>.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="mdp">Language generation as a Markov decision process</h2>
+
+  <p><strong>Reinforcement learning</strong> <span class="zh">强化学习</span> studies an agent that picks actions, observes rewards, and improves a <strong>policy</strong> <span class="zh">策略</span>, a distribution over actions given a state, to maximize expected total reward. A language model already <em>is</em> such a policy. Take a prompt \(x\) drawn from a dataset \(\mathcal D\) and let the model write a response \(y = (y_1, \dots, y_T)\) token by token (<a href="01-big-picture.html">page 01</a>, <a href="06-decoding-kv-cache.html">page 06</a>). The mapping to RL vocabulary is exact:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>RL object</th><th>In LLM generation</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>State \(s_t\)</td><td>the prompt plus the tokens generated so far, \(s_t = (x, y_{&lt;t})\)</td><td>\(s_1 = x\). The state is the whole prefix, so it is unique to the path that produced it.</td></tr>
+      <tr><td>Action \(a_t\)</td><td>the next token \(y_t \in \mathcal V\)</td><td>\(|\mathcal V| = 128{,}256\) for Llama 3. The end-of-sequence token is an action, so the episode length \(T\) is random.</td></tr>
+      <tr><td>Policy \(\pi_\theta(a_t \mid s_t)\)</td><td>the LM's next-token distribution \(p_\theta(y_t \mid x, y_{&lt;t})\)</td><td>The same softmax you trained with cross-entropy. No new parameters.</td></tr>
+      <tr><td>Transition</td><td>\(s_{t+1} = (s_t, a_t)\), append the token</td><td>Deterministic, so there are no dynamics to model or estimate.</td></tr>
+      <tr><td>Reward \(r_t\)</td><td>zero for \(t &lt; T\); a scalar \(R(x,y)\) from a reward model or a verifier at \(t = T\)</td><td>Sparse and delayed. Per-token KL terms are added in <a href="#kl">the KL section</a>.</td></tr>
+      <tr><td>Episode</td><td>one response, from the prompt to EOS (or the length limit)</td><td>The unit that gets scored.</td></tr>
+      <tr><td>Discount \(\gamma\)</td><td>1 in practice</td><td>Ziegler et al. use \(\gamma = 1\), and InstructGPT applies no discount when estimating advantages <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2.2]</a> <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, App. C.4]</a>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The objective is the expected return over prompts and over the model's own samples,</p>
+
+  <div class="eq-box">
+  \[ J(\theta) = \E_{x \sim \mathcal D}\; \E_{y \sim \pi_\theta(\cdot \mid x)}\big[ R(x, y) \big], \qquad \pi_\theta(y \mid x) = \prod_{t=1}^{T} \pi_\theta(y_t \mid x, y_{&lt;t}) \]
+  <div class="eq-label">Expected reward of the policy; the sequence probability factorizes over tokens exactly as in pretraining</div>
+  </div>
+
+  <p>Two design choices in this table deserve a <strong>why</strong>.</p>
+  <ul>
+    <li><strong>Why \(\gamma = 1\).</strong> The horizon is finite (EOS or a length cap), so the return is finite without discounting. Discounting would be harmful, not neutral: with a terminal reward, \(\gamma &lt; 1\) turns \(R\) into \(\gamma^{T-1} R\), which silently rewards short responses. The GAE paper's point about \(\gamma\) applies fully here: a discount below 1 biases the gradient of the objective you actually care about, whatever the value function <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, §3]</a>.</li>
+    <li><strong>Why deterministic transitions matter.</strong> In a general MDP the policy gradient needs no model of the dynamics either, but \(Q(s,a)\) is an expectation over random next states that must be estimated. Here \(s_{t+1}\) is a function of \((s_t, a_t)\), so \(Q(s_t, a_t) = r_t + V(s_{t+1})\) exactly. We use this in <a href="#baselines">the baseline section</a>.</li>
+  </ul>
+
+  <h3 id="bandit-view">Token-level MDP versus bandit</h3>
+  <p>There is a coarser description of the same problem. Treat the <em>entire response</em> as one action: state = prompt, action = \(y \in \mathcal V^{\le T_{\max}}\), reward \(R(x,y)\), episode ends after one step. That is a <strong>contextual bandit</strong>. InstructGPT states it explicitly: "The environment is a bandit environment which presents a random customer prompt and expects a response to the prompt. Given the prompt and response, it produces a reward determined by the reward model and ends the episode" <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.5]</a>, and then adds a per-token KL penalty on top, which reintroduces token-level structure.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Token-level MDP</th><th>Sequence-level bandit</th></tr></thead>
+    <tbody>
+      <tr><td>Decision</td><td>each token, \(T\) decisions per episode</td><td>the whole response, 1 decision</td></tr>
+      <tr><td>Reward</td><td>\(r_t\), zero except at the end (plus KL terms)</td><td>\(R(x,y)\)</td></tr>
+      <tr><td>Policy gradient</td><td>\(\E[\sum_t \nabla\log\pi(a_t|s_t)\, (G_t - b(s_t))]\)</td><td>\(\E[\nabla\log\pi(y|x)\, (R - b(x))]\)</td></tr>
+      <tr><td>Baseline may depend on</td><td>the prefix: \(b(s_t)\), for example a critic \(V_\phi(s_t)\)</td><td>the prompt only: \(b(x)\), for example a group mean</td></tr>
+      <tr><td>Credit assignment</td><td>a critic can give different tokens different advantages</td><td>every token of a response shares one number</td></tr>
+      <tr><td>Used by</td><td>PPO with a value head</td><td>REINFORCE, RLOO <a href="https://arxiv.org/abs/2402.14740">[Ahmadian et al. 2024]</a>, GRPO's outcome mode <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §4.1.2]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <p>These are not two models of the world but two <em>estimators</em> of the same gradient. With a terminal reward, \(\gamma = 1\) and no per-token reward, \(G_t = R\) for every \(t\), and the two policy gradients are equal in expectation (we prove it in <a href="#pg">the next section</a>). What differs is variance and what a baseline may depend on. PPO adds a learned value function \(V_\phi(s_t)\), the <strong>critic</strong> <span class="zh">评论家</span>, a scalar head that predicts expected future reward from each prefix; Figure 1 shows where it reads. Ahmadian et al. go further and argue that modeling partial sequences is unnecessary when the reward is attached to full generations, and that a bandit REINFORCE estimator beats PPO in RLHF settings (their PPO baseline reached 67.6, 29.2 and 32.0 win-rate on TL;DR, HH-Pythia and HH-Llama, against 77.9, 43.7 and 64.1 for RLOO with \(k=4\)) <a href="https://arxiv.org/abs/2402.14740">[Ahmadian et al. 2024, Tab. 1]</a>. That is one group's evidence on 6.9B and 7B models with their PPO implementation, and later long-CoT work reports the opposite ordering when the critic is handled carefully (<a href="#gae-llm">below</a>).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 368" role="img" aria-labelledby="fig-22-1-title">
+<title id="fig-22-1-title">A response as an episode in a token-level MDP: states are prefixes, actions are tokens, the reward model scores only the last token, and every token also receives a KL penalty against the reference policy</title>
+<defs><marker id="arrow-22-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="12" y="14" class="s-small s-muted">critic (value head) reads each state</text>
+<text x="708" y="14" text-anchor="end" class="s-small s-muted">policy: a<tspan baseline-shift="sub" font-size="10">t</tspan> ~ π<tspan baseline-shift="sub" font-size="10">θ</tspan>(· | s<tspan baseline-shift="sub" font-size="10">t</tspan>); transition s<tspan baseline-shift="sub" font-size="10">t+1</tspan> = (s<tspan baseline-shift="sub" font-size="10">t</tspan>, a<tspan baseline-shift="sub" font-size="10">t</tspan>) is deterministic</text>
+<rect class="s-a" x="24.0" y="26" width="80" height="28" rx="6"/>
+<text x="64.0" y="45" text-anchor="middle" class="s-small">V<tspan baseline-shift="sub" font-size="10">φ</tspan>(s<tspan baseline-shift="sub" font-size="10">1</tspan>)</text>
+<path class="s-line s-dash" d="M64.0,54 L64.0,111" marker-end="url(#arrow-22-1)"/>
+<rect class="s-a" x="188.0" y="26" width="80" height="28" rx="6"/>
+<text x="228.0" y="45" text-anchor="middle" class="s-small">V<tspan baseline-shift="sub" font-size="10">φ</tspan>(s<tspan baseline-shift="sub" font-size="10">2</tspan>)</text>
+<path class="s-line s-dash" d="M228.0,54 L228.0,111" marker-end="url(#arrow-22-1)"/>
+<rect class="s-a" x="352.0" y="26" width="80" height="28" rx="6"/>
+<text x="392.0" y="45" text-anchor="middle" class="s-small">V<tspan baseline-shift="sub" font-size="10">φ</tspan>(s<tspan baseline-shift="sub" font-size="10">3</tspan>)</text>
+<path class="s-line s-dash" d="M392.0,54 L392.0,111" marker-end="url(#arrow-22-1)"/>
+<rect class="s-a" x="516.0" y="26" width="80" height="28" rx="6"/>
+<text x="556.0" y="45" text-anchor="middle" class="s-small">V<tspan baseline-shift="sub" font-size="10">φ</tspan>(s<tspan baseline-shift="sub" font-size="10">4</tspan>)</text>
+<path class="s-line s-dash" d="M556.0,54 L556.0,111" marker-end="url(#arrow-22-1)"/>
+<rect class="s-box" x="12" y="112" width="104" height="52" rx="6"/>
+<text x="64.0" y="133" text-anchor="middle" class="s-bold">s<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="64.0" y="152" text-anchor="middle" class="s-small s-muted">x</text>
+<rect class="s-box" x="176" y="112" width="104" height="52" rx="6"/>
+<text x="228.0" y="133" text-anchor="middle" class="s-bold">s<tspan baseline-shift="sub" font-size="10">2</tspan></text>
+<text x="228.0" y="152" text-anchor="middle" class="s-small s-muted">x, y<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<rect class="s-box" x="340" y="112" width="104" height="52" rx="6"/>
+<text x="392.0" y="133" text-anchor="middle" class="s-bold">s<tspan baseline-shift="sub" font-size="10">3</tspan></text>
+<text x="392.0" y="152" text-anchor="middle" class="s-small s-muted">x, y<tspan baseline-shift="sub" font-size="10">1</tspan>, y<tspan baseline-shift="sub" font-size="10">2</tspan></text>
+<rect class="s-box" x="504" y="112" width="104" height="52" rx="6"/>
+<text x="556.0" y="133" text-anchor="middle" class="s-bold">s<tspan baseline-shift="sub" font-size="10">4</tspan></text>
+<text x="556.0" y="152" text-anchor="middle" class="s-small s-muted">x, y<tspan baseline-shift="sub" font-size="10">1:3</tspan></text>
+<rect class="s-c" x="668" y="112" width="46" height="52" rx="6"/>
+<text x="691.0" y="133" text-anchor="middle" class="s-bold">end</text>
+<text x="691.0" y="152" text-anchor="middle" class="s-small s-muted">T = 4</text>
+<path class="s-line" d="M118,150 L174,150" marker-end="url(#arrow-22-1)"/>
+<text x="146.0" y="126" text-anchor="middle" class="s-small">a<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="146.0" y="140" text-anchor="middle" class="s-small s-mono">“The”</text>
+<path class="s-line" d="M282,150 L338,150" marker-end="url(#arrow-22-1)"/>
+<text x="310.0" y="126" text-anchor="middle" class="s-small">a<tspan baseline-shift="sub" font-size="10">2</tspan></text>
+<text x="310.0" y="140" text-anchor="middle" class="s-small s-mono">“answer”</text>
+<path class="s-line" d="M446,150 L502,150" marker-end="url(#arrow-22-1)"/>
+<text x="474.0" y="126" text-anchor="middle" class="s-small">a<tspan baseline-shift="sub" font-size="10">3</tspan></text>
+<text x="474.0" y="140" text-anchor="middle" class="s-small s-mono">“is 42”</text>
+<path class="s-line" d="M610,150 L666,150" marker-end="url(#arrow-22-1)"/>
+<text x="638.0" y="126" text-anchor="middle" class="s-small">a<tspan baseline-shift="sub" font-size="10">4</tspan></text>
+<text x="638.0" y="140" text-anchor="middle" class="s-small s-mono">&lt;eos&gt;</text>
+<path class="s-line" d="M64.0,164 L64.0,231" marker-end="url(#arrow-22-1)"/>
+<rect class="s-d" x="8" y="232" width="112" height="40" rx="6"/>
+<text x="64.0" y="249" text-anchor="middle" class="s-small">r<tspan baseline-shift="sub" font-size="10">1</tspan> = −β ℓ<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="64.0" y="264" text-anchor="middle" class="s-small s-muted">no task reward</text>
+<path class="s-line" d="M228.0,164 L228.0,231" marker-end="url(#arrow-22-1)"/>
+<rect class="s-d" x="172" y="232" width="112" height="40" rx="6"/>
+<text x="228.0" y="249" text-anchor="middle" class="s-small">r<tspan baseline-shift="sub" font-size="10">2</tspan> = −β ℓ<tspan baseline-shift="sub" font-size="10">2</tspan></text>
+<text x="228.0" y="264" text-anchor="middle" class="s-small s-muted">no task reward</text>
+<path class="s-line" d="M392.0,164 L392.0,231" marker-end="url(#arrow-22-1)"/>
+<rect class="s-d" x="336" y="232" width="112" height="40" rx="6"/>
+<text x="392.0" y="249" text-anchor="middle" class="s-small">r<tspan baseline-shift="sub" font-size="10">3</tspan> = −β ℓ<tspan baseline-shift="sub" font-size="10">3</tspan></text>
+<text x="392.0" y="264" text-anchor="middle" class="s-small s-muted">no task reward</text>
+<path class="s-line" d="M556.0,164 L556.0,231" marker-end="url(#arrow-22-1)"/>
+<rect class="s-e" x="468.0" y="232" width="176" height="58" rx="6"/>
+<text x="556.0" y="249" text-anchor="middle" class="s-small">r<tspan baseline-shift="sub" font-size="10">4</tspan> = r<tspan baseline-shift="sub" font-size="10">RM</tspan>(x, y) − β ℓ<tspan baseline-shift="sub" font-size="10">4</tspan></text>
+<text x="556.0" y="264" text-anchor="middle" class="s-small s-muted">the only task reward,</text>
+<text x="556.0" y="278" text-anchor="middle" class="s-small s-muted">paid at the last token</text>
+<rect class="s-plain s-dash" x="12" y="316" width="330" height="44" rx="6"/>
+<text x="177" y="334" text-anchor="middle" class="s-small">ℓ<tspan baseline-shift="sub" font-size="10">t</tspan> = log π<tspan baseline-shift="sub" font-size="10">θ</tspan>(a<tspan baseline-shift="sub" font-size="10">t</tspan>|s<tspan baseline-shift="sub" font-size="10">t</tspan>) − log π<tspan baseline-shift="sub" font-size="10">ref</tspan>(a<tspan baseline-shift="sub" font-size="10">t</tspan>|s<tspan baseline-shift="sub" font-size="10">t</tspan>)</text>
+<text x="177" y="351" text-anchor="middle" class="s-small s-muted">a frozen reference policy scores the same tokens</text>
+<text x="366" y="330" class="s-small">return with γ = 1:</text>
+<text x="366" y="349" class="s-small">G<tspan baseline-shift="sub" font-size="10">t</tspan> = Σ<tspan baseline-shift="sub" font-size="10">t′≥t</tspan> r<tspan baseline-shift="sub" font-size="10">t′</tspan> = r<tspan baseline-shift="sub" font-size="10">RM</tspan>(x, y) − β Σ<tspan baseline-shift="sub" font-size="10">t′≥t</tspan> ℓ<tspan baseline-shift="sub" font-size="10">t′</tspan></text>
+</svg>
+    <figcaption><b>Figure 1.</b> One response (four tokens) as an episode. Each state is a prefix and each action appends a token. The critic reads every state (top). The reward model contributes a single number at the last token; every token, including the last, also pays \(-\beta\,\ell_t\) for drifting from the reference policy. With \(\gamma = 1\) the return from token \(t\) is the RM score minus the KL accumulated from \(t\) onward.</figcaption>
+  </figure>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your classifier minimized \(-\log p_\theta(\text{label} \mid x)\) against a label the dataset provided. Here there is no label: the "target" is a token sampled from the model itself, and its quality is judged after the fact by a black box that cannot be differentiated. Two consequences drive everything below. The gradient must go through the <em>sampling distribution</em>, not through the reward. And the data distribution depends on \(\theta\), so the moment you update, the samples you hold are slightly stale.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="pg">The policy gradient theorem, for sequences</h2>
+
+  <p>We want \(\nabla_\theta J\), but \(R\) is a black box (a neural reward model sampled at discrete tokens, or a program that checks an answer), and the sample space \(\mathcal V^T\) is astronomically large. The <strong>policy gradient</strong> <span class="zh">策略梯度</span> theorem removes both obstacles with one identity. Write \(\tau = (x, y_1, \dots, y_T)\) for a trajectory and \(p_\theta(\tau) = \mathcal D(x)\prod_t \pi_\theta(a_t \mid s_t)\) for its probability (the deterministic transitions contribute factors of 1).</p>
+
+  <ol>
+    <li><strong>Log-derivative trick.</strong> \(J = \sum_\tau p_\theta(\tau) R(\tau)\), and \(\nabla p_\theta = p_\theta \nabla \log p_\theta\), so
+      \[ \nabla_\theta J = \sum_\tau p_\theta(\tau)\,\nabla_\theta \log p_\theta(\tau)\, R(\tau) = \E_{\tau \sim p_\theta}\big[ R(\tau)\, \nabla_\theta \log p_\theta(\tau) \big]. \]
+      A gradient of an expectation became an expectation of a gradient, which we can estimate by sampling. \(R\) is only <em>evaluated</em>, never differentiated.</li>
+    <li><strong>Token factorization.</strong> \(\log p_\theta(\tau) = \log \mathcal D(x) + \sum_t \log \pi_\theta(a_t \mid s_t)\). The prompt term does not depend on \(\theta\), so
+      \[ \nabla_\theta \log p_\theta(\tau) = \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(a_t \mid s_t). \]</li>
+  </ol>
+
+  <div class="eq-box">
+  \[ \nabla_\theta J \;=\; \E\Big[ R(x,y) \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(y_t \mid x, y_{&lt;t}) \Big] \;=\; \E\big[ R(x,y)\, \nabla_\theta \log \pi_\theta(y \mid x) \big] \]
+  <div class="eq-label">Sequence-level REINFORCE <a href="https://link.springer.com/article/10.1007/BF00992696">[Williams 1992]</a>: this is already the bandit gradient, and it holds for any reward function</div>
+  </div>
+
+  <p>The variance of this estimator is the whole problem, and the next steps reduce it without changing its mean. They all rest on one lemma.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Lemma: the score function has zero mean</div>
+    <p>For any state \(s\): \(\E_{a \sim \pi(\cdot|s)}[\nabla_\theta \log \pi_\theta(a|s)] = \sum_a \nabla_\theta \pi_\theta(a|s) = \nabla_\theta \sum_a \pi_\theta(a|s) = \nabla_\theta 1 = 0\). Any quantity that is fixed once \(s_t\) is fixed, multiplied by \(\nabla\log\pi(a_t|s_t)\), has zero expected contribution. Causality, baselines, and the KL-penalty derivation below are three uses of this line.</p>
+  </aside>
+
+  <ol start="3">
+    <li><strong>Causality (reward-to-go).</strong> The action \(a_t\) cannot change a reward received earlier. For \(t' &lt; t\), the reward \(r_{t'}\) is determined by \(s_t\) (it is a function of earlier states and actions, all contained in the prefix), so
+      \[ \E\big[ r_{t'}\, \nabla\log\pi(a_t|s_t) \big] = \E\Big[ r_{t'}\; \underbrace{\E_{a_t}\big[\nabla\log\pi(a_t|s_t)\big]}_{=\,0} \Big] = 0. \]
+      Dropping those terms replaces the full return by the <strong>reward-to-go</strong> \(G_t = \sum_{t' \ge t} \gamma^{t'-t} r_{t'}\):</li>
+  </ol>
+
+  <div class="eq-box">
+  \[ \nabla_\theta J \;=\; \E\Big[ \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\; G_t \Big] \]
+  <div class="eq-label">Policy gradient theorem, trajectory form. Conditioning \(G_t\) on \((s_t,a_t)\) gives \(Q^\pi(s_t,a_t)\), the form in <a href="https://proceedings.neurips.cc/paper_files/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf">[Sutton et al. 1999]</a></div>
+  </div>
+
+  <p>Notice what is missing: no term differentiates how often each state is visited, and no term needs the dynamics. Changing \(\theta\) changes which states we reach, but the identity accounts for that through the sampling distribution itself.</p>
+
+  <p><strong>Terminal reward makes the two views coincide.</strong> If \(r_t = 0\) for \(t &lt; T\) and \(\gamma = 1\), then \(G_t = R\) for every \(t\), so the token-level estimator \(\sum_t \nabla\log\pi_t\, G_t\) equals the sequence-level one \(R \sum_t \nabla\log\pi_t\) sample by sample, not just in expectation. Reward-to-go only changes anything when rewards appear earlier, as they do with the per-token KL of <a href="#kl">the KL section</a>.</p>
+
+  <h3 id="pg-what">What the gradient does to the logits</h3>
+  <p>For a softmax policy with logits \(z\), \(\partial \log\pi(a|s)/\partial z = e_a - \pi(\cdot|s)\). So a single token contributes \(G_t\,(e_{a_t} - \pi)\): the sampled token's logit goes up, every other logit goes down in proportion to its current probability, and the whole thing is scaled by how good the continuation was. Sign matters: a negative \(G_t\) pushes the sampled token <em>down</em>. Since \(e_a - \pi\) sums to zero, the update never changes the logits' overall shift. Averaged over \(a \sim \pi\), the update is \(\sum_a \pi(a)\,Q(s,a)\,(e_a - \pi)\), the covariance between the action-value and the one-hot token, which is why the expected update raises the probability of actions with above-average value.</p>
+
+  <h3 id="pg-code">In code: a weighted cross-entropy on your own samples</h3>
+  <p>The only LLM-specific work is bookkeeping. Position \(t\) of the logits predicts token \(t+1\), and the loss must ignore prompt tokens and padding. In fact \(\log\pi\) of the sampled token is minus the cross-entropy you already know from pretraining:</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def response_logprobs(model, input_ids, response_mask):
+    # input_ids: (B, L) prompt + response, right-padded; response_mask: (B, L), 1 on response tokens only
+    logits = model(input_ids).logits[:, :-1]                           # (B, L-1, V): position t predicts token t+1
+    logp = -F.cross_entropy(logits.transpose(1, 2), input_ids[:, 1:], reduction="none")  # (B, L-1)  log pi(a_t | s_t)
+    return logp, response_mask[:, 1:]                                  # exclude prompt tokens and padding
+
+def reinforce_loss(logp, rewards, baseline, mask):
+    # logp, rewards, baseline, mask: (B, L-1), rewards and baseline are zero outside the response
+    G = (rewards * mask).flip(1).cumsum(1).flip(1)                     # reward-to-go, gamma = 1
+    adv = (G - baseline).detach()                                      # a constant weight: the reward is never differentiated
+    return -(adv * logp * mask).sum() / logp.shape[0]                  # sum over tokens, mean over responses
+</code></pre>
+  <p class="small muted">If you sample with temperature \(\tau \ne 1\), the policy is \(\softmax(z/\tau)\) and \(\log\pi\) must be computed from those scaled logits (<a href="06-decoding-kv-cache.html">page 06</a>), otherwise you differentiate a distribution you did not sample from. A simplified form of the drill's <code>reinforce_loss</code> in <code>exercises/drills/pg.py</code>, which adds discounting and per-token baselines.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p><strong>Policy gradient is advantage-weighted maximum likelihood on the model's own samples.</strong> Set the weight to 1 on demonstrations from a dataset and you have SFT (<a href="19-sft-distillation.html">page 19</a>). Set it to a reward-based weight on samples drawn from the current policy and you have RL. Everything else on this page is about choosing that weight to have low variance and small bias, and about safely reusing the samples for more than one step.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="baselines">Baselines, the value function and the advantage</h2>
+
+  <p>The estimator above is unbiased but noisy. If rewards are all positive (a 0/1 verifier, or a reward model whose scores are mostly above zero), every sampled token gets pushed up, and only the <em>relative</em> sizes of the pushes carry signal. The fix is to subtract a <strong>baseline</strong> <span class="zh">基线</span> \(b\) from the return.</p>
+
+  <div class="eq-box">
+  \[ \nabla_\theta J = \E\Big[ \sum_t \nabla\log\pi_\theta(a_t|s_t)\,\big(G_t - b(s_t)\big) \Big] \qquad \text{for any } b \text{ that does not depend on } a_t \text{ or later tokens} \]
+  <div class="eq-label">Baselines change the variance, never the mean</div>
+  </div>
+
+  <p><strong>Proof.</strong> The subtracted term is \(\E[\nabla\log\pi(a_t|s_t)\, b(s_t)] = \E\big[ b(s_t)\, \E_{a_t}[\nabla\log\pi(a_t|s_t)] \big] = 0\) by the lemma, because \(b(s_t)\) is a constant once the prefix is fixed. The proof uses <em>only</em> that \(b\) is independent of \(a_t\), so \(b\) may depend on the prompt, on the whole prefix, and on any randomness that is independent of \(a_t\) <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, Prop. 1]</a>. It may not depend on \(a_t\), on later tokens, or on the outcome of the sample it multiplies.</p>
+
+  <div class="decision">
+    <div class="decision-title">What breaks unbiasedness</div>
+    <dl>
+      <dt>Problem</dt><dd>Practitioners are tempted to use a baseline that peeks at the sample: the sample's own reward, or the critic's value after the action.</dd>
+      <dt>Extreme case</dt><dd>\(b = G_t\) makes every term zero: the estimator returns 0, a gradient that is wrong by \(-\nabla J\).</dd>
+      <dt>Benign case</dt><dd>GRPO's group mean includes the sample itself. With \(G\) samples, \(R_i - \tfrac1G\sum_j R_j = (1-\tfrac1G) R_i - \tfrac1G\sum_{j\ne i} R_j\), and the second term is independent of \(y_i\), so the expected gradient is \((1 - \tfrac1G)\nabla J\): the right direction, scaled down. Leave-one-out (RLOO) removes the self term and is exactly unbiased; it equals \(\tfrac{G}{G-1}\) times the GRPO advantage without the std division <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, App. A]</a>.</dd>
+      <dt>Rule</dt><dd>Ask "is this number known before the token was chosen?" If yes, it is a legal baseline.</dd>
+    </dl>
+  </div>
+
+  <h3 id="opt-baseline">Which baseline is best</h3>
+  <p>For one token, the second moment of the gradient term is \(\E[(G - b)^2\,\|\nabla\log\pi(a|s)\|^2 \mid s]\). Differentiating with respect to \(b\) and setting the result to zero gives</p>
+  \[ b^\star(s) = \frac{\E\big[\|\nabla\log\pi\|^2\, G \mid s\big]}{\E\big[\|\nabla\log\pi\|^2 \mid s\big]}, \]
+  <p>a return average weighted by the squared score norm <a href="https://www.jmlr.org/papers/volume5/greensmith04a/greensmith04a.pdf">[Greensmith et al. 2004]</a>. If the score norm is roughly independent of the return, \(b^\star\) reduces to \(\E[G_t \mid s_t]\), the <strong>value function</strong> <span class="zh">价值函数</span>. That is why the value function is the default: it is the mean-return baseline, and the GAE paper calls the resulting advantage "almost the lowest possible variance" <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, §2]</a>. Define</p>
+  \[ V^\pi(s_t) = \E[G_t \mid s_t], \qquad Q^\pi(s_t, a_t) = \E[G_t \mid s_t, a_t], \qquad A^\pi(s_t, a_t) = Q^\pi(s_t,a_t) - V^\pi(s_t). \]
+  <p>The <strong>advantage</strong> <span class="zh">优势函数</span> measures how much better token \(a_t\) is than the policy's average token in that state, and by construction \(\E_{a \sim \pi}[A^\pi(s,a)] = 0\). The policy gradient becomes \(\nabla_\theta J = \E[\sum_t \nabla\log\pi(a_t|s_t)\, A^\pi(s_t,a_t)]\), and a positive advantage raises the token's probability while a negative one lowers it.</p>
+
+  <h3 id="adv-llm">What the advantage is in an LLM</h3>
+  <p>Because the next state is a deterministic function of \((s_t, a_t)\) and the reward is a deterministic function of the sequence, \(Q^\pi(s_t,a_t) = r_t + V^\pi(s_{t+1})\) with no expectation left. Therefore</p>
+  <div class="eq-box">
+  \[ A^\pi(s_t, a_t) = r_t + V^\pi(s_{t+1}) - V^\pi(s_t) =: \delta_t, \qquad V^\pi(s_{T+1}) = 0 \]
+  <div class="eq-label">With the true value function, the one-step TD residual <em>is</em> the advantage (no Q-network needed)</div>
+  </div>
+  <p>With a stochastic reward (a sampled LLM judge) \(\delta_t\) is an unbiased estimate of \(A_t\) instead. For a verifier with reward in \(\{0,1\}\) this has a clean reading: \(V(s_t)\) is the probability, after prefix \(s_t\), that the final answer will be judged correct, and the advantage of a token is <em>how much that token moved the predicted success probability</em>. A token that opens a dead-end derivation has negative advantage before anyone knows the answer is wrong. This is exactly the credit assignment a critic can provide and a single outcome number cannot.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Baseline</th><th>Depends on</th><th>Cost</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Learned critic \(V_\phi(s_t)\)</td><td>prompt and prefix</td><td>a second model of policy size, trained alongside</td><td>PPO <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022]</a></td></tr>
+      <tr><td>Group mean \(\bar R\) of \(G\) samples</td><td>prompt only</td><td>\(G\) samples per prompt, no extra model</td><td>GRPO <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024]</a></td></tr>
+      <tr><td>Leave-one-out mean</td><td>prompt only, excludes self</td><td>\(k \ge 2\) samples per prompt</td><td>RLOO <a href="https://arxiv.org/abs/2402.14740">[Ahmadian et al. 2024]</a></td></tr>
+      <tr><td>Moving average of rewards</td><td>nothing</td><td>free</td><td>REINFORCE with baseline <a href="https://arxiv.org/abs/2402.14740">[Ahmadian et al. 2024, §2.2]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>Only the critic can vary over the tokens of one response. The others give every token of a sequence the same advantage. <a href="24-rlvr-reasoning.html">Page 24</a> is about living with that.</p>
+
+  <h3 id="toy">Worked numbers: exact gradient and three estimators on a two-token MDP</h3>
+  <p>Take the smallest response that has structure: two binary tokens. Token 1 is \(a_1 \sim \text{Bernoulli}(\sigma(z_0))\). Token 2 depends on token 1: \(a_2 \sim \text{Bernoulli}(\sigma(z_A))\) if \(a_1 = 0\) and \(\text{Bernoulli}(\sigma(z_B))\) if \(a_1 = 1\). Three logits \(\theta = (z_0, z_A, z_B)\). A verifier pays \(R = 1\) only for the response "11". Start at \(\theta = 0\), so every probability is \(\tfrac12\) and each of the four responses has probability \(\tfrac14\).</p>
+  <p><strong>Exact gradient.</strong> \(J = \sigma(z_0)\,\sigma(z_B)\), so \(\partial J/\partial z_0 = \sigma(z_0)(1-\sigma(z_0))\,\sigma(z_B) = \tfrac14\cdot\tfrac12 = 0.125\), \(\partial J/\partial z_B = \sigma(z_0)\,\sigma(z_B)(1-\sigma(z_B)) = 0.125\), and \(\partial J/\partial z_A = 0\). So \(\nabla J = (0.125,\ 0,\ 0.125)\).</p>
+  <p><strong>Estimators.</strong> For a Bernoulli logit, \(\partial\log\pi(a)/\partial z = a - p\), so the score of a response is \(\big(a_1 - \tfrac12,\ (1-a_1)(a_2 - \tfrac12),\ a_1(a_2 - \tfrac12)\big)\) (only the logit that was used gets a term). The per-response gradient estimate is \(\hat g = \sum_t \text{score}_t\,(G_t - b_t)\). The critic's baseline is \(V(s_1) = J = 0.25\) at the prompt and \(V(s_2) = 0\) after "0", \(0.5\) after "1".</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Response</th><th class="num">Prob.</th><th class="num">\(R\)</th><th>Score \(\nabla\log\pi\)</th><th>\(\hat g\), \(b = 0\)</th><th>\(\hat g\), \(b = 0.25\)</th><th>\(\hat g\), \(b = V(s_t)\)</th></tr></thead>
+    <tbody>
+      <tr><td>00</td><td class="num">¼</td><td class="num">0</td><td>(−.5, −.5, 0)</td><td>(0, 0, 0)</td><td>(.125, .125, 0)</td><td>(.125, 0, 0)</td></tr>
+      <tr><td>01</td><td class="num">¼</td><td class="num">0</td><td>(−.5, +.5, 0)</td><td>(0, 0, 0)</td><td>(.125, −.125, 0)</td><td>(.125, 0, 0)</td></tr>
+      <tr><td>10</td><td class="num">¼</td><td class="num">0</td><td>(+.5, 0, −.5)</td><td>(0, 0, 0)</td><td>(−.125, 0, .125)</td><td>(−.125, 0, .25)</td></tr>
+      <tr><td>11</td><td class="num">¼</td><td class="num">1</td><td>(+.5, 0, +.5)</td><td>(.5, 0, .5)</td><td>(.375, 0, .375)</td><td>(.375, 0, .25)</td></tr>
+      <tr class="hl"><td>Mean</td><td class="num"></td><td class="num">.25</td><td></td><td>(.125, 0, .125)</td><td>(.125, 0, .125)</td><td>(.125, 0, .125)</td></tr>
+      <tr><td>\(\E\|\hat g\|^2\)</td><td class="num"></td><td class="num"></td><td></td><td class="num">0.1250</td><td class="num">0.0938</td><td class="num">0.0781</td></tr>
+      <tr class="hl"><td>Variance (trace)</td><td class="num"></td><td class="num"></td><td></td><td class="num">0.0938</td><td class="num">0.0625</td><td class="num">0.0469</td></tr>
+    </tbody>
+  </table></div>
+  <p>All three means equal the exact gradient, which is the unbiasedness proof in numbers. The variance is \(\E\|\hat g\|^2 - \|\nabla J\|^2\) with \(\|\nabla J\|^2 = 0.03125\): \(0.09375 \to 0.0625\) with a constant baseline (\(-33\%\)) and \(\to 0.046875\) with the state-dependent baseline (\(-50\%\)). Two things to read off the table. First, every one of the four responses has score norm\(^2\) \(= 0.5\), so the optimal constant baseline \(b^\star = \E[\|\text{score}\|^2 R]/\E[\|\text{score}\|^2]\) equals \(J\) exactly, and \(0.0625\) is the best any constant can do. Second, the state baseline zeroes the noise in \(z_A\) entirely: after token 1 the critic already knows what the return of "0?" will be, so token 2 carries no news there.</p>
+  <p><strong>Offset invariance.</strong> Add 10 to every reward (a reward model whose scores are all large and positive). The no-baseline variance jumps from 0.094 to 52.59; the two baselined estimators are unchanged at 0.0625 and 0.0469 because \((R + 10) - (J + 10) = R - J\). The drill's variance test reproduces these numbers by enumeration.</p>
+</section>
+
+<section>
+  <h2 id="gae">Actor-critic and generalized advantage estimation</h2>
+
+  <p>A learned value function lets us replace the noisy return \(G_t\) with something built from a few real rewards plus a prediction. This is the <strong>actor-critic</strong> <span class="zh">演员-评论家</span> idea: the policy is the actor, the value model \(V_\phi\) is the critic. The building block is the <strong>TD residual</strong> <span class="zh">时序差分残差</span></p>
+  \[ \delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t), \qquad V_\phi(s_{T+1}) := 0 \]
+  <p>which, as shown above, equals the advantage when \(V_\phi = V^\pi\). Summing \(k\) discounted residuals telescopes into a \(k\)-step estimate:</p>
+  \[ \hat A^{(k)}_t = \sum_{l=0}^{k-1} \gamma^l \delta_{t+l} = \underbrace{r_t + \gamma r_{t+1} + \dots + \gamma^{k-1} r_{t+k-1}}_{k \text{ real rewards}} + \gamma^k V_\phi(s_{t+k}) - V_\phi(s_t). \]
+  <p>\(k = 1\) is \(\delta_t\): one real reward, then trust the critic, so variance is small but any critic error becomes bias. \(k \to \infty\) is the Monte-Carlo return minus \(V_\phi(s_t)\): no critic error enters except through the baseline (which never biases), but every future random choice adds variance. <strong>Generalized advantage estimation</strong> (GAE) <span class="zh">广义优势估计</span> averages all of them with geometric weights <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, Eq. 16]</a>:</p>
+
+  <div class="eq-box">
+  \[ \hat A^{\text{GAE}(\gamma,\lambda)}_t = (1-\lambda)\sum_{k \ge 1} \lambda^{k-1} \hat A^{(k)}_t = \sum_{l=0}^{T-t} (\gamma\lambda)^l\, \delta_{t+l} = \delta_t + \gamma\lambda\, \hat A_{t+1} \]
+  <div class="eq-label">GAE as an exponentially weighted sum of TD residuals, and its backward recursion (the implementation)</div>
+  </div>
+
+  <p><strong>Why the two forms agree.</strong> Substitute \(\hat A^{(k)}_t = \sum_{l&lt;k}\gamma^l\delta_{t+l}\) and collect the coefficient of \(\delta_{t+l}\): it is \(\gamma^l (1-\lambda)\sum_{k &gt; l}\lambda^{k-1} = \gamma^l (1-\lambda)\,\lambda^l/(1-\lambda) = (\gamma\lambda)^l\). The recursion \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\) then gives an \(O(T)\) backward loop.</p>
+
+  <h3 id="gae-knobs">What \(\gamma\) and \(\lambda\) each do</h3>
+  <ul>
+    <li><strong>\(\lambda = 0\):</strong> \(\hat A_t = \delta_t\). Lowest variance, biased unless \(V_\phi = V^\pi\).</li>
+    <li><strong>\(\lambda = 1\):</strong> \(\hat A_t = \sum_l \gamma^l r_{t+l} - V_\phi(s_t)\), the Monte-Carlo return minus a baseline. Unbiased whatever \(V_\phi\) is, highest variance.</li>
+    <li><strong>\(\gamma\) versus \(\lambda\) are different knobs.</strong> "Taking \(\gamma &lt; 1\) introduces bias into the policy gradient estimate, regardless of the value function's accuracy. On the other hand, \(\lambda &lt; 1\) introduces bias only when the value function is inaccurate" <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, §3]</a>. The paper's experiments favored intermediate values (\(\gamma \in [0.96, 0.99]\) and \(\lambda \in [0.92, 0.99]\) on cart-pole, \(\lambda \in [0.9, 0.99]\) in its discussion) and it remarks that the best \(\lambda\) tends to sit below the best \(\gamma\) because \(\lambda\) adds far less bias when the critic is reasonable. PPO's MuJoCo settings are \(\gamma = 0.99\), \(\lambda = 0.95\) <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, Tab. 3]</a>.</li>
+    <li><strong>Reward-shaping view.</strong> \(\delta_t\) is the reward of a modified MDP, \(\tilde r_t = r_t + \gamma\Phi(s_{t+1}) - \Phi(s_t)\), with potential \(\Phi = V_\phi\). Such shaping leaves the advantage function unchanged, and GAE is the \((\gamma\lambda)\)-discounted return of the shaped reward. A good critic makes the shaped reward nearly immediate, so a steep extra discount \(\lambda\) discards little.</li>
+  </ul>
+
+<pre><code class="language-python">def gae(rewards, values, gamma, lam, mask, last_value=None):
+    # rewards, values, mask: (B, T), right-padded; values[:, t] = V(s_t). Returns (advantages, returns) of shape (B, T).
+    B, T = rewards.shape
+    nxt = torch.zeros_like(values)
+    nxt[:, :-1] = values[:, 1:] * mask[:, 1:]              # V(s_{t+1}); 0 after the last real token (EOS terminates)
+    if last_value is not None:
+        nxt[:, -1] = last_value * mask[:, -1]              # rows cut off at the length limit are bootstrapped
+    delta = (rewards + gamma * nxt - values) * mask        # TD residuals
+    adv, acc = torch.zeros_like(delta), torch.zeros(B)
+    for t in reversed(range(T)):                           # A_t = delta_t + gamma * lam * A_{t+1}
+        acc = (delta[:, t] + gamma * lam * acc) * mask[:, t]
+        adv[:, t] = acc
+    return adv, (adv + values) * mask                      # returns = A + V: the critic's regression target
+</code></pre>
+  <p class="small muted">This is the drill's <code>gae</code>. The "terminal bootstrap convention" is the two lines that set <code>nxt</code>: EOS means the next value is zero, a truncated row bootstraps from the critic. Many RLHF codebases instead give truncated responses a fixed penalty (Ziegler et al. use \(-1\)), which avoids asking the critic about an unfinished state <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, Detail 23]</a>.</p>
+
+  <h3 id="gae-llm">The LLM setting: \(\gamma = 1\), one reward at the end</h3>
+  <p>Set \(\gamma = \lambda = 1\) with only a terminal reward \(R\): GAE collapses to \(\hat A_t = R - V(s_t)\), REINFORCE with a learned per-token baseline, and with \(V \equiv 0\) to the plain bandit gradient. With \(\lambda &lt; 1\) the picture changes. Take \(r_t = 0\) for \(t &lt; T\) and \(\gamma = 1\): the residuals are \(\delta_t = V(s_{t+1}) - V(s_t)\) for \(t &lt; T\) and \(\delta_T = R - V(s_T)\). Suppose the critic is untrained and outputs 0. Then every \(\delta_t\) before the end is zero, and</p>
+  \[ \hat A_t = \lambda^{\,T-t}\, R. \]
+  <p>The terminal reward decays geometrically as it travels backward. The half-life of the signal is \(\ln 0.5 / \ln\lambda\) tokens: 13.5 for \(\lambda = 0.95\), 69 for 0.99, 693 for 0.999. For a token 1,000 positions before the end, \(0.95^{1000} = 5.3\times10^{-23}\) and even \(0.99^{1000} = 4.3\times10^{-5}\). Such a token receives essentially no direct credit, and its advantage is whatever the critic's bootstrapped predictions imply. That is fine when the critic is good (the worked numbers below) and disastrous when it is not.</p>
+
+  <p>ByteDance's VC-PPO analysis of long chain-of-thought RL makes this concrete. Two defaults inherited from RLHF and control, GAE with \(\lambda = 0.95\) and a value model initialized from the reward model, produce a systematic bias: the reward model is trained to score only the EOS token, so it assigns lower values to earlier (more incomplete) prefixes, the advantage is positively biased and correlated with token position, and the policy learns to emit shorter responses until output length collapses. Their fixes are <strong>value pretraining</strong> (fit the critic to Monte-Carlo returns of a fixed policy before RL) and <strong>decoupled GAE</strong>: \(\lambda_{\text{critic}} = 1\) for the critic's regression target (no reward decay, no bootstrapped target) and \(\lambda_{\text{actor}} = 0.95\) for the policy advantage <a href="https://arxiv.org/abs/2503.01491">[Yuan et al. 2025, §3.2-3.3]</a>. VAPO adds a <strong>length-adaptive</strong> \(\lambda_{\text{policy}} = 1 - 1/(\alpha\ell)\) with \(\alpha = 0.05\), which is 0.8 at \(\ell = 100\) tokens and 0.98 at 1,000. The number of residuals GAE effectively sums, \(1/(1-\lambda) = \alpha\ell\), then grows with the response length (5, then 50) instead of being fixed at 20 for every length; the authors' stated aim is a more uniform spread of TD errors across short and long responses <a href="https://arxiv.org/abs/2504.05118">[Yue et al. 2025, §4.2]</a>.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Setup (Qwen2.5-32B base, AIME 2024)</th><th class="num">Score</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>PPO, \(\lambda = 0.95\), critic from RM</td><td class="num">5.6</td><td rowspan="4">VC-PPO, Tab. 2 (8k context, pass@1)</td></tr>
+      <tr><td>+ value pretraining, no decoupled GAE</td><td class="num">29.4</td></tr>
+      <tr><td>+ value pretraining + decoupled GAE (VC-PPO)</td><td class="num">41.9</td></tr>
+      <tr><td>GRPO, same setting</td><td class="num">35.8</td></tr>
+      <tr><td>Vanilla PPO, then VAPO (value pretraining, decoupled and length-adaptive GAE, clip-higher, token-level loss, positive-example LM loss, group sampling)</td><td class="num">5 → 60</td><td>VAPO, Tab. 1 (avg@32)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Caveats: both papers are from one group, use a binary verifier, set \(\beta = 0\), and evaluate on the small AIME 2024 set, so single differences of a few points are noise. The robust lesson is qualitative: with long responses and a terminal reward, \(\lambda\) and the critic's initialization are first-order decisions, not defaults. In short-response RLHF the same tension shows up mildly: Ahmadian et al. saw reward decrease monotonically as \(\lambda\) fell from 1 toward 0 in their setup <a href="https://arxiv.org/abs/2402.14740">[§3.1]</a>.</p>
+
+  <h3 id="gae-numbers">Worked numbers: a 5-token episode</h3>
+  <p>A response of five tokens, \(\gamma = 1\), reward 1 after the last token (\(r = (0,0,0,0,1)\)), and critic values \(V(s_1..s_5) = 0.30, 0.35, 0.40, 0.55, 0.80\) with \(V(s_6) = 0\). The TD residuals are \(\delta_1 = 0 + 0.35 - 0.30 = 0.05\), \(\delta_2 = 0.05\), \(\delta_3 = 0.15\), \(\delta_4 = 0.25\), \(\delta_5 = 1 + 0 - 0.80 = 0.20\). For \(\lambda = 0.95\) run the recursion backward: \(\hat A_5 = 0.20\); \(\hat A_4 = 0.25 + 0.95\cdot0.20 = 0.44\); \(\hat A_3 = 0.15 + 0.95\cdot0.44 = 0.568\); \(\hat A_2 = 0.05 + 0.95\cdot0.568 = 0.5896\); \(\hat A_1 = 0.05 + 0.95\cdot0.5896 = 0.61012\). For \(\lambda = 1\) the sum telescopes: \(\hat A_t = 1 - V(s_t)\), and indeed \(0.05+0.05+0.15+0.25+0.20 = 0.70 = 1 - 0.30\).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>\(t\)</th><th class="num">\(V(s_t)\)</th><th class="num">\(\delta_t\)</th><th class="num">\(\hat A_t\), \(\lambda=0\)</th><th class="num">\(\hat A_t\), \(\lambda=0.95\)</th><th class="num">\(\hat A_t\), \(\lambda=1\)</th><th class="num">critic target \(\hat A + V\), \(\lambda=0.95\)</th><th class="num">target, \(\lambda=1\)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="num">0.30</td><td class="num">0.05</td><td class="num">0.05</td><td class="num">0.61012</td><td class="num">0.70</td><td class="num">0.91012</td><td class="num">1</td></tr>
+      <tr><td>2</td><td class="num">0.35</td><td class="num">0.05</td><td class="num">0.05</td><td class="num">0.5896</td><td class="num">0.65</td><td class="num">0.9396</td><td class="num">1</td></tr>
+      <tr><td>3</td><td class="num">0.40</td><td class="num">0.15</td><td class="num">0.15</td><td class="num">0.568</td><td class="num">0.60</td><td class="num">0.968</td><td class="num">1</td></tr>
+      <tr><td>4</td><td class="num">0.55</td><td class="num">0.25</td><td class="num">0.25</td><td class="num">0.44</td><td class="num">0.45</td><td class="num">0.99</td><td class="num">1</td></tr>
+      <tr><td>5</td><td class="num">0.80</td><td class="num">0.20</td><td class="num">0.20</td><td class="num">0.20</td><td class="num">0.20</td><td class="num">1</td><td class="num">1</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 486" role="img" aria-labelledby="fig-22-2-title">
+<title id="fig-22-2-title">GAE advantages for a 5-token response with terminal reward 1, for lambda 0, 0.95 and 1, with an informative critic (top) and with an all-zero critic (bottom)</title>
+<text x="64" y="16" class="s-big">Informative critic</text>
+<text x="694" y="16" text-anchor="end" class="s-small s-muted">V(s₁..s₅) = 0.30, 0.35, 0.40, 0.55, 0.80</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="180.0" x2="694" y2="180.0"/>
+<text x="58" y="184.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="147.5" x2="694" y2="147.5"/>
+<text x="58" y="151.5" text-anchor="end" class="s-small s-muted">0.25</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="115.0" x2="694" y2="115.0"/>
+<text x="58" y="119.0" text-anchor="end" class="s-small s-muted">0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="82.5" x2="694" y2="82.5"/>
+<text x="58" y="86.5" text-anchor="end" class="s-small s-muted">0.75</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="50.0" x2="694" y2="50.0"/>
+<text x="58" y="54.0" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line" x1="64" y1="180" x2="694" y2="180"/>
+<rect class="s-fill-muted" x="75.0" y="173.5" width="31.7" height="6.5" rx="2"/>
+<text x="90.8" y="169.5" text-anchor="middle" style="font-size:10.5px">0.05</text>
+<rect class="s-b" x="109.7" y="100.7" width="31.7" height="79.3" rx="2"/>
+<text x="125.5" y="96.7" text-anchor="middle" style="font-size:10.5px">0.61</text>
+<rect class="s-a" x="144.3" y="89.0" width="31.7" height="91.0" rx="2"/>
+<text x="160.2" y="85.0" text-anchor="middle" style="font-size:10.5px">0.70</text>
+<text x="127.0" y="196" text-anchor="middle" class="s-small s-muted">t = 1</text>
+<rect class="s-fill-muted" x="201.0" y="173.5" width="31.7" height="6.5" rx="2"/>
+<text x="216.8" y="169.5" text-anchor="middle" style="font-size:10.5px">0.05</text>
+<rect class="s-b" x="235.7" y="103.4" width="31.7" height="76.6" rx="2"/>
+<text x="251.5" y="99.4" text-anchor="middle" style="font-size:10.5px">0.59</text>
+<rect class="s-a" x="270.3" y="95.5" width="31.7" height="84.5" rx="2"/>
+<text x="286.2" y="91.5" text-anchor="middle" style="font-size:10.5px">0.65</text>
+<text x="253.0" y="196" text-anchor="middle" class="s-small s-muted">t = 2</text>
+<rect class="s-fill-muted" x="327.0" y="160.5" width="31.7" height="19.5" rx="2"/>
+<text x="342.8" y="156.5" text-anchor="middle" style="font-size:10.5px">0.15</text>
+<rect class="s-b" x="361.7" y="106.2" width="31.7" height="73.8" rx="2"/>
+<text x="377.5" y="102.2" text-anchor="middle" style="font-size:10.5px">0.57</text>
+<rect class="s-a" x="396.3" y="102.0" width="31.7" height="78.0" rx="2"/>
+<text x="412.2" y="98.0" text-anchor="middle" style="font-size:10.5px">0.60</text>
+<text x="379.0" y="196" text-anchor="middle" class="s-small s-muted">t = 3</text>
+<rect class="s-fill-muted" x="453.0" y="147.5" width="31.7" height="32.5" rx="2"/>
+<text x="468.8" y="143.5" text-anchor="middle" style="font-size:10.5px">0.25</text>
+<rect class="s-b" x="487.7" y="122.8" width="31.7" height="57.2" rx="2"/>
+<text x="503.5" y="118.8" text-anchor="middle" style="font-size:10.5px">0.44</text>
+<rect class="s-a" x="522.3" y="121.5" width="31.7" height="58.5" rx="2"/>
+<text x="538.2" y="117.5" text-anchor="middle" style="font-size:10.5px">0.45</text>
+<text x="505.0" y="196" text-anchor="middle" class="s-small s-muted">t = 4</text>
+<rect class="s-fill-muted" x="579.0" y="154.0" width="31.7" height="26.0" rx="2"/>
+<text x="594.8" y="150.0" text-anchor="middle" style="font-size:10.5px">0.20</text>
+<rect class="s-b" x="613.7" y="154.0" width="31.7" height="26.0" rx="2"/>
+<text x="629.5" y="150.0" text-anchor="middle" style="font-size:10.5px">0.20</text>
+<rect class="s-a" x="648.3" y="154.0" width="31.7" height="26.0" rx="2"/>
+<text x="664.2" y="150.0" text-anchor="middle" style="font-size:10.5px">0.20</text>
+<text x="631.0" y="196" text-anchor="middle" class="s-small s-muted">t = 5</text>
+<text x="64" y="244" class="s-big">Critic outputs 0</text>
+<text x="694" y="244" text-anchor="end" class="s-small s-muted">V(s) = 0 everywhere, as at initialization of a fresh value head</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="408.0" x2="694" y2="408.0"/>
+<text x="58" y="412.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="375.5" x2="694" y2="375.5"/>
+<text x="58" y="379.5" text-anchor="end" class="s-small s-muted">0.25</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="343.0" x2="694" y2="343.0"/>
+<text x="58" y="347.0" text-anchor="end" class="s-small s-muted">0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="310.5" x2="694" y2="310.5"/>
+<text x="58" y="314.5" text-anchor="end" class="s-small s-muted">0.75</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="64" y1="278.0" x2="694" y2="278.0"/>
+<text x="58" y="282.0" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line" x1="64" y1="408" x2="694" y2="408"/>
+<text x="90.8" y="404.0" text-anchor="middle" class="s-muted" style="font-size:10.5px">0</text>
+<rect class="s-b" x="109.7" y="302.1" width="31.7" height="105.9" rx="2"/>
+<text x="125.5" y="298.1" text-anchor="middle" style="font-size:10.5px">0.81</text>
+<rect class="s-a" x="144.3" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="160.2" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<text x="127.0" y="424" text-anchor="middle" class="s-small s-muted">t = 1</text>
+<text x="216.8" y="404.0" text-anchor="middle" class="s-muted" style="font-size:10.5px">0</text>
+<rect class="s-b" x="235.7" y="296.5" width="31.7" height="111.5" rx="2"/>
+<text x="251.5" y="292.5" text-anchor="middle" style="font-size:10.5px">0.86</text>
+<rect class="s-a" x="270.3" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="286.2" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<text x="253.0" y="424" text-anchor="middle" class="s-small s-muted">t = 2</text>
+<text x="342.8" y="404.0" text-anchor="middle" class="s-muted" style="font-size:10.5px">0</text>
+<rect class="s-b" x="361.7" y="290.7" width="31.7" height="117.3" rx="2"/>
+<text x="377.5" y="286.7" text-anchor="middle" style="font-size:10.5px">0.90</text>
+<rect class="s-a" x="396.3" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="412.2" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<text x="379.0" y="424" text-anchor="middle" class="s-small s-muted">t = 3</text>
+<text x="468.8" y="404.0" text-anchor="middle" class="s-muted" style="font-size:10.5px">0</text>
+<rect class="s-b" x="487.7" y="284.5" width="31.7" height="123.5" rx="2"/>
+<text x="503.5" y="280.5" text-anchor="middle" style="font-size:10.5px">0.95</text>
+<rect class="s-a" x="522.3" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="538.2" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<text x="505.0" y="424" text-anchor="middle" class="s-small s-muted">t = 4</text>
+<rect class="s-fill-muted" x="579.0" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="594.8" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<rect class="s-b" x="613.7" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="629.5" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<rect class="s-a" x="648.3" y="278.0" width="31.7" height="130.0" rx="2"/>
+<text x="664.2" y="274.0" text-anchor="middle" style="font-size:10.5px">1.00</text>
+<text x="631.0" y="424" text-anchor="middle" class="s-small s-muted">t = 5</text>
+<text x="379" y="442" text-anchor="middle" class="s-small">token position (the reward 1 arrives after t = 5)</text>
+<rect class="s-fill-muted" x="70" y="464" width="14" height="12" rx="2"/><text x="90" y="474" class="s-small">λ = 0 (TD residual)</text>
+<rect class="s-b" x="250" y="464" width="14" height="12" rx="2"/><text x="270" y="474" class="s-small">λ = 0.95</text>
+<rect class="s-a" x="370" y="464" width="14" height="12" rx="2"/><text x="390" y="474" class="s-small">λ = 1 (return minus V), γ = 1</text>
+</svg>
+    <figcaption><b>Figure 2.</b> The same episode under three values of \(\lambda\). Top, a reasonable critic: \(\lambda = 1\) gives \(1 - V(s_t)\), the outcome minus the predicted success; \(\lambda = 0.95\) pulls each advantage toward its local residual, and \(\lambda = 0\) uses only local residuals. Bottom, an untrained critic that outputs 0: \(\lambda = 0\) tells only the last token anything, \(\lambda = 0.95\) gives credit that decays as \(0.95^{5-t}\) (0.81 at \(t = 1\), and effectively zero after a few hundred tokens), and \(\lambda = 1\) credits every token equally with the outcome.</figcaption>
+  </figure>
+
+  <p>Read the last two columns of the table: with \(\lambda = 1\) the critic is regressed onto the observed return (all ones), an honest target. With \(\lambda = 0.95\) the early-state targets (0.91, 0.94, 0.97) are pulled toward the critic's <em>own</em> current predictions. That is bootstrapping: lower variance, but a moving, self-referential target that is only as good as the critic already is.</p>
+
+  <h3 id="value-head">The value head and its loss</h3>
+  <p>The critic is a scalar head on a transformer: a linear map \(d \to 1\) on the final hidden states, exactly the shape of the reward-model head of <a href="21-preference-optimization.html">page 21</a>. Alignment is the classic off-by-one: \(V(s_t)\) must be read at the position that produces the logits for \(a_t\), the last token of \(s_t\) (for \(t = 1\), the last prompt token), so one forward pass gives both \(\pi(\cdot|s_t)\) and \(V(s_t)\). The critic is usually a separate model. InstructGPT used a 6B reward model and a 6B value function, initialized from the reward model, for policies of every size <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, App. C.4]</a>. Warm-starting from the RM is standard <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, Detail 22]</a>, but see the failure mode above.</p>
+  <p>The critic is trained by regression onto the \(\lambda\)-return \(\hat R_t = \hat A_t + V_{\text{old}}(s_t)\), where \(V_{\text{old}}\) is the critic that produced the rollout's values:</p>
+  \[ L^{V}(\phi) = \tfrac12\, \E_t\Big[ \big(V_\phi(s_t) - \hat R_t\big)^2 \Big], \qquad L^{V}_{\text{clip}} = \tfrac12\,\E_t\Big[\max\Big( (V_\phi - \hat R_t)^2,\ \big(\clip(V_\phi,\, V_{\text{old}}-\epsilon_v,\, V_{\text{old}}+\epsilon_v) - \hat R_t\big)^2 \Big)\Big]. \]
+  <p>Advantages must be computed with \(V_{\text{old}}\), not the freshly updated critic: in the extreme, an over-fit critic drives every residual to zero and with it the policy gradient <a href="https://arxiv.org/abs/1506.02438">[Schulman et al. 2016, §6.1]</a>. The clipped variant is a code-level addition of the OpenAI baselines implementation, not in the PPO paper <a href="https://arxiv.org/abs/2005.12729">[Engstrom et al. 2020, §3]</a>. Its value is contested: Andrychowicz et al. found it hurts performance on continuous control <a href="https://arxiv.org/abs/2006.05990">[§3.4]</a>, Ahmadian et al. disabled it without effect, and Huang et al. keep it with \(\epsilon_v = 0.2\) and coefficient \(c_1 = 0.1\) <a href="https://arxiv.org/abs/2403.17031">[Tab. 7]</a>. A useful health metric is the critic's explained variance, \(1 - \mathrm{Var}(\hat R - V)/\mathrm{Var}(\hat R)\).</p>
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A value head looks like the classification or regression head you attached to your encoder, but the analogy stops at the architecture. Your labels were fixed, so regression converged to a stationary target. The critic's targets \(\hat R_t\) are the return of the <em>current</em> policy, which the actor changes every step, so the critic chases a moving target, and its errors feed back into the actor's advantages. That is why critic learning rate, initialization and \(\lambda\) matter far more here than head design.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="ppo">From importance sampling to the PPO clip</h2>
+
+  <h3 id="offpolicy">Why we reuse samples, and what it costs</h3>
+  <p>Generating a batch of responses is expensive: it is autoregressive decoding (<a href="06-decoding-kv-cache.html">page 06</a>) on a model that will then be updated. We would like to take several gradient steps on each batch. But the policy gradient is an expectation over samples from the <em>current</em> policy. After one step, \(\theta \ne \theta_{\text{old}}\) and our tokens came from \(\pi_{\theta_{\text{old}}}\). InstructGPT splits each batch of 512 responses into 8 minibatches of 64 and makes one pass, so minibatch 1 is exactly on-policy and minibatches 2 to 8 are progressively stale <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, App. C.4]</a>. Ziegler et al. take 4 PPO epochs over each batch <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2.2]</a>.</p>
+
+  <p><strong>Importance sampling</strong> <span class="zh">重要性采样</span> repairs the mismatch for one decision: for any function \(f\), \(\E_{a \sim \pi_\theta}[f(a)] = \E_{a \sim \pi_{\text{old}}}[\rho\, f(a)]\) with the <strong>probability ratio</strong></p>
+  \[ \rho_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t \mid s_t)} = \exp\big(\log\pi_\theta(a_t|s_t) - \log\pi_{\theta_{\text{old}}}(a_t|s_t)\big). \]
+  <p>The <strong>surrogate objective</strong> is \(L^{\text{IS}}(\theta) = \E_{t}[\rho_t(\theta)\,\hat A_t]\), with tokens and advantages from the rollout policy. Its gradient is \(\rho_t \hat A_t \nabla\log\pi_\theta(a_t|s_t)\) (because \(\nabla\rho = \rho\,\nabla\log\pi_\theta\)), and at \(\theta = \theta_{\text{old}}\) we have \(\rho = 1\): the first step is exactly the on-policy gradient. Away from \(\theta_{\text{old}}\) it is an approximation, and it is worth knowing which one.</p>
+
+  <p><strong>Where the surrogate comes from.</strong> Kakade and Langford's identity says that the exact improvement of a new policy over an old one is the old policy's advantage accumulated along the <em>new</em> policy's trajectories: \(J(\theta) - J(\theta_{\text{old}}) = \E_{\tau \sim \pi_\theta}[\sum_t A^{\pi_{\text{old}}}(s_t, a_t)]\) <a href="https://arxiv.org/abs/1502.05477">[Schulman et al. 2015, Eq. 1]</a>. The trouble is that states \(s_t\) are drawn from \(\pi_\theta\). The surrogate replaces them by states from \(\pi_{\text{old}}\), which is what we have samples of. That is the only approximation, and it matches \(J\) in value and gradient at \(\theta_{\text{old}}\) <a href="https://arxiv.org/abs/1502.05477">[Eq. 4]</a>. For an LLM it has a clear meaning: the ratio \(\rho_t\) corrects how likely token \(a_t\) is <em>given its prefix</em>, but ignores that changing earlier tokens changes which prefixes are visited at all.</p>
+
+  <p><strong>How far can we trust it?</strong> TRPO proves a lower bound, \(J(\theta) \ge L(\theta) - C\, D_{\text{KL}}^{\max}(\theta_{\text{old}}, \theta)\) with \(C = 4\varepsilon\gamma/(1-\gamma)^2\), where \(\varepsilon = \max|A|\). The proof sums \(\varepsilon\,\gamma^t\,4\alpha\,(1-(1-\alpha)^t)\) over time steps, where \(\alpha\) is the maximum total-variation distance between the policies, and \(\alpha^2 \le D_{\text{KL}}\) converts the result to KL <a href="https://arxiv.org/abs/1502.05477">[Schulman et al. 2015, Thm. 1, App. A]</a>. The constant explodes as \(\gamma \to 1\), which is our regime. Redoing the same sum with \(\gamma = 1\) over a horizon \(T\), and using \(1-(1-\alpha)^t \le t\alpha\), gives \(\sum_{t=0}^{T-1} 4\alpha\,(1-(1-\alpha)^t) \le 4\alpha^2\sum_{t} t = 2\alpha^2 T(T-1)\), so \(J(\theta) \ge L(\theta) - 2\varepsilon\,T(T-1)\,D_{\text{KL}}^{\max}\) (our derivation from their proof, not a stated result). At \(T = 10^3\) the coefficient is about \(2\times10^{6}\,\varepsilon\): useless as a numeric guarantee, but it says the right thing qualitatively. A policy change compounds over the length of the sequence, so the safe step shrinks with response length and we need a <strong>trust region</strong> <span class="zh">信任区域</span>.</p>
+
+  <p>TRPO enforces one exactly: maximize \(L(\theta)\) subject to a bound \(\delta\) on the <em>average</em> KL between old and new policies (the theory's penalty coefficient \(C\) would give "very small" steps), solved with conjugate gradient and a line search. That works, but it is second-order machinery that does not combine cleanly with dropout or parameters shared between actor and critic <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, §1]</a>. PPO keeps the idea and drops the machinery.</p>
+
+  <h3 id="clip">The clipped objective</h3>
+  <p><strong>Proximal policy optimization</strong> <span class="zh">近端策略优化</span> (PPO) clips the ratio inside the objective <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, Eq. 7]</a>:</p>
+
+  <div class="eq-box">
+  \[ L^{\text{CLIP}}(\theta) = \E_t\Big[ \min\big( \rho_t(\theta)\,\hat A_t,\ \ \clip(\rho_t(\theta),\, 1-\epsilon,\, 1+\epsilon)\,\hat A_t \big) \Big], \qquad \epsilon = 0.2 \text{ typically} \]
+  <div class="eq-label">Maximize \(L^{\text{CLIP}}\) (the code minimizes its negative). At \(\rho = 1\) it equals the plain surrogate to first order</div>
+  </div>
+
+  <p>The first term inside the min is the surrogate \(\rho\hat A\). The second removes the incentive to move \(\rho\) outside \([1-\epsilon, 1+\epsilon]\). Taking the <em>minimum</em> makes the whole objective a pessimistic bound on the surrogate. In the paper's words, "we only ignore the change in probability ratio when it would make the objective improve, and we include it when it makes the objective worse". The behavior depends on the sign of \(\hat A\) and on where \(\rho\) is:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Advantage</th><th>Ratio region</th><th>Which term is the min</th><th>Gradient w.r.t. \(\log\pi_\theta\)</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3">\(\hat A &gt; 0\) (good token)</td><td>\(\rho &lt; 1-\epsilon\)</td><td>unclipped, \(\rho\hat A\)</td><td>\(\rho \hat A\), nonzero</td><td>the token got <em>less</em> likely despite being good: keep pushing up</td></tr>
+      <tr><td>\(1-\epsilon \le \rho \le 1+\epsilon\)</td><td>the two terms are equal</td><td>\(\rho \hat A\)</td><td>ordinary policy-gradient step</td></tr>
+      <tr><td>\(\rho &gt; 1+\epsilon\)</td><td>clipped, \((1+\epsilon)\hat A\)</td><td><strong>0</strong></td><td>already made as likely as allowed: stop</td></tr>
+      <tr><td rowspan="3">\(\hat A &lt; 0\) (bad token)</td><td>\(\rho &lt; 1-\epsilon\)</td><td>clipped, \((1-\epsilon)\hat A\)</td><td><strong>0</strong></td><td>already pushed down as far as allowed: stop</td></tr>
+      <tr><td>\(1-\epsilon \le \rho \le 1+\epsilon\)</td><td>the two terms are equal</td><td>\(\rho \hat A\)</td><td>ordinary policy-gradient step</td></tr>
+      <tr><td>\(\rho &gt; 1+\epsilon\)</td><td>unclipped, \(\rho\hat A\)</td><td>\(\rho \hat A\), nonzero</td><td>the token got <em>more</em> likely despite being bad: keep pushing down</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The four outer cells are the ones to draw (Figure 3). Numerically, with \(\epsilon = 0.2\) and \(|\hat A| = 1\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">\(\rho\)</th><th class="num">0.5</th><th class="num">0.9</th><th class="num">1.0</th><th class="num">1.1</th><th class="num">1.3</th><th class="num">1.5</th></tr></thead>
+    <tbody>
+      <tr><td>\(A=+1\): \(L\)</td><td class="num">0.5</td><td class="num">0.9</td><td class="num">1.0</td><td class="num">1.1</td><td class="num">1.2</td><td class="num">1.2</td></tr>
+      <tr><td>\(A=+1\): \(dL/d\rho\)</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>\(A=-1\): \(L\)</td><td class="num">−0.8</td><td class="num">−0.9</td><td class="num">−1.0</td><td class="num">−1.1</td><td class="num">−1.3</td><td class="num">−1.5</td></tr>
+      <tr><td>\(A=-1\): \(dL/d\rho\)</td><td class="num">0</td><td class="num">−1</td><td class="num">−1</td><td class="num">−1</td><td class="num">−1</td><td class="num">−1</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 336" role="img" aria-labelledby="fig-22-3-title">
+<title id="fig-22-3-title">The PPO clipped surrogate for one token as a function of the probability ratio, for positive advantage (left) and negative advantage (right), with the regions where the gradient is zero</title>
+<text x="200.0" y="20" text-anchor="middle" class="s-big">A > 0 (good token)</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="50.0" y1="70" x2="50.0" y2="260"/>
+<text x="50.0" y="276" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="125.0" y1="70" x2="125.0" y2="260"/>
+<text x="125.0" y="276" text-anchor="middle" class="s-small s-muted">0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="200.0" y1="70" x2="200.0" y2="260"/>
+<text x="200.0" y="276" text-anchor="middle" class="s-small s-muted">1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="275.0" y1="70" x2="275.0" y2="260"/>
+<text x="275.0" y="276" text-anchor="middle" class="s-small s-muted">1.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="350.0" y1="70" x2="350.0" y2="260"/>
+<text x="350.0" y="276" text-anchor="middle" class="s-small s-muted">2</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="50" y1="260.0" x2="350" y2="260.0"/>
+<text x="44" y="264.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="50" y1="165.0" x2="350" y2="165.0"/>
+<text x="44" y="169.0" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="50" y1="70.0" x2="350" y2="70.0"/>
+<text x="44" y="74.0" text-anchor="end" class="s-small s-muted">2</text>
+<line class="s-line" x1="50" y1="260" x2="350" y2="260"/>
+<line class="s-line" x1="50" y1="70" x2="50" y2="260"/>
+<text x="200.0" y="294" text-anchor="middle" class="s-small">ratio ρ = π<tspan baseline-shift="sub" font-size="10">θ</tspan>(a|s) / π<tspan baseline-shift="sub" font-size="10">old</tspan>(a|s)</text>
+<rect x="170.0" y="70" width="60.0" height="190" style="fill:var(--accent-soft);opacity:.55"/>
+<text x="200.0" y="64" text-anchor="middle" class="s-small s-muted">[1−ε, 1+ε]</text>
+<polyline class="s-line s-dash" points="50.0,260.0 53.0,258.1 56.0,256.2 59.0,254.3 62.0,252.4 65.0,250.5 68.0,248.6 71.0,246.7 74.0,244.8 77.0,242.9 80.0,241.0 83.0,239.1 86.0,237.2 89.0,235.3 92.0,233.4 95.0,231.5 98.0,229.6 101.0,227.7 104.0,225.8 107.0,223.9 110.0,222.0 113.0,220.1 116.0,218.2 119.0,216.3 122.0,214.4 125.0,212.5 128.0,210.6 131.0,208.7 134.0,206.8 137.0,204.9 140.0,203.0 143.0,201.1 146.0,199.2 149.0,197.3 152.0,195.4 155.0,193.5 158.0,191.6 161.0,189.7 164.0,187.8 167.0,185.9 170.0,184.0 173.0,182.1 176.0,180.2 179.0,178.3 182.0,176.4 185.0,174.5 188.0,172.6 191.0,170.7 194.0,168.8 197.0,166.9 200.0,165.0 203.0,163.1 206.0,161.2 209.0,159.3 212.0,157.4 215.0,155.5 218.0,153.6 221.0,151.7 224.0,149.8 227.0,147.9 230.0,146.0 233.0,144.1 236.0,142.2 239.0,140.3 242.0,138.4 245.0,136.5 248.0,134.6 251.0,132.7 254.0,130.8 257.0,128.9 260.0,127.0 263.0,125.1 266.0,123.2 269.0,121.3 272.0,119.4 275.0,117.5 278.0,115.6 281.0,113.7 284.0,111.8 287.0,109.9 290.0,108.0 293.0,106.1 296.0,104.2 299.0,102.3 302.0,100.4 305.0,98.5 308.0,96.6 311.0,94.7 314.0,92.8 317.0,90.9 320.0,89.0 323.0,87.1 326.0,85.2 329.0,83.3 332.0,81.4 335.0,79.5 338.0,77.6 341.0,75.7 344.0,73.8 347.0,71.9 350.0,70.0"/>
+<polyline class="s-line-b s-dash" points="50.0,184.0 53.0,184.0 56.0,184.0 59.0,184.0 62.0,184.0 65.0,184.0 68.0,184.0 71.0,184.0 74.0,184.0 77.0,184.0 80.0,184.0 83.0,184.0 86.0,184.0 89.0,184.0 92.0,184.0 95.0,184.0 98.0,184.0 101.0,184.0 104.0,184.0 107.0,184.0 110.0,184.0 113.0,184.0 116.0,184.0 119.0,184.0 122.0,184.0 125.0,184.0 128.0,184.0 131.0,184.0 134.0,184.0 137.0,184.0 140.0,184.0 143.0,184.0 146.0,184.0 149.0,184.0 152.0,184.0 155.0,184.0 158.0,184.0 161.0,184.0 164.0,184.0 167.0,184.0 170.0,184.0 173.0,182.1 176.0,180.2 179.0,178.3 182.0,176.4 185.0,174.5 188.0,172.6 191.0,170.7 194.0,168.8 197.0,166.9 200.0,165.0 203.0,163.1 206.0,161.2 209.0,159.3 212.0,157.4 215.0,155.5 218.0,153.6 221.0,151.7 224.0,149.8 227.0,147.9 230.0,146.0 233.0,146.0 236.0,146.0 239.0,146.0 242.0,146.0 245.0,146.0 248.0,146.0 251.0,146.0 254.0,146.0 257.0,146.0 260.0,146.0 263.0,146.0 266.0,146.0 269.0,146.0 272.0,146.0 275.0,146.0 278.0,146.0 281.0,146.0 284.0,146.0 287.0,146.0 290.0,146.0 293.0,146.0 296.0,146.0 299.0,146.0 302.0,146.0 305.0,146.0 308.0,146.0 311.0,146.0 314.0,146.0 317.0,146.0 320.0,146.0 323.0,146.0 326.0,146.0 329.0,146.0 332.0,146.0 335.0,146.0 338.0,146.0 341.0,146.0 344.0,146.0 347.0,146.0 350.0,146.0"/>
+<polyline class="s-line-a" style="stroke-width:3" points="50.0,260.0 53.0,258.1 56.0,256.2 59.0,254.3 62.0,252.4 65.0,250.5 68.0,248.6 71.0,246.7 74.0,244.8 77.0,242.9 80.0,241.0 83.0,239.1 86.0,237.2 89.0,235.3 92.0,233.4 95.0,231.5 98.0,229.6 101.0,227.7 104.0,225.8 107.0,223.9 110.0,222.0 113.0,220.1 116.0,218.2 119.0,216.3 122.0,214.4 125.0,212.5 128.0,210.6 131.0,208.7 134.0,206.8 137.0,204.9 140.0,203.0 143.0,201.1 146.0,199.2 149.0,197.3 152.0,195.4 155.0,193.5 158.0,191.6 161.0,189.7 164.0,187.8 167.0,185.9 170.0,184.0 173.0,182.1 176.0,180.2 179.0,178.3 182.0,176.4 185.0,174.5 188.0,172.6 191.0,170.7 194.0,168.8 197.0,166.9 200.0,165.0 203.0,163.1 206.0,161.2 209.0,159.3 212.0,157.4 215.0,155.5 218.0,153.6 221.0,151.7 224.0,149.8 227.0,147.9 230.0,146.0 233.0,146.0 236.0,146.0 239.0,146.0 242.0,146.0 245.0,146.0 248.0,146.0 251.0,146.0 254.0,146.0 257.0,146.0 260.0,146.0 263.0,146.0 266.0,146.0 269.0,146.0 272.0,146.0 275.0,146.0 278.0,146.0 281.0,146.0 284.0,146.0 287.0,146.0 290.0,146.0 293.0,146.0 296.0,146.0 299.0,146.0 302.0,146.0 305.0,146.0 308.0,146.0 311.0,146.0 314.0,146.0 317.0,146.0 320.0,146.0 323.0,146.0 326.0,146.0 329.0,146.0 332.0,146.0 335.0,146.0 338.0,146.0 341.0,146.0 344.0,146.0 347.0,146.0 350.0,146.0"/>
+<circle class="s-fill-e" cx="200.0" cy="165.0" r="5" style="stroke:none"/>
+<text x="59.0" y="85.19999999999999" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">ρ &lt; 1+ε: slope A,</text>
+<text x="59.0" y="100.19999999999999" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">the token is pushed up</text>
+<text x="242.0" y="201.1" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">ρ &gt; 1+ε: flat,</text>
+<text x="242.0" y="216.1" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">gradient 0</text>
+<text x="209.0" y="183.0" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">start ρ = 1</text>
+<text x="550.0" y="20" text-anchor="middle" class="s-big">A < 0 (bad token)</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="400.0" y1="70" x2="400.0" y2="260"/>
+<text x="400.0" y="276" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="475.0" y1="70" x2="475.0" y2="260"/>
+<text x="475.0" y="276" text-anchor="middle" class="s-small s-muted">0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="550.0" y1="70" x2="550.0" y2="260"/>
+<text x="550.0" y="276" text-anchor="middle" class="s-small s-muted">1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="625.0" y1="70" x2="625.0" y2="260"/>
+<text x="625.0" y="276" text-anchor="middle" class="s-small s-muted">1.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="700.0" y1="70" x2="700.0" y2="260"/>
+<text x="700.0" y="276" text-anchor="middle" class="s-small s-muted">2</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="400" y1="260.0" x2="700" y2="260.0"/>
+<text x="394" y="264.0" text-anchor="end" class="s-small s-muted">-2</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="400" y1="165.0" x2="700" y2="165.0"/>
+<text x="394" y="169.0" text-anchor="end" class="s-small s-muted">-1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="400" y1="70.0" x2="700" y2="70.0"/>
+<text x="394" y="74.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" x1="400" y1="260" x2="700" y2="260"/>
+<line class="s-line" x1="400" y1="70" x2="400" y2="260"/>
+<text x="550.0" y="294" text-anchor="middle" class="s-small">ratio ρ = π<tspan baseline-shift="sub" font-size="10">θ</tspan>(a|s) / π<tspan baseline-shift="sub" font-size="10">old</tspan>(a|s)</text>
+<rect x="520.0" y="70" width="60.0" height="190" style="fill:var(--accent-soft);opacity:.55"/>
+<text x="550.0" y="64" text-anchor="middle" class="s-small s-muted">[1−ε, 1+ε]</text>
+<polyline class="s-line s-dash" points="400.0,70.0 403.0,71.9 406.0,73.8 409.0,75.7 412.0,77.6 415.0,79.5 418.0,81.4 421.0,83.3 424.0,85.2 427.0,87.1 430.0,89.0 433.0,90.9 436.0,92.8 439.0,94.7 442.0,96.6 445.0,98.5 448.0,100.4 451.0,102.3 454.0,104.2 457.0,106.1 460.0,108.0 463.0,109.9 466.0,111.8 469.0,113.7 472.0,115.6 475.0,117.5 478.0,119.4 481.0,121.3 484.0,123.2 487.0,125.1 490.0,127.0 493.0,128.9 496.0,130.8 499.0,132.7 502.0,134.6 505.0,136.5 508.0,138.4 511.0,140.3 514.0,142.2 517.0,144.1 520.0,146.0 523.0,147.9 526.0,149.8 529.0,151.7 532.0,153.6 535.0,155.5 538.0,157.4 541.0,159.3 544.0,161.2 547.0,163.1 550.0,165.0 553.0,166.9 556.0,168.8 559.0,170.7 562.0,172.6 565.0,174.5 568.0,176.4 571.0,178.3 574.0,180.2 577.0,182.1 580.0,184.0 583.0,185.9 586.0,187.8 589.0,189.7 592.0,191.6 595.0,193.5 598.0,195.4 601.0,197.3 604.0,199.2 607.0,201.1 610.0,203.0 613.0,204.9 616.0,206.8 619.0,208.7 622.0,210.6 625.0,212.5 628.0,214.4 631.0,216.3 634.0,218.2 637.0,220.1 640.0,222.0 643.0,223.9 646.0,225.8 649.0,227.7 652.0,229.6 655.0,231.5 658.0,233.4 661.0,235.3 664.0,237.2 667.0,239.1 670.0,241.0 673.0,242.9 676.0,244.8 679.0,246.7 682.0,248.6 685.0,250.5 688.0,252.4 691.0,254.3 694.0,256.2 697.0,258.1 700.0,260.0"/>
+<polyline class="s-line-b s-dash" points="400.0,146.0 403.0,146.0 406.0,146.0 409.0,146.0 412.0,146.0 415.0,146.0 418.0,146.0 421.0,146.0 424.0,146.0 427.0,146.0 430.0,146.0 433.0,146.0 436.0,146.0 439.0,146.0 442.0,146.0 445.0,146.0 448.0,146.0 451.0,146.0 454.0,146.0 457.0,146.0 460.0,146.0 463.0,146.0 466.0,146.0 469.0,146.0 472.0,146.0 475.0,146.0 478.0,146.0 481.0,146.0 484.0,146.0 487.0,146.0 490.0,146.0 493.0,146.0 496.0,146.0 499.0,146.0 502.0,146.0 505.0,146.0 508.0,146.0 511.0,146.0 514.0,146.0 517.0,146.0 520.0,146.0 523.0,147.9 526.0,149.8 529.0,151.7 532.0,153.6 535.0,155.5 538.0,157.4 541.0,159.3 544.0,161.2 547.0,163.1 550.0,165.0 553.0,166.9 556.0,168.8 559.0,170.7 562.0,172.6 565.0,174.5 568.0,176.4 571.0,178.3 574.0,180.2 577.0,182.1 580.0,184.0 583.0,184.0 586.0,184.0 589.0,184.0 592.0,184.0 595.0,184.0 598.0,184.0 601.0,184.0 604.0,184.0 607.0,184.0 610.0,184.0 613.0,184.0 616.0,184.0 619.0,184.0 622.0,184.0 625.0,184.0 628.0,184.0 631.0,184.0 634.0,184.0 637.0,184.0 640.0,184.0 643.0,184.0 646.0,184.0 649.0,184.0 652.0,184.0 655.0,184.0 658.0,184.0 661.0,184.0 664.0,184.0 667.0,184.0 670.0,184.0 673.0,184.0 676.0,184.0 679.0,184.0 682.0,184.0 685.0,184.0 688.0,184.0 691.0,184.0 694.0,184.0 697.0,184.0 700.0,184.0"/>
+<polyline class="s-line-a" style="stroke-width:3" points="400.0,146.0 403.0,146.0 406.0,146.0 409.0,146.0 412.0,146.0 415.0,146.0 418.0,146.0 421.0,146.0 424.0,146.0 427.0,146.0 430.0,146.0 433.0,146.0 436.0,146.0 439.0,146.0 442.0,146.0 445.0,146.0 448.0,146.0 451.0,146.0 454.0,146.0 457.0,146.0 460.0,146.0 463.0,146.0 466.0,146.0 469.0,146.0 472.0,146.0 475.0,146.0 478.0,146.0 481.0,146.0 484.0,146.0 487.0,146.0 490.0,146.0 493.0,146.0 496.0,146.0 499.0,146.0 502.0,146.0 505.0,146.0 508.0,146.0 511.0,146.0 514.0,146.0 517.0,146.0 520.0,146.0 523.0,147.9 526.0,149.8 529.0,151.7 532.0,153.6 535.0,155.5 538.0,157.4 541.0,159.3 544.0,161.2 547.0,163.1 550.0,165.0 553.0,166.9 556.0,168.8 559.0,170.7 562.0,172.6 565.0,174.5 568.0,176.4 571.0,178.3 574.0,180.2 577.0,182.1 580.0,184.0 583.0,185.9 586.0,187.8 589.0,189.7 592.0,191.6 595.0,193.5 598.0,195.4 601.0,197.3 604.0,199.2 607.0,201.1 610.0,203.0 613.0,204.9 616.0,206.8 619.0,208.7 622.0,210.6 625.0,212.5 628.0,214.4 631.0,216.3 634.0,218.2 637.0,220.1 640.0,222.0 643.0,223.9 646.0,225.8 649.0,227.7 652.0,229.6 655.0,231.5 658.0,233.4 661.0,235.3 664.0,237.2 667.0,239.1 670.0,241.0 673.0,242.9 676.0,244.8 679.0,246.7 682.0,248.6 685.0,250.5 688.0,252.4 691.0,254.3 694.0,256.2 697.0,258.1 700.0,260.0"/>
+<circle class="s-fill-e" cx="550.0" cy="165.0" r="5" style="stroke:none"/>
+<text x="409.0" y="214.4" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">ρ &lt; 1−ε: flat,</text>
+<text x="409.0" y="229.4" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">gradient 0</text>
+<text x="542.5" y="104.19999999999999" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">ρ &gt; 1−ε: slope A,</text>
+<text x="542.5" y="119.19999999999999" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">the token is pushed down</text>
+<text x="559.0" y="155.0" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">start ρ = 1</text>
+<line class="s-line s-dash" x1="50" y1="322" x2="80" y2="322"/><text x="86" y="326" class="s-small">ρ·A (unclipped)</text>
+<line class="s-line-b s-dash" x1="200" y1="322" x2="230" y2="322"/><text x="236" y="326" class="s-small">clip(ρ, 1−ε, 1+ε)·A</text>
+<line class="s-line-a" style="stroke-width:3" x1="400" y1="322" x2="430" y2="322"/><text x="436" y="326" class="s-small">min of the two = the objective (ε = 0.2, |A| = 1)</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One token's contribution to \(L^{\text{CLIP}}\) as a function of \(\rho\). Left, \(A &gt; 0\): the objective rises with slope \(A\) until \(\rho = 1+\epsilon\) and is then flat. Right, \(A &lt; 0\): the objective is flat below \(1-\epsilon\) and falls with slope \(A\) above. Notice the asymmetry that the min creates: on the "wrong" side (a good token whose probability fell, a bad token whose probability rose) the gradient is never cut off, so the update can always undo damage. The shaded band is where clipping is inactive.</figcaption>
+  </figure>
+
+  <div class="decision">
+    <div class="decision-title">Why \(\min\) with the clipped term, not just \(\clip(\rho)\hat A\)</div>
+    <dl>
+      <dt>Problem</dt><dd>Clipping alone, \(\clip(\rho, 1-\epsilon, 1+\epsilon)\hat A\), has zero gradient whenever \(\rho\) is outside the band, on either side.</dd>
+      <dt>Idea</dt><dd>Take the smaller of the clipped and the unclipped objective.</dd>
+      <dt>Why it works</dt><dd>Outside the band on the <em>improving</em> side the clipped term is smaller, so it wins and the gradient vanishes (no incentive to go further). On the <em>worsening</em> side the unclipped term is smaller, so it wins and the gradient stays (the step is corrected).</dd>
+      <dt>Evidence</dt><dd>On seven MuJoCo tasks, clipping with \(\epsilon = 0.2\) scored 0.82 (normalized), against 0.76 for \(\epsilon = 0.1\), 0.70 for \(\epsilon = 0.3\), 0.74 for the best adaptive-KL penalty and 0.72 for the best fixed penalty. With neither clip nor penalty the score was \(-0.39\) <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, Tab. 1]</a>.</dd>
+      <dt>Cost</dt><dd>It is a heuristic: it removes an incentive but does not bound the ratio. See below.</dd>
+      <dt>Used by</dt><dd>InstructGPT (\(\epsilon = 0.2\)), GRPO, DAPO (asymmetric), nearly every LLM policy-gradient recipe.</dd>
+    </dl>
+  </div>
+
+  <h3 id="clip-limits">What the clip does not do</h3>
+  <ul>
+    <li><strong>It is not a constraint.</strong> The clip only zeroes the gradient of tokens already outside the band. Engstrom et al. found that the maximum ratio during PPO training on MuJoCo consistently violates the \(1+\epsilon\) line, and that with tuning a PPO variant without clipping often matched PPO with it. Their account: the first step is identical to an unclipped step, and the trust region that emerges depends on how the objective is optimized (learning rate, momentum) rather than on the objective itself <a href="https://arxiv.org/abs/2005.12729">[Engstrom et al. 2020, §4-5]</a>.</li>
+    <li><strong>It is per token, but parameters are shared.</strong> A token inside the band can still be dragged outside by the gradients of other tokens.</li>
+    <li><strong>It is often inactive.</strong> In their RLHF runs Ahmadian et al. found the loss clipped on average under 5% of the time, and removing clipping (and then the ratio itself) changed nothing <a href="https://arxiv.org/abs/2402.14740">[§3.2]</a>. With one update per batch, DeepSeekMath's own analysis sets \(\pi_{\text{old}} = \pi_\theta\) and drops both the min and the clip <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, App. A.1.5]</a>. Clipping earns its keep when data are reused or arrive asynchronously (<a href="25-rl-systems-agentic.html">page 25</a>).</li>
+    <li><strong>It bounds relative, not absolute, probability change.</strong> A token can move by a factor \(1\pm\epsilon\): \(0.01 \to 0.012\), \(0.10 \to 0.12\), \(0.50 \to 0.60\), and \(0.90 \to 1.08\), which exceeds 1 and so never binds. Rare "exploration" tokens with positive advantage are therefore held back most tightly, the observation behind DAPO's <strong>Clip-Higher</strong> (\(\epsilon_{\text{low}} = 0.2\), \(\epsilon_{\text{high}} = 0.28\)) <a href="https://arxiv.org/abs/2503.14476">[Yu et al. 2025, §3.1]</a>. The drill's <code>eps_high</code> argument implements it.</li>
+  </ul>
+  <p>Monitor three numbers in any PPO run: the fraction of tokens clipped, an approximate KL between old and new policies (the k3 estimator below, with \(r = \rho_t\), estimates \(\KL(\pi_{\text{old}}\|\pi_\theta)\) from the rollout tokens), and the maximum ratio. A ratio that is not exactly 1 on the first minibatch is a bug or a numerics mismatch (dropout left on, or old log-probabilities taken from a sampler whose kernels differ from the trainer's, <a href="25-rl-systems-agentic.html">page 25</a>), which is why Huang et al. disable dropout during RLHF <a href="https://arxiv.org/abs/2403.17031">[Detail 7]</a>.</p>
+
+  <h3 id="ppo-full">The full objective and one PPO iteration</h3>
+  <p>PPO's objective for a shared actor-critic network adds a value loss and an entropy bonus <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, Eq. 9]</a>: \(L = L^{\text{CLIP}} - c_1 L^{V} + c_2 S[\pi_\theta]\). With separate actor and critic models (the LLM norm) no parameters are shared, and \(c_1\) only rescales the critic's step relative to the actor's. The RLHF recipes cited on this page list no entropy term, because the KL penalty already keeps entropy from collapsing: Ziegler et al. say it "plays the role of an entropy bonus" <a href="https://arxiv.org/abs/1909.08593">[§2]</a>. One iteration, in the order that matters:</p>
+
+<pre><code class="language-python">def ppo_iteration(policy, ref, critic, reward_fn, prompts, K=4, beta=0.05, eps=0.2, gamma=1.0, lam=0.95):
+    resp, mask = policy.generate(prompts)                   # (B, T) tokens and 0/1 response mask
+    with torch.no_grad():                                   # 1) everything below is frozen at rollout time
+        logp_old = policy.logprobs(prompts, resp)           # (B, T) log pi_old(a_t | s_t), recomputed by the trainer
+        logp_ref = ref.logprobs(prompts, resp)              # (B, T)
+        values   = critic.values(prompts, resp)             # (B, T) V_old(s_t)
+        rewards  = -beta * (logp_old - logp_ref) * mask     # 2) KL shaping on every token: -beta * k1
+        last     = mask.sum(1).long() - 1
+        rewards[torch.arange(len(last)), last] += reward_fn(prompts, resp)   # task reward on the last real token
+        adv, ret = gae(rewards, values, gamma, lam, mask)   # 3) advantages and critic targets
+        adv      = masked_whiten(adv, mask)                 #    normalize advantages over the batch
+    for _ in range(K):                                      # 4) K passes over the same batch
+        logp = policy.logprobs(prompts, resp)               #    with grad
+        loss_pi = ppo_clip_loss(logp, logp_old, adv, eps, mask)
+        loss_v  = 0.5 * ((critic.values(prompts, resp) - ret).pow(2) * mask).sum() / mask.sum()
+        policy.step(loss_pi); critic.step(loss_v)           #    separate optimizers for actor and critic
+</code></pre>
+  <p class="small muted">Deleting the critic (let <code>values</code> be a per-prompt mean reward and set \(\lambda = 1\)) and using \(K = 1\) turns this loop into REINFORCE or RLOO training with a KL-shaped reward. Real implementations split each pass into minibatches. The drill implements <code>gae</code>, <code>masked_whiten</code> and <code>ppo_clip_loss</code>.</p>
+
+  <p>Reported settings vary widely, which is itself the lesson: PPO for LLMs is a family, not one algorithm.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Ziegler et al. 2019</th><th>InstructGPT 2022</th><th>Huang et al. 2024 (TL;DR)</th><th>VC-PPO / VAPO 2025 (baseline PPO)</th></tr></thead>
+    <tbody>
+      <tr><td>Batch per iteration</td><td>1024 (style) or 512 (summarization) responses</td><td>512 responses, 256k episodes in all</td><td>512 responses, 1M episodes</td><td>8,192 prompts, 1 sample each (VAPO)</td></tr>
+      <tr><td>Passes per batch</td><td>4 epochs, 1 minibatch</td><td>1 epoch, 8 minibatches of 64</td><td>4 epochs, 1 minibatch</td><td>1 epoch, minibatch 512</td></tr>
+      <tr><td>Clip \(\epsilon\)</td><td>PPO2 default</td><td>0.2</td><td>0.2 (value clip 0.2, \(c_1 = 0.1\))</td><td>0.2 (VAPO later: 0.2 low, 0.28 high)</td></tr>
+      <tr><td>\(\gamma\), \(\lambda\)</td><td>\(\gamma = 1\)</td><td>no discount</td><td>1, 0.95</td><td>1, 0.95 (VC-PPO critic: \(\lambda = 1\))</td></tr>
+      <tr><td>KL coefficient \(\beta\)</td><td>0.1 (CNN/DM), 0.03 (TL;DR), or adaptive</td><td>0.02</td><td>0.05</td><td>0 (rule-based reward)</td></tr>
+      <tr><td>Learning rate</td><td>1.41e-5 (style), 7.07e-6 (summ.)</td><td>value: 9e-6 (1.3B, 6B), 5e-6 (175B)</td><td>3e-6 (AdamW)</td><td>actor 1e-6, critic 2e-6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: Ziegler §2.2 and §3.2; Ouyang App. C.4; Huang Tab. 7; Yuan et al. §4.1 and Yue et al. §5.1. Entries are as reported; tasks, model sizes and reward types differ, so they are not comparable numbers.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: implementation details are part of the algorithm</div>
+    <p>In continuous control, "code-level optimizations" (value clipping, reward scaling, initialization, learning-rate annealing) mattered more for final reward than the choice between PPO and TRPO <a href="https://arxiv.org/abs/2005.12729">[Engstrom et al. 2020, §3, §5]</a>, and Huang et al. list over 20 such details for RLHF <a href="https://arxiv.org/abs/2403.17031">[Details 7 to 25]</a>. When someone reports that PPO "does not work", ask which of these were set.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="kl">KL control: the penalty and its estimators</h2>
+
+  <h3 id="why-kl">Why penalize distance from the reference policy</h3>
+  <p>A reward model is a proxy fit on responses from roughly the SFT policy \(\pi_{\text{ref}}\). Far from that distribution its scores are unreliable, and an optimizer will find the unreliable spots (<a href="21-preference-optimization.html#over-optimization">page 21</a> quantifies this). The penalty keeps the policy where the reward is trustworthy. Ziegler et al. list three roles: it "plays the role of an entropy bonus, it prevents the policy from moving too far from the range where \(r\) is valid", and for their style tasks it is part of the task definition, since humans judged style and the KL term supplied coherence <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2]</a>. They also recount a sign-flip bug that flipped the reward <em>and</em> the KL term: the model optimized for maximally bad output while staying fluent, a reminder that the KL term pulls toward the reference, not toward good behavior.</p>
+  <p>How large is too far? Huang et al.'s 1B policies that reached a summed per-token KL of about 50 and 85 nats <em>did</em> raise the RLHF reward, and GPT-3.5 judged them worse than reference summaries more than 80% of the time; the policies had learned to concatenate words without spaces <a href="https://arxiv.org/abs/2403.17031">[§7.1]</a>. InstructGPT found the best \(\beta\) around 0.01 to 0.02, and both \(\beta = 0\) and \(\beta = 2\) gave poor results; raising \(\beta\) 100-fold to 2.0 did <em>not</em> repair regressions on public benchmarks, which needed the pretraining-mix term instead <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, App. E.6-E.7]</a>.</p>
+
+  <p>The regularized objective is the one from <a href="21-preference-optimization.html#kl-objective">page 21</a>, \(J_\beta(\theta) = \E[R(x,y)] - \beta\,\KL(\pi_\theta \| \pi_{\text{ref}})\). The KL is over whole sequences, and by the chain rule it is the expected <em>sum</em> of per-token KLs:</p>
+  \[ \KL(\pi_\theta \| \pi_{\text{ref}}) = \E_{y \sim \pi_\theta}\Big[\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}\Big] = \E\Big[\sum_{t=1}^{T} \ell_t\Big], \qquad \ell_t := \log\pi_\theta(a_t|s_t) - \log\pi_{\text{ref}}(a_t|s_t). \]
+
+  <h3 id="kl-where">Where it enters: in the reward or in the loss</h3>
+  <p><strong>In the reward</strong> (InstructGPT, Ziegler et al., Huang et al.'s PPO recipe; DeepSeekMath calls it PPO's standard approach <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, Eq. 2]</a>). Each token gets \(\tilde r_t = -\beta\,\ell_t\), and the last token also gets the reward-model score. This is the "per-token KL penalty from the SFT model at each token" of InstructGPT <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>, and it is the sequence-level reward \(R(x,y) = r(x,y) - \beta\log\pi(y|x)/\rho(y|x)\) of Ziegler et al. written token by token <a href="https://arxiv.org/abs/1909.08593">[Eq. 2]</a>. It flows through returns and GAE like any other reward. <strong>For on-policy samples this gives the exact gradient of \(J_\beta\).</strong> Differentiating the KL term directly,</p>
+  \[ \nabla\,\E\Big[\sum_t \ell_t\Big] = \E\Big[\sum_t \nabla\log\pi(a_t|s_t)\sum_{s \ge t}\ell_s\Big] + \E\Big[\sum_t \underbrace{\nabla\ell_t}_{=\nabla\log\pi(a_t|s_t)}\Big], \]
+  <p>where the second expectation is zero by the lemma. So treating \(\ell_t\) as a fixed reward and running the policy gradient, which uses <em>reward-to-go</em> \(\sum_{s\ge t}\ell_s\), is exact. The single-sample k1 is all you need.</p>
+  <p><strong>In the loss</strong> (GRPO). The advantage stays the outcome advantage, and a separate term \(+\beta\,k_3(a_t)\) is added to the per-token loss, "avoiding complicating the calculation of \(\hat A_{i,t}\)" <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §4.1.1]</a> (\(\beta = 0.04\) in DeepSeekMath). DeepSeek-V3.2 still uses this form, with a correction discussed below <a href="https://arxiv.org/abs/2512.02556">[§3.1]</a>. Long-CoT recipes with verifiable rewards often drop the term entirely: DAPO argues the model may legitimately drift far from the initial one, and Dr. GRPO assumes \(\beta = 0\), which also frees the memory of the reference model <a href="https://arxiv.org/abs/2503.14476">[Yu et al. 2025, §2.3]</a> <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, §3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">KL penalty in the reward versus in the loss</div>
+    <dl>
+      <dt>Problem</dt><dd>We must add \(-\beta\,\KL(\pi_\theta\|\pi_{\text{ref}})\) to an RL objective that has no differentiable reward.</dd>
+      <dt>Idea A: reward</dt><dd>Fold \(-\beta\ell_t\) into \(r_t\). Advantage estimation (returns, GAE, critic) handles it.</dd>
+      <dt>Idea B: loss</dt><dd>Compute a per-token estimator (usually k3) and add \(\beta\times\) it to the loss.</dd>
+      <dt>Why A is exact</dt><dd>The reward-to-go includes every later KL term, which is what the sequence-level gradient needs (derivation above). A critic simply learns to predict it as part of the return.</dd>
+      <dt>Why B is popular</dt><dd>It is simple, needs no critic, does not perturb the advantage scale, and the k3 estimate is nonnegative and low-variance when policies are close. But autodiff sees only the token-level part of the gradient, and k3's is the gradient of the <em>other</em> KL direction (next section).</dd>
+      <dt>Evidence</dt><dd>On-policy RLOO on MATH with Qwen2.5-7B and Llama-3.1-8B-Instruct, k1 in the reward beat k3 in the loss on in- and out-of-domain evaluations; k3 in the loss was stable but consistently lower, k1 in the loss was unstable, and k3 in the reward collapsed <a href="https://arxiv.org/abs/2512.21852">[Shah et al. 2026, Tab. 1, §4]</a>. At strong regularization (\(\beta = 0.001\)) the differences between variants were small in Tang and Munos's Llama-3 8B run <a href="https://arxiv.org/abs/2506.09477">[§5.1]</a>.</dd>
+      <dt>Cost</dt><dd>A needs a reward-to-go (so \(\gamma = 1\), \(\lambda\) close to 1 matters more); B is a biased regularizer that happens to work.</dd>
+      <dt>Used by</dt><dd>A: Ziegler et al., InstructGPT, the PPO recipe of Huang et al. B: DeepSeekMath, DeepSeek-V3.2 (corrected k3).</dd>
+    </dl>
+  </div>
+
+  <h3 id="kl-beta">Choosing \(\beta\); and not confusing two KLs</h3>
+  <p>Fixed \(\beta\) values in the literature: 0.1 and 0.03 (Ziegler et al., CNN/DM and TL;DR), 0.02 (InstructGPT), 0.05 (Huang et al.), 0.04 (DeepSeekMath's GRPO), 0 for verifier-reward long-CoT runs. Because different seeds with the same \(\beta\) end at different KLs, Ziegler et al. also use a log-space proportional controller that steers the KL to a target (6 nats for their descriptiveness task, 10 for sentiment):</p>
+  \[ e_t = \clip\!\Big(\frac{\KL(\pi_t\|\rho) - \KL_{\text{target}}}{\KL_{\text{target}}},\ -0.2,\ 0.2\Big), \qquad \beta_{t+1} = \beta_t\,(1 + K_\beta\, e_t), \quad K_\beta = 0.1 \]
+  <p>so \(\beta\) changes by at most \(0.1 \times 0.2 = 2\%\) per update <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al. 2019, §2.2, §3.1.2]</a>.</p>
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: two different KLs are called "the KL"</div>
+    <p>The <strong>KL to the reference policy</strong> \(\KL(\pi_\theta\|\pi_{\text{ref}})\) accumulates over the whole run and reaches tens of nats. The <strong>KL between old and new policy</strong> \(\KL(\pi_{\text{old}}\|\pi_\theta)\) is the per-update trust-region quantity: about 0.02 at the maximizer of the PPO surrogate on the first Hopper update, in the PPO paper's Figure 2, and it is what TRPO constrains and what PPO's own adaptive-KL variant targets (\(d_{\text{targ}} = 0.003\) to 0.03, with \(\beta\) halved or doubled when the measured KL falls below \(d_{\text{targ}}/1.5\) or exceeds \(1.5\,d_{\text{targ}}\)) <a href="https://arxiv.org/abs/1707.06347">[Schulman et al. 2017, §4, Fig. 2]</a>. They have different scales, different purposes, and different \(\beta\)s.</p>
+  </aside>
+
+  <h3 id="kl-estimators">Estimating KL from samples: k1, k2, k3</h3>
+  <p>For one token position we could compute \(\KL\) exactly, \(\sum_a \pi_\theta(a|s)\log\frac{\pi_\theta(a|s)}{\pi_{\text{ref}}(a|s)}\), but that needs both full \(V\)-dimensional distributions at every position, and the sequence-level KL has no such shortcut. What we always have are the two log-probabilities of the <em>sampled</em> token. Schulman's note "Approximating KL Divergence" gives three estimators of \(\KL[q,p] = \E_{x\sim q}[\log q/p]\) from \(x \sim q\), with \(r = p(x)/q(x)\) <a href="http://joschu.net/blog/kl-approx.html">[Schulman 2020]</a>. In our setting the sampling distribution is the policy, \(q = \pi_\theta\), and \(p = \pi_{\text{ref}}\), so \(r = \pi_{\text{ref}}(a|s)/\pi_\theta(a|s)\) and \(\log r = -\ell_t\):</p>
+
+  <div class="eq-box">
+  \[ k_1 = -\log r = \ell_t, \qquad k_2 = \tfrac12 (\log r)^2, \qquad k_3 = (r - 1) - \log r, \qquad r = \frac{\pi_{\text{ref}}(a|s)}{\pi_\theta(a|s)},\ \ a \sim \pi_\theta \]
+  <div class="eq-label">The samples come from \(\pi_\theta\), the target is \(\KL(\pi_\theta\|\pi_{\text{ref}})\). Getting the sampling distribution wrong is the common error</div>
+  </div>
+
+  <ul>
+    <li><strong>k1 is unbiased and noisy.</strong> \(\E_q[-\log r] = \KL\) by definition. But the KL is nonnegative while \(k_1\) is negative whenever the sampled token is <em>more</em> likely under \(\pi_{\text{ref}}\) than under \(\pi_\theta\), which is about half the tokens when the policies are close. Its standard deviation is 20 times the true KL when the KL is 0.005.</li>
+    <li><strong>k2 is a biased, low-variance estimator with a principled reason.</strong> \(\E_q[\tfrac12(\log r)^2]\) is an \(f\)-divergence with \(f(x) = \tfrac12(\log x)^2\), and all differentiable \(f\)-divergences agree with KL to second order when \(q \approx p\) (here \(f''(1) = 1\) for both). So the bias is tiny for nearby policies and grows as they separate.</li>
+    <li><strong>k3 is k1 plus a control variate.</strong> Since \(\E_q[r] = \sum_x p(x) = 1\), the term \(\lambda(r-1)\) has mean zero, so \(-\log r + \lambda(r-1)\) is unbiased for every \(\lambda\). Choosing \(\lambda = 1\) makes it nonnegative because \(\log r \le r - 1\): \(k_3\) is the vertical gap between \(\log r\) and its tangent at \(r = 1\), a Bregman divergence (in Figure 4's coordinates \(x = \log r\), the gap between \(e^x\) and its tangent \(1 + x\)). Unbiased, never negative, and usually low variance.</li>
+  </ul>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-22-4-title">
+<title id="fig-22-4-title">The three KL estimators k1, k2 and k3 as functions of the log ratio x = log(pi_ref/pi): k1 is linear and negative for half the samples, k2 is a parabola, k3 is the gap between exp(x) and its tangent at zero</title>
+<defs><marker id="arrow-22-4" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="70.0" y1="20" x2="70.0" y2="310"/>
+<text x="70.0" y="326" text-anchor="middle" class="s-small s-muted">-1.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="159.33333333333331" y1="20" x2="159.33333333333331" y2="310"/>
+<text x="159.33333333333331" y="326" text-anchor="middle" class="s-small s-muted">-1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="248.66666666666666" y1="20" x2="248.66666666666666" y2="310"/>
+<text x="248.66666666666666" y="326" text-anchor="middle" class="s-small s-muted">-0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="338.0" y1="20" x2="338.0" y2="310"/>
+<text x="338.0" y="326" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="427.3333333333333" y1="20" x2="427.3333333333333" y2="310"/>
+<text x="427.3333333333333" y="326" text-anchor="middle" class="s-small s-muted">0.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="516.6666666666667" y1="20" x2="516.6666666666667" y2="310"/>
+<text x="516.6666666666667" y="326" text-anchor="middle" class="s-small s-muted">1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="606.0" y1="20" x2="606.0" y2="310"/>
+<text x="606.0" y="326" text-anchor="middle" class="s-small s-muted">1.5</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="70" y1="268.57142857142856" x2="606" y2="268.57142857142856"/>
+<text x="64" y="272.57142857142856" text-anchor="end" class="s-small s-muted">-1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="70" y1="199.52380952380952" x2="606" y2="199.52380952380952"/>
+<text x="64" y="203.52380952380952" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="70" y1="130.47619047619048" x2="606" y2="130.47619047619048"/>
+<text x="64" y="134.47619047619048" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="70" y1="61.428571428571445" x2="606" y2="61.428571428571445"/>
+<text x="64" y="65.42857142857144" text-anchor="end" class="s-small s-muted">2</text>
+<line class="s-line" style="stroke-width:1" x1="70" y1="199.52380952380952" x2="606" y2="199.52380952380952"/>
+<line class="s-line" x1="70" y1="20" x2="70" y2="310"/>
+<text x="338.0" y="344" text-anchor="middle" class="s-small">x = log r = log π<tspan baseline-shift="sub" font-size="10">ref</tspan>(a|s) − log π<tspan baseline-shift="sub" font-size="10">θ</tspan>(a|s), for a token a sampled from π<tspan baseline-shift="sub" font-size="10">θ</tspan></text>
+<text x="16" y="165.0" text-anchor="middle" class="s-small" transform="rotate(-90 16 165.0)">estimate of the per-token KL</text>
+<polyline class="s-line s-dash" style="stroke-width:1;opacity:.6" points="70.0,184.1 73.6,183.8 77.1,183.5 80.7,183.2 84.3,182.8 87.9,182.5 91.4,182.2 95.0,181.8 98.6,181.4 102.2,181.1 105.7,180.7 109.3,180.3 112.9,179.9 116.5,179.5 120.0,179.1 123.6,178.7 127.2,178.3 130.7,177.9 134.3,177.4 137.9,177.0 141.5,176.5 145.0,176.1 148.6,175.6 152.2,175.1 155.8,174.6 159.3,174.1 162.9,173.6 166.5,173.1 170.1,172.6 173.6,172.0 177.2,171.5 180.8,170.9 184.3,170.3 187.9,169.7 191.5,169.1 195.1,168.5 198.6,167.9 202.2,167.2 205.8,166.6 209.4,165.9 212.9,165.2 216.5,164.5 220.1,163.8 223.7,163.1 227.2,162.4 230.8,161.6 234.4,160.9 237.9,160.1 241.5,159.3 245.1,158.5 248.7,157.6 252.2,156.8 255.8,155.9 259.4,155.1 263.0,154.2 266.5,153.2 270.1,152.3 273.7,151.4 277.3,150.4 280.8,149.4 284.4,148.4 288.0,147.3 291.5,146.3 295.1,145.2 298.7,144.1 302.3,143.0 305.8,141.9 309.4,140.7 313.0,139.5 316.6,138.3 320.1,137.0 323.7,135.8 327.3,134.5 330.9,133.2 334.4,131.8 338.0,130.5 341.6,129.1 345.1,127.7 348.7,126.2 352.3,124.7 355.9,123.2 359.4,121.7 363.0,120.1 366.6,118.5 370.2,116.9 373.7,115.2 377.3,113.5 380.9,111.7 384.5,110.0 388.0,108.2 391.6,106.3 395.2,104.4 398.7,102.5 402.3,100.6 405.9,98.6 409.5,96.5 413.0,94.4 416.6,92.3 420.2,90.1 423.8,87.9 427.3,85.7 430.9,83.4 434.5,81.0 438.1,78.6 441.6,76.2 445.2,73.7 448.8,71.2 452.3,68.6 455.9,65.9 459.5,63.2 463.1,60.5 466.6,57.7 470.2,54.8 473.8,51.9 477.4,48.9 480.9,45.9 484.5,42.8 488.1,39.6 491.7,36.4 495.2,33.1 498.8,29.7 502.4,26.3 505.9,22.8 509.5,19.2"/>
+<polyline class="s-line s-dash" style="stroke-width:1;opacity:.6" points="70.0,234.0 73.6,232.7 77.1,231.3 80.7,229.9 84.3,228.5 87.9,227.1 91.4,225.8 95.0,224.4 98.6,223.0 102.2,221.6 105.7,220.2 109.3,218.9 112.9,217.5 116.5,216.1 120.0,214.7 123.6,213.3 127.2,212.0 130.7,210.6 134.3,209.2 137.9,207.8 141.5,206.4 145.0,205.0 148.6,203.7 152.2,202.3 155.8,200.9 159.3,199.5 162.9,198.1 166.5,196.8 170.1,195.4 173.6,194.0 177.2,192.6 180.8,191.2 184.3,189.9 187.9,188.5 191.5,187.1 195.1,185.7 198.6,184.3 202.2,183.0 205.8,181.6 209.4,180.2 212.9,178.8 216.5,177.4 220.1,176.0 223.7,174.7 227.2,173.3 230.8,171.9 234.4,170.5 237.9,169.1 241.5,167.8 245.1,166.4 248.7,165.0 252.2,163.6 255.8,162.2 259.4,160.9 263.0,159.5 266.5,158.1 270.1,156.7 273.7,155.3 277.3,154.0 280.8,152.6 284.4,151.2 288.0,149.8 291.5,148.4 295.1,147.0 298.7,145.7 302.3,144.3 305.8,142.9 309.4,141.5 313.0,140.1 316.6,138.8 320.1,137.4 323.7,136.0 327.3,134.6 330.9,133.2 334.4,131.9 338.0,130.5 341.6,129.1 345.1,127.7 348.7,126.3 352.3,125.0 355.9,123.6 359.4,122.2 363.0,120.8 366.6,119.4 370.2,118.0 373.7,116.7 377.3,115.3 380.9,113.9 384.5,112.5 388.0,111.1 391.6,109.8 395.2,108.4 398.7,107.0 402.3,105.6 405.9,104.2 409.5,102.9 413.0,101.5 416.6,100.1 420.2,98.7 423.8,97.3 427.3,96.0 430.9,94.6 434.5,93.2 438.1,91.8 441.6,90.4 445.2,89.0 448.8,87.7 452.3,86.3 455.9,84.9 459.5,83.5 463.1,82.1 466.6,80.8 470.2,79.4 473.8,78.0 477.4,76.6 480.9,75.2 484.5,73.9 488.1,72.5 491.7,71.1 495.2,69.7 498.8,68.3 502.4,67.0 505.9,65.6 509.5,64.2 513.1,62.8 516.7,61.4 520.2,60.0 523.8,58.7 527.4,57.3 531.0,55.9 534.5,54.5 538.1,53.1 541.7,51.8 545.3,50.4 548.8,49.0 552.4,47.6 556.0,46.2 559.5,44.9 563.1,43.5 566.7,42.1 570.3,40.7 573.8,39.3 577.4,38.0 581.0,36.6 584.6,35.2 588.1,33.8 591.7,32.4 595.3,31.0 598.9,29.7 602.4,28.3 606.0,26.9"/>
+<polyline class="s-line-b" style="stroke-width:2.4" points="70.0,96.0 73.6,97.3 77.1,98.7 80.7,100.1 84.3,101.5 87.9,102.9 91.4,104.2 95.0,105.6 98.6,107.0 102.2,108.4 105.7,109.8 109.3,111.1 112.9,112.5 116.5,113.9 120.0,115.3 123.6,116.7 127.2,118.0 130.7,119.4 134.3,120.8 137.9,122.2 141.5,123.6 145.0,125.0 148.6,126.3 152.2,127.7 155.8,129.1 159.3,130.5 162.9,131.9 166.5,133.2 170.1,134.6 173.6,136.0 177.2,137.4 180.8,138.8 184.3,140.1 187.9,141.5 191.5,142.9 195.1,144.3 198.6,145.7 202.2,147.0 205.8,148.4 209.4,149.8 212.9,151.2 216.5,152.6 220.1,154.0 223.7,155.3 227.2,156.7 230.8,158.1 234.4,159.5 237.9,160.9 241.5,162.2 245.1,163.6 248.7,165.0 252.2,166.4 255.8,167.8 259.4,169.1 263.0,170.5 266.5,171.9 270.1,173.3 273.7,174.7 277.3,176.0 280.8,177.4 284.4,178.8 288.0,180.2 291.5,181.6 295.1,183.0 298.7,184.3 302.3,185.7 305.8,187.1 309.4,188.5 313.0,189.9 316.6,191.2 320.1,192.6 323.7,194.0 327.3,195.4 330.9,196.8 334.4,198.1 338.0,199.5 341.6,200.9 345.1,202.3 348.7,203.7 352.3,205.0 355.9,206.4 359.4,207.8 363.0,209.2 366.6,210.6 370.2,212.0 373.7,213.3 377.3,214.7 380.9,216.1 384.5,217.5 388.0,218.9 391.6,220.2 395.2,221.6 398.7,223.0 402.3,224.4 405.9,225.8 409.5,227.1 413.0,228.5 416.6,229.9 420.2,231.3 423.8,232.7 427.3,234.0 430.9,235.4 434.5,236.8 438.1,238.2 441.6,239.6 445.2,241.0 448.8,242.3 452.3,243.7 455.9,245.1 459.5,246.5 463.1,247.9 466.6,249.2 470.2,250.6 473.8,252.0 477.4,253.4 480.9,254.8 484.5,256.1 488.1,257.5 491.7,258.9 495.2,260.3 498.8,261.7 502.4,263.0 505.9,264.4 509.5,265.8 513.1,267.2 516.7,268.6 520.2,270.0 523.8,271.3 527.4,272.7 531.0,274.1 534.5,275.5 538.1,276.9 541.7,278.2 545.3,279.6 548.8,281.0 552.4,282.4 556.0,283.8 559.5,285.1 563.1,286.5 566.7,287.9 570.3,289.3 573.8,290.7 577.4,292.0 581.0,293.4 584.6,294.8 588.1,296.2 591.7,297.6 595.3,299.0 598.9,300.3 602.4,301.7 606.0,303.1"/>
+<polyline class="s-line-c" style="stroke-width:2.4" points="70.0,121.8 73.6,123.9 77.1,125.9 80.7,127.9 84.3,129.9 87.9,131.9 91.4,133.8 95.0,135.7 98.6,137.5 102.2,139.4 105.7,141.2 109.3,143.0 112.9,144.7 116.5,146.4 120.0,148.1 123.6,149.8 127.2,151.5 130.7,153.1 134.3,154.7 137.9,156.2 141.5,157.8 145.0,159.3 148.6,160.7 152.2,162.2 155.8,163.6 159.3,165.0 162.9,166.4 166.5,167.7 170.1,169.0 173.6,170.3 177.2,171.6 180.8,172.8 184.3,174.0 187.9,175.2 191.5,176.3 195.1,177.4 198.6,178.5 202.2,179.6 205.8,180.6 209.4,181.6 212.9,182.6 216.5,183.6 220.1,184.5 223.7,185.4 227.2,186.3 230.8,187.1 234.4,187.9 237.9,188.7 241.5,189.5 245.1,190.2 248.7,190.9 252.2,191.6 255.8,192.2 259.4,192.8 263.0,193.4 266.5,194.0 270.1,194.5 273.7,195.0 277.3,195.5 280.8,196.0 284.4,196.4 288.0,196.8 291.5,197.2 295.1,197.5 298.7,197.9 302.3,198.1 305.8,198.4 309.4,198.6 313.0,198.8 316.6,199.0 320.1,199.2 323.7,199.3 327.3,199.4 330.9,199.5 334.4,199.5 338.0,199.5 341.6,199.5 345.1,199.5 348.7,199.4 352.3,199.3 355.9,199.2 359.4,199.0 363.0,198.8 366.6,198.6 370.2,198.4 373.7,198.1 377.3,197.9 380.9,197.5 384.5,197.2 388.0,196.8 391.6,196.4 395.2,196.0 398.7,195.5 402.3,195.0 405.9,194.5 409.5,194.0 413.0,193.4 416.6,192.8 420.2,192.2 423.8,191.6 427.3,190.9 430.9,190.2 434.5,189.5 438.1,188.7 441.6,187.9 445.2,187.1 448.8,186.3 452.3,185.4 455.9,184.5 459.5,183.6 463.1,182.6 466.6,181.6 470.2,180.6 473.8,179.6 477.4,178.5 480.9,177.4 484.5,176.3 488.1,175.2 491.7,174.0 495.2,172.8 498.8,171.6 502.4,170.3 505.9,169.0 509.5,167.7 513.1,166.4 516.7,165.0 520.2,163.6 523.8,162.2 527.4,160.7 531.0,159.3 534.5,157.8 538.1,156.2 541.7,154.7 545.3,153.1 548.8,151.5 552.4,149.8 556.0,148.1 559.5,146.4 563.1,144.7 566.7,143.0 570.3,141.2 573.8,139.4 577.4,137.5 581.0,135.7 584.6,133.8 588.1,131.9 591.7,129.9 595.3,127.9 598.9,125.9 602.4,123.9 606.0,121.8"/>
+<polyline class="s-line-a" style="stroke-width:3" points="70.0,149.6 73.6,150.7 77.1,151.7 80.7,152.8 84.3,153.8 87.9,154.9 91.4,155.9 95.0,156.9 98.6,158.0 102.2,159.0 105.7,160.0 109.3,161.0 112.9,162.0 116.5,163.0 120.0,163.9 123.6,164.9 127.2,165.9 130.7,166.8 134.3,167.8 137.9,168.7 141.5,169.6 145.0,170.6 148.6,171.5 152.2,172.4 155.8,173.2 159.3,174.1 162.9,175.0 166.5,175.8 170.1,176.7 173.6,177.5 177.2,178.4 180.8,179.2 184.3,180.0 187.9,180.8 191.5,181.5 195.1,182.3 198.6,183.1 202.2,183.8 205.8,184.5 209.4,185.2 212.9,186.0 216.5,186.6 220.1,187.3 223.7,188.0 227.2,188.6 230.8,189.2 234.4,189.9 237.9,190.5 241.5,191.0 245.1,191.6 248.7,192.2 252.2,192.7 255.8,193.2 259.4,193.7 263.0,194.2 266.5,194.7 270.1,195.1 273.7,195.5 277.3,195.9 280.8,196.3 284.4,196.7 288.0,197.1 291.5,197.4 295.1,197.7 298.7,198.0 302.3,198.2 305.8,198.5 309.4,198.7 313.0,198.9 316.6,199.0 320.1,199.2 323.7,199.3 327.3,199.4 330.9,199.5 334.4,199.5 338.0,199.5 341.6,199.5 345.1,199.5 348.7,199.4 352.3,199.3 355.9,199.2 359.4,199.0 363.0,198.8 366.6,198.6 370.2,198.3 373.7,198.0 377.3,197.7 380.9,197.4 384.5,197.0 388.0,196.5 391.6,196.1 395.2,195.6 398.7,195.0 402.3,194.5 405.9,193.8 409.5,193.2 413.0,192.5 416.6,191.7 420.2,191.0 423.8,190.1 427.3,189.3 430.9,188.3 434.5,187.4 438.1,186.4 441.6,185.3 445.2,184.2 448.8,183.0 452.3,181.8 455.9,180.6 459.5,179.2 463.1,177.9 466.6,176.4 470.2,174.9 473.8,173.4 477.4,171.8 480.9,170.1 484.5,168.4 488.1,166.6 491.7,164.8 495.2,162.9 498.8,160.9 502.4,158.8 505.9,156.7 509.5,154.5 513.1,152.3 516.7,149.9 520.2,147.5 523.8,145.0 527.4,142.5 531.0,139.8 534.5,137.1 538.1,134.3 541.7,131.4 545.3,128.4 548.8,125.3 552.4,122.2 556.0,118.9 559.5,115.6 563.1,112.1 566.7,108.6 570.3,105.0 573.8,101.2 577.4,97.4 581.0,93.5 584.6,89.4 588.1,85.2 591.7,81.0 595.3,76.6 598.9,72.1 602.4,67.4 606.0,62.7"/>
+<path class="s-line" d="M477.36000000000007,76.61904761904765 L477.36000000000007,48.89834357274327" marker-end="url(#arrow-22-4)" marker-start="url(#arrow-22-4)"/>
+<text x="469.36000000000007" y="32.4285714285715" text-anchor="end" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">k3 = gap between e<tspan baseline-shift="super" font-size="10">x</tspan> and its tangent 1 + x</text>
+<text x="612.0" y="66.6928975242765" class="s-small s-bold s-ta">k3 = e<tspan baseline-shift="super" font-size="10">x</tspan> − 1 − x</text>
+<text x="612.0" y="125.84523809523807" class="s-small s-bold s-tc">k2 = x²/2</text>
+<text x="612.0" y="307.0952380952381" class="s-small s-bold s-tb">k1 = −x</text>
+<text x="600.64" y="228.52380952380952" text-anchor="end" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">k1 &lt; 0 when π<tspan baseline-shift="sub" font-size="10">θ</tspan> &lt; π<tspan baseline-shift="sub" font-size="10">ref</tspan></text>
+<text x="75.36" y="267.1904761904762" class="s-small s-muted" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">dashed: e<tspan baseline-shift="super" font-size="10">x</tspan> and its tangent 1 + x</text>
+<text x="75.36" y="292.04761904761904" class="s-small s-muted" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">near x = 0, k2 and k3 both ≈ x²/2</text>
+</svg>
+    <figcaption><b>Figure 4.</b> The three estimators as functions of \(x = \log r\), the log-ratio of reference to policy probability of the sampled token. k1 is linear, so it goes negative for \(x &gt; 0\) (tokens the policy has made <em>less</em> likely than the reference). k2 is a parabola. k3 is the gap between \(e^x\) and its tangent \(1 + x\): zero at \(x = 0\), positive on both sides, matching k2 near zero, and growing like \(e^x\) on the right. That right tail, tokens the policy suppressed relative to the reference, drives k3's variance in the far regime.</figcaption>
+  </figure>
+
+  <p><strong>Numbers.</strong> Schulman's Gaussian experiments (\(q = N(0,1)\), \(p = N(\mu, 1)\)), which we reproduced with 4 million samples:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th class="num">bias / KL, KL = 0.005</th><th class="num">std / KL, KL = 0.005</th><th class="num">bias / KL, KL = 0.5</th><th class="num">std / KL, KL = 0.5</th></tr></thead>
+    <tbody>
+      <tr><td>k1</td><td class="num">0</td><td class="num">20</td><td class="num">0</td><td class="num">2</td></tr>
+      <tr><td>k2</td><td class="num">0.002</td><td class="num">1.42</td><td class="num">0.25</td><td class="num">1.73</td></tr>
+      <tr class="hl"><td>k3</td><td class="num">0</td><td class="num">1.42</td><td class="num">0</td><td class="num">1.7</td></tr>
+    </tbody>
+  </table></div>
+  <p>Gaussians are gentle. Token distributions are not, so enumerate two three-token examples exactly (\(q = \pi_\theta\), \(p = \pi_{\text{ref}}\); expectations are exact sums, not simulations):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Regime</th><th>Estimator</th><th class="num">Values on the 3 tokens</th><th class="num">Mean</th><th class="num">Std</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3">Close: \(\pi_\theta = (0.5, 0.3, 0.2)\), \(\pi_{\text{ref}} = (0.4, 0.4, 0.2)\), KL = 0.02527</td><td>k1</td><td class="num">0.223, −0.288, 0</td><td class="num">0.02527</td><td class="num">0.2216</td></tr>
+      <tr><td>k2</td><td class="num">0.0249, 0.0414, 0</td><td class="num">0.02486 (−1.6%)</td><td class="num">0.0143</td></tr>
+      <tr class="hl"><td>k3</td><td class="num">0.0231, 0.0457, 0</td><td class="num">0.02527</td><td class="num">0.0160</td></tr>
+      <tr><td rowspan="3">Far: \(\pi_\theta = (0.90, 0.05, 0.05)\), \(\pi_{\text{ref}} = (0.60, 0.05, 0.35)\), KL = 0.2676</td><td>k1</td><td class="num">0.406, 0, −1.946</td><td class="num">0.2676</td><td class="num">0.515</td></tr>
+      <tr><td>k2</td><td class="num">0.082, 0, 1.893</td><td class="num">0.1687 (−37%)</td><td class="num">0.396</td></tr>
+      <tr><td>k3</td><td class="num">0.072, 0, 4.054</td><td class="num">0.2676</td><td class="num">0.869</td></tr>
+    </tbody>
+  </table></div>
+  <p>In the close regime k3 has 14 times less standard deviation than k1 with no bias, which is the case Schulman's note is about. In the far regime the picture changes: the third token has \(r = 0.35/0.05 = 7\), so \(k_3 = 6 - \ln 7 = 4.054\) on a token that occurs 5% of the time, and k3's standard deviation (0.87) is <em>larger</em> than k1's (0.52) while k2's bias reaches 37%. k3 is not "strictly better" once the policy has suppressed tokens the reference likes. DeepSeek-V3.2 reports exactly this failure mode for the k3 gradient: it "assigns disproportionately large, unbounded weights" to tokens with \(\pi_\theta \ll \pi_{\text{ref}}\) <a href="https://arxiv.org/abs/2512.02556">[§3.1]</a>.</p>
+
+  <h3 id="kl-grad">An estimator is not its gradient</h3>
+  <p>The estimators are unbiased <em>values</em> of the KL (k2 nearly so). When you add \(\beta k(a_t)\) to a loss and call <code>backward()</code>, autodiff treats the sampled token \(a_t\) as fixed and differentiates only the integrand. The true gradient has two parts <a href="https://arxiv.org/abs/2506.09477">[Tang and Munos 2025, App. B]</a>:</p>
+  \[ \nabla_\theta\, \E_{a\sim\pi_\theta}[k(a)] = \underbrace{\E[\nabla_\theta k(a)]}_{\text{what autodiff computes}} + \underbrace{\E[k(a)\,\nabla_\theta\log\pi_\theta(a)]}_{\text{score-function part, missing}}. \]
+  <p>Work out what the first term is for each estimator, using \(\nabla r = -r\,\nabla\log\pi_\theta\) and the lemma \(\E_\pi[\nabla\log\pi] = 0\):</p>
+  <ul>
+    <li>\(\nabla k_1 = \nabla\log\pi_\theta\), whose expectation is <strong>0</strong>. A k1 loss adds noise and no regularization.</li>
+    <li>\(\nabla k_2 = \log r\,\nabla\log r = \ell\,\nabla\log\pi_\theta\), and \(\E_\pi[\ell\,\nabla\log\pi] = \nabla\KL(\pi_\theta\|\pi_{\text{ref}})\) exactly. <strong>k2 as a loss has the correct gradient.</strong></li>
+    <li>\(\nabla k_3 = (1 - r)\,\nabla\log\pi_\theta\), and \(\E_\pi[(1-r)\nabla\log\pi] = -\sum_a \pi_{\text{ref}}\nabla\log\pi_\theta = \nabla\KL(\pi_{\text{ref}}\|\pi_\theta)\). <strong>k3 as a loss descends the other direction of the KL</strong>, \(\KL(\pi_{\text{ref}}\|\pi_\theta)\), not the one it estimates.</li>
+  </ul>
+  <p>A numerical check with a 3-token softmax (logits \((0.3, -0.2, 0.5)\), \(\pi_{\text{ref}} = (0.4, 0.4, 0.2)\)), gradients with respect to the logits:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Quantity</th><th class="num">\(\partial/\partial z_1\)</th><th class="num">\(\partial/\partial z_2\)</th><th class="num">\(\partial/\partial z_3\)</th></tr></thead>
+    <tbody>
+      <tr><td>\(\nabla\,\KL(\pi_\theta\|\pi_{\text{ref}})\), the target</td><td class="num">−0.0985</td><td class="num">−0.1670</td><td class="num">0.2655</td></tr>
+      <tr><td>k1 as loss, exact expectation</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr class="hl"><td>k2 as loss</td><td class="num">−0.0985</td><td class="num">−0.1670</td><td class="num">0.2655</td></tr>
+      <tr><td>k3 as loss</td><td class="num">−0.0464</td><td class="num">−0.1855</td><td class="num">0.2319</td></tr>
+      <tr><td>\(\nabla\,\KL(\pi_{\text{ref}}\|\pi_\theta)\)</td><td class="num">−0.0464</td><td class="num">−0.1855</td><td class="num">0.2319</td></tr>
+    </tbody>
+  </table></div>
+  <p>The k3 row equals the other-direction KL gradient to four digits. The drill's gradient-identity test reproduces this table. Note the terminology trap: "reverse KL" means \(\KL(\pi_\theta\|\pi_{\text{ref}})\) in most RLHF writing but is sometimes used for the other direction, so always write the arguments.</p>
+
+  <p><strong>The sequence problem.</strong> There is a second gap. The full sequence-level gradient is \(\E[\sum_t \nabla\log\pi_t \sum_{s\ge t}\ell_s]\), while a per-token loss at best delivers the \(s = t\) terms: the effect of token \(a_t\) on <em>later</em> tokens' KL is dropped <a href="https://arxiv.org/abs/2506.09477">[Tang and Munos 2025, §4]</a>. The shaped-reward route of the previous subsection keeps all of them. For on-policy data, putting the estimator in <em>both</em> the reward (with stop-gradient) and the loss reproduces the full gradient for any unbiased estimator, and Shah et al. confirm that such configurations beat k3-in-loss <a href="https://arxiv.org/abs/2512.21852">[App. D.2]</a>.</p>
+  <p><strong>Off-policy.</strong> The samples usually come from \(\pi_{\text{old}}\), not \(\pi_\theta\), so even the value of k3 is estimated under the wrong distribution after the first minibatch. DeepSeek-V3.2 multiplies k3 by the ratio \(\pi_\theta/\pi_{\text{old}}\), which restores an unbiased KL and gradient estimate for the sampling distribution it actually has <a href="https://arxiv.org/abs/2512.02556">[§3.1, Eq. 7]</a>. In short: <strong>k1 in the reward is the safe default, k3 in the loss is a common regularizer that is not the gradient of what it claims, and k2 is the one whose autodiff gradient is right.</strong></p>
+</section>
+
+<section>
+  <h2 id="aggregation">Token level versus sequence level: credit, ratio and loss</h2>
+
+  <p>"Token-level" versus "sequence-level" names three separate choices that are often conflated. Keep them apart, because <a href="24-rlvr-reasoning.html">page 24</a> is built on exactly these distinctions.</p>
+
+  <h3 id="agg-credit">1. Credit: one advantage per response, or one per token</h3>
+  <p>With outcome supervision and a group baseline (GRPO, RLOO), the advantage of every token in response \(i\) is the same number: \(\hat A_{i,t} = \hat A_i\) <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §4.1.2]</a>. This is what "bandit-like" means in practice. The consequences for credit assignment:</p>
+  <ul>
+    <li>Nothing in one sample says <em>which</em> tokens caused the outcome. A token's update is the correlation between "this choice appeared" and "the outcome was good", and it only becomes informative by averaging over many samples of the same prompt. The signal-to-noise ratio of a prompt's gradient grows roughly like the square root of the group size.</li>
+    <li>Most tokens of a long derivation do not decide the outcome, so their gradient terms are noise. The estimator's variance grows with response length, which is one reason RL learning rates are small (\(10^{-6}\) in the recipes above).</li>
+    <li>A critic can in principle localize credit, since \(A_t = \delta_t\) is the change in predicted success caused by token \(t\). DeepSeekMath's argument against a critic is that with only the last token rewarded it "may complicate the training of a value function that is accurate at each token" <a href="https://arxiv.org/abs/2402.03300">[§4.1.1]</a>; VAPO's answer is that a well-engineered critic has a "higher performance ceiling" <a href="https://arxiv.org/abs/2504.05118">[Yue et al. 2025, §1]</a>. That is a claim from one group, so treat it as open. Process reward models (<a href="23-rlhf.html">page 23</a>) attack the same problem from the reward side.</li>
+  </ul>
+
+  <h3 id="agg-ratio">2. Importance ratio: per token or per sequence</h3>
+  <p>PPO and GRPO use the token ratio \(\rho_t = \pi_\theta(y_t|s_t)/\pi_{\text{old}}(y_t|s_t)\). A sequence-level ratio is the product \(\prod_t \rho_t = \pi_\theta(y|x)/\pi_{\text{old}}(y|x)\). GSPO uses its length-normalized geometric mean, and clips whole responses <a href="https://arxiv.org/abs/2507.18071">[Zheng et al. 2025, Eq. 5-7]</a>:</p>
+  \[ s_i(\theta) = \Big(\frac{\pi_\theta(y_i|x)}{\pi_{\text{old}}(y_i|x)}\Big)^{1/|y_i|} = \exp\Big(\frac{1}{|y_i|}\sum_{t=1}^{|y_i|}\log\rho_{i,t}\Big). \]
+  <p>Their argument is that importance sampling needs many samples of the behavior distribution to correct a mismatch, whereas a token ratio is computed from a single sample of each next-token distribution, so it "introduces high-variance noise" that accumulates with length, and "the unit of optimization objective should match the unit of reward". They report clipped-token fractions differing by two orders of magnitude (0.0013 for GSPO against 0.15 for GRPO) and more stable MoE training, where about 10% of activated experts change after each update on Qwen3-30B-A3B-Base <a href="https://arxiv.org/abs/2507.18071">[§3, §5.2-5.3]</a>. Read this alongside <a href="#offpolicy">the surrogate derivation</a>: the token ratio is the principled object when we want the first-order Kakade-Langford surrogate, and the product is the exact sequence-level importance weight but with variance that grows with length. Which is better in practice depends on how off-policy your data are, and the evidence so far comes from one group's MoE setting.</p>
+
+  <h3 id="agg-loss">3. Loss normalization: how per-token terms are averaged</h3>
+  <p>The exact policy-gradient estimator sums token terms and averages over responses. Implementations divide by something, and the divisor changes the weight each token's gradient gets. For response \(i\) with advantage \(A_i\) and \(|o_i|\) tokens, in a group of \(G\), the weight on \(\nabla\log\pi\) of each of its tokens is, up to a factor \(1/G\) common to all rows:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Normalization</th><th>Weight per token of \(o_i\)</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Exact estimator: sum over tokens, mean over responses</td><td>\(A_i\)</td><td>REINFORCE, RLOO</td></tr>
+      <tr><td>Sequence-mean: mean over tokens of each response, then over responses</td><td>\(A_i / |o_i|\)</td><td>GRPO; OpenRLHF's PPO loss <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, Listing 1]</a></td></tr>
+      <tr><td>Token-mean over the batch</td><td>\(A_i \,/\, \overline{|o|}\), with \(\overline{|o|} = \tfrac1G\sum_j |o_j|\)</td><td>DAPO <a href="https://arxiv.org/abs/2503.14476">[§3.3]</a>; TRL and verl PPO losses <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, Listing 1]</a></td></tr>
+      <tr><td>Constant divisor (for example the generation budget)</td><td>\(A_i / L_{\max}\)</td><td>Dr. GRPO <a href="https://arxiv.org/abs/2503.20783">[Liu et al. 2025, §3.2]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Worked example.</strong> Two responses to one prompt: a correct one with 2 tokens (\(A = +1\)) and an incorrect one with 8 tokens (\(A = -1\)). The exact estimator weights every token by \(|A| = 1\), so the totals per response are 2 and 8. Under sequence-mean the per-token weights are \(1/2\) and \(1/8\) and each response has total weight 1: a token in the long wrong answer is punished four times more lightly than a token in the short right answer is rewarded. Liu et al. show this pushes toward longer wrong answers, because for negative advantages a larger \(|o_i|\) means a smaller penalty per token <a href="https://arxiv.org/abs/2503.20783">[§3.1]</a>. Under token-mean the mean length is \(\overline{|o|} = 5\), every token has weight \(1/5\), the totals are 0.4 and 1.6, and the long response holds 80% of the weight. Under a constant divisor \(L_{\max} = 8\) every token has weight \(1/8\) and the totals are 0.25 and 1, proportional to the exact estimator's 2 and 8.</p>
+  <p>Liu et al. also checked several open PPO implementations (TRL, OpenRLHF, verl, SimpleRL-Zero, Open-Reasoner-Zero) and found all of them normalize by response length, so the "formulation-implementation misalignment" predates GRPO <a href="https://arxiv.org/abs/2503.20783">[§3.1, Tab. 2]</a>. DAPO reports that moving GRPO to a token-level loss lifted AIME 2024 from 41 to 42 (avg@32) and, more importantly, made length and entropy growth healthier <a href="https://arxiv.org/abs/2503.14476">[Tab. 1, §3.3]</a>. The drill's <code>ppo_clip_loss</code> takes <code>agg="token"</code> or <code>"seq"</code> for exactly this reason. Mean-weights are a modeling choice, not a bug fix: pick one deliberately and log response length.</p>
+</section>
+
+<section>
+  <h2 id="practical">Practicalities: whitening, scales, conventions, and the four-model footprint</h2>
+
+  <p>Most of what separates a PPO run that learns from one that does not is in this list. Each item has a reason, and each was learned the hard way.</p>
+  <ul>
+    <li><strong>Whiten advantages over the batch.</strong> Subtract the (masked) mean and divide by the standard deviation across all response tokens in the batch (<code>masked_whiten</code> in the drill). This makes the update invariant to a global rescaling of all rewards, so the learning rate need not be retuned when the rewards change units (the relative size of the reward-model score and \(\beta\ell_t\) still matters) <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, Detail 25]</a>. Do it across the batch, not per prompt: Liu et al. show that dividing by the per-prompt standard deviation gives prompts with near-uniform outcomes (too easy or too hard) higher weight, a "difficulty bias", whereas batch-level normalization is the standard trick <a href="https://arxiv.org/abs/2503.20783">[§3.1]</a>. In continuous control, per-minibatch advantage normalization "seems not to affect the performance too much" <a href="https://arxiv.org/abs/2006.05990">[Andrychowicz et al. 2021, §3.3]</a>.</li>
+    <li><strong>Fix the reward scale and offset.</strong> A reward model's output is defined only up to a shift, so InstructGPT adds a bias so that labeler demonstrations score 0 on average before RL <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>, and Ziegler et al. normalize to mean 0 and variance 1 on reference samples <a href="https://arxiv.org/abs/1909.08593">[§2]</a>. The scale relative to \(\beta\,\ell_t\) is what sets the effective KL strength. Reward whitening is optional; in Huang et al.'s ablation it made responses shorter and lowered the GPT-judged win rate, though length-controlled comparisons looked similar <a href="https://arxiv.org/abs/2403.17031">[Detail 24, §7.1]</a>.</li>
+    <li><strong>Reward at EOS, and what a truncated response gets.</strong> The reward model reads the EOS token, so a response without EOS has no defined score. Huang et al. assign a constant \(-1\) in that case, which also discourages rambling <a href="https://arxiv.org/abs/2403.17031">[Details 12, 23]</a>. The alternative is to bootstrap from the critic (the <code>last_value</code> argument of <code>gae</code>).</li>
+    <li><strong>Critic initialization and learning rate.</strong> Warm-starting the critic from the reward model is standard and can bias early advantages on long responses (<a href="#gae-llm">above</a>). In VC-PPO and VAPO the critic gets twice the actor's learning rate (2e-6 against 1e-6), because it must keep pace with a moving policy.</li>
+    <li><strong>Turn dropout off.</strong> With dropout the log-probabilities of the same tokens differ between passes, so \(\rho\) is not 1 on the first minibatch and the KL penalty is noisy <a href="https://arxiv.org/abs/2403.17031">[Huang et al. 2024, Detail 7]</a>.</li>
+    <li><strong>Compute \(\log\pi_{\text{old}}\) with the trainer's forward pass,</strong> and with the same temperature and sampling mask as the sampler. Truncated sampling (top-p, top-k) makes \(\pi_{\text{old}}\) live on a different action set from \(\pi_\theta\), which breaks importance sampling; DeepSeek-V3.2 saves the truncation masks at sampling time and reapplies them in training ("Keep Sampling Mask") <a href="https://arxiv.org/abs/2512.02556">[§3.1]</a>. Rollout engine versus trainer numerics is the subject of <a href="25-rl-systems-agentic.html">page 25</a>.</li>
+    <li><strong>Mask carefully.</strong> The response mask must exclude the prompt and padding, include the EOS token (it is an action and carries the reward), and be used identically in the ratio, the KL, the value loss and the whitening statistics.</li>
+    <li><strong>Watch a handful of numbers:</strong> mean reward, KL to the reference (per token and per sequence), fraction of clipped tokens, old-versus-new approximate KL, response length, critic explained variance, and policy entropy. Length collapse or explosion and entropy collapse are the classic failure signatures.</li>
+  </ul>
+
+  <h3 id="four-models">The four-model footprint (preview of page 23)</h3>
+  <p>PPO with a learned reward keeps four models resident: the <strong>policy</strong> (trained), the <strong>critic</strong> (trained), the <strong>reference</strong> policy (frozen, for the KL) and the <strong>reward model</strong> (frozen). Ahmadian et al. list exactly these as the cost of PPO for RLHF <a href="https://arxiv.org/abs/2402.14740">[§1]</a>. Take Llama-3-8B (8.03B parameters) and the 16 bytes per parameter for a model trained with mixed-precision Adam (<a href="15-distributed-training.html#states">page 15</a>): 16 B for the policy, 16 B for a critic of the same size, and 2 B (bf16 weights) for each frozen model.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Configuration</th><th>Models in memory</th><th class="num">Bytes per policy parameter</th><th class="num">Model states for 8.03B</th></tr></thead>
+    <tbody>
+      <tr><td>PPO, learned reward model, KL</td><td>policy, critic, reference, RM</td><td class="num">16 + 16 + 2 + 2 = 36</td><td class="num">289 GB</td></tr>
+      <tr><td>PPO, verifier reward, KL</td><td>policy, critic, reference</td><td class="num">34</td><td class="num">273 GB</td></tr>
+      <tr><td>GRPO, learned reward model, KL</td><td>policy, reference, RM</td><td class="num">20</td><td class="num">161 GB</td></tr>
+      <tr><td>GRPO, verifier reward, KL</td><td>policy, reference</td><td class="num">18</td><td class="num">145 GB</td></tr>
+      <tr class="hl"><td>GRPO or RLOO, verifier reward, \(\beta = 0\)</td><td>policy only</td><td class="num">16</td><td class="num">128 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Arithmetic: \(8.03\times10^9\ \text{params} \times 36\ \text{B} = 289.1\) GB, and \(\times 34 = 273.0\), \(\times 20 = 160.6\), \(\times 18 = 144.5\), \(\times 16 = 128.5\) GB. Model states only: no activations, no rollout KV cache, no sharding. The critic and reward model need not match the policy's size (InstructGPT used a 6B reward model and 6B value function for policies from 1.3B to 175B <a href="https://arxiv.org/abs/2203.02155">[App. C.4]</a>), and frozen models can be offloaded to CPU, as Huang et al. did for their 6.9B run <a href="https://arxiv.org/abs/2403.17031">[Detail 8]</a>.</p>
+  <p>This is the practical force behind critic-free methods: dropping the critic removes 16 of 36 bytes per parameter. <a href="23-rlhf.html">Page 23</a> covers the pipeline, and <a href="25-rl-systems-agentic.html">page 25</a> the cost of moving weights between the trainer and the rollout engine.</p>
+
+  <aside class="callout note">
+    <div class="callout-title">As of September 2026</div>
+    <p>Open reasoning-RL recipes are dominated by critic-free, group-baseline methods: DeepSeekMath introduced GRPO, and DeepSeek-V3.2 still trains with it, adding an off-policy correction to k3, sequence masking of stale negative samples, and "Keep Routing" for MoE models <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>. Critic-based PPO remains alive where teams engineer the critic: VAPO reports 60.4 on AIME 2024 with Qwen2.5-32B, against 50 for DAPO in the same setup <a href="https://arxiv.org/abs/2504.05118">[Yue et al. 2025]</a>. Neither camp has settled the question, and every number here is from a single lab's runs on a small benchmark. The derivations on this page apply to both: GRPO is REINFORCE with a group baseline, a token-level PPO clip and, optionally, a k3 loss.</p>
+  </aside>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Subtracting a baseline changes what you optimize."</strong> It changes only the variance. Any \(b\) that is fixed before the token is chosen has zero expected contribution (the score function has zero mean). What does bias the gradient is a baseline that peeks at the action or the outcome: a sample's own reward gives a rescaled \((1-1/G)\) gradient, and \(b = G_t\) gives zero.</li>
+    <li><strong>"PPO's clip keeps the ratio inside \([1-\epsilon, 1+\epsilon]\)."</strong> The clip only zeroes the gradient of tokens that have already moved outside on the improving side. The first minibatch is unclipped by construction, tokens share parameters, momentum carries on, and measured maximum ratios exceed the band. Track the clip fraction and the approximate KL instead of assuming a trust region.</li>
+    <li><strong>"GAE with \(\lambda = 0.95\) is a harmless default."</strong> It was tuned on locomotion with dense rewards. With \(\gamma = 1\), a terminal reward and thousands of tokens, the reward reaches token \(t\) scaled by \(\lambda^{T-t}\), essentially zero far from the end, so early tokens depend on the critic's bootstrapped predictions. Also keep \(\gamma = 1\): \(\gamma &lt; 1\) turns a terminal reward into an implicit length penalty \(\gamma^{T-1}\).</li>
+    <li><strong>"Adding \(\beta\,k_3\) to the loss minimizes \(\beta\,\KL(\pi_\theta\|\pi_{\text{ref}})\)."</strong> Autodiff of a k3 loss gives the gradient of \(\KL(\pi_{\text{ref}}\|\pi_\theta)\), per token, and misses the effect of a token on later tokens' KL. A k1 loss has zero expected gradient. Only k1 <em>in the reward</em> (or k2 as a token-level loss) has the right gradient.</li>
+    <li><strong>"k3 is strictly better than k1."</strong> It is unbiased, nonnegative and far less noisy when the policies are close. When the sampled token has \(\pi_\theta \ll \pi_{\text{ref}}\), \(r\) is large and k3's variance and gradient weights blow up (3-token example above: std 0.87 versus 0.52).</li>
+    <li><strong>"There is one KL in RLHF."</strong> The KL to the reference accumulates over a run (tens of nats) and is a regularizer. The KL between the old and the new policy is a per-update trust-region quantity (about 0.02 nats in the PPO paper's example). They have different scales and different coefficients.</li>
+    <li><strong>"PPO is an off-policy algorithm."</strong> It is near-on-policy: samples come from \(\pi_{\text{old}}\), the ratio corrects the action probabilities at the visited prefixes, and the clip limits how stale the data may become. The ratio does not correct the shift in which prefixes are visited, which is why the surrogate is only a local approximation.</li>
+    <li><strong>"Dividing the loss by response length is cosmetic."</strong> It changes each token's weight: with \(1/|o_i|\), a token in a long wrong answer is penalized less than one in a short wrong answer, biasing toward longer errors, and many PPO code bases do it by default. Choose the normalizer deliberately and log lengths.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Formulate LLM generation as an MDP. What are the state, action, transition and reward, and why is \(\gamma = 1\)?</summary>
+    <div class="answer">
+      <p>State \(s_t = (x, y_{&lt;t})\), the prompt plus the tokens so far. Action \(a_t = y_t\), the next token from the vocabulary; EOS is an action, so episode length is random. The policy \(\pi_\theta(a|s)\) is the LM's next-token distribution. The transition is deterministic: append the token. The reward is zero until the end, where a reward model or verifier scores the whole response; per-token KL terms may add small rewards along the way. The objective is \(J = \E_{x, y\sim\pi_\theta}[R(x,y)]\).</p>
+      <p>\(\gamma = 1\) because the horizon is finite and the reward is terminal: any \(\gamma &lt; 1\) multiplies the reward by \(\gamma^{T-1}\), an accidental length preference, and it biases the gradient of the true objective regardless of the critic (GAE paper). InstructGPT and Ziegler et al. use no discount. The same problem is a contextual bandit if you call the whole response one action; with a terminal reward the two give the same expected gradient.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is the log-derivative trick and why does RL for LLMs need it?</summary>
+    <div class="answer">
+      <p>\(\nabla p_\theta = p_\theta\,\nabla\log p_\theta\), so \(\nabla_\theta \E_{y\sim\pi_\theta}[R(y)] = \sum_y \nabla\pi_\theta(y) R(y) = \E_{y\sim\pi_\theta}[R(y)\,\nabla\log\pi_\theta(y)]\). It turns a gradient of an expectation into an expectation of a gradient that we can sample.</p>
+      <p>We need it for three reasons. The reward comes from a black box (a reward model evaluated on decoded text, or a program) and is not differentiable in \(\theta\). Sampling a discrete token is not differentiable either. And the sum over \(|\mathcal V|^T\) sequences cannot be enumerated. The estimator only evaluates \(R\) and differentiates \(\log\pi_\theta\), which factorizes into a sum over tokens. Its price is variance, which is what baselines and critics address.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why is a KL penalty to the reference model used in RLHF?</summary>
+    <div class="answer">
+      <p>The reward model is a proxy trained on samples near the SFT policy. Away from that distribution its scores are unreliable, and an optimizer finds the unreliable region: reward rises while true quality falls (over-optimization). Huang et al.'s 1B policies at 50 to 85 nats of summed KL had higher RLHF reward but were judged worse than reference summaries over 80% of the time, with garbled strings. The penalty keeps the policy in the region where the reward is valid, preserves fluency, and acts like an entropy bonus so the policy does not collapse to a single mode <a href="https://arxiv.org/abs/1909.08593">[Ziegler et al.]</a>.</p>
+      <p>It also has a clean meaning: \(J_\beta = \E[R] - \beta\,\KL(\pi\|\pi_{\text{ref}})\) has the closed-form optimum \(\pi^\star \propto \pi_{\text{ref}}\exp(R/\beta)\) (page 21). The coefficient is a trade-off: InstructGPT's best values were around 0.01 to 0.02, \(\beta = 0\) drifts, and a 100-fold larger \(\beta\) did not fix benchmark regressions. With a verifier reward that is hard to hack, long-CoT recipes such as DAPO drop the term entirely.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Where does the KL penalty enter in InstructGPT-style PPO, and where in GRPO?</summary>
+    <div class="answer">
+      <p><strong>PPO (InstructGPT):</strong> in the <em>reward</em>. Every token gets \(-\beta(\log\pi_\theta(a_t|s_t) - \log\pi_{\text{ref}}(a_t|s_t))\), the k1 estimator, and the last token also gets the reward-model score. These rewards pass through returns, GAE and the critic, so the policy gradient uses reward-to-go that includes future KL. That is the exact gradient of the KL-regularized objective.</p>
+      <p><strong>GRPO:</strong> in the <em>loss</em>. The advantage is the group-normalized outcome reward, untouched by KL, and \(\beta\,k_3\) with \(k_3 = \frac{\pi_{\text{ref}}}{\pi_\theta} - \log\frac{\pi_{\text{ref}}}{\pi_\theta} - 1\) is added per token, \(\beta = 0.04\) in DeepSeekMath. It is simpler, but the gradient of a k3 loss is that of the other KL direction and per token only (see the deep-dive question). DeepSeek-V3.2 multiplies it by \(\pi_\theta/\pi_{\text{old}}\) because samples come from the old policy.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the policy gradient. Why does subtracting a baseline not bias it?</summary>
+    <div class="answer">
+      <p><strong>Derivation.</strong> \(J = \sum_\tau p_\theta(\tau)R(\tau)\) with \(p_\theta(\tau) = \mathcal D(x)\prod_t\pi_\theta(a_t|s_t)\). Use \(\nabla p = p\nabla\log p\): \(\nabla J = \E_\tau[R(\tau)\nabla\log p_\theta(\tau)]\). The prompt term has no \(\theta\), so \(\nabla\log p_\theta(\tau) = \sum_t\nabla\log\pi_\theta(a_t|s_t)\). Causality: for \(t'&lt;t\), \(\E[r_{t'}\nabla\log\pi(a_t|s_t)] = 0\) because \(r_{t'}\) is fixed by the prefix and \(\E_{a_t}[\nabla\log\pi(a_t|s_t)] = 0\). So \(\nabla J = \E[\sum_t\nabla\log\pi_\theta(a_t|s_t)\,G_t]\) with reward-to-go \(G_t\).</p>
+      <p><strong>Baseline.</strong> For any \(b(s_t)\) independent of \(a_t\): \(\E[\nabla\log\pi(a_t|s_t)\,b(s_t)] = \E[b(s_t)\sum_a\nabla\pi(a|s_t)] = \E[b(s_t)\,\nabla 1] = 0\). Only the variance changes. It fails if \(b\) depends on \(a_t\) or on the sample's own outcome (\(b = G_t\) zeroes the estimator; a group mean including the sample rescales the gradient by \(1-1/G\)). The variance-minimizing scalar baseline is \(\E[\|\nabla\log\pi\|^2G]/\E[\|\nabla\log\pi\|^2]\), close to \(V(s_t)\) when the score norm is roughly independent of the return.</p>
+      <p>A sanity example: a 2-token MDP with reward 1 only for "11" has \(\nabla J = (0.125, 0, 0.125)\); the estimator's variance is 0.094 with no baseline, 0.0625 with \(b = J\) and 0.047 with \(b = V(s_t)\), all with the same mean.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is the advantage function and how does GAE estimate it?</summary>
+    <div class="answer">
+      <p>\(A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)\): how much better action \(a\) is than the policy's average action in \(s\). In an LLM the next state is a deterministic function of \((s,a)\), so \(Q(s_t,a_t) = r_t + V(s_{t+1})\) and \(A_t = \delta_t = r_t + V(s_{t+1}) - V(s_t)\) with the true \(V\). With a terminal verifier reward, \(A_t\) is the change in predicted success caused by token \(t\).</p>
+      <p>We only have a learned \(V_\phi\). The \(k\)-step estimate \(\hat A^{(k)}_t = \sum_{l&lt;k}\gamma^l\delta_{t+l}\) trades bias (\(k\) small, critic errors) against variance (\(k\) large, noisy returns). GAE takes the geometric average \((1-\lambda)\sum_k\lambda^{k-1}\hat A^{(k)}\), which collapses to \(\hat A_t = \sum_{l\ge0}(\gamma\lambda)^l\delta_{t+l} = \delta_t + \gamma\lambda\hat A_{t+1}\), an \(O(T)\) backward recursion. \(\lambda = 0\) gives \(\delta_t\), \(\lambda = 1\) gives the Monte-Carlo return minus \(V\). The paper's key point: \(\gamma&lt;1\) biases the objective whatever \(V\) is, while \(\lambda&lt;1\) biases only through critic error. The critic is trained on \(\hat A + V_{\text{old}}\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain PPO's clipped objective. What happens for positive and negative advantages?</summary>
+    <div class="answer">
+      <p>With \(\rho_t = \pi_\theta(a_t|s_t)/\pi_{\text{old}}(a_t|s_t)\), the per-token objective is \(\min(\rho_t\hat A_t,\ \clip(\rho_t,1-\epsilon,1+\epsilon)\hat A_t)\), \(\epsilon\approx0.2\). It equals \(\rho\hat A\) near \(\rho=1\), so the first step is the ordinary policy gradient.</p>
+      <p><strong>\(\hat A&gt;0\):</strong> the objective is \(\hat A\min(\rho, 1+\epsilon)\). Once \(\rho&gt;1+\epsilon\) it is flat: gradient zero, no reward for making a good token even more likely. If \(\rho&lt;1-\epsilon\) (the good token got less likely) the unclipped term is the min, so the gradient stays and pushes it back up. <strong>\(\hat A&lt;0\):</strong> mirror image. Below \(1-\epsilon\) it is flat (already pushed down enough); above \(1+\epsilon\) the unclipped term is smaller, so the gradient continues to push the token down. The min is what keeps the recovery direction alive: we ignore a ratio change only when it would improve the objective, never when it would worsen it, so the objective is a pessimistic lower bound on the surrogate.</p>
+      <p>Numerically with \(\epsilon=0.2\), \(A=+1\): \(\rho=1.3\) gives \(L=1.2\), gradient 0; \(\rho=0.5\) gives \(L=0.5\), gradient \(\rho A\). It does not enforce the band; it only removes the incentive.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compare the k1, k2, k3 KL estimators.</summary>
+    <div class="answer">
+      <p>Samples \(a\sim\pi_\theta\), \(r = \pi_{\text{ref}}(a|s)/\pi_\theta(a|s)\), target \(\KL(\pi_\theta\|\pi_{\text{ref}})\) (Schulman). <strong>k1</strong> \(= -\log r\): unbiased, but negative whenever \(\pi_\theta&lt;\pi_{\text{ref}}\) on the sample, so high variance (std 20 times the KL at KL 0.005). <strong>k2</strong> \(= \frac12(\log r)^2\): nonnegative, low variance, biased, but small for nearby policies (0.2% of the KL at KL 0.005, 25% at KL 0.5) because its expectation is an \(f\)-divergence with \(f''(1)=1\), which agrees with the KL to second order. <strong>k3</strong> \(= (r-1)-\log r\): k1 plus the zero-mean control variate \(r-1\); unbiased, nonnegative (\(\log r\le r-1\)), and about as low-variance as k2 (std 1.42 and 1.7 times the KL in the two Gaussian cases).</p>
+      <p>Caveats. When \(r\) can be large (policy suppressed tokens the reference likes) k3's tail is heavy: in a 3-token example its std was 0.87 against k1's 0.52. As gradients: a k1 loss has zero expected gradient, a k2 loss has the exact gradient of \(\KL(\pi_\theta\|\pi_{\text{ref}})\), a k3 loss has the gradient of \(\KL(\pi_{\text{ref}}\|\pi_\theta)\). Usage: k1 in the reward (PPO/InstructGPT), k3 in the loss (GRPO).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why is RL on LLMs usually "bandit-like", and what does that imply for credit assignment?</summary>
+    <div class="answer">
+      <p>The reward is attached to the whole response, and transitions are deterministic, so nothing in the environment differentiates between tokens. Formally, with \(\gamma=1\) and a terminal reward, \(G_t = R\) for every \(t\), and \(\E[\sum_t\nabla\log\pi_t\,R] = \E[R\,\nabla\log\pi(y|x)]\): the bandit gradient. InstructGPT literally describes its environment as a bandit. Ahmadian et al. argue partial sequences need not be modeled and get better results from REINFORCE/RLOO than from PPO in their RLHF setup.</p>
+      <p>The implication: with a group or moving-average baseline every token of a response gets the same advantage. A token's update is the correlation of its presence with the outcome, and it becomes informative only across many samples per prompt. Most tokens do not decide the outcome, so gradient noise grows with length. To localize credit you need something token-level: a critic (\(A_t=\delta_t\) is the change in predicted success, but the critic is hard to train on sparse terminal rewards, and \(\lambda&lt;1\) starves early tokens), a process reward model, or per-token KL terms (which are token-level but carry no task information). VAPO argues an engineered critic reaches a higher ceiling; that is one group's result.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> On-policy versus off-policy: where does PPO sit, and why does that matter for sample reuse?</summary>
+    <div class="answer">
+      <p>The policy gradient theorem requires samples from the current policy: on-policy. PPO collects a batch with \(\pi_{\text{old}}\) and then takes several minibatch or epoch updates, during which \(\pi_\theta\) drifts from \(\pi_{\text{old}}\): mildly off-policy. The importance ratio \(\rho_t\) reweights each token to its probability under \(\pi_\theta\), and the clip limits how far the data may go stale. Exactly on-policy at the first update (\(\rho=1\)), increasingly off-policy afterwards.</p>
+      <p>It matters because generation is the expensive part: reuse divides the cost per update. InstructGPT takes 8 minibatches per batch, Ziegler et al. and Huang et al. 4 epochs. The costs: the ratio corrects only action probabilities at visited prefixes, not the shift in which prefixes occur (so the surrogate is first-order), stale samples need clipping or masking, and the mismatch is worse with asynchronous rollouts or different numerics in sampler and trainer (page 25). DeepSeekMath does a single update per batch, so the clip is inactive and the algorithm is on-policy.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: for a 4-token response with \(\gamma=1\), terminal reward 1 and critic values \(V(s_1..s_4)=0.4, 0.5, 0.6, 0.9\), compute GAE for \(\lambda=0.9\) and \(\lambda=1\). What changes if the critic outputs 0?</summary>
+    <div class="answer">
+      <p>\(V(s_5)=0\). Residuals: \(\delta_1 = 0.5-0.4 = 0.1\), \(\delta_2 = 0.6-0.5 = 0.1\), \(\delta_3 = 0.9-0.6 = 0.3\), \(\delta_4 = 1+0-0.9 = 0.1\).</p>
+      <p>\(\lambda=0.9\), backward: \(\hat A_4 = 0.1\); \(\hat A_3 = 0.3+0.9\cdot0.1 = 0.39\); \(\hat A_2 = 0.1+0.9\cdot0.39 = 0.451\); \(\hat A_1 = 0.1+0.9\cdot0.451 = 0.5059\). \(\lambda=1\): \(\hat A_t = 1-V(s_t) = 0.6, 0.5, 0.4, 0.1\) (check: \(0.1+0.1+0.3+0.1 = 0.6\)).</p>
+      <p>If \(V\equiv0\), all intermediate residuals vanish, so \(\hat A_t = \lambda^{4-t}\): \(0.729, 0.81, 0.9, 1\) for \(\lambda=0.9\) and all ones for \(\lambda=1\); \(\lambda=0\) credits only the last token. The decay factor per token is \(\lambda\), which for a 1,000-token response with \(\lambda=0.95\) is \(5\times10^{-23}\): only bootstrapping through the critic can carry credit to early tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Show that PPO with one update per batch reduces to vanilla policy gradient. When does the clip actually matter?</summary>
+    <div class="answer">
+      <p>Before any update \(\theta = \theta_{\text{old}}\), so \(\rho_t = 1\) for every token, inside the band. The gradient of \(\rho_t\hat A_t\) is \(\rho_t\hat A_t\nabla\log\pi_\theta = \hat A_t\nabla\log\pi_\theta\): the policy gradient with advantage \(\hat A\). With a single update per batch the clip is never active, which is why DeepSeekMath's analysis sets \(\pi_{\text{old}} = \pi_\theta\) and drops the min and the clip. (In practice you need identical numerics between the pass that produced \(\log\pi_{\text{old}}\) and the training pass: dropout off, same kernels.)</p>
+      <p>The clip matters only when \(\rho\ne1\): several updates per batch, asynchronous or stale rollouts, or numerics mismatch. Ahmadian et al. measured clipping active on under 5% of tokens in RLHF and saw no loss when removing it. In the PPO paper's MuJoCo setup (10 epochs over each batch) it matters: with neither clip nor penalty the normalized score was \(-0.39\). Monitor the clip fraction: near zero means the clip is decorative, large means the updates are too aggressive for the data reuse.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: a PPO run on a verifiable-reward reasoning task shows response length collapsing within a few hundred steps and validation accuracy falling. How do you diagnose and fix it?</summary>
+    <div class="answer">
+      <p>Length collapse with a verifier means the policy is being paid to be short, and the KL is not the cause (\(\beta\) is 0 or tiny). Candidates, in order of what to check: (1) <strong>Advantage versus token position.</strong> Plot the mean advantage by position: VC-PPO found a strong positive bias at early tokens, growing toward the start. (2) <strong>Critic initialization:</strong> a critic copied from a reward model, trained only to score EOS, undervalues early prefixes, so \(\delta_t\) is positive on average and accumulates backward. (3) <strong>\(\lambda&lt;1\):</strong> the terminal reward reaches early tokens as \(\lambda^{T-t}\), so the advantage is dominated by these biased bootstrap terms. (4) <strong>Loss normalization:</strong> \(1/|o_i|\) penalizes long wrong answers less per token.</p>
+      <p>Fixes: pretrain the critic on Monte-Carlo returns (\(\lambda=1\)) of a fixed policy until explained variance is high; decouple GAE (\(\lambda_{\text{critic}}=1\) for the regression target, \(\lambda_{\text{actor}}\approx0.95\) for the policy), or use a length-adaptive \(\lambda\); use a token-level or constant-normalized loss; verify truncation handling. In VC-PPO's 8k ablation, PPO reached 5.6 on AIME 2024, value pretraining alone 29.4 and with decoupled GAE 41.9, above GRPO's 35.8 (single lab, small benchmark). The fallback is to drop the critic for a group baseline.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why does putting k3 in the loss not give the gradient of \(\KL(\pi_\theta\|\pi_{\text{ref}})\)? Derive it, and say what you would do instead.</summary>
+    <div class="answer">
+      <p>Autodiff differentiates the integrand with the sampled token frozen, but \(\nabla\E_{a\sim\pi_\theta}[k] = \E[\nabla k] + \E[k\,\nabla\log\pi_\theta]\): it misses the score-function term. With \(r = \pi_{\text{ref}}/\pi_\theta\) and \(\nabla r = -r\nabla\log\pi_\theta\): \(\nabla k_3 = (1-r)\nabla\log\pi_\theta\), so \(\E_\pi[\nabla k_3] = -\E_\pi[r\nabla\log\pi] = -\sum_a\pi_{\text{ref}}(a)\nabla\log\pi_\theta(a) = \nabla\KL(\pi_{\text{ref}}\|\pi_\theta)\): the other direction. By contrast \(\nabla k_1 = \nabla\log\pi_\theta\) has zero mean, and \(\nabla k_2 = \ell\nabla\log\pi_\theta\) with \(\ell=\log(\pi_\theta/\pi_{\text{ref}})\) has expectation \(\nabla\KL(\pi_\theta\|\pi_{\text{ref}})\). A 3-token check: target gradient \((-0.0985,-0.1670,0.2655)\); k2 gives the same, k3 gives \((-0.0464,-0.1855,0.2319)\), which equals the reverse-direction KL gradient.</p>
+      <p>Two more gaps: a per-token loss omits the effect of \(a_t\) on later tokens' KL (the \(\sum_{s&gt;t}\ell_s\) terms), and after the first minibatch the samples come from \(\pi_{\text{old}}\). Options: put k1 in the <em>reward</em> (exact on-policy, includes future KL via returns); or use the estimator in both reward and loss; or use k2 as a token-level loss; or keep k3 but multiply by \(\pi_\theta/\pi_{\text{old}}\) as DeepSeek-V3.2 does. Empirically (Shah et al.), k1-in-reward beat k3-in-loss, which was stable but consistently worse; at very small \(\beta\) the gaps are small.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> What does the PPO clip not guarantee? How would you detect and fix ratio blow-ups in a large RL run?</summary>
+    <div class="answer">
+      <p>It does not bound \(\rho\). It only zeroes the gradient of tokens that are already outside the band on the improving side. Engstrom et al. found the maximum ratio consistently exceeding \(1+\epsilon\) on MuJoCo and argued that the effective trust region depends on the optimizer. On the worsening side there is no cap at all: for \(\hat A&lt;0\) and \(\rho&gt;1+\epsilon\) the gradient is \(\rho\hat A\nabla\log\pi\), which grows with \(\rho\), so one exploded ratio produces a huge update.</p>
+      <p>Sources: too many epochs or too high a learning rate; Adam momentum; dropout; \(\log\pi_{\text{old}}\) from a sampler whose numerics or truncation (top-p) differ from the trainer's; in MoE models, routing that changes after a few updates (Qwen reports about 10% of activated experts changing per update on Qwen3-30B-A3B). Detection: log the maximum and 99th-percentile ratio, clip fraction, old-versus-new approximate KL, and ratio on the first minibatch (must be 1). Fixes: recompute \(\log\pi_{\text{old}}\) in the trainer with the same masks and temperature; disable dropout; fewer or smaller updates; gradient clipping; mask sequences whose mean log-ratio exceeds a threshold (DeepSeek-V3.2's off-policy sequence masking for negative-advantage samples); for MoE, replay the routing (Keep Routing) or use a sequence-level ratio (GSPO).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Trade-off: would you choose PPO with a critic or a critic-free method (RLOO or GRPO) for (a) chat RLHF with a learned reward model and (b) long-CoT RL with a verifier?</summary>
+    <div class="answer">
+      <p><strong>Costs.</strong> PPO keeps four models (about 36 bytes per parameter of model state for an 8B policy with a same-size critic and RM) against 20 for GRPO with an RM and 16 for a verifier without KL. Critic-free methods spend the saving on \(G\) samples per prompt, which raises generation cost, and prompts whose samples are all correct or all wrong give zero advantage (DAPO's dynamic sampling filters them). PPO can use one sample per prompt.</p>
+      <p><strong>(a) Chat RLHF, responses of hundreds of tokens, dense scalar RM scores.</strong> The critic is easier to train at this length and PPO is the reference method, but Ahmadian et al. found RLOO beat their PPO on TL;DR and HH (e.g. 77.9 versus 67.6 win rate) with less memory. I would start with RLOO or GRPO with KL in the reward or a corrected k3 and reach for PPO if variance or credit assignment is the bottleneck. Watch reward hacking and length bias (page 23). <strong>(b) Long CoT with a binary verifier.</strong> Critic training is hard and \(\lambda&lt;1\) starves early tokens, so a group baseline is the robust default (with token-level or constant normalization, clip-higher, and \(\beta=0\)). A carefully engineered critic (value pretraining, decoupled and length-adaptive GAE) reportedly wins (VAPO 60.4 versus DAPO 50 on AIME 2024), but that is one group's result on one benchmark and needs expertise and budget. I would decide by measuring critic explained variance early: if it stays low, use the group baseline.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Policy-gradient building blocks.</strong> Implement five functions with masks and shape conventions for padded responses: <code>reinforce_loss</code> (reward-to-go, per-token or per-response baseline, no gradient through the advantage), <code>gae</code> (backward recursion with the terminal convention: zero after EOS, bootstrap only for truncated rows), <code>ppo_clip_loss</code> (with an <code>eps_high</code> option for clip-higher and <code>agg</code> for token- versus sequence-mean), <code>kl_estimators</code> (k1, k2, k3 with a numerically stable k3), and <code>masked_whiten</code>. The tests are self-contained: the REINFORCE estimator is checked for unbiasedness against the exact gradient of the two-token MDP of this page for three different baselines, and for the variances 0.094, 0.0625 and 0.047. GAE is compared with a brute-force double sum and with the worked example (0.61012 for \(\lambda=0.95\)). The PPO loss is tested in all four clip regions, and the KL estimators are tested for unbiasedness, nonnegativity of k3, float32 stability, and the gradient identities of the KL section. Budget 40 minutes; an interviewer would expect <code>gae</code> and <code>ppo_clip_loss</code> in about 20. <span class="ex-path">exercises/drills/pg.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_pg.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://link.springer.com/article/10.1007/BF00992696">Williams (1992). Simple statistical gradient-following algorithms for connectionist reinforcement learning. Machine Learning 8.</a> <span class="why">Why read it: the origin of REINFORCE, the log-derivative estimator and baselines.</span></li>
+    <li><a href="https://proceedings.neurips.cc/paper_files/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf">Sutton, McAllester, Singh, Mansour (1999). Policy gradient methods for reinforcement learning with function approximation. NeurIPS.</a> <span class="why">Why read it: the policy gradient theorem in state-action form, with the state distribution left undifferentiated.</span></li>
+    <li><a href="https://arxiv.org/abs/1502.05477">Schulman et al. (2015). Trust Region Policy Optimization.</a> <span class="why">Why read it: the improvement identity, the surrogate, and the bound that motivates trust regions (Thm. 1 and App. A).</span></li>
+    <li><a href="https://arxiv.org/abs/1506.02438">Schulman et al. (2016). High-dimensional continuous control using generalized advantage estimation.</a> <span class="why">Why read it: GAE, the \(\gamma\) versus \(\lambda\) argument, and the reward-shaping view (§3-4).</span></li>
+    <li><a href="https://arxiv.org/abs/1707.06347">Schulman et al. (2017). Proximal Policy Optimization Algorithms.</a> <span class="why">Why read it: the clipped objective, Figure 1 and Table 1; only 8 pages of content.</span></li>
+    <li><a href="http://joschu.net/blog/kl-approx.html">Schulman (2020). Approximating KL divergence (blog).</a> <span class="why">Why read it: k1, k2, k3, their bias and variance, and the control-variate derivation of k3.</span></li>
+    <li><a href="https://arxiv.org/abs/1909.08593">Ziegler et al. (2019). Fine-tuning language models from human preferences.</a> <span class="why">Why read it: the KL-shaped reward \(R = r - \beta\log\pi/\rho\), the adaptive \(\beta\) controller, and PPO details for LMs.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.02155">Ouyang et al. (2022). Training language models to follow instructions with human feedback.</a> <span class="why">Why read it: the bandit environment, per-token KL, critic from the RM, and the hyperparameters in App. C.4.</span></li>
+    <li><a href="https://arxiv.org/abs/2403.17031">Huang et al. (2024). The N+ implementation details of RLHF with PPO.</a> <span class="why">Why read it: the 20-odd implementation details that decide whether RLHF PPO works (EOS trick, whitening, value init).</span></li>
+    <li><a href="https://arxiv.org/abs/2506.09477">Tang and Munos (2025). On a few pitfalls in KL divergence gradient estimation for RL.</a> <span class="why">Why read it: what autodiff gives you for k1, k2, k3 as losses, and the sequence-level gradient.</span></li>
+  </ol>
+  <p class="small muted">Cited above and worth opening next: Engstrom et al. 2020 (<a href="https://arxiv.org/abs/2005.12729">2005.12729</a>, implementation matters), Yuan et al. 2025 (<a href="https://arxiv.org/abs/2503.01491">2503.01491</a>, VC-PPO), Shah et al. 2026 (<a href="https://arxiv.org/abs/2512.21852">2512.21852</a>, KL estimator configurations), Ahmadian et al. 2024 (<a href="https://arxiv.org/abs/2402.14740">2402.14740</a>, RLOO).</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>MDP: \(s_t = (x, y_{&lt;t})\), \(a_t = y_t\), deterministic transitions, reward at EOS (plus per-token KL), \(\gamma = 1\). \(\pi_\theta\) is the LM.</li>
+      <li>Policy gradient: \(\nabla J = \E[\sum_t\nabla\log\pi(a_t|s_t)\,G_t]\); baseline \(b(s_t)\) is free (lemma: \(\E_a[\nabla\log\pi(a|s)] = 0\)); terminal reward gives \(G_t = R\), the bandit gradient.</li>
+      <li>Advantage \(A = Q - V\); in an LLM \(A_t = \delta_t = r_t + V(s_{t+1}) - V(s_t)\) exactly. Optimal scalar baseline \(\E[\|\nabla\log\pi\|^2G]/\E[\|\nabla\log\pi\|^2]\approx V\).</li>
+      <li>GAE: \(\hat A_t = \sum_l(\gamma\lambda)^l\delta_{t+l} = \delta_t + \gamma\lambda\hat A_{t+1}\). \(\lambda=0\): \(\delta_t\); \(\lambda=1\): return minus \(V\). \(\gamma&lt;1\) always biases, \(\lambda&lt;1\) only via critic error. Terminal reward with \(V=0\): \(\hat A_t = \lambda^{T-t}R\).</li>
+      <li>Toy MDP numbers: \(\nabla J = (0.125, 0, 0.125)\); variance 0.094 / 0.0625 / 0.047 for \(b\) = 0 / \(J\) / \(V(s_t)\). GAE 5-token example: \(\hat A_1 = 0.61012\) (\(\lambda=0.95\)), \(0.70\) (\(\lambda=1\)).</li>
+      <li>PPO: \(\rho = \pi_\theta/\pi_{\text{old}}\); \(L = \min(\rho A, \clip(\rho, 1\pm\epsilon)A)\), \(\epsilon = 0.2\). \(A&gt;0\): flat above \(1+\epsilon\); \(A&lt;0\): flat below \(1-\epsilon\); the other sides keep their gradient. Not a hard constraint; first minibatch has \(\rho = 1\).</li>
+      <li>Critic: head on the hidden state at the position that emits \(a_t\); loss \(\tfrac12(V - \hat R)^2\), \(\hat R = \hat A + V_{\text{old}}\); value clipping is contested; VC-PPO: \(\lambda_{\text{critic}}=1\), \(\lambda_{\text{actor}}=0.95\), value pretraining.</li>
+      <li>KL: reward form \(r_t = -\beta(\log\pi_\theta - \log\pi_{\text{ref}})\) (k1, exact gradient); loss form \(\beta k_3\) (GRPO, \(\beta=0.04\)). \(\beta\): 0.02 (InstructGPT), 0.05 (Huang), 0 for verifier long-CoT. Adaptive: \(\beta \leftarrow \beta(1 + 0.1\,\clip(\cdot,\pm0.2))\).</li>
+      <li>Estimators (samples \(\sim\pi_\theta\), \(r = \pi_{\text{ref}}/\pi_\theta\)): \(k_1 = -\log r\) (unbiased, noisy), \(k_2 = \tfrac12\log^2 r\) (biased, low var), \(k_3 = r - 1 - \log r\) (unbiased, \(\ge0\), heavy tail if \(r\gg1\)). As losses: k1 gives 0, k2 gives \(\nabla\KL(\pi\|\pi_{\text{ref}})\), k3 gives \(\nabla\KL(\pi_{\text{ref}}\|\pi)\).</li>
+      <li>Level: credit (per token vs per response), ratio (token \(\rho_t\) vs GSPO \(\rho^{1/|y|}\)), loss normalizer (\(1/|o_i|\) vs token-mean vs constant). Memory per 8B policy: PPO 36 B/param, GRPO+RM 20, verifier no KL 16.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

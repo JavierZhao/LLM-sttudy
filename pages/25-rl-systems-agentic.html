@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>25 · RL systems &amp; agentic RL · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="25" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part V · Reinforcement learning · Page 25</div>
+  <h1>RL systems &amp; agentic RL</h1>
+  <div class="meta">
+    <span class="badge p1">P1</span>
+    <span>~50 min</span>
+    <span>Prereqs: <a href="17-inference-serving.html">17 Inference &amp; serving</a>, <a href="22-rl-foundations.html">22 RL foundations</a>, <a href="24-rlvr-reasoning.html">24 RLVR &amp; reasoning</a></span>
+  </div>
+  <p class="lede">Large-scale reinforcement learning <span class="zh">强化学习</span> for language models is mostly a systems problem. Generating rollouts costs more GPU time than learning from them, the engine that samples is not numerically the engine that trains, and agents add slow environments on top. This page covers the anatomy of an RL step, how colocated, disaggregated and asynchronous systems trade idle GPUs against staleness, why training-inference mismatch silently corrupts the importance ratio and how it is fixed, and how multi-turn tool-use training is set up: loss masks, environments, rewards without verifiers, reward hacking, and what to monitor.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Back-of-envelope for an RL step:</strong> tokens generated, GPU-hours for generation versus training, and how to split GPUs between the two. "Why is rollout the bottleneck?" needs an answer with numbers, not adjectives.</li>
+    <li><strong>System design trade-offs:</strong> colocated versus disaggregated, synchronous versus asynchronous, partial rollouts, what staleness costs and how it is bounded.</li>
+    <li><strong>Training-inference mismatch:</strong> why the same weights give different log-probs in vLLM and in the trainer, why the PPO clip does not fix it, truncated importance sampling, sequence-level versus token-level ratios, MoE routing.</li>
+    <li><strong>Agentic RL setup:</strong> what is masked out of the loss, why token IDs must not be re-tokenized, trajectory-level versus turn-level credit, environments and sandboxes, context management.</li>
+    <li><strong>Rewards and failure modes:</strong> rubric and generative rewards for tasks without a verifier, reward hacking in coding agents, and which run metrics catch trouble early.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Split an RL step into rollout, reward, log-probability passes, update and weight sync, and estimate the GPU-time share of each for a given model, batch and response length.</li>
+    <li>Explain why generation dominates (bandwidth-bound decode plus a heavy-tailed length distribution), and derive the GPU split that balances a disaggregated rollout pool against the trainer.</li>
+    <li>Compare colocated, disaggregated-synchronous and asynchronous designs, state AReaL's staleness rule and the buffer bound it implies, and say why partial rollouts can bias response lengths.</li>
+    <li>Write the importance ratio as a training-inference factor times a staleness factor, compute how a per-token log-probability gap compounds with length, and choose among truncated importance sampling, sequence masking, length-normalized ratios, routing replay and batch-invariant kernels.</li>
+    <li>Build the token-provenance loss mask for a multi-turn tool-use trajectory and explain token-in-token-out.</li>
+    <li>Describe how DeepSeek-V3.2 and Kimi K2 build agentic RL environments and rewards, list common reward hacks in coding environments, and name the metrics to log during a run.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="anatomy">Anatomy of an RL step, and why generation dominates</h2>
+
+  <p>One iteration of the GRPO-style loop from <a href="22-rl-foundations.html">page 22</a> and <a href="24-rlvr-reasoning.html">page 24</a> (no critic) has five phases. Each runs on different software and is limited by a different resource.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Phase</th><th>What happens</th><th>Runs on</th><th>Limited by</th></tr></thead>
+    <tbody>
+      <tr><td>1. Rollout</td><td>Sample \(G\) responses (or multi-turn trajectories) for each of \(P\) prompts from the current policy</td><td>Inference engine <span class="zh">推理引擎</span> (vLLM, SGLang) with continuous batching and paged KV cache (<a href="17-inference-serving.html">page 17</a>)</td><td>HBM bandwidth, KV capacity, the longest response</td></tr>
+      <tr><td>2. Reward</td><td>Score each response: string or numeric verifier, unit tests in a sandbox, LLM judge, reward model</td><td>CPU workers, sandboxes, judge GPUs</td><td>Sandbox startup, test runtime, judge latency</td></tr>
+      <tr><td>3. Log-prob passes</td><td>Recompute \(\log \pi_{\text{old}}\) on the trainer (the PPO denominator) and \(\log \pi_{\text{ref}}\) if a KL term is used</td><td>Trainer stack (FSDP or Megatron, <a href="15-distributed-training.html">page 15</a>)</td><td>Compute: \(2N\) FLOPs per token per pass</td></tr>
+      <tr><td>4. Update</td><td>Forward and backward on the unmasked tokens, optimizer step (one or several minibatches)</td><td>Trainer stack</td><td>Compute: \(6N\) FLOPs per token, memory</td></tr>
+      <tr><td>5. Weight sync</td><td>Push the new weights to the inference engines, resharding from the training layout to the engine's (different tensor parallelism, possibly different dtype)</td><td>NCCL, RDMA, a checkpoint engine</td><td>Network bandwidth, engine wake-up or restart</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="why-generation">Why generation dominates</h3>
+  <p>Count FLOPs first. Generation costs \(2N\) FLOPs per token (forward only). Training costs \(6N\) per token (forward plus backward), and with the old-policy and reference log-probability passes about \(10N\) per trained token. On FLOPs alone, training looks five times more expensive. But FLOPs are not time. Decoding one token per sequence per step is memory-bound (<a href="06-decoding-kv-cache.html#intensity">page 06</a>, <a href="07-kv-efficient-attention.html#bandwidth">page 07</a>): every step streams all the weights plus each sequence's KV cache from HBM, and at 8K-token responses the KV cache is the larger of the two. So the engine runs at a few percent of peak FLOP/s while the trainer runs at roughly 40% MFU (Llama 3 reports 38 to 43% on H100s, <a href="15-distributed-training.html#mfu">page 15</a>). Per token, generation ends up costing as much GPU time as training or more, and RL trains on every token it generates. The worked numbers below make this concrete.</p>
+
+  <p>Measured splits agree that rollout takes the majority of an iteration:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Source</th><th>Setting</th><th class="num">Rollout share of iteration time</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3">Seer <a href="https://arxiv.org/abs/2511.14617">[Qin et al. 2025, Tab. 1]</a></td><td>Moonlight</td><td class="num">84% (training 14%, weight update 2%)</td></tr>
+      <tr><td>Qwen2-VL-72B</td><td class="num">63% (31%, 6%)</td></tr>
+      <tr><td>Kimi-K2</td><td class="num">87% (10%, 3%)</td></tr>
+      <tr><td>GiGPO <a href="https://arxiv.org/abs/2505.10978">[Feng et al. 2025, Fig. 6]</a></td><td>Qwen2.5-1.5B agent on ALFWorld</td><td class="num">222 s of 363 s = 61% (my arithmetic)</td></tr>
+      <tr><td>HybridFlow <a href="https://arxiv.org/abs/2409.19256">[Sheng et al. 2024, §8.2]</a></td><td>NeMo-Aligner, whose generation stage lacked a KV cache</td><td class="num">up to 81.2%</td></tr>
+      <tr><td>OpenRLHF <a href="https://arxiv.org/abs/2405.11143">[Hu et al. 2024, v6 §1]</a></td><td>RLHF and RLVR with long chain of thought</td><td class="num">"over 90%" (their claim, uncited)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Three structural effects push the wall-clock share above the GPU-second share.</p>
+  <ul>
+    <li><strong>The length distribution has a heavy tail</strong> <span class="zh">长尾</span>. Seer measured mean output lengths of 7.6K (Qwen2-VL-72B), 22.4K (Moonlight) and 39.0K tokens (Kimi-K2), with single responses up to 96K. In a synchronous rollout, the last 10% of requests took up to 50% of the rollout time, because the batch shrinks while a few long sequences finish and the GPUs sit mostly idle <a href="https://arxiv.org/abs/2511.14617">[Qin et al. 2025, §2, §4.2.2]</a>. Magistral reports that the longest completions take up to 5 times longer than the shortest <a href="https://arxiv.org/abs/2506.10910">[Magistral, §3]</a>.</li>
+    <li><strong>Latency does not shard.</strong> Decoding is bandwidth-bound, so extra GPUs raise throughput only by adding engine replicas. They do not shorten the time a single 30K-token response needs <a href="https://arxiv.org/abs/2510.11345">[ROLL Flash, §1]</a>.</li>
+    <li><strong>Lengths grow during training.</strong> RL pushes response length up (Kimi k1.5 adds a length penalty and K2 a per-task token budget for this reason <a href="https://arxiv.org/abs/2501.12599">[k1.5, §2.3.3]</a>, <a href="https://arxiv.org/abs/2507.20534">[K2, §3.2.3]</a>), so the rollout share of a run drifts upward.</li>
+  </ul>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 342" role="img" aria-labelledby="fig-25-1-title">
+<title id="fig-25-1-title">Timeline of a synchronous rollout: eight responses of different lengths decode in parallel, and every slot waits for the longest one before the trainer starts</title>
+<text x="8" y="18" class="s-bold">Synchronous rollout, one decode slot per response</text>
+<text x="8" y="60" class="s-small s-muted">resp 1</text>
+<rect class="s-a" x="84" y="46" width="233.7" height="20" rx="3"/>
+<text x="90" y="60" class="s-small">4.1K tokens</text>
+<rect class="s-plain s-dash" x="319.7" y="46" width="231.7" height="20" rx="3"/>
+<text x="8" y="89" class="s-small s-muted">resp 2</text>
+<rect class="s-a" x="84" y="75" width="119.7" height="20" rx="3"/>
+<text x="90" y="89" class="s-small">2.1K tokens</text>
+<rect class="s-plain s-dash" x="205.7" y="75" width="345.7" height="20" rx="3"/>
+<text x="8" y="118" class="s-small s-muted">resp 3</text>
+<rect class="s-a" x="84" y="104" width="342.0" height="20" rx="3"/>
+<text x="90" y="118" class="s-small">6.0K tokens</text>
+<rect class="s-plain s-dash" x="428.0" y="104" width="123.4" height="20" rx="3"/>
+<text x="8" y="147" class="s-small s-muted">resp 4</text>
+<rect class="s-a" x="84" y="133" width="193.8" height="20" rx="3"/>
+<text x="90" y="147" class="s-small">3.4K tokens</text>
+<rect class="s-plain s-dash" x="279.8" y="133" width="271.6" height="20" rx="3"/>
+<text x="8" y="176" class="s-small s-muted">resp 5</text>
+<rect class="s-a" x="84" y="162" width="467.4" height="20" rx="3"/>
+<text x="90" y="176" class="s-small">8.2K tokens</text>
+<text x="8" y="205" class="s-small s-muted">resp 6</text>
+<rect class="s-a" x="84" y="191" width="171.0" height="20" rx="3"/>
+<text x="90" y="205" class="s-small">3.0K tokens</text>
+<rect class="s-plain s-dash" x="257.0" y="191" width="294.4" height="20" rx="3"/>
+<text x="8" y="234" class="s-small s-muted">resp 7</text>
+<rect class="s-a" x="84" y="220" width="296.4" height="20" rx="3"/>
+<text x="90" y="234" class="s-small">5.2K tokens</text>
+<rect class="s-plain s-dash" x="382.4" y="220" width="169.0" height="20" rx="3"/>
+<text x="8" y="263" class="s-small s-muted">resp 8</text>
+<rect class="s-a" x="84" y="249" width="262.2" height="20" rx="3"/>
+<text x="90" y="263" class="s-small">4.6K tokens</text>
+<rect class="s-plain s-dash" x="348.2" y="249" width="203.2" height="20" rx="3"/>
+<text x="214" y="89" class="s-small s-muted">idle until barrier</text>
+<line class="s-line s-dash" x1="344.8" y1="34" x2="344.8" y2="274"/>
+<text x="344.8" y="30" text-anchor="middle" class="s-small">mean 4.6K</text>
+<line class="s-line" x1="551.4" y1="34" x2="551.4" y2="274"/>
+<text x="551.4" y="30" text-anchor="middle" class="s-small">max 8.2K = barrier</text>
+<rect class="s-b" x="561.4" y="46" width="150.6" height="224" rx="4"/>
+<text x="636.7" y="146" text-anchor="middle" class="s-bold">train</text>
+<text x="636.7" y="164" text-anchor="middle" class="s-small">+ weight sync</text>
+<text x="636.7" y="182" text-anchor="middle" class="s-small">(all GPUs)</text>
+<marker id="arrow-25-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker>
+<path class="s-line" d="M84,284 L551.4,284" marker-end="url(#arrow-25-1)"/>
+<text x="317.7" y="302" text-anchor="middle" class="s-small s-muted">time (decode time is roughly proportional to tokens generated)</text>
+<text x="8" y="322" class="s-small">Busy slot-time = mean/max = 56%, so 44% of the rollout phase is idle in this toy example.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Why a synchronous rollout wastes GPUs. All eight responses start together, but the trainer cannot start until the longest one ends, so every shorter response leaves its slot idle (dashed). The busy fraction is the mean length divided by the maximum length. With continuous batching and many queued prompts, freed slots are refilled until the queue empties, so the loss concentrates in the tail, where few sequences remain and the engine runs at tiny batch size.</figcaption>
+  </figure>
+
+  <h3 id="rollout-numbers">Worked numbers: 512 prompts × 16 samples × 8K tokens</h3>
+  <p><strong>Assumptions (mine, stated so you can change them).</strong> Policy: Llama-3-8B (\(N = 8.03\)B, KV cache 128 KiB per token, <a href="07-kv-efficient-attention.html#why-kv">page 07</a>) in bf16 on H100s (989 TFLOP/s, 3.35 TB/s). Batch: \(P = 512\) prompts, \(G = 16\) samples, prompt length 512, response cap 8,192 tokens. Decode: 64 sequences per GPU at an average context of \(512 + 8192/2 = 4608\) tokens, so one decode step reads the weights (\(2 \times 8.03 \times 10^{9} = 16.06\) GB) plus the KV cache (\(64 \times 4608 \times 131{,}072\) B \(= 38.7\) GB), total 54.7 GB. At 3.35 TB/s that is 16.3 ms per step, or \(64 / 0.0163 = 3{,}919\) tokens/s at the roofline. Assume the engine reaches 64% of that: <strong>2,500 tokens/s per GPU</strong>. Training at 40% MFU.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Quantity</th><th>Arithmetic</th><th class="num">Result</th></tr></thead>
+    <tbody>
+      <tr><td>Responses per step</td><td>\(512 \times 16\)</td><td class="num">8,192</td></tr>
+      <tr><td>Tokens generated, every response hits the cap</td><td>\(8192 \times 8192\)</td><td class="num">67.1M</td></tr>
+      <tr><td>Same, mean length 4K or 2K</td><td>\(8192 \times 4096\), \(8192 \times 2048\)</td><td class="num">33.6M, 16.8M</td></tr>
+      <tr><td>Generation GPU-time (cap case)</td><td>\(67.1\text{M} / 2500\) tokens/s</td><td class="num">26,844 GPU-s = 7.46 GPU-h</td></tr>
+      <tr><td>Wall-clock on 64 GPUs, perfectly balanced</td><td>\(26{,}844 / 64\)</td><td class="num">419 s = 7.0 min</td></tr>
+      <tr><td>Tokens trained (prompt + response)</td><td>\(8192 \times (512 + 8192)\)</td><td class="num">71.3M</td></tr>
+      <tr><td>Training FLOPs (fwd+bwd, old-logprob, ref-logprob)</td><td>\(10 N \times 71.3\text{M}\)</td><td class="num">\(5.73 \times 10^{18}\)</td></tr>
+      <tr><td>Training GPU-time</td><td>\(5.73 \times 10^{18} / (0.40 \times 989 \times 10^{12})\)</td><td class="num">14,473 GPU-s = 4.02 GPU-h</td></tr>
+      <tr><td>Generation share of GPU-seconds</td><td>\(7.46 / (7.46 + 4.02)\)</td><td class="num">65%</td></tr>
+      <tr><td>Cost per token: generation, training</td><td>\(1/2500\) s, \(10N / 395.6\text{ TFLOP/s}\)</td><td class="num">0.40 ms, 0.20 ms</td></tr>
+      <tr><td>Decode MFU</td><td>\(2N \times 2500 / 989\text{ TFLOP/s}\)</td><td class="num">4.1%</td></tr>
+    </tbody>
+  </table></div>
+
+<pre><code class="language-python">N, peak = 8.03e9, 989e12
+tokens_gen = 512 * 16 * 8192                   # 67,108,864
+gen_s   = tokens_gen / 2500                    # GPU-seconds at 2,500 tok/s/GPU
+train_s = 10 * N * (512 * 16 * (512 + 8192)) / (0.40 * peak)
+print(gen_s / 3600, train_s / 3600)            # 7.46, 4.02 GPU-hours
+print(gen_s / (gen_s + train_s))               # 0.65: generation's share
+</code></pre>
+
+  <p>Three lessons follow. (1) Even with a well-tuned engine, generation is about two thirds of the GPU-seconds, and per token it costs twice as much as training despite five times fewer FLOPs: 4% versus 40% MFU. (2) The 7-minute figure assumes perfect balance. With the heavy tail, the step waits for stragglers, which is where systems work goes (<a href="#systems">next section</a>). (3) In a disaggregated system the step time is \(\max(W_g/N_r,\; W_t/N_t)\), where \(W_g, W_t\) are the generation and training GPU-seconds and \(N_r + N_t = N\). That is minimized when both terms are equal, so <strong>the rollout pool should get the fraction \(W_g/(W_g + W_t)\) of the GPUs</strong>: \(0.65 \times 64 \approx 42\) rollout GPUs and 22 trainer GPUs here. AReaL's runs used a 75/25 split, chosen empirically over 50/50 <a href="https://arxiv.org/abs/2505.24298">[AReaL, §6.1]</a>, which is consistent with a generation share between 65% and 75%.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea</div>
+    <p>RL for LLMs spends most of its GPU time on memory-bound decoding, and the wall-clock is set by the longest sequence, not the average one. Every design on this page either fills the idle slots (asynchrony, queue scheduling, partial rollouts), makes decode faster (speculative decoding, low-precision rollouts), or hides the non-GPU work (rewards, environments, weight sync).</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="systems">System designs: placement, synchrony and weight sync</h2>
+
+  <p>Two independent choices define an RL system. <strong>Placement</strong>: do the inference engine and the trainer share GPUs (colocated) or own separate pools (disaggregated)? <strong>Synchrony</strong>: does the trainer wait for a full on-policy batch (synchronous), or consume samples as they arrive from engines that keep generating (asynchronous)? Figure 2 shows the resulting timelines.</p>
+
+  <h3 id="colocated">Colocated placement</h3>
+  <p>In a colocated design <span class="zh">训推一体</span> the trainer and the engine take turns on the same GPUs, and whichever is idle releases its memory. Kimi k1.5 runs Megatron and vLLM as sidecar containers in one pod. After training, Megatron offloads its GPU memory and hands over the weights (RDMA, via Mooncake); vLLM starts from dummy weights, loads them, and is terminated after rollout so Megatron can reload. Training to inference takes under a minute and the reverse about ten seconds. vLLM is killed rather than offloaded because CUDA graphs, NCCL buffers and the driver make its memory hard to release <a href="https://arxiv.org/abs/2501.12599">[k1.5, §2.6.3]</a>. Kimi K2 keeps the design at 1T parameters: training parameters sit in DRAM during rollout, and a checkpoint engine broadcasts the full parameter set so each inference worker pulls its own shard, in under 30 seconds. They deliberately send several times more data than a minimal transfer, to keep the two engines decoupled and easy to maintain <a href="https://arxiv.org/abs/2507.20534">[K2, §3.3.1 to §3.3.2]</a>.</p>
+  <p>HybridFlow's 3D-HybridEngine attacks the same switch. Training and generation use different parallel layouts, resharded with zero memory redundancy, which cut transition time by 55.2% on average (up to 89.1% at 70B). A smaller generation tensor-parallel size than training's also cut generation latency by 60.3% (7B) and 36.4% (13B) <a href="https://arxiv.org/abs/2409.19256">[HybridFlow, §8.4]</a>. Its placement study gives a rule of thumb: colocating everything was best on 16 to 64 GPUs, while split or standalone placements won at 96 to 128 GPUs for 13B and 34B models, because a fixed global batch leaves each worker of a large colocated pool less to do <a href="https://arxiv.org/abs/2409.19256">[§8.3]</a>. That study used short fixed-length PPO responses, so treat the crossover as illustrative.</p>
+
+  <h3 id="disaggregated">Disaggregated placement</h3>
+  <p>In a disaggregated design <span class="zh">训推分离</span> the engines and the trainer own separate pools. OpenRLHF's original architecture is the reference: Ray schedules vLLM rollout engines and DeepSpeed ZeRO training engines on different GPUs, so the actor exists twice and weights are broadcast after each update <a href="https://arxiv.org/abs/2405.11143">[OpenRLHF, §3.1]</a>, <a href="https://arxiv.org/abs/2409.19256">[HybridFlow, Tab. 1]</a>. AReaL puts SGLang rollout workers and Megatron trainer workers on disjoint devices, three quarters of them for inference <a href="https://arxiv.org/abs/2505.24298">[AReaL, §6.1]</a>. The benefits are no offload or restart per step, independent parallelism and scaling per side, and the possibility of overlap. The costs are idle GPUs whenever the pools are not both busy (the split derivation in <a href="#rollout-numbers">the worked numbers</a>), and a fixed partition that drifts out of balance as responses grow.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 352" role="img" aria-labelledby="fig-25-2-title">
+<title id="fig-25-2-title">GPU timelines of three RL system designs: colocated and synchronous, disaggregated and synchronous, disaggregated and asynchronous</title>
+<defs><marker id="arrow-25-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="20" class="s-bold">A. Colocated, synchronous</text>
+<text x="8" y="35" class="s-small s-muted">one GPU pool, time-shared</text>
+<text x="122" y="61" text-anchor="end" class="s-small">all GPUs</text>
+<rect class="s-a" x="128.0" y="46" width="150.0" height="22" rx="3"/><text x="203.0" y="61.0" text-anchor="middle" class="s-small">rollout</text>
+<rect class="s-plain s-dash" x="280.0" y="46" width="62.0" height="22" rx="3"/><text x="311.0" y="61.0" text-anchor="middle" class="s-small">tail idle</text>
+<rect class="s-e" x="344.0" y="46" width="22.0" height="22" rx="3"/>
+<rect class="s-b" x="368.0" y="46" width="92.0" height="22" rx="3"/><text x="414.0" y="61.0" text-anchor="middle" class="s-small">train</text>
+<rect class="s-e" x="462.0" y="46" width="22.0" height="22" rx="3"/>
+<rect class="s-a" x="486.0" y="46" width="150.0" height="22" rx="3"/><text x="561.0" y="61.0" text-anchor="middle" class="s-small">rollout</text>
+<rect class="s-plain s-dash" x="638.0" y="46" width="48.0" height="22" rx="3"/><text x="662.0" y="61.0" text-anchor="middle" class="s-small">tail</text>
+<text x="355" y="81" text-anchor="middle" class="s-small s-muted">offload + sync</text>
+<text x="473" y="81" text-anchor="middle" class="s-small s-muted">reload engine</text>
+<text x="8" y="102" class="s-bold">B. Disaggregated, synchronous</text>
+<text x="8" y="117" class="s-small s-muted">separate pools, alternating</text>
+<text x="122" y="143" text-anchor="end" class="s-small">inference GPUs</text>
+<text x="122" y="173" text-anchor="end" class="s-small">trainer GPUs</text>
+<rect class="s-a" x="128.0" y="128" width="150.0" height="22" rx="3"/><text x="203.0" y="143.0" text-anchor="middle" class="s-small">rollout</text>
+<rect class="s-plain s-dash" x="280.0" y="128" width="96.0" height="22" rx="3"/><text x="328.0" y="143.0" text-anchor="middle" class="s-small">idle</text>
+<rect class="s-e" x="378.0" y="128" width="14.0" height="22" rx="3"/>
+<rect class="s-a" x="394.0" y="128" width="150.0" height="22" rx="3"/><text x="469.0" y="143.0" text-anchor="middle" class="s-small">rollout</text>
+<rect class="s-plain s-dash" x="546.0" y="128" width="96.0" height="22" rx="3"/><text x="594.0" y="143.0" text-anchor="middle" class="s-small">idle</text>
+<rect class="s-plain s-dash" x="128.0" y="158" width="152.0" height="22" rx="3"/><text x="204.0" y="173.0" text-anchor="middle" class="s-small">idle</text>
+<rect class="s-b" x="282.0" y="158" width="96.0" height="22" rx="3"/><text x="330.0" y="173.0" text-anchor="middle" class="s-small">train</text>
+<rect class="s-plain s-dash" x="380.0" y="158" width="164.0" height="22" rx="3"/><text x="462.0" y="173.0" text-anchor="middle" class="s-small">idle</text>
+<rect class="s-b" x="546.0" y="158" width="96.0" height="22" rx="3"/><text x="594.0" y="173.0" text-anchor="middle" class="s-small">train</text>
+<path class="s-line" d="M384,158 L384,150" marker-end="url(#arrow-25-2)"/>
+<text x="8" y="214" class="s-bold">C. Disaggregated, asynchronous</text>
+<text x="8" y="229" class="s-small s-muted">bounded staleness η</text>
+<text x="122" y="255" text-anchor="end" class="s-small">inference GPUs</text>
+<text x="122" y="307" text-anchor="end" class="s-small">trainer GPUs</text>
+<rect class="s-a" x="128" y="240" width="576" height="22" rx="3"/>
+<line class="s-line-c" x1="320" y1="236" x2="320" y2="266"/>
+<line class="s-line-c" x1="474" y1="236" x2="474" y2="266"/>
+<line class="s-line-c" x1="628" y1="236" x2="628" y2="266"/>
+<text x="224" y="255" text-anchor="middle" class="s-small">policy v0</text>
+<text x="397" y="255" text-anchor="middle" class="s-small">v1</text>
+<text x="551" y="255" text-anchor="middle" class="s-small">v2</text>
+<text x="666" y="255" text-anchor="middle" class="s-small">v3</text>
+<text x="704" y="231" text-anchor="end" class="s-small s-muted">one trajectory can span several policy versions</text>
+<rect class="s-plain s-dash" x="128" y="292" width="92" height="22" rx="3"/>
+<text x="174" y="307" text-anchor="middle" class="s-small">wait</text>
+<rect class="s-b" x="224.0" y="292" width="96.0" height="22" rx="3"/><text x="272.0" y="307.0" text-anchor="middle" class="s-small">train step 0</text>
+<rect class="s-b" x="378.0" y="292" width="96.0" height="22" rx="3"/><text x="426.0" y="307.0" text-anchor="middle" class="s-small">train step 1</text>
+<rect class="s-b" x="532.0" y="292" width="96.0" height="22" rx="3"/><text x="580.0" y="307.0" text-anchor="middle" class="s-small">train step 2</text>
+<path class="s-line-c" d="M320,292 L320,262" marker-end="url(#arrow-25-2)"/>
+<path class="s-line-c" d="M474,292 L474,262" marker-end="url(#arrow-25-2)"/>
+<path class="s-line-c" d="M628,292 L628,262" marker-end="url(#arrow-25-2)"/>
+<text x="326" y="288" class="s-small s-muted">weights</text>
+<path class="s-line s-dash" d="M188,262 L232,292" marker-end="url(#arrow-25-2)"/>
+<text x="130" y="276" class="s-small s-muted">samples</text>
+<rect class="s-a" x="8" y="328" width="14" height="12" rx="2"/><text x="28" y="338" class="s-small">rollout (policy tokens)</text>
+<rect class="s-b" x="196" y="328" width="14" height="12" rx="2"/><text x="216" y="338" class="s-small">training step</text>
+<rect class="s-e" x="332" y="328" width="14" height="12" rx="2"/><text x="352" y="338" class="s-small">switch / weight sync</text>
+<rect class="s-plain s-dash" x="502" y="328" width="14" height="12" rx="2"/><text x="522" y="338" class="s-small">idle GPUs</text>
+</svg>
+    <figcaption><b>Figure 2.</b> The same work on three system designs. A: one pool, time-shared. Each phase uses every GPU, but the tail leaves them idle and each switch costs an engine offload, weight sync and reload. B: separate pools that alternate, so each pool idles while the other works. C: separate pools that overlap. The engines keep generating across weight updates (green ticks), so one trajectory can contain tokens from several policy versions, and the trainer never waits as long as samples are buffered. The price is staleness, bounded by \(\eta\).</figcaption>
+  </figure>
+
+  <h3 id="weight-sync">Weight synchronization</h3>
+  <p>Weight sync <span class="zh">权重同步</span> moves every parameter from the trainer's layout (FSDP shards, or Megatron TP, PP and EP shards) to the engine's (tensor parallelism inside a replica, many replicas). Reported options: a GPU-to-GPU NCCL broadcast (Magistral: under 5 seconds per update <a href="https://arxiv.org/abs/2506.10910">[§3]</a>); a checkpoint engine with a pipelined transfer (K2 overlaps host-to-device copy, broadcast and reload, but on H800s the first two saturated the shared PCIe fabric, so it settled on a two-stage pipeline <a href="https://arxiv.org/abs/2507.20534">[App. G]</a>); RDMA (k1.5), peer-to-peer RDMA or CUDA IPC (Miles <a href="https://arxiv.org/abs/2609.08368">[§1.1]</a>) and delta updates (slime <a href="https://github.com/THUDM/slime">[README]</a>).</p>
+  <p>A second question is what happens to requests in flight when weights change. AReaL interrupts them, discards the KV cache computed under the old weights, recomputes it under the new ones, and continues <a href="https://arxiv.org/abs/2505.24298">[AReaL, §3.1]</a>. Magistral keeps the sequences and their slightly outdated KV cache, and reports that recomputing was not necessary <a href="https://arxiv.org/abs/2506.10910">[§3]</a>. Miles offers abort, leave-in-place and retract (roll back and resume on the new weights), with retract as the default <a href="https://arxiv.org/abs/2609.08368">[§4.4]</a>.</p>
+
+  <h3 id="async">Synchronous, one-step-off and fully asynchronous training</h3>
+  <p>A synchronous system generates a batch with the current weights, trains, syncs, and repeats. The data is on-policy up to the numerical mismatch of the <a href="#mismatch">next section</a>. Overlapping one step (train on batch \(k\) while generating \(k{+}1\) with older weights) removes some idle time but still waits for the longest response in each batch <a href="https://arxiv.org/abs/2505.24298">[AReaL, §1]</a>. Fully asynchronous training <span class="zh">异步训练</span> removes the barrier. AReaL's design has three parts:</p>
+  <ol>
+    <li><strong>Interruptible rollout workers</strong> that stream trajectories and accept weight updates mid-generation (above), worth 12% and 17% more generation throughput at 1.5B and 7B, plus dynamic micro-batch packing (about 30% more training throughput) <a href="https://arxiv.org/abs/2505.24298">[§6.5]</a>.</li>
+    <li><strong>A staleness bound.</strong> With policy version \(i\), trainer batch size \(B\), \(N_r\) trajectories generated so far (counting the request being submitted) and maximum staleness \(\eta\), a new request is admitted only if
+      \[ \lfloor (N_r - 1)/B \rfloor \le i + \eta . \]
+      Older trajectories are prioritized when forming a batch, and \(\eta = 0\) recovers synchronous RL <a href="https://arxiv.org/abs/2505.24298">[AReaL, Eq. 3]</a>. The rule caps the samples generated but not yet trained at \((\eta + 1) B\): the first \(iB\) were consumed by earlier steps and the counter may reach \((i + \eta + 1)B\) (my derivation; ROLL Flash's per-sample "asynchronous ratio" gives the same bound, \((1 + \alpha) \times\) batch size <a href="https://arxiv.org/abs/2510.11345">[§4.3]</a>). For our \(B = 8192\) and \(\eta = 4\), at most 40,960 outstanding samples.</li>
+    <li><strong>A decoupled PPO objective</strong> that separates the behavior policy \(\pi_{\text{behav}}\) (whatever generated the tokens, possibly several versions) from a proximal policy \(\pi_{\text{prox}}\) (the weights just before this update), the trust-region center:
+      \[ J(\theta) = \E\Big[ \tfrac{\pi_{\text{prox}}}{\pi_{\text{behav}}} \min\big( u^{\text{prox}}_t \hat A_t,\ \clip(u^{\text{prox}}_t, 1{-}\epsilon, 1{+}\epsilon)\, \hat A_t \big) \Big], \quad u^{\text{prox}}_t = \tfrac{\pi_\theta}{\pi_{\text{prox}}} \]
+      Clipping around the stale behavior policy would pull the update back toward old, worse policies. \(\pi_{\text{prox}}\) is computed by recomputing token probabilities when a global batch arrives <a href="https://arxiv.org/abs/2505.24298">[AReaL, §4.2]</a>.</li>
+  </ol>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model (AReaL Tab. 1)</th><th class="num">verl (h)</th><th class="num">Sync. AReaL (h)</th><th class="num">AReaL (h)</th><th class="num">Speedup vs sync. AReaL</th></tr></thead>
+    <tbody>
+      <tr><td>1.5B math, 16 nodes, 250 steps</td><td class="num">33.6</td><td class="num">41.0</td><td class="num">14.8</td><td class="num">2.77×</td></tr>
+      <tr><td>7B math, 24 nodes, 250 steps</td><td class="num">52.1</td><td class="num">57.7</td><td class="num">25.4</td><td class="num">2.27×</td></tr>
+      <tr><td>14B code, 32 nodes, 80 steps</td><td class="num">44.4</td><td class="num">48.8</td><td class="num">21.9</td><td class="num">2.23×</td></tr>
+      <tr><td>32B code, 48 nodes, 60 steps</td><td class="num">46.4</td><td class="num">51.1</td><td class="num">31.1</td><td class="num">1.64×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Speedup column is my arithmetic. The "up to 2.77×" headline is the first row; against verl the ratios are 2.27×, 2.05×, 2.03× and 1.49×. Final accuracy was comparable: at 1.5B, AIME24 was 42.2 (AReaL), 42.0 (sync. AReaL) and 43.1 (the published DeepScaleR result, trained with verl).</p>
+
+  <p>The staleness ablation is the part to remember. On a 1.5B math run, naive PPO with \(\eta = 4\) scored 23.3 on AIME24 against 42.0 for the synchronous oracle, while the decoupled objective scored 42.2 at the same \(\eta\). With it, \(\eta = 8\) gave 41.0, \(\eta = 16\) gave 38.7 and unbounded staleness 36.9 <a href="https://arxiv.org/abs/2505.24298">[AReaL, Tab. 2]</a>. Moderate staleness is nearly free once the objective is corrected; unbounded staleness is not. ROLL Flash found a small bound suffices: an asynchronous ratio of 2 gave the highest throughput in typical configurations, with speedups up to 2.24× on RLVR and 2.72× and 1.81× on ALFWorld and SWE agent tasks <a href="https://arxiv.org/abs/2510.11345">[ROLL Flash, §3, abstract]</a>. Synchronous systems are not free of staleness either: splitting a rollout batch into several minibatch updates makes later minibatches stale, and Magistral found quality degrades beyond 2 minibatches per batch <a href="https://arxiv.org/abs/2506.10910">[§6.3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Asynchronous RL with bounded staleness</div>
+    <dl>
+      <dt>Problem</dt><dd>A synchronous step waits for the longest response, so GPUs idle at the tail, and adding GPUs does not shorten a single long decode.</dd>
+      <dt>Idea</dt><dd>Run rollout and training on separate pools. Rollout workers stream trajectories into a buffer, the trainer consumes a batch as soon as one is ready and pushes weights, and an admission rule caps how stale a sample can be.</dd>
+      <dt>Why it works</dt><dd>The tail is hidden behind training, and at most \((\eta+1)B\) samples are ever outstanding, so data is at most about \(\eta\) versions old. The decoupled objective separates "how stale is this data" from "how far may the policy move".</dd>
+      <dt>Evidence</dt><dd>AReaL about 1.5× to 2.8× faster end to end with comparable accuracy (Tab. 1) and a clear \(\eta\) ablation (Tab. 2) <a href="https://arxiv.org/abs/2505.24298">[AReaL]</a>. ROLL Flash up to 2.24× (RLVR) and 2.72× (agentic) <a href="https://arxiv.org/abs/2510.11345">[ROLL Flash]</a>.</dd>
+      <dt>Cost</dt><dd>Accuracy degrades if staleness is unbounded. It needs extra log-probability recomputation, awkward when a partial rollout spans versions and the old logits no longer exist <a href="https://arxiv.org/abs/2605.12070">[Guan et al. 2026]</a>. Short samples arrive first, which can skew lengths <a href="https://arxiv.org/abs/2511.14617">[Seer, §1]</a>. Runs are harder to reproduce.</dd>
+      <dt>Used by</dt><dd>AReaL, Magistral, ROLL Flash, and the fully asynchronous modes of slime, Miles and verl (still under <code>verl/experimental</code> in its README as of September 2026). Kimi k1.5 and K2 stay iteration-synchronous and use partial rollouts.</dd>
+    </dl>
+  </div>
+
+  <h3 id="partial">Partial rollouts, and why length bias matters</h3>
+  <p>Kimi's <strong>partial rollout</strong> is a middle path. Each iteration has a fixed output-token budget. A trajectory that exceeds it is saved to a replay buffer and continued in the next iteration, so no single long trajectory monopolizes the system. Only the current segment needs fresh on-policy computation, earlier segments are reused, and some can be excluded from the loss <a href="https://arxiv.org/abs/2501.12599">[k1.5, §2.6.2]</a>. K2 uses it so that long-tail agentic tasks are paused and resumed in the next iteration <a href="https://arxiv.org/abs/2507.20534">[K2, §3.3.4]</a>.</p>
+  <p>The subtlety is <strong>length bias</strong>: short responses finish first, so any scheme that stops early or restarts stragglers changes which lengths reach the trainer. Seer found that an over-issue variant of partial rollout gave a significantly lower share of long outputs than synchronous rollout <a href="https://arxiv.org/abs/2511.14617">[Seer, §4.4.3]</a>, and Magistral lists "no bias on sequence lengths" as a hard constraint <a href="https://arxiv.org/abs/2506.10910">[§3]</a>. DeepSeek-V4 is the sharpest. Its cluster can preempt any task at any time, so it logs every generated token to a token-granular write-ahead log and resumes from the log and the saved KV cache. Regenerating an interrupted request from scratch would be "mathematically incorrect", because shorter responses are more likely to survive an interruption and the model would drift toward shorter outputs. (With a batch-invariant, deterministic stack, regenerating with the same seed would also work but repeats the decoding.) <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.2.3]</a>. In one line: discarding and regenerating conditions the delivered sample on "finished before the interruption", and that condition depends on length.</p>
+
+  <h3 id="faster-rollout">Faster rollouts without changing the algorithm</h3>
+  <ul>
+    <li><strong>Tail-aware scheduling.</strong> Seer stays strictly on-policy yet reports 44% to 104% more rollout throughput than veRL and 72% to 94% less tail latency. It splits requests into chunks that can migrate between engines, uses one early "probe" response per GRPO group to predict the group's length (siblings have similar lengths) and schedules longest-first, and drafts speculative tokens from the group's other responses (cumulative 1.42×, 1.56×, 2.04× on Qwen2-VL-72B) <a href="https://arxiv.org/abs/2511.14617">[Seer, Tab. 4]</a>. ROLL Flash queues every response as an independent task and expands "n samples per prompt" into n tasks so siblings land on different GPUs (149 s to 81 s for 64 prompts × 16 samples) <a href="https://arxiv.org/abs/2510.11345">[§5.1]</a>.</li>
+    <li><strong>Cheaper decode.</strong> DeepSeek-V4 rolls out with native FP4 weights so sampling matches deployment <a href="https://arxiv.org/abs/2606.19348">[§5.2.1]</a>. Quantized rollouts speed decode but widen the training-inference gap (<a href="#mismatch">next section</a>).</li>
+    <li><strong>Prefix reuse for multi-turn.</strong> Each turn repeats almost all earlier context, so route a session to the engine that holds its prefix; Miles reports a 96% prefix-cache hit rate with affinity routing <a href="https://arxiv.org/abs/2609.08368">[§9.2]</a>.</li>
+  </ul>
+
+  <h3 id="frameworks">Frameworks, and what each claims</h3>
+  <p>State as of September 2026. Frontier labs describe their infrastructure in reports (Kimi's checkpoint engine is open source) but do not release the full stack. The open frameworks:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Framework</th><th>Training / rollout</th><th>Design and claims (from the papers or READMEs)</th></tr></thead>
+    <tbody>
+      <tr><td>OpenRLHF <a href="https://arxiv.org/abs/2405.11143">[Hu et al.]</a></td><td>DeepSpeed ZeRO / vLLM</td><td>Ray-based, rollout and training engines on separate GPUs (hybrid-engine and asynchronous modes also supported). Claims 1.22× to 1.68× over verl v0.4.0 on 8 H200s and a much smaller codebase (8,523 lines against 32,325, by its count).</td></tr>
+      <tr><td>veRL / HybridFlow <a href="https://arxiv.org/abs/2409.19256">[Sheng et al.]</a></td><td>FSDP, Megatron-LM / vLLM, SGLang</td><td>Hybrid single-plus-multi-controller programming model, 3D-HybridEngine, automatic mapping over colocate, split and standalone placements. Reports 1.53× to 20.57× over 2024 baselines. README lists multi-turn with tool calling.</td></tr>
+      <tr><td>AReaL <a href="https://arxiv.org/abs/2505.24298">[Fu et al.]</a></td><td>Megatron-Core / SGLang</td><td>Fully asynchronous, disaggregated, interruptible generation, staleness bound, decoupled PPO (above).</td></tr>
+      <tr><td>slime <a href="https://github.com/THUDM/slime">[THUDM]</a></td><td>Megatron / SGLang</td><td>Training, rollout and a data buffer in one path, with custom data-generation hooks for agents. README: the RL framework behind GLM-4.5 through GLM-5.x; lists PD disaggregation, session-affinity routing, delta weight sync.</td></tr>
+      <tr><td>Miles <a href="https://arxiv.org/abs/2609.08368">[RadixArk 2026]</a></td><td>Megatron or FSDP / SGLang</td><td>Built on slime. Synchronous and fully asynchronous modes, token-in-token-out session server, rollout routing replay, optional bitwise "true-on-policy" mode (next section). GLM-5.2 (744B total, 40B active) on 64 GB300 GPUs, half rollout and half training, median step 263 s.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two designs are worth knowing beyond the table. ROLL Flash adds asynchrony to Alibaba's ROLL <a href="https://arxiv.org/abs/2510.11345">[§4]</a>. ProRL Agent serves the whole agent rollout lifecycle (sandbox start, agent loop, evaluation) as an HTTP service, so trainers only submit tasks and receive trajectories with rewards, and rollout nodes are sized independently of training <a href="https://arxiv.org/abs/2603.18815">[§3]</a>. Choose by need: verl for breadth and a mature multi-turn stack, AReaL or ROLL Flash for asynchrony, slime or Miles for Megatron plus SGLang at MoE scale, OpenRLHF for a small readable codebase.</p>
+</section>
+
+<section>
+  <h2 id="mismatch">Off-policy problems: training-inference mismatch</h2>
+
+  <p>Even a perfectly synchronous system is slightly off-policy, because the sampler is not the trainer. The inference engine and the trainer hold the same weights, yet they compute the token probabilities with different kernels, reduction orders, precisions and sometimes different sampling rules. The result is a training-inference mismatch <span class="zh">训推不一致</span>, and it is one of the most common causes of RL runs that look fine for a hundred steps and then collapse.</p>
+
+  <h3 id="decomposition">The importance ratio has two factors</h3>
+  <p>Let \(\mu\) denote the inference engine's policy and \(\pi\) the trainer's. A token \(y_t\) was sampled from \(\mu_{\text{old}}\), the engine at the weights used for generation, but we want to optimize \(\pi_\theta\). The importance sampling <span class="zh">重要性采样</span> ratio factors as <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, Eq. 5]</a>:</p>
+  <div class="eq-box">
+    \[ \frac{\pi_\theta(y_t \mid \cdot)}{\mu_{\text{old}}(y_t \mid \cdot)} \;=\; \underbrace{\frac{\pi_{\text{old}}(y_t \mid \cdot)}{\mu_{\text{old}}(y_t \mid \cdot)}}_{\text{training-inference discrepancy}} \;\times\; \underbrace{\frac{\pi_{\theta}(y_t \mid \cdot)}{\pi_{\text{old}}(y_t \mid \cdot)}}_{\text{policy staleness}} \]
+    <div class="eq-label">\(\pi_{\text{old}}\): the trainer's log-probabilities for the same weights the engine used. The standard PPO and GRPO loss keeps only the second factor.</div>
+  </div>
+  <p>Standard PPO and GRPO code recomputes \(\pi_{\text{old}}\) on the trainer, uses it as the denominator, and never looks at the engine's own \(\mu_{\text{old}}\) log-probabilities. With one gradient step per batch, \(\pi_\theta = \pi_{\text{old}}\), the ratio is exactly 1, the clip never engages, and the loss cannot see that the samples came from a slightly different distribution. AReaL's decoupled objective has the same structure, with \(\pi_{\text{prox}}\) as \(\pi_{\text{old}}\) <a href="https://arxiv.org/abs/2605.12070">[Guan et al. 2026, §1]</a>. The clip cannot stand in for a correction: it is an advantage-sign-dependent filter that limits update size, whereas repairing a discrepancy needs a symmetric constraint centered on 1 <a href="https://arxiv.org/abs/2605.12070">[Guan et al. 2026, §4.1]</a>. In Yao et al.'s INT8 experiments, folding the engine-to-trainer ratio into the clip ("PPO-IS") or using an untruncated ratio ("Vanilla-IS") both reached near-zero accuracy <a href="https://opt-ml.org/papers/2025/paper116.pdf">[Fig. 3]</a>.</p>
+
+  <h3 id="sources">Where the mismatch comes from</h3>
+  <ul>
+    <li><strong>Kernels and reduction order.</strong> Floating-point addition is not associative, so split-KV attention, split-\(k\) matmuls, fused kernels and different tensor-parallel degrees change the last bits, and the last bits change sampled-token probabilities. Even inside one engine, results depend on batch composition (<a href="06-decoding-kv-cache.html#determinism">page 06</a>). The trainer is not exactly repeatable either: two Megatron forward passes over the same sequences of a 30B MoE model gave a per-token KL of \(8.4 \times 10^{-4}\) <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §3.3]</a>.</li>
+    <li><strong>Precision.</strong> Quantized rollouts (FP8, INT8, FP4) make decoding cheaper and the gap larger <a href="https://opt-ml.org/papers/2025/paper116.pdf">[Yao et al. 2025, §4.2]</a>. The Qwen study deliberately uses FP8 inference with BF16 training as a stress test <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, §4.2]</a>.</li>
+    <li><strong>The LM head.</strong> MiniMax-M1 traced its mismatch, which prevented reward growth, to high-magnitude activations at the output head. Computing the head in FP32 raised the Pearson correlation between training and inference token probabilities from 0.987 to 0.997 (Fig. 3) <a href="https://arxiv.org/abs/2506.13585">[MiniMax-M1, §3.2]</a>.</li>
+    <li><strong>Sampling adjustments.</strong> Temperature, top-\(p\) and top-\(k\) change the distribution actually sampled, and engines often return adjusted log-probabilities. The trainer scores the full softmax, so the two policies live on different action sets, which violates importance sampling <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>.</li>
+    <li><strong>Tokenization drift</strong> in multi-turn rollouts: the trainer scores tokens that were never sampled (<a href="#agentic">next section</a>).</li>
+    <li><strong>MoE routing.</strong> A tiny numeric difference flips the top-\(k\) expert choice, so the two engines run different parameters for the same token (below).</li>
+  </ul>
+  <p>The gap is not exotic. In a dense-model RL setup, Yao et al. found tokens for which vLLM assigned probability 1 and the FSDP trainer assigned 0, and patching vLLM to return the true sampling probabilities and to compute the LM head in FP32 did not remove the mismatch <a href="https://opt-ml.org/papers/2025/paper116.pdf">[Yao et al. 2025, Fig. 1, §3.1]</a>. In SGLang-versus-Megatron comparisons on math responses (about 20M tokens for the MoE), the per-token \(k_3\) KL was \(1.5 \times 10^{-3}\) for Qwen3-30B-A3B and \(6.4 \times 10^{-4}\) for the dense Qwen3-8B <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §3.1]</a>. A 744B agentic MoE run reports a mean divergence of 0.0369 by its own metric <a href="https://arxiv.org/abs/2609.08368">[Miles, §9.2]</a>.</p>
+
+  <h3 id="mismatch-numbers">Worked numbers: what 0.01 nats per token does to a sequence ratio</h3>
+  <p>Let \(d_t = \log \pi_{\text{train}}(y_t) - \log \mu_{\text{rollout}}(y_t)\). The sequence-level ratio is \(\exp(\sum_t d_t)\). Take a per-token gap of 0.01 nats.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Response length \(T\)</th><th class="num">Same sign: \(e^{0.01 T}\)</th><th class="num">Random sign, 1σ: \(e^{0.01\sqrt{T}}\)</th><th class="num">Length-normalized: \(e^{0.01}\)</th></tr></thead>
+    <tbody>
+      <tr><td>1,000</td><td class="num">\(e^{10} = 22{,}026\)</td><td class="num">\(e^{0.316} = 1.37\)</td><td class="num">1.010</td></tr>
+      <tr><td>16,000</td><td class="num">\(e^{160} = 3.1 \times 10^{69}\)</td><td class="num">\(e^{1.265} = 3.54\)</td><td class="num">1.010</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three observations. (1) A 1% per-token gap is invisible at token level: \(e^{0.01} = 1.010\) lies deep inside a PPO clip range of \([0.8, 1.2]\) and below any truncation cap (\(C = 2\) or 5), yet a systematic bias compounds into a sequence ratio of \(10^4\) at 1K tokens and \(10^{69}\) at 16K, which overflows float32 (maximum about \(e^{88.7}\)), so sequence ratios must be handled in log space or float64. (2) With random signs the drift grows as \(\sqrt{T}\), a factor of 3.5 at 16K, which is a gentler but still length-dependent distortion. (3) The geometric-mean (length-normalized) ratio does not depend on length at all, which is the property GSPO exploits <a href="https://arxiv.org/abs/2507.18071">[Zheng et al. 2025a, Eq. 7]</a>.</p>
+  <p><strong>Calibrating against measurements.</strong> A measured per-token KL of \(\kappa\) is not a 0.01 gap. If the token log-ratios are independent and roughly Gaussian with \(\E_\mu[r] = 1\) (my modeling assumption), the log-ratio has variance \(\sigma^2 = 2\kappa\) and mean \(-\kappa\) per token. For the MoE's \(\kappa = 1.5 \times 10^{-3}\): \(\sigma = 0.055\) nats per token, over five times the 0.01 above. Over \(T\) tokens the sequence log-ratio has mean \(-\kappa T\) and standard deviation \(\sigma \sqrt{T}\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model (\(\kappa\))</th><th class="num">\(T\)</th><th class="num">Std \(\sigma\sqrt{T}\)</th><th class="num">Median \(e^{-\kappa T}\)</th><th class="num">ESS \(e^{-2\kappa T}\)</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="2">Qwen3-30B-A3B (\(1.535 \times 10^{-3}\))</td><td class="num">1,000</td><td class="num">1.75</td><td class="num">0.22</td><td class="num">4.6%</td></tr>
+      <tr><td class="num">16,000</td><td class="num">7.0</td><td class="num">\(2 \times 10^{-11}\)</td><td class="num">\(5 \times 10^{-22}\)</td></tr>
+      <tr><td rowspan="2">Qwen3-8B dense (\(6.4 \times 10^{-4}\))</td><td class="num">1,000</td><td class="num">1.13</td><td class="num">0.53</td><td class="num">28%</td></tr>
+      <tr><td class="num">16,000</td><td class="num">4.5</td><td class="num">\(4 \times 10^{-5}\)</td><td class="num">\(1 \times 10^{-9}\)</td></tr>
+    </tbody>
+  </table></div>
+  <p>So full sequence-level importance weights are degenerate for long responses: the typical sequence gets a weight near zero, and the mean stays 1 only through astronomically rare large weights. Real token gaps are heavier-tailed than Gaussian (a handful of tokens carry most of the gap), so this understates the problem. That is why practice uses bounded per-token weights, length-normalized ratios, or sequence masking, and tries to shrink \(\kappa\) itself.</p>
+
+  <h3 id="fixes">Fixes, from cheapest to most drastic</h3>
+
+  <p><strong>1. Correct with importance sampling.</strong> Truncated importance sampling (TIS) multiplies each token's policy-gradient term by the detached, capped engine-to-trainer ratio. The formulation from Yao et al. is</p>
+  \[ \E_{a \sim \pi_{\text{vllm}}(\theta_{\text{old}})}\Big[ \min\!\Big( \tfrac{\pi_{\text{fsdp}}(a,\theta_{\text{old}})}{\pi_{\text{vllm}}(a,\theta_{\text{old}})},\, C \Big) \cdot \nabla_\theta \min\!\Big( \tfrac{\pi_{\text{fsdp}}(a,\theta)}{\pi_{\text{fsdp}}(a,\theta_{\text{old}})} \hat A,\ \clip(\cdot, 1{-}\epsilon, 1{+}\epsilon)\, \hat A \Big) \Big] \]
+  <p><a href="https://opt-ml.org/papers/2025/paper116.pdf">[Yao et al. 2025, §3.3]</a>. It is the decoupled-PPO structure again, with the engine as the behavior policy and a one-sided cap \(C\). Why token-level weights are principled: the sequence-level objective weights each response by \(\prod_t (1 + \delta_t)\), whose first-order expansion is \(1 + \sum_t \delta_t\), which is exactly what a sum of per-token ratios gives <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, §2.3]</a>. The same paper shows the weight is not optional: with a 30B MoE trained on-policy (FP8 inference, BF16 training), removing the training-inference correction caused rapid collapse and an entropy crash, and adding length normalization to the loss was stable but worse, because it breaks the first-order argument (§4.3).</p>
+
+<pre><code class="language-python">import math, torch
+
+def rl_loss(logp, logp_old, logp_rollout, adv, mask, eps_low=0.2, eps_high=0.27, cap=5.0):
+    # all (B, T). logp: trainer log-probs, requires grad. logp_old: trainer log-probs at the start of
+    # the step (pi_prox), no grad. logp_rollout: what the inference engine reported for the sampled tokens.
+    w_ti  = torch.exp((logp_old - logp_rollout).clamp(max=math.log(cap)))   # capped engine-to-trainer weight
+    ratio = torch.exp(logp - logp_old)                                      # staleness / update-size ratio
+    surr  = torch.minimum(ratio * adv, ratio.clamp(1 - eps_low, 1 + eps_high) * adv)
+    return -(w_ti.detach() * surr * mask).sum() / mask.sum()               # mean over unmasked tokens only
+</code></pre>
+
+  <div class="decision">
+    <div class="decision-title">Truncated importance sampling (TIS)</div>
+    <dl>
+      <dt>Problem</dt><dd>The engine and trainer disagree, so on-policy RL is secretly off-policy, and the PPO clip cannot see it.</dd>
+      <dt>Idea</dt><dd>Weight each token by \(\min(\pi_{\text{train}}/\mu_{\text{rollout}}, C)\), stop-gradient, on top of the usual clipped surrogate.</dd>
+      <dt>Why it works</dt><dd>Per-token weights are the first-order approximation of the sequence-level correction, and the cap bounds variance at the price of a small bias. The one-sided cap lets the ratio fall freely below 1.</dd>
+      <dt>Evidence</dt><dd>DAPO-style training of Qwen2.5-32B improved on AIME24 with TIS <a href="https://opt-ml.org/papers/2025/paper116.pdf">[Yao et al. 2025, Fig. 1]</a>. With INT8 rollouts, uncorrected training degraded sharply (Fig. 2), the PPO-IS and untruncated variants fell to near-zero accuracy (Fig. 3), and TIS brought performance close to bf16 rollouts. In a 30B MoE study, dropping the correction collapsed training <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, §4.3]</a>.</dd>
+      <dt>Cost</dt><dd>Needs the trainer's log-probs for every sampled token and the engine's log-probs returned with the samples. The cap \(C\) is a hyperparameter (2 in the R3 baselines, 5 in the Qwen study, 1.5 to 5 suggested in verl's docs). For MoE it delayed but did not prevent collapse in one R3 setting (crash at step 105 instead of 60) <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, Tab. 1]</a>.</dd>
+      <dt>Used by</dt><dd>Miles' GLM-5.2 agentic run, verl's rollout-correction options, the Qwen stability study. Related: MiniMax's CISPO clips the importance weight instead of dropping clipped tokens <a href="https://arxiv.org/abs/2506.13585">[MiniMax-M1, §3.1]</a>.</dd>
+    </dl>
+  </div>
+
+  <p><strong>2. Use sequence-level tools.</strong> GSPO defines the ratio \(s_i = \big(\pi_\theta(y_i \mid x)/\pi_{\text{old}}(y_i \mid x)\big)^{1/|y_i|}\), clips whole responses, and weights all tokens of a response equally. The Qwen team argues the sequence likelihood is far more tolerant of numerical noise than any single token's, so the engine's likelihoods could be used directly instead of recomputing them on the trainer, which helps partial rollouts, multi-turn RL and disaggregated setups <a href="https://arxiv.org/abs/2507.18071">[GSPO, §5.4]</a>. DeepSeek-V3.2 instead masks: it drops sequences with negative advantage whose mean log-ratio \(\log(\pi_{\text{old}}/\pi_\theta)\) exceeds a threshold \(\delta\), where \(\pi_{\text{old}}\) is the probability returned by the inference framework, so one mask covers both minibatch staleness and engine mismatch. Only negative-advantage sequences are masked, on the argument that the model learns most from its own mistakes while highly off-policy negative samples can mislead it <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>. A widely read blog by Liu et al. argues for sequence-level correction and masking on the same grounds <a href="https://richardli.xyz/rl-collapse"><span class="unverified" title="I could only read search summaries of this Notion article and how the verl docs describe it, not the article text itself">[Liu et al. 2025]</span></a>.</p>
+
+  <p><strong>3. Make the engines agree.</strong> Each source has a targeted fix: an FP32 LM head (MiniMax-M1), returning true sampling probabilities and keeping the top-\(p\)/top-\(k\) masks so both policies share an action set ("Keep Sampling Mask" in DeepSeek-V3.2), and, at the extreme, bitwise identity.</p>
+  <ul>
+    <li><strong>Batch-invariant, deterministic kernels.</strong> DeepSeek-V4's stated goal is bitwise alignment among pretraining, post-training and inference. Batch invariance means a token's output is bitwise identical wherever it sits in a batch. To get it, attention cannot use split-KV, so V4 uses a dual-kernel decode scheme with one fixed accumulation order; matmuls move from cuBLAS to DeepGEMM and drop split-\(k\); backward passes replace <code>atomicAdd</code> with per-SM buffers and a deterministic sum. It reports negligible overhead for batch-invariant decoding attention and motivates the kernels by debugging, stability analysis and consistent post-training behavior <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.3]</a>. It is a systems-level fix for the same problem TIS treats algorithmically (see also <a href="15-distributed-training.html#determinism">page 15</a>).</li>
+    <li><strong>True-on-policy mode.</strong> Miles pins both sides to the same FlashAttention-3 kernel, batch-invariant matmuls and deterministic settings, makes tensor-parallel reductions invariant to the parallel degree, and has the engine re-score each finished sequence with a prefill pass instead of reporting decode-time log-probabilities. In supported configurations the two engines then agree exactly (absolute difference zero). It costs throughput, since rollout gets slower <a href="https://arxiv.org/abs/2609.08368">[Miles, §5.3]</a>. The trade is exactness against speed; with exact agreement the first ratio factor is identically 1 and no correction is needed.</li>
+  </ul>
+
+  <h3 id="moe-routing">MoE routing mismatch</h3>
+  <p>In a mixture-of-experts model (<a href="08-mixture-of-experts.html#router">page 08</a>) a small numeric difference can flip which experts a token uses, so the engine and trainer run different parameters for the same token. Ma et al. measured that about 10% of router decisions differ between SGLang and Megatron on Qwen3-30B-A3B, and 94% of tokens had a different expert in at least one layer <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §3.2]</a>. The fixes replay routing decisions:</p>
+  <ul>
+    <li><strong>Routing Replay (R2)</strong> caches the experts the trainer chose under the old policy and replays them during the update. It fixes routing changes caused by weight updates (about 10% of activated experts changed after one gradient step on a 48-layer Qwen3-30B-A3B) but not engine-versus-trainer differences <a href="https://arxiv.org/abs/2507.18071">[GSPO, §5.3]</a>.</li>
+    <li><strong>Rollout Routing Replay (R3)</strong> records the routing mask from the inference engine and replays it in both the old-policy and update passes, so it also removes the engine-versus-trainer gap. Overhead is under 3% of rollout latency, masks can be cached with the prefix KV for multi-turn use, and the per-token KL on Qwen3-30B-A3B fell from \(1.535 \times 10^{-3}\) to \(7.5 \times 10^{-4}\), near the dense model's \(6.4 \times 10^{-4}\) <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §4]</a>. The masks cost \((\text{tokens} - 1) \times \text{layers} \times k\) int32 values, about 60 MB per 32K-token trajectory at 60 layers and \(k = 8\) <a href="https://arxiv.org/abs/2609.08368">[Miles, §2.5]</a> (\(32{,}767 \times 60 \times 8 \times 4\) B = 63 MB by my check).</li>
+    <li><strong>Keep Routing</strong> is DeepSeek's version: preserve the sampling-time routing paths and enforce them in training. The report calls it crucial for MoE RL stability, in the pipeline since DeepSeek-V3-0324 <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.1]</a>.</li>
+    <li><strong>Avoid the need:</strong> GSPO's sequence-level ratio removed the dependence on Routing Replay for Qwen's MoE runs <a href="https://arxiv.org/abs/2507.18071">[GSPO, §5.3]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Routing replay for MoE RL</div>
+    <dl>
+      <dt>Problem</dt><dd>Top-\(k\) routing is discontinuous, so tiny numeric differences change which experts run, and the importance ratio compares two different sub-networks.</dd>
+      <dt>Idea</dt><dd>Treat each token's expert assignment as rollout data: record it in the engine, and replay it in the trainer's forward passes.</dd>
+      <dt>Why it works</dt><dd>The trainer then evaluates the same expert subset that produced the sample, restoring the first-order approximation, at the cost of biasing the target policy toward the recorded routing <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, §3.2]</a>.</dd>
+      <dt>Evidence</dt><dd>Qwen3-30B-A3B runs that crashed at step 60 to 120 without R3 stayed stable with it. On a multi-turn SWE task GRPO scored 31.8 and collapsed near step 90, while GRPO+R3 reached 38.6 <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, Tab. 1 and 2]</a>.</dd>
+      <dt>Cost</dt><dd>Extra memory and communication, and bias toward the recorded routing. On-policy, R3 gave no gain in the Qwen study; at 2 times off-policiness R2 beat R3, and at 4 to 8 times R3 won <a href="https://arxiv.org/abs/2512.01374">[Zheng et al. 2025b, §4.3 to §4.4]</a>. Miles leaves R3 off in its asynchronous GLM-5.2 reference run.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3.2 (Keep Routing), Miles and verl (router-replay options), and Qwen's earlier MoE RL runs (Routing Replay).</dd>
+    </dl>
+  </div>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: the mismatch grows during a run</div>
+    <p>Collapsed runs in the R3 study were almost always preceded by rising training-inference KL and a rising fraction of "extreme" tokens. In one run the share of tokens whose trainer and engine probabilities differed by more than 2× exceeded 10% after step 60, against under \(10^{-4}\) for most of the runs with R3 <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §5.2]</a>. Log these numbers from step 0 (see <a href="#monitor">monitoring</a>).</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="agentic">Agentic RL: multi-turn tool use</h2>
+
+  <p>An agent <span class="zh">智能体</span> acts through tool calls <span class="zh">工具调用</span> in an environment over many turns: it emits reasoning and a call, the environment executes it and returns text, and the loop continues until a final answer or a budget runs out. The trajectory is one growing token sequence that interleaves <em>policy tokens</em> with <em>environment tokens</em>, and the reward usually arrives only at the end (the tests pass or they do not). Almost everything specific to agentic RL follows from that interleaving.</p>
+
+  <h3 id="masking">Trajectories, and what gets masked</h3>
+  <p>The state is the whole context so far, an action is one assistant turn (reasoning plus tool call), and a transition appends the tool's output. The RL loss must touch only tokens the policy actually sampled:</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 350" role="img" aria-labelledby="fig-25-3-title">
+<title id="fig-25-3-title">A multi-turn agent trajectory as one token sequence, with the loss mask that keeps only tokens the policy sampled</title>
+<text x="8" y="18" class="s-bold">One growing token sequence per trajectory (sizes not to scale)</text>
+<text x="92" y="83.0" text-anchor="end" class="s-small">context</text>
+<rect class="s-box" x="100" y="56" width="96" height="46" rx="4"/>
+<text x="148.0" y="75" text-anchor="middle" class="s-small s-bold">system + user</text>
+<text x="148.0" y="90" text-anchor="middle" class="s-small">task prompt</text>
+<text x="148.0" y="50" text-anchor="middle" class="s-small s-muted">850 tok</text>
+<rect class="s-a" x="199" y="56" width="104" height="46" rx="4"/>
+<text x="251.0" y="75" text-anchor="middle" class="s-small s-bold">assistant</text>
+<text x="251.0" y="90" text-anchor="middle" class="s-small">think + call</text>
+<text x="251.0" y="50" text-anchor="middle" class="s-small s-muted">180 tok</text>
+<rect class="s-d" x="306" y="56" width="96" height="46" rx="4"/>
+<text x="354.0" y="75" text-anchor="middle" class="s-small s-bold">tool output</text>
+<text x="354.0" y="90" text-anchor="middle" class="s-small">stdout, files</text>
+<text x="354.0" y="50" text-anchor="middle" class="s-small s-muted">1,240 tok</text>
+<rect class="s-a" x="405" y="56" width="104" height="46" rx="4"/>
+<text x="457.0" y="75" text-anchor="middle" class="s-small s-bold">assistant</text>
+<text x="457.0" y="90" text-anchor="middle" class="s-small">think + call</text>
+<text x="457.0" y="50" text-anchor="middle" class="s-small s-muted">150 tok</text>
+<rect class="s-d" x="512" y="56" width="88" height="46" rx="4"/>
+<text x="556.0" y="75" text-anchor="middle" class="s-small s-bold">tool output</text>
+<text x="556.0" y="90" text-anchor="middle" class="s-small">test log</text>
+<text x="556.0" y="50" text-anchor="middle" class="s-small s-muted">620 tok</text>
+<rect class="s-a" x="603" y="56" width="104" height="46" rx="4"/>
+<text x="655.0" y="75" text-anchor="middle" class="s-small s-bold">assistant</text>
+<text x="655.0" y="90" text-anchor="middle" class="s-small">patch + answer</text>
+<text x="655.0" y="50" text-anchor="middle" class="s-small s-muted">260 tok</text>
+<text x="92" y="129" text-anchor="end" class="s-small">produced by</text>
+<text x="148.0" y="129" text-anchor="middle" class="s-small s-muted">harness</text>
+<text x="251.0" y="129" text-anchor="middle" class="s-small s-muted">policy</text>
+<text x="354.0" y="129" text-anchor="middle" class="s-small s-muted">environment</text>
+<text x="457.0" y="129" text-anchor="middle" class="s-small s-muted">policy</text>
+<text x="556.0" y="129" text-anchor="middle" class="s-small s-muted">environment</text>
+<text x="655.0" y="129" text-anchor="middle" class="s-small s-muted">policy</text>
+<text x="92" y="158" text-anchor="end" class="s-small s-bold">loss mask</text>
+<rect class="s-plain" x="100" y="142" width="96" height="22" rx="3"/>
+<text x="148.0" y="158" text-anchor="middle" class="s-small s-muted">0 0 0 … 0</text>
+<rect class="s-a" x="199" y="142" width="104" height="22" rx="3"/>
+<text x="251.0" y="158" text-anchor="middle" class="s-small s-bold">1 1 1 … 1</text>
+<rect class="s-plain" x="306" y="142" width="96" height="22" rx="3"/>
+<text x="354.0" y="158" text-anchor="middle" class="s-small s-muted">0 0 0 … 0</text>
+<rect class="s-a" x="405" y="142" width="104" height="22" rx="3"/>
+<text x="457.0" y="158" text-anchor="middle" class="s-small s-bold">1 1 1 … 1</text>
+<rect class="s-plain" x="512" y="142" width="88" height="22" rx="3"/>
+<text x="556.0" y="158" text-anchor="middle" class="s-small s-muted">0 0 0 … 0</text>
+<rect class="s-a" x="603" y="142" width="104" height="22" rx="3"/>
+<text x="655.0" y="158" text-anchor="middle" class="s-small s-bold">1 1 1 … 1</text>
+<text x="92" y="189" text-anchor="end" class="s-small">log-probs</text>
+<text x="148.0" y="189" text-anchor="middle" class="s-small s-muted">not used</text>
+<text x="251.0" y="189" text-anchor="middle" class="s-small">μ (engine)</text>
+<text x="251.0" y="203" text-anchor="middle" class="s-small">π (trainer)</text>
+<text x="354.0" y="189" text-anchor="middle" class="s-small s-muted">not used</text>
+<text x="457.0" y="189" text-anchor="middle" class="s-small">μ (engine)</text>
+<text x="457.0" y="203" text-anchor="middle" class="s-small">π (trainer)</text>
+<text x="556.0" y="189" text-anchor="middle" class="s-small s-muted">not used</text>
+<text x="655.0" y="189" text-anchor="middle" class="s-small">μ (engine)</text>
+<text x="655.0" y="203" text-anchor="middle" class="s-small">π (trainer)</text>
+<text x="92" y="229" text-anchor="end" class="s-small">advantage</text>
+<text x="148.0" y="229" text-anchor="middle" class="s-small s-muted">none</text>
+<text x="251.0" y="229" text-anchor="middle" class="s-small">Â (shared)</text>
+<text x="354.0" y="229" text-anchor="middle" class="s-small s-muted">none</text>
+<text x="457.0" y="229" text-anchor="middle" class="s-small">Â (shared)</text>
+<text x="556.0" y="229" text-anchor="middle" class="s-small s-muted">none</text>
+<text x="655.0" y="229" text-anchor="middle" class="s-small">Â (shared)</text>
+<rect class="s-c" x="100" y="244" width="607" height="30" rx="4"/>
+<text x="403.5" y="263" text-anchor="middle" class="s-small">outcome reward r (tests pass = 1), known after the last turn: one Â per trajectory</text>
+<text x="92" y="263" text-anchor="end" class="s-small">reward</text>
+<text x="8" y="296" class="s-small s-muted">Template tokens the harness adds around each turn (role headers, tool-result wrappers)</text>
+<text x="8" y="312" class="s-small s-muted">are not sampled either, so they are masked too. Â is copied to every unmasked token.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One trajectory as one sequence. Blue tokens were sampled by the policy, so they carry a rollout log-probability \(\mu\), a trainer log-probability \(\pi\), and the trajectory's advantage. Everything else (the prompt, tool outputs, template scaffolding) is context: it conditions the next turn but contributes no loss, no importance ratio and no KL term. The end-of-turn token the model emits is its own action and stays in the mask, otherwise it would never learn to stop or to call a tool.</figcaption>
+  </figure>
+
+  <p>The rule is <strong>token provenance</strong>: train exactly the tokens the policy sampled. Three reasons. (1) Gradient on environment text teaches the model to predict retrieved passages or stdout, which is not the behavior we want and can drown the signal. (2) The importance ratio is undefined there: the engine never sampled those tokens, so there is no \(\mu\). (3) It is measurably better. Search-R1 masks retrieved tokens in the PPO and GRPO objectives (including the KL term) and reports an average exact-match score of 0.431 with the mask against 0.343 without on Qwen2.5-7B with PPO <a href="https://arxiv.org/abs/2503.09516">[Search-R1, §3.1, Tab. 4]</a>. This is the RL sibling of SFT loss masking (<a href="19-sft-distillation.html#masking">page 19</a>), with one difference: in SFT the assistant tokens are given, while here they must be recorded at sampling time. A minimal rollout loop makes the bookkeeping explicit:</p>
+
+<pre><code class="language-python">def rollout(engine, env, tokenizer, prompt_ids, max_turns=30):
+    ids, mask, logp = list(prompt_ids), [0] * len(prompt_ids), [0.0] * len(prompt_ids)
+    for _ in range(max_turns):
+        out = engine.generate(ids)                    # new token ids + the engine's per-token log-probs (mu)
+        ids += out.token_ids; mask += [1] * len(out.token_ids); logp += out.logprobs
+        call = parse_tool_call(out.token_ids)         # decode ONLY to dispatch the call; never re-encode the text
+        if call is None:                              # final answer: episode over
+            break
+        obs = tokenizer.encode(env.step(call), add_special_tokens=False)   # environment text, tokenized once
+        ids += obs; mask += [0] * len(obs); logp += [0.0] * len(obs)       # masked: context only
+    return ids, mask, logp, env.reward()              # reward from the verifier, outside the agent's reach
+</code></pre>
+
+  <p>The loss then averages over unmasked tokens only (the <code>mask.sum()</code> denominator in the loss of the <a href="#fixes">previous section</a>), so a 1,240-token tool output neither adds gradient nor dilutes the average.</p>
+
+  <h3 id="tito">Token-in, token-out: train on the tokens that were sampled</h3>
+  <p>A subtle failure sits under the mask. Many multi-turn pipelines decode the model's tokens to text to parse the tool call, append the tool result as a message, re-render the chat template, and re-tokenize the whole conversation for the trainer. That round trip is lossy. Byte-pair encoding is not reversible, so decode-then-encode can produce different token IDs; chat templates may strip reasoning from earlier turns or re-serialize tool-call arguments; and the boundaries between assistant and tool tokens have to be reconstructed after the fact, differently for each model family <a href="https://huggingface.co/blog/huggingface/tito">[Hugging Face, Token-In Token-Out]</a>. The trainer then scores tokens the policy never sampled, so the old log-probabilities, the mask and the importance ratio all describe a trajectory that did not occur. Miles puts it plainly: the update is taken against "a trajectory that never occurred" <a href="https://arxiv.org/abs/2609.08368">[Miles, §2.4]</a>.</p>
+  <p>The fix is to make <strong>token IDs the canonical representation</strong>. The engine returns completion token IDs and log-probabilities, prior assistant turns keep their original IDs, and only new environment messages are tokenized and appended. ProRL Agent carries <code>input_ids</code>, <code>output_ids</code> and <code>logprobs</code> unchanged through the pipeline, so every token ID reaching the trainer is the one produced at rollout <a href="https://arxiv.org/abs/2603.18815">[ProRL Agent, §3.3.3]</a>. Miles moves tokenization into a session server that checkpoints prompt IDs, output IDs, log-probabilities and routed experts after each completion, tokenizes only the appended suffix on the next turn, and assembles one contiguous training sequence with the non-model tokens loss-masked. It also checks per model family that the chat template is append-only from turn to turn, the invariant this approach relies on <a href="https://arxiv.org/abs/2609.08368">[Miles, §2.4]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Token-provenance masking with token-in-token-out</div>
+    <dl>
+      <dt>Problem</dt><dd>In a multi-turn trajectory only some tokens are the policy's actions, and text round trips change which tokens the trainer sees.</dd>
+      <dt>Idea</dt><dd>Record token IDs, log-probs and provenance (policy or environment) at sampling time, append environment tokens once, and mask by provenance.</dd>
+      <dt>Why it works</dt><dd>The loss, the importance ratio and the KL are then computed on exactly the sampled actions, and the engine-versus-trainer comparison of the previous section is meaningful.</dd>
+      <dt>Evidence</dt><dd>Retrieved-token masking: 0.431 against 0.343 average score <a href="https://arxiv.org/abs/2503.09516">[Search-R1, Tab. 4]</a>. Token IDs as the canonical form are a design requirement in ProRL Agent and Miles.</dd>
+      <dt>Cost</dt><dd>The harness must not own tokenization, so agent scaffolds written for text APIs need an adapter or a session server. Templates that rewrite history (dropping earlier reasoning) break the append-only property and force branching into several training sequences.</dd>
+      <dt>Used by</dt><dd>Search-R1, verl's multi-turn stack (with template-aware masking), ProRL Agent, Miles.</dd>
+    </dl>
+  </div>
+
+  <h3 id="credit">Trajectory-level versus turn-level rewards</h3>
+  <p>The default is a <strong>trajectory-level outcome reward</strong>: the verifier scores the finished episode, GRPO normalizes within the group of \(G\) trajectories for the same task, and the resulting advantage is copied to every unmasked token (Figure 3). DeepSeek-V3.2 uses a rule-based outcome reward, a length penalty and a language-consistency reward for reasoning and agent tasks, and a generative reward model with per-prompt rubrics for general tasks <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3]</a>. It is cheap and hard to game, but a 50-step episode with over 20K tokens (ALFWorld) gives one bit for dozens of decisions, and credit assignment across turns is weak.</p>
+  <p>Turn-level credit has three routes. <strong>Dense environment rewards</strong> (partial test passes, subgoal flags) help but invite hacking. <strong>Learned process rewards</strong> are discussed on <a href="23-rlhf.html">page 23</a>. <strong>GiGPO</strong> stays critic-free: it keeps the episode-level advantage \(A_E\) and adds a step-level advantage \(A_S\) computed among actions taken from the <em>same environment state</em> across the group's trajectories (anchor states found with a hash map, no extra rollouts), combined as \(A = A_E + \omega A_S\). On ALFWorld and WebShop with Qwen2.5-1.5B and 7B it beat GRPO by more than 12% and 9%, at under 0.002% extra time, and it falls back to GRPO when no states repeat <a href="https://arxiv.org/abs/2505.10978">[GiGPO, abstract, §5.6, §6]</a>. GSPO's token-level variant likewise allows per-token advantages when multi-turn RL wants finer credit than one number per response <a href="https://arxiv.org/abs/2507.18071">[GSPO, §4.3]</a>.</p>
+
+  <h3 id="environments">Environments: real, simulated and synthesized</h3>
+  <p>The frontier reports converge on the same recipe: a cold start that teaches the format, then RL on a large and diverse pool of executable environments with checkable outcomes. DeepSeek-V3.2 gives the most detail. Its cold start unifies reasoning and tool use in single trajectories through prompting, and it then trains on 85,267 prompts across four task families (Table 1 of the report, my sum):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Task family</th><th class="num">Tasks</th><th>Environment</th><th>Prompts</th></tr></thead>
+    <tbody>
+      <tr><td>Code agent (GitHub issue resolution)</td><td class="num">24,667</td><td>real, executable</td><td>extracted</td></tr>
+      <tr><td>Search agent</td><td class="num">50,275</td><td>real (web search APIs)</td><td>synthesized</td></tr>
+      <tr><td>General agent</td><td class="num">4,417</td><td>synthesized (1,827 environments)</td><td>synthesized</td></tr>
+      <tr><td>Code interpreter (Jupyter)</td><td class="num">5,908</td><td>real</td><td>extracted</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: <a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2, §3.2.3, Tab. 1</a>. The "1,800+ environments and 85,000 prompts" in the introduction correspond to the 1,827 synthesized general-agent environments and the sum of the four rows.</p>
+  <ul>
+    <li><strong>Synthesizing environments that are hard to solve but easy to verify.</strong> An agent gets a task category and a sandbox with bash and search, gathers data into a sandbox database, writes task-specific tools as Python functions, then proposes a simple task with a solution function (allowed to call only the tools, never the database) and a verification function that must accept the solution's output. It iteratively raises difficulty, yielding \(\langle\)environment, tools, task, verifier\(\rangle\) tuples. Trip planning is the example: searching the combinatorial space of plans is hard, checking one plan against constraints is easy. Only instances with non-zero pass@100 (measured during RL with DeepSeek-V3.2) were kept, leaving 1,827 environments and 4,417 tasks. They are hard: on 50 sampled tasks DeepSeek-V3.2-Exp reached 12% pass@1 and the best frontier model tested 62% <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.2.3, §4.3]</a>. RL on the synthetic tasks alone improved \(\tau^2\)-bench, MCP-Mark and MCP-Universe over the SFT checkpoint, while RL restricted to code and search environments did not (Fig. 5), which suggests that environment diversity matters for out-of-domain generalization.</li>
+    <li><strong>Executable software-engineering environments.</strong> From millions of GitHub issue and pull-request pairs, an environment-setup agent builds a runnable environment (dependencies, test runner, JUnit-format results). It is valid only if applying the gold patch turns at least one failing test into a passing one and breaks none (F2P greater than 0, P2F equal to 0), giving tens of thousands of environments in eight languages <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.2.3]</a>. Kimi K2 likewise builds SWE environments from GitHub issues with executable unit tests on Kubernetes, supporting over 10,000 concurrent sandbox instances <a href="https://arxiv.org/abs/2507.20534">[K2, §3.2.1]</a>.</li>
+    <li><strong>Simulated tools and users.</strong> K2's pipeline collects 3,000+ real MCP tools from GitHub and evolves over 20,000 synthetic tools by domain, builds thousands of agents from different system prompts and tool subsets, pairs each task with a rubric, and lets LLM user personas talk to the agent while a tool simulator (functionally a world model with state and controlled stochasticity) answers tool calls. An LLM judge filters trajectories against the rubric. The report notes the fidelity limit of simulation and complements it with real sandboxes where execution matters, such as coding <a href="https://arxiv.org/abs/2507.20534">[K2, §3.1.1]</a>. This pipeline produces the SFT data; the joint RL stage runs verifiable tasks, real sandboxes and a rubric-based reward (<a href="#rewards">next section</a>).</li>
+    <li><strong>A contrast: SWE-RL.</strong> Meta's SWE-RL needs no sandbox. Given an issue and file contents, the model writes search/replace edits, and the reward is the <code>difflib.SequenceMatcher</code> similarity in \([0, 1]\) between the predicted and the oracle patch, or \(-1\) for a malformed answer. GRPO on Llama-3.3-70B-Instruct over 273K pull-request seeds reached 41.0% on SWE-bench Verified inside a pipeline scaffold, and the continuous reward beat exact match (repair accuracy 34.8 against 29.0). The authors flag the costs: similarity is not semantic equivalence, and a fixed pipeline cannot learn from interaction feedback <a href="https://arxiv.org/abs/2502.18449">[SWE-RL, §2.1, §3.6, §5]</a>. It is cheap, single-turn and not agentic; DeepSeek-V3.2 and K2 pay for execution to get faithful rewards.</li>
+  </ul>
+
+  <p><strong>Sandboxes are systems work.</strong> Kimi k1.5's code sandbox replaced Docker with crun, pre-created cgroups and used a tmpfs overlay: container startup dropped from 0.12 s to 0.04 s and the maximum start rate on a 16-core machine rose from 27 to 120 containers per second <a href="https://arxiv.org/abs/2501.12599">[k1.5, §2.6.4]</a>. DeepSeek-V4's DSec is a Rust platform (API gateway, per-host agent, cluster monitor) exposing four substrates behind one SDK, from pre-warmed function-call containers to Firecracker microVMs and full QEMU VMs, whose lifecycles coordinate with GPU preemption and checkpoint resumption, and a single cluster manages hundreds of thousands of concurrent sandboxes <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.2.5]</a>. The verifier must run where the agent cannot reach it (<a href="#rewards">reward hacking</a>).</p>
+
+  <h3 id="context">Context management over long trajectories</h3>
+  <p>Agent trajectories outgrow the context window. DeepSeek-V3.2 (128K) reports that over 20% of BrowseComp test cases exceed it. Two rules matter.</p>
+  <ul>
+    <li><strong>Keep reasoning across tool calls.</strong> DeepSeek-R1 discarded reasoning content when a second round of messages arrived, which forced the model to re-derive its plan after every tool result. V3.2 discards reasoning only when a <em>new user message</em> arrives. Tool calls and results always stay. Harnesses that simulate tool results as user messages defeat this (the report names Roo Code and Terminus and recommends non-thinking mode there) <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3.2.1]</a>.</li>
+    <li><strong>Overflow strategies.</strong> At 80% of the window, V3.2 applies Summary (summarize the overflowed trajectory and restart), Discard-75% (drop the first 75% of tool-call history) or Discard-all (reset, dropping all previous tool-call history). On BrowseComp the score was 51.4 without management, 60.2 with Summary (364 steps on average) and 67.6 with Discard-all, comparable to parallel scaling while using far fewer steps <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §4.4]</a>.</li>
+  </ul>
+  <p>What this means for training is my reading, not something the report details. If the harness rewrites history, later contexts are no longer extensions of earlier ones, so one trajectory cannot be scored as a single sequence. It has to become several training sequences, each with its own context, sharing the trajectory's reward. Miles offers "linear" and "branching" session rules, which determine how many training trajectories one session can produce <a href="https://arxiv.org/abs/2609.08368">[Miles, §2.4.1]</a>. Train with the same context policy you deploy, or the model is optimized for contexts it will not see.</p>
+
+  <h3 id="agentic-systems">Systems for agentic rollouts</h3>
+  <p>Environment latency adds a second source of idle GPUs: a turn waiting on a virtual machine or a test suite holds its KV cache and generates nothing. Two remedies are reported, on top of prefix-aware routing (see <a href="#faster-rollout">faster rollouts</a>).</p>
+  <ul>
+    <li><strong>Overlap and over-subscribe.</strong> K2 deploys heavy environments as dedicated services and runs many concurrent rollouts to amortize slow interactions, plus partial rollout for long-tail trajectories <a href="https://arxiv.org/abs/2507.20534">[K2, §3.3.4]</a>. ROLL Flash decomposes each trajectory into environment-level units so pending trajectories go to free engines while one waits for its environment, and adds redundant environment rollouts (7% to 16% more throughput). Environment-level asynchrony gave 2.72× on ALFWorld and 1.81× on SWE <a href="https://arxiv.org/abs/2510.11345">[ROLL Flash, §5.2]</a>.</li>
+    <li><strong>Serve rollouts as a service.</strong> ProRL Agent runs INIT, RUN and EVAL as separate worker pools behind an HTTP API, so slow container startup, GPU-bound agent loops and minutes-long test suites are sized independently, and failed rollouts are excluded from the gradient instead of stalling the pool <a href="https://arxiv.org/abs/2603.18815">[ProRL Agent, §3.3, §4.1]</a>.</li>
+  </ul>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger trained on a fixed dataset: the label never depended on the network's own earlier outputs, so you could reuse the same events for many epochs. An agent's data depends on the policy. Each tool call changes what the environment returns next, so a trajectory is valid training data only for policies close to the one that produced it. That is why RL needs fresh rollouts, why staleness and mismatch matter so much, and why a large share of the machinery on this page exists.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="rewards">Rewards beyond verifiers, and reward hacking</h2>
+
+  <p>The reward sources form a spectrum from cheap and narrow to broad and gameable:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Source</th><th>Example</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Rule-based verifier</td><td>Exact or numeric match, format checks</td><td>Cheap, deterministic, hard to game</td><td>Only for tasks with a checkable answer</td></tr>
+      <tr><td>Execution in a sandbox</td><td>Unit tests, terminal tasks, SWE environments</td><td>Faithful to function for code</td><td>Slow, environment bugs, exploitable through the test infrastructure</td></tr>
+      <tr><td>Similarity to a reference</td><td>SWE-RL patch similarity</td><td>No execution needed</td><td>Measures text overlap, not behavior</td></tr>
+      <tr><td>Generative judge with rubrics</td><td>DeepSeek-V3.2, Kimi K2, RaR</td><td>Works for open-ended tasks</td><td>Judge noise and bias, itself gameable, costs inference</td></tr>
+      <tr><td>Learned scalar reward model</td><td><a href="21-preference-optimization.html">Page 21</a></td><td>Cheap online</td><td>Over-optimization (<a href="21-preference-optimization.html#over-optimization">page 21</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="rubrics">Rubrics and generative reward models</h3>
+  <p>For tasks without a verifier, the frontier recipes replace a single scalar model with a <strong>generative judge that reasons against explicit criteria</strong>.</p>
+  <ul>
+    <li><strong>DeepSeek-V3.2:</strong> for general tasks it uses a generative reward model in which each prompt has its own rubrics, and its search-agent data pairs verifiable answers with rubric scoring so that both factual reliability and helpfulness are optimized <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §3, §3.2.3]</a>.</li>
+    <li><strong>Kimi K2's self-critique rubric reward:</strong> the actor samples several responses to a general prompt, and the K2 critic ranks them by <em>pairwise</em> comparison against a mix of core rubrics (the assistant's basic values), prescriptive rubrics "that aim to eliminate reward hacking", and human-written rubrics for specific instruction types. The critic starts from preference data in SFT and, crucially, is refined during RL using on-policy rollouts from verifiable-reward prompts, so its standards are grounded in tasks with ground truth and recalibrate as the policy changes <a href="https://arxiv.org/abs/2507.20534">[K2, §3.2.2]</a>. K2 also runs a "hack-check" layer for instruction following that detects claims of compliance without actual compliance (§3.2.1).</li>
+    <li><strong>Rubrics as Rewards (RaR):</strong> a strong LLM writes a prompt-specific rubric of 7 to 20 self-contained items (Essential, Important, Optional, Pitfall), conditioned on a reference answer. The reward is an <em>explicit</em> weighted sum \(\sum_j w_j c_j / \sum_j w_j\) of binary checks or an <em>implicit</em> holistic 1 to 10 score from a judge shown the whole rubric. RLVR is the special case of one item. Against direct Likert-style judge rewards it improved by up to 31% (HealthBench) and 7% (GPQA-Diamond); generic fixed rubrics and rubrics written without a reference answer did worse (32.0 versus 35.9 on HealthBench-1k). It covers medicine and science only, not tool use <a href="https://arxiv.org/abs/2507.17746">[Gunjal et al. 2025, §2 to §6, §9]</a>.</li>
+    <li><strong>DeepSeek-GRM:</strong> a <em>pointwise</em> generative reward model that writes principles, then a critique and a score per response, so one format rates one, two or many responses. Pairwise models cannot rate a single response, and scalar models return one deterministic number, so sampling more does not help them. With a 27B model the benchmark average rose from 69.9 (greedy) to 71.0 (voting over 32 samples) and 72.8 with a meta reward model guiding the vote <a href="https://arxiv.org/abs/2504.02495">[Liu et al. 2025, §3, §5, Tab. 2]</a>.</li>
+  </ul>
+  <p>Cost arithmetic for the design choice: ranking a group of \(G = 16\) responses pairwise takes \(\binom{16}{2} = 120\) comparisons (240 if each pair is judged in both orders to cancel position bias), against 16 calls pointwise. Judge cost is a real fraction of the reward budget, and rubric guidance helped small judges most in RaR's judge-alignment study <a href="https://arxiv.org/abs/2507.17746">[Gunjal et al. 2025, §5]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Rubric-based generative rewards</div>
+    <dl>
+      <dt>Problem</dt><dd>Open-ended tasks (writing, advice, search-based answers with no unique string) have no verifier, and scalar reward models are noisy and over-optimized.</dd>
+      <dt>Idea</dt><dd>Turn "is this good" into a per-prompt checklist, have an LLM judge score each response against it (pointwise or pairwise), and use the score as the RL reward.</dd>
+      <dt>Why it works</dt><dd>Explicit criteria give the judge structure (less length and style bias than a bare score), decompose quality so partial credit exists, and can be tied to reference answers or refined on verifiable tasks so the judge stays calibrated.</dd>
+      <dt>Evidence</dt><dd>RaR up to 31% relative gain over Likert judging <a href="https://arxiv.org/abs/2507.17746">[RaR]</a>. DeepSeek-V3.2 and K2 both put rubric judges in their production RL stages <a href="https://arxiv.org/abs/2512.02556">[V3.2]</a>, <a href="https://arxiv.org/abs/2507.20534">[K2]</a>.</dd>
+      <dt>Cost</dt><dd>Judge inference in the loop, judge errors that the policy can exploit, rubric quality (reference answers help), and no tool-use study yet in RaR. Needs held-out human or verifiable checks to detect judge exploitation.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3.2, Kimi K2, Scale AI's RaR, DeepSeek-GRM as a research reward model.</dd>
+    </dl>
+  </div>
+
+  <h3 id="hacking">Reward hacking in agentic settings</h3>
+  <p>Reward hacking <span class="zh">奖励黑客</span> is sharper for agents than for a text-only policy, because the agent acts inside the same system that computes its reward. It has a shell, a filesystem and often the test files, so the attack surface is the whole environment, and stronger models find more exploits. OpenAI reported that as RL scaled, agents found more complex, harder-to-detect hacks <a href="https://arxiv.org/abs/2503.11926">[Baker et al. 2025, §1]</a>. The catalog from three primary sources:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Hack</th><th>What the agent does</th><th>Reported in</th></tr></thead>
+    <tbody>
+      <tr><td>Edit or delete the tests</td><td>Changes assertions or test files so they pass</td><td>OpenAI honeypots (§3.1); ImpossibleBench (Claude models did this in over 79% of their cheating on Conflicting-SWEbench)</td></tr>
+      <tr><td>Exit before the asserts</td><td><code>sys.exit(0)</code>: return code 0 before any assertion runs</td><td>OpenAI frontier run; Anthropic production environments</td></tr>
+      <tr><td>Skip the tests</td><td>Raises <code>SkipTest</code> from code outside the test framework</td><td>OpenAI frontier run</td></tr>
+      <tr><td>Always-equal object</td><td>Returns an object whose <code>__eq__</code> is always true (and whose <code>strip</code> returns itself)</td><td>Anthropic; ImpossibleBench ("operator overloading")</td></tr>
+      <tr><td>Patch the framework</td><td>A <code>conftest.py</code> that monkey-patches pytest's <code>TestReport.from_item_and_call</code> to report every test as passed</td><td>Anthropic</td></tr>
+      <tr><td>Special-case or read the tests</td><td>Detects the exact test and returns its expected value; parses test files at run time; records call counts to vary outputs</td><td>ImpossibleBench; OpenAI</td></tr>
+      <tr><td>Stub or replace the dependency</td><td>Writes a local stub of a library (for example pandas) so verification trivially passes; writes stubs where coverage is weak</td><td>OpenAI</td></tr>
+      <tr><td>Read the answer</td><td>Decompiles a reference solution accidentally left in the environment</td><td>OpenAI</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: <a href="https://arxiv.org/abs/2503.11926">Baker et al. 2025 (OpenAI), §2 and App. A</a>; <a href="https://arxiv.org/abs/2511.18397">MacDiarmid et al. 2025 (Anthropic), §2, Fig. 7 and 8</a>; <a href="https://arxiv.org/abs/2510.20270">Zhong et al. 2025 (ImpossibleBench), §4</a>. METR reported o3 monkey-patching the timing function in RE-Bench, as cited in ImpossibleBench's introduction.</p>
+
+  <p><strong>How much, and what helps.</strong> ImpossibleBench makes tasks impossible by construction (a test conflicts with the specification), so any pass is a cheat. With tests open to editing, GPT-5 passed 54.0% of Conflicting-SWEbench and 76% of Oneoff-SWEbench but only 2.9% of Oneoff-LiveCodeBench, and stronger models generally cheated more. Prompt wording moved the rate enormously: on Conflicting-LiveCodeBench a loose "do not modify the tests" prompt gave over 85% cheating for GPT-5 and o3, the strictest prompt 1% and 33%. Hiding the tests cut cheating to near zero but hurt legitimate scores; read-only tests kept legitimate scores and stopped test editing but not special-casing or operator overloading; an explicit abort option (<code>flag_for_human_intervention</code>) cut GPT-5's cheating from 54% to 9% and o3's from 49% to 12%, with a much smaller effect on Claude Opus 4.1 <a href="https://arxiv.org/abs/2510.20270">[ImpossibleBench, §4 to §5]</a>.</p>
+  <p><strong>What it does to training.</strong> In OpenAI's frontier run, two systemic hacks, <code>exit(0)</code> and <code>raise SkipTest</code>, once discovered, "quickly get reinforced and become systemic, affecting nearly every training environment". A prompted GPT-4o that read the agent's chain of thought caught them with 95% joint recall against 60% for a monitor that saw only actions. But when the monitor was folded into the reward, the agent first improved (more real solutions, fewer hacks) and then learned <em>obfuscated</em> reward hacking: it hid its intent in a benign-looking chain of thought, monitor recall fell to near zero, and hacking continued <a href="https://arxiv.org/abs/2503.11926">[Baker et al. 2025, §2 to §3]</a>. Anthropic's study adds that hacking need not stay local: models that learned to hack in real coding environments generalized to alignment faking and sabotage on other evaluations. Effective mitigations were preventing the hack, diversifying the RLHF safety data, and "inoculation prompting" <a href="https://arxiv.org/abs/2511.18397">[MacDiarmid et al. 2025, Abstract, §2]</a>.</p>
+  <p><strong>A defensive checklist</strong> (my synthesis of the sources above):</p>
+  <ol>
+    <li><strong>Isolate the verifier.</strong> Run tests where the agent cannot write, inject or restore the test files at scoring time, and prefer hidden tests. A verifier the agent shares a filesystem with is a suggestion.</li>
+    <li><strong>Require more than one signal.</strong> DeepSeek-V3.2's validity rule (fail-to-pass greater than 0, pass-to-fail equal to 0), held-out tests, or rubric-plus-execution rewards.</li>
+    <li><strong>Detect what you know.</strong> Regexes and AST checks for known hacks (OpenAI used regexes for <code>exit(0)</code> and <code>SkipTest</code> as ground truth), LLM monitors over whole trajectories, and manual reading of the highest-reward trajectories every few hundred steps.</li>
+    <li><strong>Do not train hard against the monitor.</strong> Use flags to patch environments and gate releases, not as a large reward term, and accept the "monitorability tax".</li>
+    <li><strong>Offer a legitimate exit</strong> ("this task is broken") and <strong>evaluate on a different harness</strong>, the cheapest way to see train reward and true quality diverge.</li>
+  </ol>
+</section>
+
+<section>
+  <h2 id="monitor">What to monitor in an RL run</h2>
+  <p>RL runs fail quietly: reward can rise while quality falls, and collapse often follows a long period of drift. Log these from step 0 and plot them together.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Metric</th><th>Why</th><th>Failure signature</th><th>First response</th></tr></thead>
+    <tbody>
+      <tr><td>Mean reward and per-task pass rate (train)</td><td>Learning progress, per environment</td><td>One task family rises while others fall; plateau</td><td>Check the data mix and difficulty filter</td></tr>
+      <tr><td>Held-out eval on unseen tasks, ideally a different harness</td><td>Generalization, and hacking</td><td>Train reward up, eval flat or down</td><td>Read top-reward trajectories, harden the verifier</td></tr>
+      <tr><td>Share of groups with zero advantage (all pass or all fail)</td><td>Signal density</td><td>Rising share</td><td>Filter such groups and re-balance difficulty (Magistral filters non-diverse groups <a href="https://arxiv.org/abs/2506.10910">[§2.1]</a>; K2 selects moderate-difficulty prompts <a href="https://arxiv.org/abs/2507.20534">[§3.2.1]</a>)</td></tr>
+      <tr><td>Response length: mean, p99, truncation rate</td><td>Drift, and the rollout tail</td><td>Runaway growth, rising truncation, repetition loops</td><td>Length penalty or budget; repetition cut-off (MiniMax halts a generation after 3,000 consecutive tokens with probability above 0.99 <a href="https://arxiv.org/abs/2506.13585">[§3.2]</a>)</td></tr>
+      <tr><td>Policy entropy</td><td>Exploration</td><td>Fast collapse (or a sharp crash right before divergence)</td><td>Less off-policy data, clip-higher (<a href="24-rlvr-reasoning.html">page 24</a>)</td></tr>
+      <tr><td>KL to the reference, gradient norm</td><td>Drift and stability</td><td>Jumps or spikes</td><td>Lower learning rate, check for a hack or a mismatch spike</td></tr>
+      <tr><td>Clip fraction, and fraction masked by sequence masking</td><td>How off-policy the update is</td><td>High and rising</td><td>Fewer minibatches per batch, tighter staleness. Compare only within one algorithm: GSPO's clipped-token fraction was about 0.15 against 0.0013 for GRPO by design <a href="https://arxiv.org/abs/2507.18071">[GSPO, §5.2]</a></td></tr>
+      <tr><td>Engine-versus-trainer gap: per-token \(k_3\) KL, extreme-token fraction \(F(\tau{=}2)\), probability correlation</td><td>Mismatch</td><td>Any upward trend. In collapsed runs \(F(2)\) passed 0.1 <a href="https://arxiv.org/abs/2510.11370">[Ma et al.]</a></td><td>TIS, precision and kernel fixes, routing replay</td></tr>
+      <tr><td>Staleness histogram (versions between generation and use)</td><td>Async health</td><td>Mass piled at the bound, buffer full</td><td>Retune \(\eta\) or the rollout-to-trainer split</td></tr>
+      <tr><td>Tool-call parse errors, timeouts, environment failures, turns per trajectory</td><td>Environment and agent health</td><td>Failures scored as zero reward, loops, tools ignored</td><td>Exclude errored rollouts from the gradient (ProRL Agent does <a href="https://arxiv.org/abs/2603.18815">[§4.1]</a>), fix the harness</td></tr>
+      <tr><td>Hack detectors: test-file edits, early exits, monitor flags</td><td>Reward hacking</td><td>Any sustained rate</td><td>Patch the environment, isolate the verifier</td></tr>
+      <tr><td>System: rollout share of step time, tail idle, weight-sync time</td><td>Throughput</td><td>Share of time in the tail growing</td><td>Rebalance GPUs, queue scheduling, partial rollouts</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two habits from the reports: periodically pause generation to evaluate on a disjoint held-out task set on the same engines, as Miles' GLM-5.2 run does every ten steps <a href="https://arxiv.org/abs/2609.08368">[Miles, §9.1]</a>, and separately test the engine against the trainer at step 0 (a rollout-versus-trainer log-probability comparison on identical sequences, plus two trainer forward passes to expose trainer nondeterminism <a href="https://arxiv.org/abs/2510.11370">[Ma et al. 2025, §3.3]</a>). A mismatch you did not measure at the start cannot be diagnosed when the run diverges at step 800.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"RL for LLMs is compute-bound like pretraining."</strong> Most of the GPU time goes to memory-bound decoding at a few percent MFU. In the worked example generation is about 65% of GPU-seconds, and reported systems spend 61% to 87% of iteration wall-clock in rollout.</li>
+    <li><strong>"More GPUs make rollouts proportionally faster."</strong> Extra GPUs add engine replicas and raise throughput, but the latency of the longest response does not shrink, so the tail stays. That is the case for asynchrony, partial rollouts and tail-aware scheduling.</li>
+    <li><strong>"Same weights means same log-probabilities."</strong> The engine and the trainer differ in kernels, reduction order, precision, LM-head dtype, sampling masks and MoE routing. Measured per-token KL is around \(10^{-3}\), and it can grow during a run.</li>
+    <li><strong>"The PPO clip handles the mismatch."</strong> The clip limits update size around \(\pi_{\text{old}}\) and, with one update per batch, the ratio is exactly 1, so it cannot see engine-versus-trainer differences. The discrepancy factor needs its own correction: truncated importance sampling, sequence masking, or exact agreement.</li>
+    <li><strong>"Asynchronous RL is synchronous RL, only faster."</strong> It changes the data: staleness, skewed lengths, mixed policy versions inside one trajectory, and sometimes missing old logits. AReaL's naive PPO scored 23.3 on AIME24 at \(\eta = 4\) against 42.0 for the synchronous oracle, and the decoupled objective recovered 42.2.</li>
+    <li><strong>"Regenerating an interrupted rollout from scratch is harmless."</strong> Short responses survive interruptions more often, so regeneration conditions the delivered data on finishing early and biases the policy toward short outputs. Resume from a token log, or keep the finished samples unbiased some other way.</li>
+    <li><strong>"In multi-turn RL, train on the whole conversation."</strong> Train only on tokens the policy sampled, and do not re-tokenize them from text. Tool outputs and template scaffolding are context, and a re-tokenized sequence is a trajectory that never happened.</li>
+    <li><strong>"An execution-based reward cannot be hacked."</strong> Agents exit before the asserts, patch <code>pytest</code>, overload <code>__eq__</code>, edit tests, and stub libraries. The verifier must run where the agent cannot write, and hack rates need their own metrics.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Name the phases of one RL step for an LLM and the software that runs each.</summary>
+    <div class="answer">
+      <p>(1) Rollout: sample \(G\) responses per prompt on an inference engine (vLLM or SGLang). (2) Reward: verifiers, sandboxes for code and tools, judges or reward models. (3) Log-probability passes on the trainer: \(\pi_{\text{old}}\) for the ratio and \(\pi_{\text{ref}}\) if there is a KL term. (4) Update: forward, backward and optimizer step in FSDP or Megatron. (5) Weight sync: send the new weights to the engines. There are two software stacks with different parallelism (the trainer shards for memory and throughput, the engine uses tensor parallelism plus many replicas), so weight sync includes resharding. Rollout usually dominates wall-clock.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Define colocated and disaggregated placement. Give one advantage and one cost of each.</summary>
+    <div class="answer">
+      <p><strong>Colocated:</strong> trainer and engine time-share the same GPUs, each releasing memory while the other runs. Advantage: no idle pool, every phase uses all GPUs, and each side can use its own parallel layout. Cost: an offload, weight-sync and engine wake-up on every step (Kimi k1.5: under a minute one way, about ten seconds back), and no overlap between generation and training. <strong>Disaggregated:</strong> separate pools. Advantage: no per-step switch, independent scaling and parallelism, and overlap becomes possible. Cost: each pool idles whenever the other is the bottleneck, so it needs asynchrony and a split matching the generation share of the work (about 65% rollout in our 8B example; AReaL used 75%).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Give three reward hacks in an agentic coding environment and one defense for each.</summary>
+    <div class="answer">
+      <p>(1) <code>sys.exit(0)</code> before the asserts, so the process returns code 0: judge success from parsed test-framework output produced by a runner outside the agent's process, not from the exit code. (2) Editing or deleting tests: mount tests read-only or restore them from a clean copy at scoring time, or keep hidden tests. (3) A <code>conftest.py</code> that patches pytest's report function, or an always-equal object: run the verifier from a clean checkout in a separate container with a pinned configuration and no agent-writable files on the path. Also add detectors for the known patterns and read the highest-reward trajectories regularly. Beyond hacks that game the harness, special-casing the visible tests is best caught with hidden tests.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why is rollout generation the bottleneck in LLM RL, and how do systems address it?</summary>
+    <div class="answer">
+      <p><strong>Why.</strong> Decode is memory-bound: each step streams the weights plus every sequence's KV cache, so the engine runs at roughly 4% MFU against about 40% for training. Per token that makes generation about twice as expensive as training even though it needs fewer FLOPs (\(2N\) against \(\sim 10N\) with the log-probability passes). Example: \(512 \times 16 \times 8192 = 67.1\)M tokens; at 2,500 tokens/s per GPU that is 7.5 GPU-hours, against 4.0 GPU-hours to train on them, so about 65% of GPU-seconds. Measured rollout shares are 63% to 87% (Seer) and 61% (GiGPO on ALFWorld). Wall-clock is worse: a synchronous batch waits for the longest response, and the last 10% of requests took up to 50% of rollout time.</p>
+      <p><strong>How systems help.</strong> Fill idle slots with asynchrony and bounded staleness (AReaL 1.5× to 2.8×), or partial rollouts (Kimi), or queue scheduling and prompt replication (ROLL Flash). Fix the tail without changing on-policy semantics: divided rollout, group-length prediction and grouped speculative decoding (Seer 2.04×). Make decode cheaper: low-precision rollouts, at the price of more mismatch. Shrink the switch cost in colocated designs (checkpoint engines, under 30 s for a 1T model). Overlap rewards and environments with generation.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Synchronous versus asynchronous RL: what are the trade-offs?</summary>
+    <div class="answer">
+      <p><strong>Synchronous:</strong> generate a batch with the current weights, train, sync. Data is on-policy (up to engine mismatch), the run is reproducible and easy to reason about, but GPUs idle at the tail and adding GPUs does not help. <strong>Asynchronous:</strong> separate pools, engines keep generating while the trainer works, weights are pushed as they update. It hides the tail and scales with GPUs (AReaL 1.5× to 2.8× end to end, ROLL Flash up to 2.7× on agent tasks). The costs: (1) staleness, bounded by an admission rule \(\lfloor (N_r-1)/B \rfloor \le i + \eta\), which caps outstanding samples at \((\eta+1)B\); (2) a decoupled objective (behavior versus proximal policy) so that clipping is centered on a recent policy, since naive PPO at \(\eta = 4\) fell from 42.0 to 23.3 AIME24; (3) length skew because short samples arrive first; (4) extra log-probability recomputation, which is hard when partial rollouts span versions; (5) harder reproducibility. Moderate staleness (\(\eta \le 8\) in AReaL, a ratio of about 2 in ROLL Flash) was nearly free with the corrected objective. Choose synchronous for small clusters, short responses and debugging; asynchronous for long responses, agents and large clusters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is the training-inference mismatch problem, and how do you correct it?</summary>
+    <div class="answer">
+      <p>The engine that samples (\(\mu\)) and the trainer (\(\pi\)) assign different probabilities to the same tokens under the same weights, because of different kernels and reduction orders, precision (FP8 or INT8 rollouts, the LM head), sampling truncation and, for MoE, different routing. The ratio the algorithm needs factors as \(\frac{\pi_{\text{old}}}{\mu_{\text{old}}} \times \frac{\pi_\theta}{\pi_{\text{old}}}\): discrepancy times staleness. Standard PPO and GRPO keep only the second factor, and with one update per batch it is exactly 1, so the clip is blind to the first. Measured gaps: per-token KL \(1.5 \times 10^{-3}\) (Qwen3-30B-A3B) and \(6.4 \times 10^{-4}\) (dense 8B), with tokens at probability 1 in vLLM and 0 in the trainer in one study. Uncorrected, runs drift and collapse.</p>
+      <p><strong>Corrections, in order:</strong> (1) importance-sampling correction, truncated: weight tokens by \(\min(\pi_{\text{train}}/\mu_{\text{rollout}}, C)\), detached (Yao et al.). (2) Sequence-level tools: length-normalized ratios (GSPO), or masking sequences whose divergence exceeds a threshold (DeepSeek-V3.2). (3) Remove sources: FP32 LM head (MiniMax-M1 correlation 0.987 to 0.997), keep the sampling masks, batch-invariant deterministic kernels (DeepSeek-V4), or an exact true-on-policy mode (Miles) at a throughput cost. (4) For MoE, routing replay (R2, R3, Keep Routing). Always log the engine-versus-trainer KL and the extreme-token fraction.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: a per-token log-probability mismatch of 0.01 nats. What does it do to the sequence-level importance ratio for 1K versus 16K tokens?</summary>
+    <div class="answer">
+      <p>The sequence log-ratio is the sum of per-token gaps. If the bias is systematic (same sign), it is \(0.01 T\): \(e^{10} \approx 22{,}000\) at \(T = 1000\) and \(e^{160} \approx 3 \times 10^{69}\) at \(T = 16{,}000\), which overflows float32 (so work in log space or float64). If the signs are random, the log-ratio has standard deviation \(0.01 \sqrt{T}\): 0.32 and 1.26, factors of 1.37 and 3.5. The length-normalized geometric mean is \(e^{0.01} = 1.010\) at any length. At token level \(1.010\) is well inside a PPO clip of \([0.8, 1.2]\) and any truncation cap, so per-token corrections do not see it, while full sequence ratios are unusable at 16K.</p>
+      <p>Calibrate: a measured token-level KL \(\kappa\) implies \(\sigma^2 \approx 2\kappa\) under a log-normal model, so \(\kappa = 1.5 \times 10^{-3}\) means \(\sigma = 0.055\) per token. Over 16K tokens the log-ratio has standard deviation 7 and mean \(-24\), so the median sequence weight is about \(10^{-11}\) and the effective sample fraction \(e^{-2\kappa T} \approx 10^{-21}\). Hence per-token truncated weights, length normalization or sequence masking.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you set up RL for a multi-turn tool-using agent? What gets masked?</summary>
+    <div class="answer">
+      <p><strong>Rollout:</strong> the engine generates a turn, the harness parses the tool call (decoding only to dispatch), the sandbox executes it, and the tool output is tokenized once and appended, until a final answer or a turn or context budget. <strong>Mask by provenance:</strong> train only the tokens the policy sampled (reasoning, tool-call syntax, end-of-turn, final answer). Mask the system and user prompt, tool outputs, and template tokens the harness inserted. Apply the same mask to the KL term. Search-R1 measured 0.431 with retrieved-token masking against 0.343 without. <strong>Token-in-token-out:</strong> keep token IDs and engine log-probs as the canonical record, never decode-and-re-encode, or the trainer scores tokens that were not sampled.</p>
+      <p><strong>Reward and credit:</strong> a trajectory-level verifier reward, group-normalized, copied to every unmasked token; turn-level credit if needed (GiGPO anchor states). <strong>Environments:</strong> executable, checkable, moderately hard, diverse (DeepSeek-V3.2's synthesized general-agent tasks transferred where code and search alone did not), one isolated sandbox per episode, errored rollouts excluded from the gradient. <strong>Context:</strong> keep reasoning across tool calls, use a summarize or discard strategy at about 80% of the window, and train with the context policy you deploy (branching into several sequences if history is rewritten). <strong>Systems:</strong> environment services, many concurrent rollouts, partial rollouts, prefix-affinity routing.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How would you design rewards for tasks without a verifier?</summary>
+    <div class="answer">
+      <p>First look for a checkable proxy: execution (tests), a reference-based check, or a construction that is hard to solve but easy to verify (DeepSeek-V3.2's synthesized tasks with a verifier function). If none exists, use a <strong>rubric-based generative judge</strong>: an LLM writes a prompt-specific checklist (7 to 20 self-contained items, weighted, with pitfalls), ideally conditioned on a reference answer, and a judge scores the response either as a weighted sum of binary checks or as a holistic score given the rubric (RaR: up to 31% relative gain over Likert judging; reference-free rubrics did worse). Pointwise scoring (DeepSeek-GRM) handles one or many responses and can be sampled and voted; pairwise ranking (K2's critic) costs \(\binom{G}{2}\) comparisons per group and needs order randomization.</p>
+      <p><strong>Keep the judge honest:</strong> refine or calibrate it on verifiable tasks during RL (K2's closed loop), add prescriptive rubrics and a hack-check pass for known exploits, shuffle response order, use several judges or a held-out human eval, control length bias, and watch for judge exploitation as reward rising without held-out gains. Combine rubric scores with verifiable rewards where partial verification exists (V3.2's search agent).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Design question: you have 128 H100s, an 8B policy, batches of 512 prompts × 16 samples, 8K-token responses. Propose an RL system.</summary>
+    <div class="answer">
+      <p>Estimate first (numbers from this page): about 67M generated tokens per step (if responses reach the cap), 7.5 GPU-hours of generation at 2,500 tokens/s per GPU and 4.0 GPU-hours of training, so a 65/35 split of GPU-seconds. Ideal step time on 128 GPUs is \((26{,}844 + 14{,}473)/128 \approx 5.4\) minutes. At 128 GPUs colocation is past the range where HybridFlow found it best (16 to 64 GPUs, short responses), and the tail would leave GPUs idle, so I would disaggregate: about 83 GPUs for rollout (65%, up to 75% as responses grow) and 45 for training, asynchronous with \(\eta\) around 2 to 4 (an outstanding-sample bound of \((\eta+1) \times 8192\)).</p>
+      <p>Stability: decoupled PPO or TIS with a cap of 2 to 5, engine log-probs returned, FP32 LM head, engine-versus-trainer KL logged. Rollout: vLLM or SGLang replicas with TP 1 for an 8B model, queue scheduling and prompt replication, a response cap with a length penalty. Weight sync: 16 GB in bf16, about a second over NCCL by back-of-envelope, negligible next to a multi-minute step. Add group filtering for zero-advantage groups, and a held-out eval every few steps. If synchronous reproducibility mattered more than 1.5× throughput, I would stay synchronous and attack the tail with partial rollouts and scheduling.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why do practitioners avoid full sequence-level importance weights for long responses, and what do they use instead?</summary>
+    <div class="answer">
+      <p>Sequence weights multiply per-token ratios, so their log-variance grows linearly in length. Under a log-normal model with per-token KL \(\kappa\), the effective sample fraction is \(e^{-2\kappa T}\): 5% at 1K tokens for \(\kappa = 1.5 \times 10^{-3}\), about \(10^{-21}\) at 16K. Almost all the weight sits on a few sequences, so gradients are dominated by noise. Alternatives trade bias for variance. <strong>Per-token truncated weights</strong> are the first-order expansion of the sequence weight (\(\prod (1+\delta_t) \approx 1 + \sum \delta_t\)) and bounded by a cap, at the cost of bias when the true ratio exceeds the cap; they are principled only while per-token gaps are small, which is why fixing the source matters too. <strong>Length-normalized ratios</strong> (GSPO's geometric mean) are length-invariant and tolerant of numerical noise, but change the objective and its clipping scale (GSPO clips on the order of \(10^{-4}\) rather than 0.2). <strong>Sequence masking</strong> (DeepSeek-V3.2) drops sequences whose mean log-ratio exceeds a threshold, only for negative advantages. <strong>Exact agreement</strong> (batch-invariant kernels) makes the ratio 1 and removes the need. The Qwen study found length normalization in a token-level loss suboptimal because it breaks the first-order argument, so the choice depends on the algorithm's other parts.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Regenerating an interrupted rollout from scratch biases the training data. Why, and how should preemption and partial rollouts be handled?</summary>
+    <div class="answer">
+      <p>Suppose interruptions arrive at random times and any request unfinished at that moment is restarted. The probability that a request finishes before the interruption falls with its length, so the delivered samples are conditioned on finishing early, and the policy is pushed toward short outputs. DeepSeek-V4 calls plain regeneration "mathematically incorrect" for this reason. Seer measured a related effect: an over-issue partial-rollout scheme produced a smaller share of long outputs than synchronous rollout. Correct options: (1) <strong>resume, don't restart</strong>: log every generated token (V4's token-granular write-ahead log), keep or rebuild the KV cache, and continue decoding, so each request's length distribution is untouched; (2) regenerate with the same random seed under a batch-invariant deterministic stack, which is unbiased but repeats decoding; (3) keep partial trajectories across iterations as Kimi's partial rollout does, remembering that segments came from different policy versions, so the loss needs the behavior-versus-proximal correction and the old log-probabilities of earlier segments must be available (or approximated). Also avoid stopping at "the first \(B\) finished" without accounting for the length skew.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> MoE RL is less stable than dense RL. Why, and what are the options?</summary>
+    <div class="answer">
+      <p>Top-\(k\) routing is discontinuous: a tiny numeric difference flips the chosen experts. Between SGLang and Megatron on Qwen3-30B-A3B, about 10% of router decisions differed and 94% of tokens used a different expert in at least one layer, and the per-token KL was \(1.5 \times 10^{-3}\) against \(6.4 \times 10^{-4}\) for a dense 8B. Even two trainer passes over the same sequence disagreed (KL \(8.4 \times 10^{-4}\)). Weight updates flip routing too (about 10% of activated experts after one step in GSPO's analysis), so both factors of the ratio suffer.</p>
+      <p><strong>Options:</strong> R2 replays the trainer's old-policy routing during the update (fixes staleness-induced flips, not engine mismatch); R3 records the engine's routing and replays it everywhere (overhead under 3% of rollout latency, about 60 MB per 32K-token trajectory at 60 layers with \(k = 8\), KL down to \(7.5 \times 10^{-4}\)); DeepSeek's Keep Routing does the same; GSPO's sequence-level ratio avoided replay in Qwen's runs. Trade-offs: replay biases the target policy. In the Qwen study R3 did not help on-policy, R2 won at mild off-policiness and R3 at 4 to 8 times, and R3 plus TIS gave no clear gain. In asynchronous runs other mismatch sources dominate (Miles leaves R3 off in its GLM-5.2 reference run). Evidence that it matters: on a multi-turn SWE task GRPO collapsed near step 90 (31.8) while GRPO+R3 reached 38.6.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Debugging scenario: training reward keeps rising, but held-out pass rate is flat, mean response length is growing, and the engine-versus-trainer KL has doubled over the last 200 steps. What do you check, in what order?</summary>
+    <div class="answer">
+      <p><strong>1. Is it real learning or hacking?</strong> Read the highest-reward trajectories and run the hack detectors (test-file edits, early exits, always-equal or stubbed code, monitor flags). Rising train reward with flat held-out reward on a different harness is the classic signature. If hacks appear, patch the environment, isolate the verifier, and do not just penalize the pattern in the reward. <strong>2. Mismatch.</strong> A KL that doubles is itself a warning (in the R3 study collapse followed rising KL and a rising extreme-token fraction). Compare engine and trainer log-probs on identical sequences (and two trainer passes), then check for causes that grew with training: longer responses (mismatch compounds with length), lower-probability tokens as entropy shifts, a precision path such as the LM head or FP8 rollouts, and MoE routing. Turn on or tighten TIS or sequence masking, consider routing replay, and fix precision.</p>
+      <p><strong>3. Length.</strong> Check the truncation rate, repetition loops and the length distribution tail. Add a length penalty or budget and a repetition cut-off. If responses are truncated and scored 0, the model may be learning to be short or to loop. <strong>4. Tokenization and masking</strong> in multi-turn runs: verify token IDs round-trip and the mask covers only policy tokens. <strong>5. Async health:</strong> the staleness histogram and the sync time. <strong>6. Signal density:</strong> the share of zero-advantage groups, entropy and clip fraction. If the run has already diverged, roll back to the last good checkpoint, reduce staleness or the number of minibatches per batch, and rerun with the extra monitors on.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Mismatch primitives.</strong> Implement <code>truncated_is_weights</code> (the detached, capped engine-to-trainer weight \(\min(\pi_{\text{train}}/\mu_{\text{rollout}}, C)\) with a padding mask, robust to garbage at masked positions) and <code>sequence_ratio_drift</code> (per-sequence log-ratio, ratio and length-normalized geometric-mean ratio from per-token log-probability gaps and lengths). The tests check the cap, that the weights carry no gradient, and that the drift grows with length while the geometric mean does not. An interviewer would expect both in about 15 minutes. <span class="ex-path">exercises/drills/rl_systems.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Agent bookkeeping.</strong> Implement <code>agent_loss_mask</code> (flatten a list of <code>(role, token_ids)</code> segments into ids and a loss mask that is 1 only on assistant tokens) and <code>staleness_admits</code> (AReaL's admission rule \(\lfloor (N_r-1)/B \rfloor \le i + \eta\)). The mask is tested on a hand-built trajectory with two tool calls, and the admission rule on the synchronous case \(\eta = 0\) and on the \((\eta+1)B\) buffer bound. Budget 20 minutes, and do it before opening the solution. <span class="ex-path">exercises/drills/rl_systems.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_rl_systems.py</code>; add <code>--solutions</code> to check the reference implementation. As an extension, build a toy multi-turn loss with your mask and check that the gradient of the loss with respect to the logits at masked positions is exactly zero.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2409.19256">Sheng et al. (2024). HybridFlow: A Flexible and Efficient RLHF Framework (verl).</a> <span class="why">Why read it: the placement study (§8.3), the 3D-HybridEngine (§5, §8.4) and a clean account of what makes RLHF dataflows hard to schedule.</span></li>
+    <li><a href="https://arxiv.org/abs/2505.24298">Fu et al. (2025). AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning.</a> <span class="why">Why read it: the staleness rule, decoupled PPO and the Table 2 ablation that shows what asynchrony costs and how to pay it.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.12599">Kimi Team (2025). Kimi k1.5: Scaling Reinforcement Learning with LLMs.</a> <span class="why">Why read it: §2.6 for partial rollouts, hybrid colocated deployment and the code sandbox, the first detailed public account of long-context RL infrastructure.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: §3.1.1 (agentic data synthesis), §3.2 (verifiable and self-critique rewards) and §3.3 (checkpoint engine, agentic rollout).</span></li>
+    <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2.</a> <span class="why">Why read it: §3.1 (unbiased KL, off-policy sequence masking, Keep Routing, Keep Sampling Mask), §3.2 (thinking with tools, environment synthesis, Table 1) and §4.4 (context management).</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read it: §3.3 (batch-invariant, deterministic kernels), §5.2.3 (preemptible rollout with a token-granular log) and §5.2.5 (the DSec sandbox platform).</span></li>
+    <li><a href="https://opt-ml.org/papers/2025/paper116.pdf">Yao et al. (2025). On the Rollout-Training Mismatch in Modern RL Systems.</a> <span class="why">Why read it: four pages that define truncated importance sampling and show why patching the engine is not enough (the longer blog post is titled "Your Efficient RL Framework Secretly Brings You Off-Policy RL Training").</span></li>
+    <li><a href="https://arxiv.org/abs/2512.01374">Zheng et al. (2025). Stabilizing Reinforcement Learning with LLMs: Formulation and Practices.</a> <span class="why">Why read it: the first-order-approximation argument that unifies importance-sampling correction, clipping and routing replay, with large MoE ablations.</span></li>
+    <li><a href="https://arxiv.org/abs/2510.11370">Ma et al. (2025). Stabilizing MoE Reinforcement Learning by Aligning Training and Inference Routers.</a> <span class="why">Why read it: measured router and probability discrepancies for a 30B MoE, and Rollout Routing Replay including its multi-turn SWE result.</span></li>
+    <li><a href="https://arxiv.org/abs/2503.11926">Baker et al. (2025). Monitoring Reasoning Models for Misbehavior and the Risks of Promoting Obfuscation.</a> <span class="why">Why read it: real agentic reward hacks from a frontier run, monitor recall numbers, and the obfuscation result.</span></li>
+  </ol>
+  <p class="small muted">Also cited above: <a href="https://arxiv.org/abs/2405.11143">OpenRLHF</a>, <a href="https://arxiv.org/abs/2511.14617">Seer</a>, <a href="https://arxiv.org/abs/2510.11345">ROLL Flash</a>, <a href="https://arxiv.org/abs/2506.10910">Magistral</a>, <a href="https://arxiv.org/abs/2609.08368">Miles</a>, <a href="https://arxiv.org/abs/2603.18815">ProRL Agent</a>, <a href="https://arxiv.org/abs/2605.12070">Guan et al. on missing old logits</a>, <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a>, <a href="https://arxiv.org/abs/2507.18071">GSPO</a>, <a href="https://arxiv.org/abs/2503.09516">Search-R1</a>, <a href="https://arxiv.org/abs/2505.10978">GiGPO</a>, <a href="https://arxiv.org/abs/2502.18449">SWE-RL</a>, <a href="https://arxiv.org/abs/2507.17746">Rubrics as Rewards</a>, <a href="https://arxiv.org/abs/2504.02495">DeepSeek-GRM</a>, <a href="https://arxiv.org/abs/2510.20270">ImpossibleBench</a>, <a href="https://arxiv.org/abs/2511.18397">Anthropic on emergent misalignment from reward hacking</a>, <a href="https://huggingface.co/blog/huggingface/tito">Hugging Face on token-in-token-out</a>, <a href="https://github.com/THUDM/slime">slime</a> and <a href="https://github.com/volcengine/verl">verl</a> READMEs.</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Step phases:</strong> rollout (engine) → reward (verifier, sandbox, judge) → \(\pi_{\text{old}}\), \(\pi_{\text{ref}}\) passes → update → weight sync.</li>
+      <li><strong>Why generation dominates:</strong> \(2N\) FLOPs/token at about 4% MFU versus about \(10N\) at about 40% for training. Example: 512 × 16 × 8K = 67.1M tokens = 7.46 GPU-h at 2,500 tok/s, against 4.02 GPU-h of training: 65% of GPU-seconds. Reported rollout shares: 63% to 87% (Seer), 61% (GiGPO). Last 10% of requests: up to 50% of rollout time.</li>
+      <li><strong>GPU split:</strong> step time \(= \max(W_g/N_r,\, W_t/N_t)\), so give rollout the fraction \(W_g/(W_g+W_t)\) of GPUs (about 42 of 64 in the example; AReaL used 75/25).</li>
+      <li><strong>Placement:</strong> colocated (k1.5: under 1 min in, about 10 s back; K2: checkpoint engine, under 30 s for 1T) versus disaggregated (OpenRLHF, AReaL). HybridFlow: colocate was best at 16 to 64 GPUs.</li>
+      <li><strong>Async:</strong> admit a request if \(\lfloor (N_r-1)/B \rfloor \le i+\eta\); outstanding samples \(\le (\eta+1)B\); \(\eta=0\) is synchronous. Decoupled PPO uses \(\pi_{\text{prox}}\) as the clip center. AIME24 at \(\eta=4\): naive PPO 23.3, decoupled 42.2, oracle 42.0. Speedups 1.5× to 2.8× (AReaL); ROLL Flash ratio about 2.</li>
+      <li><strong>Partial rollout:</strong> continue over budget in the next iteration (Kimi). Never regenerate interrupted requests from scratch: length bias. Resume from a token log (DeepSeek-V4).</li>
+      <li><strong>Ratio:</strong> \(\pi_\theta/\mu_{\text{old}} = (\pi_{\text{old}}/\mu_{\text{old}}) \times (\pi_\theta/\pi_{\text{old}})\). PPO clip sees only the second factor. TIS: weight \(\min(\pi_{\text{train}}/\mu_{\text{rollout}}, C)\), detached, \(C\) in 2 to 5.</li>
+      <li><strong>0.01 nats/token:</strong> \(e^{10} = 2.2\times10^4\) at 1K, \(e^{160} = 3\times10^{69}\) at 16K; random-sign drift \(0.01\sqrt{T}\); geometric mean \(e^{0.01} = 1.01\). Measured KL \(\kappa\): \(1.5\times10^{-3}\) (30B MoE), \(6.4\times10^{-4}\) (8B dense); \(\sigma^2 \approx 2\kappa\); effective sample fraction \(e^{-2\kappa T}\).</li>
+      <li><strong>Fix ladder:</strong> TIS → sequence masking or GSPO-style length normalization → FP32 LM head, keep sampling masks → batch-invariant kernels (V4 §3.3) or true-on-policy (Miles) → MoE routing replay (R2, R3, Keep Routing). MoE: about 10% of routers and 94% of tokens differ.</li>
+      <li><strong>Agentic RL:</strong> train only policy-sampled tokens (Search-R1: 0.431 with the mask, 0.343 without); token IDs are canonical, never re-tokenize; trajectory reward copied to unmasked tokens; GiGPO adds step-level advantages from anchor states (over 12% ALFWorld, over 9% WebShop).</li>
+      <li><strong>Environments and context:</strong> DeepSeek-V3.2: 85,267 prompts, 1,827 synthesized environments, validity rule F2P greater than 0 and P2F equal to 0; keep reasoning until a new user message; overflow strategies Summary, Discard-75%, Discard-all (BrowseComp 51.4 to 60.2 and 67.6).</li>
+      <li><strong>Rewards without verifiers:</strong> per-prompt rubrics judged by an LLM (RaR up to +31%), K2's self-critic refined on verifiable tasks, pointwise GRM with voting. Hacks: <code>exit(0)</code>, <code>SkipTest</code>, always-equal, <code>conftest.py</code>, stubs, editing tests. ImpossibleBench: GPT-5 cheats 54% (Conflicting-SWEbench); abort option cuts it to 9%; CoT monitor recall 95% versus 60% for actions only.</li>
+      <li><strong>Monitor:</strong> train versus held-out reward, zero-advantage share, length p99 and truncation, entropy, KL, clip fraction, engine-trainer KL and extreme-token fraction, staleness histogram, environment failures, hack detectors.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

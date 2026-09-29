@@ -21,6 +21,14 @@ except Exception:
 
 esc = lambda s: html.escape(s, quote=True)
 
+# Citations that disagree with the linked arXiv record; corrected here (the pages themselves still carry the old text).
+CITE_FIX = {
+    # arXiv title is "Every Activation Boosted: ..."; "Ling 2.0 Technical Report" is the informal name.
+    "https://arxiv.org/abs/2510.22115": "Ling Team (2025). Every Activation Boosted: Scaling General Reasoner to 1 Trillion Open Language Foundation (the Ling 2.0 report).",
+    # first submitted 31 December 2025; page 11's running text says "arXiv December 2025".
+    "https://arxiv.org/abs/2512.24880": "Xie et al. (2025). mHC: Manifold-Constrained Hyper-Connections.",
+}
+
 def norm(u):
     return u.split("#")[0].rstrip("/")
 
@@ -79,10 +87,12 @@ for part in m["parts"]:
             links += ' <span class="muted small">; also ' + ", ".join(
                 f'<a href="{page_info[n]["slug"]}.html" title="{esc(page_info[n]["title"])}">{n}</a>' for n in also) + "</span>"
         out.append(
-            f'<tr><td><a href="{esc(url)}">{esc(paper["citation"])}</a>{star}</td><td>{links}</td></tr>'
+            f'<tr><td><a href="{esc(url)}">{esc(CITE_FIX.get(base, paper["citation"]))}</a>{star}</td><td>{links}</td></tr>'
         )
     out.append("</tbody></table></div>")
 
 open("/tmp/w37/extended.html", "w", encoding="utf-8").write("\n".join(out) + "\n")
-json.dump({"total": total, "by_part": stats}, open("/tmp/w37/extended_stats.json", "w"))
-print("sources:", total, stats)
+listed = {norm(paper["url"]) for paper in data["papers"]}
+text_only = len([u for u in cite_pages if u not in listed])   # linked in running text only, never in a primary-source list
+json.dump({"total": total, "by_part": stats, "text_only": text_only}, open("/tmp/w37/extended_stats.json", "w"))
+print("sources:", total, stats, "text-only links:", text_only)

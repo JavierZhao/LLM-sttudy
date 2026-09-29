@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT + "/tools")
 import manifest
 
 esc = lambda s: html.escape(s, quote=True)
+zhd = lambda z: esc(GD.DISPLAY.get(z, z))   # display form (STYLE_GUIDE: space between Chinese and Latin text)
 m = manifest.load()
 slug = {p["n"]: p["slug"] for part in m["parts"] for p in part["pages"]}
 src_cache = {}
@@ -116,9 +117,9 @@ for e in entries:
     var = ""
     if ALSO.get(e["zh"]):
         var = '<div class="small muted">also heard ' + "; ".join(
-            f'<span class="zh">{esc(zh)}</span>' for zh in ALSO[e["zh"]]) + "</div>"
+            f'<span class="zh">{zhd(zh)}</span>' for zh in ALSO[e["zh"]]) + "</div>"
     rows.append(
-        f'<tr id="{e["id"]}"><td><strong>{esc(e["en"])}</strong><br><span class="zh">{esc(e["zh"])}</span>{var}</td>'
+        f'<tr id="{e["id"]}"><td><strong>{esc(e["en"])}</strong><br><span class="zh">{zhd(e["zh"])}</span>{var}</td>'
         f'<td>{esc(e["definition"])} <span class="gl-page small">Page {pl}</span></td></tr>'
     )
 
@@ -142,7 +143,8 @@ NOTE = {
  "多词元预测": "Follows the course's 词元 for token; 多 token 预测 keeps the English word, as many Chinese reports do.",
  "投机解码": "The usual industry term (投机采样 for speculative sampling); 推测解码 is the literal translation and also appears.",
  "知识蒸馏": "The full term; 蒸馏 alone is the everyday short form.",
- "涌现能力": "Emergent abilities; 涌现 alone names the phenomenon.",
+ "涌现能力": "涌现能力 names the property of a model; the short form 涌现 names the phenomenon (page 13).",
+ "细粒度专家分割": "细粒度专家分割 names the technique of splitting each expert into m pieces (pages 08 and 26); the short form 细粒度专家 names the resulting many small experts (page 33).",
  "混合推理": "Hybrid reasoning (thinking and non-thinking in one model); 混合推理架构 stresses the architecture side.",
  "滑动窗口注意力": "Attention type; 滑动窗口 alone describes the window.",
  "基于人类反馈的强化学习": "The longer form is the standard rendering of RLHF; 人类反馈强化学习 drops 基于 and 的.",
@@ -152,8 +154,8 @@ n_groups = 0
 for e in entries:
     if ALSO.get(e["zh"]):
         n_groups += 1
-        crow.append((sortkey(e["en"]), f'<tr><td>{esc(e["en"])}</td><td><span class="zh">{esc(e["zh"])}</span></td>'
-                     f'<td>' + "; ".join(f'<span class="zh">{esc(zh)}</span>' for zh in ALSO[e["zh"]]) + f'</td>'
+        crow.append((sortkey(e["en"]), f'<tr><td>{esc(e["en"])}</td><td><span class="zh">{zhd(e["zh"])}</span></td>'
+                     f'<td>' + "; ".join(f'<span class="zh">{zhd(zh)}</span>' for zh in ALSO[e["zh"]]) + f'</td>'
                      f'<td>{esc(NOTE[e["zh"]])}</td></tr>'))
 crow.sort()
 conv = ['<div class="table-wrap"><table class="data">',

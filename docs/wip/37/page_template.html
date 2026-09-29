@@ -22,7 +22,7 @@
     <span>~20 min to read, then a reference</span>
     <span>Prereqs: none; most useful after pages 01 to 32</span>
   </div>
-  <p class="lede">The 25 papers worth reading in full, with the sections to read, a time estimate and the course page each one supports; all @@N_SOURCES@@ primary sources the course cites, grouped by part; and a bilingual glossary of @@N_TERMS@@ concepts. Read it once to decide what to read, then use it as an index.</p>
+  <p class="lede">The 25 papers worth reading in full, with the sections to read, a time estimate and the course page each one supports; the @@N_SOURCES@@ primary sources that the pages list, grouped by part; and a bilingual glossary of @@N_TERMS@@ concepts. Read it once to decide what to read, then use it as an index.</p>
 </header>
 
 <aside class="callout lens" id="interview-lens">
@@ -30,7 +30,7 @@
   <ul>
     <li><strong>Interviewers ask about papers as designs, not titles.</strong> "Walk me through how DeepSeek-V3 balances its experts", "why did Chinchilla disagree with Kaplan", "what would you ablate first?" For every paper below the list names the sections that answer such questions, so you read the method and the evidence, not the related work.</li>
     <li><strong>Numbers come from tables, not abstracts.</strong> Expect "what was the baseline?" and "what does that figure compare against?". The <a href="#pitfalls">reading pitfalls</a> below collect the standard traps.</li>
-    <li><strong>Recency is scored.</strong> Frontier labs expect you to know the current generation. The newest reports in the course are DeepSeek-V4 (2026) and DeepSeek-V4.1-Flash (September 2026); say "as of September 2026" when you call any model the latest.</li>
+    <li><strong>Recency is scored.</strong> Frontier labs expect you to know the current generation. The newest report in the course is DeepSeek-V4.1-Flash (September 2026), which builds on DeepSeek-V4 (April 2026 preview); Kimi K3, Gemma 4 and Qwen3.8-Next are from mid-2026 too. Say "as of September 2026" when you call any model the latest.</li>
     <li><strong>Fluency in English.</strong> The interview is in English. The <a href="#glossary">glossary</a> gives each concept's English term first and the Chinese term second. Cover the definition column and check that you can state each concept in one English sentence.</li>
     <li><strong>Budgets.</strong> Tier 1 (12 papers) takes about @@T1_H@@ hours and all 25 about @@ALL_H@@. With only two hours, read Vaswani et al., Chinchilla, PPO, DPO and DeepSeek-V2 (about @@PATH_MIN@@ minutes): attention, scaling, RL, preferences and modern KV and expert design.</li>
   </ul>
@@ -41,7 +41,7 @@
   <ul>
     <li>Choose which of the 25 papers to read for a two-hour, one-day or one-weekend budget, and name the sections that carry the interview-relevant content.</li>
     <li>Say in one sentence what problem each of the 25 papers solves and which course page teaches it.</li>
-    <li>Find the primary source behind any claim in pages 01 to 35 using the extended list of @@N_SOURCES@@ sources.</li>
+    <li>Find the primary sources that pages 01 to 35 list for a topic, using the extended list of @@N_SOURCES@@ sources, and see which course pages rely on each.</li>
     <li>Give the English term and the standard Chinese term for the @@N_TERMS@@ concepts the course defines, and define each in one English sentence.</li>
     <li>Explain the 30 core terms of the <a href="#cheatsheet">cheat sheet</a> in a minute each, with the key formula or number.</li>
     <li>Read a technical report critically: find the baseline behind an abstract number, check error bars and paper versions, and separate what was measured from what was asserted.</li>
@@ -51,7 +51,7 @@
 <section id="papers">
   <h2 id="must-read">Must-read 25: primary sources to read in full</h2>
 
-  <p>The list uses three criteria: how often the course itself cites the source (DeepSeek-V4 is the most-cited source, linked from 19 pages, then DeepSeek-V3 on 18 and Llama 3 on 17), how often interviewers ask about its content, and your own research on efficient long-context models. It is ordered as a reading sequence: groups A to E, and within a group each paper assumes the ones before it. Each entry gives the sections worth your time (the rest is related work, benchmarks and appendices), the course pages that build on it, and a time estimate.</p>
+  <p>The list uses three criteria: how often the course itself cites the source (DeepSeek-V4 is the most-cited source, linked from @@CITE_V4@@ pages, then DeepSeek-V3 on @@CITE_V3@@ and Llama 3 on @@CITE_L3@@), how often interviewers ask about its content, and your own research on efficient long-context models. It is ordered as a reading sequence: groups A to E, and within a group each paper assumes the ones before it. Each entry gives the sections worth your time (the rest is related work, benchmarks and appendices), the course pages that build on it, and a time estimate.</p>
 
   <aside class="callout note"><div class="callout-title">How the times are estimated</div>
     <p>Times assume a careful first read: 4 minutes per PDF page for the sections marked Read (equations, tables and figures included) and 1.5 minutes per page for those marked Skim, rounded to the nearest 5 minutes. Page counts come from the arXiv PDFs as of September 2026 and shift by a page or so between versions. Section numbers follow those versions too, so check the numbering if a later version reorders the paper.</p></aside>
@@ -62,12 +62,12 @@
 @@MUST@@
 
   <aside class="callout note"><div class="callout-title">Left off the list on purpose</div>
-    <p>Three well-known papers are not among the 25. <a href="https://arxiv.org/abs/2005.14165">GPT-3</a> (in-context learning and the scale anchors: <a href="01-big-picture.html">page 01</a> gives the numbers you need). <a href="https://arxiv.org/abs/2101.03961">Switch Transformer</a> (top-1 routing and the auxiliary loss: <a href="08-mixture-of-experts.html">page 08</a> derives both, and DeepSeekMoE plus V3 are the designs you will be asked about). <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (selective state spaces: <a href="09-beyond-full-attention.html">page 09</a> covers it, and Gated DeltaNet is the layer that current hybrids use). The first two are in the extended list below; Mamba is linked from the text of page 09 only.</p></aside>
+    <p>Three well-known papers are not among the 25. <a href="https://arxiv.org/abs/2005.14165">GPT-3</a> (in-context learning and the scale anchors: <a href="01-big-picture.html">page 01</a> gives the numbers you need, and <a href="33-architecture-atlas.html">page 33</a> uses its Table 2.1 as the baseline row). <a href="https://arxiv.org/abs/2101.03961">Switch Transformer</a> (top-1 routing and the auxiliary loss: <a href="08-mixture-of-experts.html">page 08</a> derives both, and DeepSeekMoE plus V3 are the designs you will be asked about). <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (selective state spaces: <a href="09-beyond-full-attention.html">page 09</a> covers it, and Gated DeltaNet is the layer that current hybrids use). The first two are in the extended list below; Mamba is linked from the text of page 09 only.</p></aside>
 </section>
 
 <section>
-  <h2 id="extended">Extended list: every primary source in the course</h2>
-  <p>Generated from the primary-source lists of pages 01 to 35 (@@N_SOURCES@@ unique sources). A source sits in the part of the earliest page that lists it. The last column links every page that lists it (to that page's Primary sources section) and, after a semicolon, the pages that link it only in the running text. ★ marks the must-read 25.</p>
+  <h2 id="extended">Extended list: the primary sources each page lists</h2>
+  <p>Generated from the primary-source lists of pages 01 to 35 (@@N_SOURCES@@ unique sources). The pages also link @@N_TEXT_ONLY@@ other sources, including many papers, only in running text next to the claim they support; those are not repeated here (Mamba is one). A source sits in the part of the earliest page that lists it. The last column links every page that lists it (to that page's Primary sources section) and, after a semicolon, the pages that link it only in the running text. ★ marks the must-read 25.</p>
 @@EXTENDED@@
 </section>
 

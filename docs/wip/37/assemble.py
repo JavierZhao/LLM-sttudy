@@ -17,11 +17,19 @@ for label, zh, gid, text in CHEAT:
     assert gid in ids, gid
     cheat.append(f'      <li><strong><a href="#{gid}">{label}</a></strong> <span class="zh">{zh}</span>: {text}</li>')
 
+refs = json.load(open("/tmp/w37/refs.json", encoding="utf-8"))
+cited = {q["url"]: q["cited_on_pages"] for q in refs["papers"]}
+c_v4, c_v3, c_l3 = (cited["https://arxiv.org/abs/2606.19348"], cited["https://arxiv.org/abs/2412.19437"],
+                    cited["https://arxiv.org/abs/2407.21783"])
+top3 = sorted(cited.values(), reverse=True)[:3]
+assert top3 == [c_v4, c_v3, c_l3], ("most-cited ranking changed", top3, c_v4, c_v3, c_l3)   # the template says V4, then V3, then Llama 3
 t1 = must_stats["tier_min"]["1"]
 tot = sum(must_stats["tier_min"].values())
 rep = {
     "@@N_SOURCES@@": str(ext_stats["total"]),
     "@@N_TERMS@@": str(gl_stats["entries"]),
+    "@@N_TEXT_ONLY@@": str(ext_stats["text_only"]),
+    "@@CITE_V4@@": str(c_v4), "@@CITE_V3@@": str(c_v3), "@@CITE_L3@@": str(c_l3),
     "@@T1_H@@": f"{t1/60:.0f}",
     "@@ALL_H@@": f"{tot/60:.0f}",
     "@@PATH_MIN@@": str(must_stats["path_min"]),

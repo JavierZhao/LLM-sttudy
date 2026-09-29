@@ -15,7 +15,7 @@ SHORT = {"01": "Big picture", "02": "Tokenization", "03": "Attention", "04": "Tr
          "15": "Parallelism", "16": "GPUs & kernels", "17": "Inference", "18": "Evaluation", "19": "SFT & distillation",
          "20": "LoRA", "21": "Preference optimization", "22": "RL foundations", "23": "RLHF", "24": "RLVR",
          "25": "RL systems", "26": "DeepSeek I", "27": "DeepSeek II", "28": "DeepSeek III", "29": "Llama",
-         "30": "Qwen", "31": "Mistral, Gemma, gpt-oss", "32": "Frontier open models", "34": "Back-of-envelope"}
+         "30": "Qwen", "31": "Mistral, Gemma, gpt-oss", "32": "Frontier open models", "33": "Architecture atlas", "34": "Back-of-envelope"}
 d = json.load(open("/tmp/w37/refs.json", encoding="utf-8"))
 cites = {p["url"]: p["cited_on_pages"] for p in d["papers"]}
 

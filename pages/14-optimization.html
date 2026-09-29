@@ -1,0 +1,1000 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Optimizers, schedules &amp; hyperparameters · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="14" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part III · Pretraining &amp; systems · Page 14</div>
+  <h1>Optimizers, schedules &amp; hyperparameters</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~65 min</span>
+    <span>Prereqs: <a href="04-transformer-block.html">04 Transformer block</a>, <a href="11-stability-tweaks.html">11 Stability</a>, <a href="13-scaling-laws.html">13 Scaling laws</a></span>
+  </div>
+  <p class="lede">A pretraining run is one pass over trillions of tokens that nobody can afford to repeat, so its optimizer, learning-rate schedule and batch size have to be right on the first attempt. This page covers the choices real runs made and the reasons behind them: AdamW and its odd-looking defaults, warmup, cosine versus warmup-stable-decay, batch size and the critical batch size, gradient clipping and the loss-spike playbook, hyperparameter transfer (μP), and Muon, the first alternative to AdamW used at trillion-parameter scale.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>AdamW from memory:</strong> the five lines of the update, bias correction, why weight decay is decoupled, and the "why" behind \(\beta_2 = 0.95\), \(\epsilon\) and weight decay 0.1. Expect a state-memory calculation for an 8B or 70B model.</li>
+    <li><strong>Schedules:</strong> why warmup exists (there are two competing explanations), cosine versus WSD versus step decay, and reading the schedule of a documented run such as DeepSeek-V3.</li>
+    <li><strong>Batch size:</strong> the critical batch size, why frontier runs ramp the batch, how to pick batch size and learning rate at a new scale, and the difference between the square-root and linear scaling rules.</li>
+    <li><strong>Debugging:</strong> "the loss spiked at step 80K, what do you do?" Clipping, monitoring, rollback-and-skip, \(\beta_2\) and \(\epsilon\), logit control.</li>
+    <li><strong>μP and hyperparameter transfer:</strong> what the parametrization changes, what it does not transfer, and the scaling-law alternative.</li>
+    <li><strong>Muon:</strong> derive the orthogonalized update, write the Newton-Schulz iteration, explain why only hidden matrices use it, and state the evidence for and against it honestly (Moonlight, Kimi K2, DeepSeek-V4).</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Write the AdamW update (moments, bias correction, decoupled decay) and implement it to match <code>torch.optim.AdamW</code>, and explain why L2 regularization is not equivalent to weight decay under Adam.</li>
+    <li>Compute optimizer-state memory for an 8B model under AdamW (fp32 and bf16 moments) and under hybrid Muon.</li>
+    <li>Give both explanations of warmup, and say what evidence separates them.</li>
+    <li>Draw cosine, WSD and step schedules, state why WSD allows cheap continuation and scaling-law sweeps, and read a documented schedule (tokens, steps, peak and final LR).</li>
+    <li>Define the critical batch size, derive \(E = E_{\min}(1 + B/B_{\text{crit}})\), and explain batch ramps.</li>
+    <li>Describe a loss-spike playbook and name what DeepSeek-V4, Kimi K2 and PaLM each did.</li>
+    <li>Explain μP and what it does not transfer, and choose between μP and fitted hyperparameter scaling laws.</li>
+    <li>Derive Muon's update from spectral-norm steepest descent, write the Newton-Schulz iteration, and state Moonlight's two scaling fixes, MuonClip, and DeepSeek-V4's setup.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="adamw">AdamW: the update, the state, the settings</h2>
+
+  <p>An <strong>optimizer</strong> <span class="zh">优化器</span> turns a minibatch gradient into a parameter update. Llama 2 and 3 and DeepSeek LLM, V2 and V3 were all trained with <strong>AdamW</strong> <a href="https://arxiv.org/abs/1711.05101">[Loshchilov &amp; Hutter 2019]</a>, and GPT-3 already used the \(\beta\) values they use today. Write \(g_t\) for the gradient after clipping and \(\eta_t\) for the learning rate <span class="zh">学习率</span> at step \(t\):</p>
+
+  <div class="eq-box">
+  \[
+  \begin{aligned}
+  m_t &= \beta_1 m_{t-1} + (1-\beta_1)\, g_t, &\qquad v_t &= \beta_2 v_{t-1} + (1-\beta_2)\, g_t^{2}\\
+  \hat m_t &= \frac{m_t}{1-\beta_1^{\,t}}, &\qquad \hat v_t &= \frac{v_t}{1-\beta_2^{\,t}}\\
+  \theta_t &= (1-\eta_t \lambda)\,\theta_{t-1} \;-\; \eta_t\, \frac{\hat m_t}{\sqrt{\hat v_t} + \epsilon}
+  \end{aligned}
+  \]
+  <div class="eq-label">AdamW, PyTorch form. All operations are elementwise; m and v start at 0 and t starts at 1</div>
+  </div>
+
+  <p>\(m_t\) is a running mean of the gradient (momentum <span class="zh">动量</span>), which averages out minibatch noise; \(v_t\) is a running mean of the squared gradient, a per-coordinate scale estimate. Dividing by \(\sqrt{\hat v_t}\) makes every coordinate move by about \(\eta_t\) per step regardless of its gradient magnitude: Kingma and Ba note that the effective step is bounded by roughly the step size, \(|\Delta_t| \lesssim \alpha\), a trust region <a href="https://arxiv.org/abs/1412.6980">[Kingma &amp; Ba 2015, §2.1]</a>. So the learning rate means "parameter change per step", and one value works across layers whose gradients differ by orders of magnitude. The term \(\lambda\theta\) is weight decay <span class="zh">权重衰减</span>.</p>
+
+  <p><strong>Bias correction</strong> <span class="zh">偏差修正</span>. Both averages start at zero, so early on they are biased toward zero. Dividing by \(1-\beta^t\) removes the bias: at \(t=1\), \(\hat m = g\) and \(\hat v = g^2\), so the first update is exactly \(\eta\cdot\mathrm{sign}(g)\). Without the correction and with \(\beta_2 = 0.999\), the first step would be \((1-\beta_1)/\sqrt{1-\beta_2} = 0.1/0.0316 = 3.16\) times larger than intended, the sparse-gradient bound in the Adam paper <a href="https://arxiv.org/abs/1412.6980">[§2.1, Fig. 4]</a>. The correction matters most exactly when \(\beta_2\) is close to 1.</p>
+
+  <div class="decision">
+    <div class="decision-title">Decoupled weight decay (AdamW instead of Adam + L2)</div>
+    <dl>
+      <dt>Problem</dt><dd>Adding \(\tfrac{\lambda'}{2}\|\theta\|^2\) to the loss adds \(\lambda'\theta\) to the gradient. For SGD this equals weight decay with \(\lambda = \eta\lambda'\). Under Adam the extra term is divided by \(\sqrt{\hat v_t}\) like every other gradient component.</dd>
+      <dt>Idea</dt><dd>Shrink the weights directly, \(\theta \leftarrow (1-\eta\lambda)\theta\), outside the adaptive machinery. The decay never enters \(m\) or \(v\).</dd>
+      <dt>Why it works</dt><dd>With L2 inside Adam, coordinates with large historical gradients have large \(\sqrt{\hat v}\) and are regularized <em>less</em>; no L2 coefficient reproduces decoupled decay for any non-scalar preconditioner. Decoupling decays every weight at the same rate \(\eta\lambda\), and the best \(\lambda\) becomes nearly independent of the best \(\eta\).</dd>
+      <dt>Evidence</dt><dd>15% relative test-error improvement over Adam+L2 on CIFAR-10 and ImageNet32×32, and a much more separable \((\eta,\lambda)\) grid <a href="https://arxiv.org/abs/1711.05101">[Loshchilov &amp; Hutter 2019, Alg. 2, Prop. 2, Fig. 2]</a>.</dd>
+      <dt>Cost</dt><dd>None computationally. One trap: the paper's Algorithm 2 scales \(\lambda\theta\) by the schedule multiplier only, PyTorch by the full learning rate; they agree once \(\alpha\) is folded into \(\eta_t\). The drill uses the PyTorch form.</dd>
+      <dt>Used by</dt><dd>Every AdamW recipe on this page. Hybrid Muon recipes keep it for embeddings, the LM head and norm gains, and copy the same decay for Muon parameters (Moonlight, DeepSeek-V4).</dd>
+    </dl>
+  </div>
+
+  <h3 id="wd-role">What weight decay does when nothing overfits</h3>
+  <p>LLM pretraining is a single pass, so weight decay is not fighting overfitting. GPT-3 called it "a small amount of regularization" <a href="https://arxiv.org/abs/2005.14165">[Brown et al. 2020, App. B]</a>, but for models trained under one epoch its measured effect is on optimization: it balances a bias-variance tradeoff in stochastic optimization, giving lower training loss and better stability <a href="https://arxiv.org/abs/2310.04415">[D'Angelo et al. 2024]</a>. Unroll the update to see it. With \(u_s\) the Adam direction, \(\theta_t = -\eta\sum_{s\le t}(1-\eta\lambda)^{t-s}u_s + \dots\): the weights are an exponential average of recent updates with <strong>timescale \(\tau = 1/(\eta\lambda)\) steps</strong>. Wang and Aitchison find that the best timescale, measured in epochs, is roughly constant, so as the dataset grows the best \(\lambda\) shrinks <a href="https://arxiv.org/abs/2405.13698">[Wang &amp; Aitchison 2024]</a>. Bergsma et al. add that the best \(\tau\) follows a power law in tokens per parameter <a href="https://arxiv.org/abs/2505.13738">[Bergsma et al. 2025]</a>.</p>
+
+  <p>Worked numbers for Llama 2 7B (peak \(\eta = 3\times10^{-4}\), \(\lambda = 0.1\), 2T tokens at 4M per step, so 500,000 steps): \(\tau = 1/(3\times10^{-4}\cdot 0.1) = 33{,}333\) steps, 6.7% of the run. At the end of the cosine, \(\eta = 3\times10^{-5}\) and \(\tau = 333{,}333\) steps, two thirds of the run: decay effectively switches off as the schedule anneals, so the two hyperparameters must be tuned together. For uncorrelated updates of RMS \(r\), weights settle near \(\mathrm{RMS}(\theta) \approx r\sqrt{\eta/2\lambda}\), which is 0.008 to 0.016 for the 0.2 to 0.4 update RMS Moonlight reports for AdamW: the same order as the 0.02 initialization of <a href="04-transformer-block.html#init">page 04</a>, a rough check and not a law.</p>
+
+  <h3 id="settings">The settings real runs used</h3>
+  <p>Every value below was read from the cited report. "n/s" means the report does not state it in the sections checked.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th class="num">\(\beta_1 / \beta_2\)</th><th class="num">\(\epsilon\)</th><th class="num">weight decay</th><th class="num">clip (global norm)</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 (2020)</td><td class="num">0.9 / 0.95</td><td class="num">1e-8</td><td class="num">0.1</td><td class="num">1.0</td><td><a href="https://arxiv.org/abs/2005.14165">App. B</a></td></tr>
+      <tr><td>Llama 2 (2023)</td><td class="num">0.9 / 0.95</td><td class="num">1e-5</td><td class="num">0.1</td><td class="num">1.0</td><td><a href="https://arxiv.org/abs/2307.09288">§2.2</a></td></tr>
+      <tr><td>Cerebras-GPT (2023)</td><td class="num">0.9 / 0.95</td><td class="num">1e-8 (1e-9 for 6.7B, 13B)</td><td class="num">0.1</td><td class="num">1.0</td><td><a href="https://arxiv.org/abs/2304.03208">§2.3</a></td></tr>
+      <tr><td>DeepSeek LLM, V2, V3</td><td class="num">0.9 / 0.95</td><td class="num">n/s</td><td class="num">0.1</td><td class="num">1.0</td><td><a href="https://arxiv.org/abs/2401.02954">LLM §2.3</a>, <a href="https://arxiv.org/abs/2405.04434">V2 §3.1.2</a>, <a href="https://arxiv.org/abs/2412.19437">V3 §4.2</a></td></tr>
+      <tr><td>DeepSeek-V4 (AdamW part)</td><td class="num">0.9 / 0.95</td><td class="num">1e-20</td><td class="num">0.1</td><td class="num">n/s</td><td><a href="https://arxiv.org/abs/2606.19348">§4.2.2</a></td></tr>
+      <tr><td>PaLM 540B (2022)</td><td class="num">0.9 / \(1-k^{-0.8}\)</td><td class="num">n/s</td><td class="num">\(\eta^2\) (dynamic)</td><td class="num">1.0</td><td><a href="https://arxiv.org/abs/2204.02311">§5</a></td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Llama 3's report gives AdamW, peak learning rates and schedules but no \(\beta\), \(\epsilon\) or decay for the 405B run (§3.4.1). In its scaling-law runs the decay "at each step is set to 0.1 times the learning rate at that step", which is the standard PyTorch form with \(\lambda = 0.1\).</p>
+
+  <div class="decision">
+    <div class="decision-title">\(\beta_2 = 0.95\) instead of Adam's default 0.999</div>
+    <dl>
+      <dt>Problem</dt><dd>\(\beta_2 = 0.999\) averages \(g^2\) over about \(1/(1-\beta_2) = 1000\) steps, billions of tokens at LLM batch sizes. When the gradient scale changes quickly (early training, a data shift, the run-up to a spike), \(\hat v\) lags and \(\hat m/\sqrt{\hat v}\) exceeds the size the learning rate assumes.</dd>
+      <dt>Idea</dt><dd>Shorten the window to 20 steps (\(\beta_2 = 0.95\)): 80M tokens for Llama 2.</dd>
+      <dt>Why it works</dt><dd>Two independent diagnoses point the same way. Loss spikes in CLIP ViT-Huge training followed moments where squared gradients were underestimated by a stale second-moment estimate <a href="https://arxiv.org/abs/2304.13013">[Wortsman et al. 2023]</a>. Molybog et al. describe instability as a state where the Adam update has a large norm and is essentially uncorrelated with the descent direction, seen from 7B to 546B parameters <a href="https://arxiv.org/abs/2304.09871">[Molybog et al. 2023]</a>.</dd>
+      <dt>Evidence</dt><dd>Adopted, with no ablation shown, by GPT-3, Llama 2, Cerebras-GPT, DeepSeek LLM/V2/V3/V4 (table above). Treat it as a convergent convention, not a proven optimum.</dd>
+      <dt>Cost</dt><dd>A noisier \(\hat v\) for rarely updated coordinates. PaLM argued the opposite: \(\beta_2 = 1-k^{-0.8}\) (0.996 at step 1,000, 0.9999 at step 100,000), because "rare embedding tokens can have poorly estimated second moments over shorter windows", with clipping and a z-loss as safeguards <a href="https://arxiv.org/abs/2204.02311">[PaLM §5]</a>. Both worked: no consensus.</dd>
+      <dt>Used by</dt><dd>Most open recipes since GPT-3; PaLM is the main counterexample.</dd>
+    </dl>
+  </div>
+
+  <h3 id="eps">Epsilon, and why DeepSeek-V4 uses 1e-20</h3>
+  <p>\(\epsilon\) protects the division when \(\hat v\) is tiny, but a large \(\epsilon\) turns Adam into momentum-SGD for small-gradient coordinates. In the RAdam study, \(\epsilon = 10^{-4}\) avoided early divergence but trained much worse than warmup, which the authors attribute to bias in the adaptive rate <a href="https://arxiv.org/abs/1908.03265">[Liu et al. 2020, §3.1]</a>. Scale sharpens this: after global-norm clipping to 1, the RMS of a gradient coordinate is at most \(1/\sqrt{N}\):</p>
+  <p>For Llama-3-8B (\(N = 8.03\)B) that bound is \(1.1\times10^{-5}\), so \(10^{-8}\) is 0.09% of it; for DeepSeek-V3 (671B) \(1.2\times10^{-6}\), 0.8%; for V4-Pro (1.6T) \(7.9\times10^{-7}\), 1.3%.</p>
+  <p>For an average coordinate \(10^{-8}\) is still negligible, but coordinates with gradients 100× below average (rare-token embedding rows, cold experts) would see \(\epsilon\) at tens of percent of \(\sqrt{\hat v}\) in a trillion-parameter MoE. DeepSeek-V4 sets \(\epsilon = 10^{-20}\) for its AdamW parameters <a href="https://arxiv.org/abs/2606.19348">[V4 §4.2.2]</a> without saying why, so this explanation is our inference. Llama 2 went the other way (\(10^{-5}\)); a tiny \(\epsilon\) risks huge steps when \(\hat v\approx0\).</p>
+
+  <h3 id="state-memory">Optimizer state memory</h3>
+  <p>AdamW keeps two extra tensors per parameter, and mixed-precision training keeps fp32 master weights next to the bf16 working copy (details in <a href="15-distributed-training.html">page 15</a>). For Llama-3-8B, \(N = 8{,}030{,}261{,}248\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Item</th><th class="num">bytes / param</th><th class="num">GB</th><th class="num">GiB</th></tr></thead>
+    <tbody>
+      <tr><td>\(m\) and \(v\) in fp32</td><td class="num">8</td><td class="num">64.2</td><td class="num">59.8</td></tr>
+      <tr><td>fp32 master weights</td><td class="num">4</td><td class="num">32.1</td><td class="num">29.9</td></tr>
+      <tr><td>bf16 weights</td><td class="num">2</td><td class="num">16.1</td><td class="num">15.0</td></tr>
+      <tr><td>bf16 or fp32 gradients</td><td class="num">2 or 4</td><td class="num">16.1 or 32.1</td><td class="num">15.0 or 29.9</td></tr>
+      <tr class="hl"><td><strong>Total, before activations</strong></td><td class="num">16 to 20</td><td class="num">128.5 to 160.6</td><td class="num">119.7 to 149.6</td></tr>
+    </tbody>
+  </table></div>
+  <p>The states alone (\(8N\) bytes = 64.2 GB) are four times the bf16 weights. DeepSeek-V3 stores both moments in bf16 "without incurring observable performance degradation" (4 bytes per parameter for \(m,v\)), keeping master weights and gradient accumulation in fp32 <a href="https://arxiv.org/abs/2412.19437">[V3, §3.3.3]</a>. Muon needs one momentum buffer per matrix (<a href="#muon">below</a>). <strong>Adafactor</strong> <a href="https://arxiv.org/abs/1804.04235">[Shazeer &amp; Stern 2018]</a> attacks the same cost by storing only per-row and per-column sums of the second moment (sublinear memory), dropping momentum and clipping updates. PaLM used Adafactor <em>without</em> factorization, which its paper describes as Adam with the learning rate scaled by the RMS of each parameter matrix <a href="https://arxiv.org/abs/2204.02311">[PaLM §5]</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A tagger is usually trained for many epochs on a fixed dataset, with a validation set for early stopping and a sweep to retune learning rate and weight decay. Pretraining is one pass over 10 to 30 trillion tokens: nothing to overfit, no epoch loop, and a sweep at full scale costs a full run. Weight decay becomes a timescale, the batch is millions of tokens, and hyperparameters must be chosen on small runs and extrapolated (<a href="#mup">μP</a>, <a href="#batch">batch size</a>).</p>
+  </aside>
+
+<pre><code class="language-python">import torch
+
+def adamw_step(p, g, m, v, t, lr, betas=(0.9, 0.95), eps=1e-8, wd=0.1):
+    """Functional AdamW. p, g, m, v: same shape; t: 1-based step. Matches torch.optim.AdamW."""
+    b1, b2 = betas
+    m = b1 * m + (1 - b1) * g                 # first moment
+    v = b2 * v + (1 - b2) * g * g             # second moment
+    m_hat = m / (1 - b1 ** t)                 # bias correction: both start at 0
+    v_hat = v / (1 - b2 ** t)
+    p = p * (1 - lr * wd) - lr * m_hat / (v_hat.sqrt() + eps)   # decay is outside the adaptive term
+    return p, m, v
+</code></pre>
+</section>
+
+<section>
+  <h2 id="schedules">Warmup and learning-rate schedules</h2>
+
+  <p>A learning-rate schedule <span class="zh">学习率调度</span> has up to three phases: warmup, a hold at the peak, and a decay. Recipes differ mostly in the hold and the decay, and that choice decides whether a run can be continued or reused.</p>
+
+  <h3 id="warmup">Warmup</h3>
+  <p>Every run in the tables below ramps the learning rate linearly (warmup <span class="zh">学习率预热</span>) from about zero to the peak: 2,000 steps for Llama 2, DeepSeek LLM, V2, V3 and V4-Flash; 500 for Kimi K2; 8,000 for Llama 3 405B; 375M tokens for GPT-3 and Cerebras-GPT. In tokens that is small: Llama 2 7B, \(2000\times 4\text{M} = 8\)B tokens, 0.4% of 2T; DeepSeek-V3, at least \(2000\times 3072\times 4096 = 25.2\)B tokens and about 33B (0.22% of 14.8T) if the batch ramps linearly in steps, an assumption the report does not state. There are two explanations for why warmup is needed, and they make different predictions.</p>
+
+  <ol>
+    <li><strong>Adam's early variance.</strong> After \(t\) steps, \(\hat v_t\) averages only \(t\) squared gradients. At \(t=1\) the ratio \(1/\sqrt{\hat v_1} = 1/|g_1|\) has unbounded variance for Gaussian gradients, so the first updates are noise-dominated. Liu et al. show that freezing parameters and momentum for the first 2,000 iterations while only accumulating \(\hat v\) ("Adam-2k") avoids the divergence without any warmup ramp, and that without either fix their Transformer translation model stalls at training loss near 10 instead of dropping below 3 <a href="https://arxiv.org/abs/1908.03265">[Liu et al. 2020, Fig. 1, §3.1]</a>.</li>
+    <li><strong>Sharpness and the target learning rate.</strong> Kalra and Barkeshli find that the main benefit of warmup is to let the network tolerate a larger target learning rate: warmup lowers the (pre-conditioned) sharpness so the peak LR stays below the instability threshold. For Adam the pre-conditioned sharpness <em>starts</em> high because the preconditioner is built from a first gradient with near-zero components, producing large "catapults" that can persist in Adam's memory. They show that initializing \(v_0 = g_0^2\) (which acts like a built-in warmup \(\eta\sqrt{1-\beta_2^t}\)) gives much of the benefit <a href="https://arxiv.org/abs/2406.09405">[Kalra &amp; Barkeshli 2024, §4.3, §5, §6]</a>.</li>
+  </ol>
+
+  <p>A number separates them. If warmup were only about collecting second-moment statistics, its length would track the averaging window, \(1/(1-\beta_2) = 20\) steps for \(\beta_2 = 0.95\). Recipes use 500 to 8,000 steps, 25 to 400 times longer, which fits the sharpness story better (our inference, not a result of either paper). Both studies used small models. Pre-LN and flat initializations reduce the need for warmup but do not remove it (<a href="04-transformer-block.html">page 04</a>; Llama 3 405B uses 8,000 steps).</p>
+
+  <div class="decision">
+    <div class="decision-title">Learning-rate warmup</div>
+    <dl>
+      <dt>Problem</dt><dd>At step 0 the model is at a random initialization where \(\hat v\) rests on one sample per coordinate and the pre-conditioned sharpness is high, so the peak learning rate that is right for the rest of training would blow up.</dd>
+      <dt>Idea</dt><dd>Ramp the learning rate linearly from about 0 to the peak over \(W\) steps, \(\eta_s = \eta_{\text{peak}}\,(s+1)/W\).</dd>
+      <dt>Why it works</dt><dd>It averages out noisy early adaptive rates, or lets sharpness fall before large steps arrive, or both.</dd>
+      <dt>Evidence</dt><dd>Loss 10 versus 3 without warmup on IWSLT'14 <a href="https://arxiv.org/abs/1908.03265">[Liu et al. 2020, Fig. 1]</a>; Adam training failures at high target LR without it <a href="https://arxiv.org/abs/2406.09405">[Kalra &amp; Barkeshli 2024, Fig. 4]</a>.</dd>
+      <dt>Cost</dt><dd>Negligible in tokens (0.2% to 0.5%); too short and the run spikes early, too long is nearly free, so err long.</dd>
+      <dt>Used by</dt><dd>Every run in this section.</dd>
+    </dl>
+  </div>
+
+  <h3 id="decay">Why decay, and the three shapes</h3>
+  <p>With a constant learning rate the iterate hovers at a noise floor set by \(\eta\) times the gradient noise; lowering \(\eta\) lets it settle and the loss drops abruptly. In MiniCPM's WSD runs "the loss experiences a significant rapid decline" during the decay, to at or below what cosine reaches at the same step <a href="https://arxiv.org/abs/2404.06395">[MiniCPM §4.3, Fig. 5]</a>. Three shapes are in use.</p>
+
+  <p><strong>Cosine to a floor</strong> <span class="zh">余弦退火</span>. After warmup,</p>
+  \[ \eta(s) = \eta_{\min} + \tfrac12(\eta_{\max}-\eta_{\min})\bigl(1 + \cos(\pi p)\bigr), \qquad p = \frac{s - W}{T - W}\in[0,1] \]
+  <p>with \(\eta_{\min} = 0.1\,\eta_{\max}\) in GPT-3 and Llama 2 and \(0.01\,\eta_{\max}\) in Llama 3 405B (\(8\times10^{-7}\) versus a peak of \(8\times10^{-5}\)). It needs the total length \(T\) in advance. MiniCPM's ablation: for training lengths from \(20N\) to \(80N\) tokens (\(N\) = non-embedding parameters) the lowest loss always came from a cosine whose period equals the training length; shorter and longer periods were worse <a href="https://arxiv.org/abs/2404.06395">[MiniCPM §4.1, Fig. 4]</a>. The flip side: a finished cosine run cannot be extended, and every token budget needs its own run.</p>
+
+  <p><strong>Step decay.</strong> DeepSeek LLM replaced cosine with a multi-step schedule: after 2,000 warmup steps the rate is held at the peak, drops to 31.6% after 80% of the tokens, and to 10% after 90%. At 1.6B parameters and 100B tokens the final performance was "essentially consistent" with cosine, and the schedule "allows for the reuse of training from the first phase, offering a unique convenience for continual training" <a href="https://arxiv.org/abs/2401.02954">[DeepSeek LLM §2.3, Fig. 1a]</a>. The factor 0.316 is \(1/\sqrt{10}\): two steps multiply to 0.1. DeepSeek-V2 moved the first drop to about 60% of tokens, the second at about 90% <a href="https://arxiv.org/abs/2405.04434">[V2 §3.1.2]</a>. DeepSeek used the first-stage reuse to train many (batch, learning rate) configurations cheaply when fitting its hyperparameter laws (<a href="#hp-laws">below</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Warmup-stable-decay (WSD) instead of cosine</div>
+    <dl>
+      <dt>Problem</dt><dd>A cosine curve is tied to the total budget \(T\). A data-scaling curve costs one full run per point, and continuing a finished run means restarting from a low rate or re-warming.</dd>
+      <dt>Idea</dt><dd>Warmup, a long stable phase at the peak, then a short decay. Each decayed checkpoint is a finished model; the stable-phase checkpoint can be extended or branched.</dd>
+      <dt>Why it works</dt><dd>Most progress happens at high learning rate; the decay collects the noise-reduction gain at the end. MiniCPM found that a decay of 10% of the steps suffices (2.5% fell short) and that decaying from any stable checkpoint reaches the loss a cosine run of that length would. Cheap branched decays give a whole loss-versus-tokens envelope from one stable run.</dd>
+      <dt>Evidence</dt><dd>A 0.036B model trained this way matched a 0.17B model at about 4× the training compute <a href="https://arxiv.org/abs/2404.06395">[MiniCPM §4.3, Fig. 6]</a>. Constant learning rate plus cooldown scales predictably, like cosine, and stochastic weight averaging helps along the trajectory <a href="https://arxiv.org/abs/2405.18392">[Hägele et al. 2024]</a>.</dd>
+      <dt>Cost</dt><dd>The decay's length and shape become hyperparameters (MiniCPM: exponential, 5,000 steps = 20B tokens for its 2.4B model; Llama 3: linear to zero over the last 40M tokens; Kimi K2, DeepSeek-V4: cosine). MiniCPM lists WSD on large models as not fully explored. The floor matters too: in one study linear decay to zero beat a 10× decay, a 610M model at 80 tokens per parameter beating the same model trained 2.5× longer, a claimed 60% compute saving <a href="https://arxiv.org/abs/2502.15938">[Bergsma et al. 2025]</a>.</dd>
+      <dt>Used by</dt><dd>MiniCPM; Kimi K2 calls its recipe WSD; DeepSeek-V3 and V4 hold the rate constant for most of training and decay at the end.</dd>
+    </dl>
+  </div>
+
+  <p>Decay is also where data changes. MiniCPM found that high-quality data introduced at the start of the decay helped much more than the same data at SFT time; Llama 3 anneals to zero over its last 40M tokens while upsampling high-quality code and math and averaging checkpoints <a href="https://arxiv.org/abs/2407.21783">[Llama 3 §3.1.3, §3.4.3]</a>. See <a href="12-pretraining-data.html">page 12</a>.</p>
+
+  <h3 id="documented">Documented schedules</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th class="num">peak LR</th><th class="num">warmup</th><th>hold / decay</th><th class="num">end LR</th><th class="num">tokens</th><th class="num">batch (tokens)</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 175B</td><td class="num">6e-5</td><td class="num">375M tokens</td><td>cosine to 10% over 260B tokens, then flat at 10%</td><td class="num">6e-6</td><td class="num">300B</td><td class="num">3.2M (ramped from 32K over 4 to 12B tokens)</td></tr>
+      <tr><td>Llama 2 7B</td><td class="num">3e-4</td><td class="num">2,000 steps</td><td>cosine to 10%</td><td class="num">3e-5</td><td class="num">2T</td><td class="num">4M</td></tr>
+      <tr><td>Llama 3 405B</td><td class="num">8e-5</td><td class="num">8,000 steps</td><td>cosine to 8e-7 over 1.2M steps; last 40M tokens linear to 0</td><td class="num">0</td><td class="num">15.6T</td><td class="num">4M, 8M, then 16M</td></tr>
+      <tr><td>DeepSeek LLM 67B</td><td class="num">3.2e-4</td><td class="num">2,000 steps</td><td>×0.316 at 80% of tokens, ×0.1 at 90%</td><td class="num">3.2e-5</td><td class="num">2T</td><td class="num">4,608 seq × 4,096 = 18.9M</td></tr>
+      <tr><td>DeepSeek-V2</td><td class="num">2.4e-4</td><td class="num">2K steps</td><td>×0.316 at about 60%, again at about 90%</td><td class="num">2.4e-5</td><td class="num">8.1T</td><td class="num">2,304 → 9,216 seq (9.4M → 37.7M)</td></tr>
+      <tr class="hl"><td>DeepSeek-V3</td><td class="num">2.2e-4</td><td class="num">2K steps</td><td>flat to 10T; cosine to 2.2e-5 over 4.3T; 333B at 2.2e-5; 167B at 7.3e-6</td><td class="num">7.3e-6</td><td class="num">14.8T</td><td class="num">3,072 → 15,360 seq (12.6M → 62.9M)</td></tr>
+      <tr><td>Kimi K2 (MuonClip)</td><td class="num">2e-4</td><td class="num">500 steps</td><td>flat to 10T; cosine to 2e-5 over 5.5T; then 2e-5 → 7e-6 over 400B more</td><td class="num">7e-6</td><td class="num">15.5T</td><td class="num">67M</td></tr>
+      <tr><td>DeepSeek-V4-Flash</td><td class="num">2.7e-4</td><td class="num">2,000 steps</td><td>flat for most of training; cosine to 2.7e-5 near the end</td><td class="num">2.7e-5</td><td class="num">32T</td><td class="num">ramped to 75.5M</td></tr>
+      <tr><td>DeepSeek-V4-Pro</td><td class="num">2.0e-4</td><td class="num">as Flash</td><td>as Flash</td><td class="num">2.0e-5</td><td class="num">33T</td><td class="num">ramped to 94.4M</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: <a href="https://arxiv.org/abs/2005.14165">GPT-3 App. B, Table 2.1</a>, <a href="https://arxiv.org/abs/2307.09288">Llama 2 §2.2</a>, <a href="https://arxiv.org/abs/2407.21783">Llama 3 §3.4</a>, <a href="https://arxiv.org/abs/2401.02954">DeepSeek LLM §2.3</a>, <a href="https://arxiv.org/abs/2405.04434">V2 §3.1.2</a>, <a href="https://arxiv.org/abs/2412.19437">V3 §4.2</a>, <a href="https://arxiv.org/abs/2507.20534">K2 §2.5</a>, <a href="https://arxiv.org/abs/2606.19348">V4 §4.2.2</a>. GPT-3's end LR is 10% of its peak.</p>
+
+  <h3 id="v3-numbers">Worked numbers: reading DeepSeek-V3's run</h3>
+  <ol>
+    <li><strong>Stages, in fractions of 14.8T tokens.</strong> Flat 10T (67.6%); cosine over 4.3T (29.1%); 333B at \(2.2\times10^{-5}\) (2.3%); 167B at \(7.3\times10^{-6}\) (1.1%). Sum: \(10 + 4.3 + 0.333 + 0.167 = 14.8\)T.</li>
+    <li><strong>Floors.</strong> \(2.2\times10^{-5}/2.2\times10^{-4} = 0.1\) (Llama 2's floor) and \(7.3\times10^{-6}/2.2\times10^{-4} = 0.033\).</li>
+    <li><strong>Learning rate at 12T tokens.</strong> \(p = (12-10)/4.3 = 0.465\); \(\tfrac12(1+\cos(0.465\pi)) = 0.555\); \(\eta = 2.2\times10^{-5} + 1.98\times10^{-4}\times 0.555 = 1.32\times10^{-4}\).</li>
+    <li><strong>Step count.</strong> Final batch \(15{,}360\times 4096 = 62.9\)M tokens. The first 469B tokens are the ramp; if the batch grows linearly in steps (mean 9,216 sequences, 37.7M tokens), that phase is \(469\text{B}/37.7\text{M} \approx 12{,}400\) steps. The remaining \((14.8\text{T}-469\text{B})/62.9\text{M} \approx 227{,}800\) steps. Total about <strong>240,000 steps</strong> (235,000 to 265,000 for any monotone ramp between the extremes).</li>
+    <li><strong>Weight-decay timescale.</strong> \(1/(2.2\times10^{-4}\cdot 0.1) = 45{,}500\) steps at the peak, about 19% of the run.</li>
+    <li><strong>Other hyperparameters share the phase boundaries.</strong> V3's MTP loss weight is 0.3 for the first 10T tokens and 0.1 after; its MoE bias-update speed is 0.001 for 14.3T tokens and 0 for the last 500B. DeepSeek-V4 drops the MTP weight from 0.3 to 0.1 "upon the start of learning rate decay". A schedule is a phase plan for the whole recipe.</li>
+  </ol>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 380" role="img" aria-labelledby="fig-14-1-title">
+<title id="fig-14-1-title">Learning rate relative to peak against the fraction of training tokens for cosine decay, warmup-stable-decay, DeepSeek-style step decay, and the documented DeepSeek-V3 schedule</title>
+<line class="s-line" x1="70.0" y1="290.0" x2="690.0" y2="290.0" style="stroke-opacity:.25"/>
+<text x="62.0" y="294.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" x1="70.0" y1="225.0" x2="690.0" y2="225.0" style="stroke-opacity:.25"/>
+<text x="62.0" y="229.0" text-anchor="end" class="s-small s-muted">0.25</text>
+<line class="s-line" x1="70.0" y1="160.0" x2="690.0" y2="160.0" style="stroke-opacity:.25"/>
+<text x="62.0" y="164.0" text-anchor="end" class="s-small s-muted">0.5</text>
+<line class="s-line" x1="70.0" y1="95.0" x2="690.0" y2="95.0" style="stroke-opacity:.25"/>
+<text x="62.0" y="99.0" text-anchor="end" class="s-small s-muted">0.75</text>
+<line class="s-line" x1="70.0" y1="30.0" x2="690.0" y2="30.0" style="stroke-opacity:.25"/>
+<text x="62.0" y="34.0" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line" x1="70.0" y1="290.0" x2="70.0" y2="295.0"/>
+<text x="70.0" y="309.0" text-anchor="middle" class="s-small s-muted">0%</text>
+<line class="s-line" x1="194.0" y1="290.0" x2="194.0" y2="295.0"/>
+<text x="194.0" y="309.0" text-anchor="middle" class="s-small s-muted">20%</text>
+<line class="s-line" x1="318.0" y1="290.0" x2="318.0" y2="295.0"/>
+<text x="318.0" y="309.0" text-anchor="middle" class="s-small s-muted">40%</text>
+<line class="s-line" x1="442.0" y1="290.0" x2="442.0" y2="295.0"/>
+<text x="442.0" y="309.0" text-anchor="middle" class="s-small s-muted">60%</text>
+<line class="s-line" x1="566.0" y1="290.0" x2="566.0" y2="295.0"/>
+<text x="566.0" y="309.0" text-anchor="middle" class="s-small s-muted">80%</text>
+<line class="s-line" x1="690.0" y1="290.0" x2="690.0" y2="295.0"/>
+<text x="690.0" y="309.0" text-anchor="middle" class="s-small s-muted">100%</text>
+<line class="s-line" x1="70.0" y1="30.0" x2="70.0" y2="290.0"/>
+<line class="s-line" x1="70.0" y1="290.0" x2="690.0" y2="290.0"/>
+<text x="380.0" y="328.0" text-anchor="middle" class="s-small s-muted">fraction of training tokens</text>
+<text x="16" y="160.0" text-anchor="middle" class="s-small s-muted" transform="rotate(-90 16 160.0)">learning rate / peak</text>
+<line class="s-line s-dash" x1="70.0" y1="264.0" x2="690.0" y2="264.0" style="stroke-opacity:.5"/>
+<text x="76.0" y="278.0" class="s-small s-muted">0.1 of peak</text>
+<path class="s-line-a" d="M70.0,290.0 L82.4,30.0 L92.5,30.2 L102.7,30.6 L112.8,31.4 L122.9,32.6 L133.0,34.0 L143.2,35.7 L153.3,37.8 L163.4,40.1 L173.5,42.8 L183.7,45.7 L193.8,48.9 L203.9,52.3 L214.0,56.1 L224.2,60.1 L234.3,64.3 L244.4,68.7 L254.6,73.4 L264.7,78.2 L274.8,83.3 L284.9,88.5 L295.1,93.9 L305.2,99.4 L315.3,105.1 L325.4,110.8 L335.6,116.7 L345.7,122.7 L355.8,128.7 L365.9,134.8 L376.1,140.9 L386.2,147.0 L396.3,153.1 L406.5,159.2 L416.6,165.3 L426.7,171.3 L436.8,177.3 L447.0,183.2 L457.1,188.9 L467.2,194.6 L477.3,200.1 L487.5,205.5 L497.6,210.7 L507.7,215.8 L517.8,220.6 L528.0,225.3 L538.1,229.7 L548.2,233.9 L558.4,237.9 L568.5,241.7 L578.6,245.1 L588.7,248.3 L598.9,251.2 L609.0,253.9 L619.1,256.2 L629.2,258.3 L639.4,260.0 L649.5,261.4 L659.6,262.6 L669.7,263.4 L679.9,263.8 L690.0,264.0" style="stroke-width:2.4"/>
+<path class="s-line-b" d="M70.0,290.0 L82.4,30.0 L628.0,30.0 L690.0,264.0" style="stroke-width:2.4"/>
+<path class="s-line-c" d="M70.0,290.0 L82.4,30.0 L566.0,30.0 L566.0,207.8 L628.0,207.8 L628.0,264.0 L690.0,264.0" style="stroke-width:2.4;stroke-dasharray:9 6"/>
+<path class="s-line-d" d="M70.0,290.0 L71.4,30.0 L488.9,30.0 L491.2,30.1 L493.4,30.4 L495.7,30.8 L497.9,31.4 L500.2,32.2 L502.4,33.2 L504.7,34.4 L506.9,35.7 L509.2,37.2 L511.4,38.9 L513.7,40.7 L515.9,42.8 L518.2,44.9 L520.4,47.2 L522.7,49.7 L524.9,52.3 L527.2,55.1 L529.4,58.0 L531.7,61.1 L534.0,64.3 L536.2,67.6 L538.5,71.0 L540.7,74.6 L543.0,78.2 L545.2,82.0 L547.5,85.9 L549.7,89.8 L552.0,93.9 L554.2,98.0 L556.5,102.2 L558.7,106.5 L561.0,110.8 L563.2,115.2 L565.5,119.7 L567.7,124.2 L570.0,128.7 L572.2,133.2 L574.5,137.8 L576.7,142.4 L579.0,147.0 L581.2,151.6 L583.5,156.2 L585.7,160.8 L588.0,165.3 L590.2,169.8 L592.5,174.3 L594.7,178.8 L597.0,183.2 L599.3,187.5 L601.5,191.8 L603.8,196.0 L606.0,200.1 L608.3,204.2 L610.5,208.1 L612.8,212.0 L615.0,215.8 L617.3,219.4 L619.5,223.0 L621.8,226.4 L624.0,229.7 L626.3,232.9 L628.5,236.0 L630.8,238.9 L633.0,241.7 L635.3,244.3 L637.5,246.8 L639.8,249.1 L642.0,251.2 L644.3,253.3 L646.5,255.1 L648.8,256.8 L651.0,258.3 L653.3,259.6 L655.5,260.8 L657.8,261.8 L660.0,262.6 L662.3,263.2 L664.6,263.6 L666.8,263.9 L669.1,264.0 L683.0,264.0 L683.0,281.4 L690.0,281.4" style="stroke-width:2.2;stroke-dasharray:2 5"/>
+<text x="584.6" y="199.8" text-anchor="middle" class="s-small s-tc">0.316</text>
+<text x="194.0" y="134.0" text-anchor="start" class="s-small s-ta">cosine, floor 10%</text>
+<text x="94.8" y="21.0" text-anchor="start" class="s-small s-muted">stable phase: peak LR held (WSD, step and V3 overlap here)</text>
+<text x="690.0" y="21.0" text-anchor="end" class="s-small s-tb">WSD: decay over the last 10%</text>
+<text x="78.0" y="210.8" class="s-small s-muted">warmup drawn as 2% of tokens for visibility;</text>
+<text x="78.0" y="224.8" class="s-small s-muted">real runs use about 0.2% to 0.5% (V3 curve).</text>
+<line class="s-line-a" x1="14" y1="346" x2="40" y2="346" style="stroke-width:2.4;"/>
+<text x="46" y="350" class="s-small">cosine to 10% (Llama 2 style)</text>
+<line class="s-line-b" x1="300" y1="346" x2="326" y2="346" style="stroke-width:2.4;"/>
+<text x="332" y="350" class="s-small">WSD: hold, then linear decay over the last 10%</text>
+<line class="s-line-c" x1="14" y1="366" x2="40" y2="366" style="stroke-width:2.4;stroke-dasharray:9 6"/>
+<text x="46" y="370" class="s-small">step: x0.316 at 80% of tokens, x0.1 at 90%</text>
+<line class="s-line-d" x1="300" y1="366" x2="326" y2="366" style="stroke-width:2.4;stroke-dasharray:2 5"/>
+<text x="332" y="370" class="s-small">DeepSeek-V3 as documented (floors 0.1, then 0.033)</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Learning rate relative to its peak against the fraction of training tokens. Cosine (blue) and WSD (orange) are drawn with an illustrative 2% warmup and a 10% floor; the step curve (green, dashed) is DeepSeek LLM's 80%/90% schedule (V2 uses about 60%/90%); the purple dotted curve is DeepSeek-V3's documented schedule, computed from the token counts above (flat to 67.6%, cosine to 96.6%, then 0.1 and 0.033). Notice that WSD, step and V3 share the same stable plateau, which is what makes their early checkpoints reusable, while cosine starts falling immediately.</figcaption>
+  </figure>
+
+<pre><code class="language-python">import math
+
+def lr_at(step, kind, peak, total, warmup, min_ratio=0.1, decay_steps=None):
+    if step &lt; warmup:                                   # linear warmup
+        return peak * (step + 1) / warmup
+    lo = peak * min_ratio
+    if kind == "cosine":
+        p = min(1.0, (step - warmup) / (total - warmup))
+        return lo + (peak - lo) * 0.5 * (1 + math.cos(math.pi * p))
+    decay_steps = decay_steps or total // 10           # WSD: hold, then decay over the last 10%
+    start = total - decay_steps
+    return peak if step &lt; start else peak + (lo - peak) * min(1.0, (step - start) / decay_steps)
+</code></pre>
+</section>
+
+<section>
+  <h2 id="batch">Batch size and the critical batch size</h2>
+
+  <p>The <strong>batch size</strong> <span class="zh">批量大小</span> that matters for LLMs is the number of tokens per optimizer step (sequences × context length). It has risen from about 1M to about 100M tokens in six years:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th class="num">batch (tokens)</th><th>Ramp</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 175B</td><td class="num">3.2M</td><td>linear from 32K tokens over the first 4 to 12B tokens <a href="https://arxiv.org/abs/2005.14165">[App. B]</a></td></tr>
+      <tr><td>PaLM 540B</td><td class="num">1M → 2M → 4M</td><td>doubled at steps 50K and 115K of 255K <a href="https://arxiv.org/abs/2204.02311">[§5]</a></td></tr>
+      <tr><td>Llama 2 (all sizes)</td><td class="num">4M</td><td>constant <a href="https://arxiv.org/abs/2307.09288">[Tab. 1]</a></td></tr>
+      <tr><td>Llama 3 405B</td><td class="num">4M → 8M → 16M</td><td>doubled after <span class="unverified" title="The paper prints 252M tokens. At 4M tokens per step that is 63 steps, well inside the 8,000-step warmup, so this may be a typo for 252B. Not resolvable from the text.">252M tokens</span> and after 2.87T <a href="https://arxiv.org/abs/2407.21783">[§3.4.1]</a></td></tr>
+      <tr><td>DeepSeek-V2</td><td class="num">9.4M → 37.7M</td><td>2,304 → 9,216 sequences over the first 225B tokens <a href="https://arxiv.org/abs/2405.04434">[§3.1.2]</a></td></tr>
+      <tr><td>DeepSeek-V3</td><td class="num">12.6M → 62.9M</td><td>3,072 → 15,360 sequences over the first 469B tokens <a href="https://arxiv.org/abs/2412.19437">[§4.2]</a></td></tr>
+      <tr><td>Kimi K2</td><td class="num">67M</td><td>constant <a href="https://arxiv.org/abs/2507.20534">[§2.5]</a></td></tr>
+      <tr><td>DeepSeek-V4-Flash / Pro</td><td class="num">→ 75.5M / → 94.4M</td><td>"from a small size" to the maximum <a href="https://arxiv.org/abs/2606.19348">[§4.2.2]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="noise-scale">Gradient noise and the critical batch size</h3>
+  <p>McCandlish et al. give the model that everyone cites, built on the gradient noise scale <span class="zh">梯度噪声尺度</span> <a href="https://arxiv.org/abs/1812.06162">[McCandlish et al. 2018, §2]</a>. A minibatch gradient is the true gradient \(G\) plus noise of covariance \(\Sigma/B\). A step of size \(\varepsilon\) changes the expected loss by \(-\varepsilon|G|^2 + \tfrac12\varepsilon^2\bigl(G^\top H G + \mathrm{tr}(H\Sigma)/B\bigr)\) (their Eq. 2.5). Minimizing over \(\varepsilon\):</p>
+  <div class="eq-box">
+  \[ \varepsilon_{\text{opt}}(B) = \frac{\varepsilon_{\max}}{1 + B_{\text{noise}}/B}, \qquad \Delta L_{\text{opt}}(B) = \frac{\Delta L_{\max}}{1 + B_{\text{noise}}/B}, \qquad B_{\text{noise}} = \frac{\mathrm{tr}(H\Sigma)}{G^\top H G} \]
+  <div class="eq-label">B_noise ≈ B_simple = tr(Σ)/|G|² when the Hessian is close to a multiple of the identity</div>
+  </div>
+  <p>For \(B \ll B_{\text{noise}}\) progress per step grows linearly with \(B\): doubling the batch halves the steps at the same token cost. For \(B \gg B_{\text{noise}}\) extra samples buy almost nothing per step. Over a whole run this becomes a trade-off between steps \(S\) and examples (tokens) \(E\): \((S/S_{\min}-1)(E/E_{\min}-1) = 1\), with the critical batch size <span class="zh">临界批量大小</span> \(B_{\text{crit}} = E_{\min}/S_{\min} \approx B_{\text{noise}}\) <a href="https://arxiv.org/abs/1812.06162">[Eq. 2.11 to 2.12]</a>. Substituting \(E = BS\), \(s = S/S_{\min}\) and \(b = B/B_{\text{crit}}\) gives \((s-1)(bs-1) = 1\), which factors to \(s = 1 + 1/b\):</p>
+  <div class="eq-box">
+  \[ E = E_{\min}\Bigl(1 + \frac{B}{B_{\text{crit}}}\Bigr), \qquad S = S_{\min}\Bigl(1 + \frac{B_{\text{crit}}}{B}\Bigr) \]
+  <div class="eq-label">At B = B_crit you spend twice the minimum tokens and twice the minimum steps</div>
+  </div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">\(B/B_{\text{crit}}\)</th><th class="num">\(1/4\)</th><th class="num">\(1/2\)</th><th class="num">1</th><th class="num">2</th><th class="num">4</th><th class="num">8</th></tr></thead>
+    <tbody>
+      <tr><td class="num">tokens \(E/E_{\min}\)</td><td class="num">1.25</td><td class="num">1.5</td><td class="num">2</td><td class="num">3</td><td class="num">5</td><td class="num">9</td></tr>
+      <tr><td class="num">steps \(S/S_{\min}\)</td><td class="num">5</td><td class="num">3</td><td class="num">2</td><td class="num">1.5</td><td class="num">1.25</td><td class="num">1.125</td></tr>
+    </tbody>
+  </table></div>
+  <p>Illustration with made-up numbers: \(E_{\min} = 10\)T tokens and \(B_{\text{crit}} = 16\)M give \(S_{\min} = 625{,}000\) steps. At \(B = 16\)M the run costs 20T tokens and 1.25M steps; quadrupling the batch to 64M cuts steps only to 781K while the token bill rises to 50T. That asymmetry is why nobody trains far above the critical batch.</p>
+
+  <p>The critical batch is <em>not</em> constant. Since \(B_{\text{noise}} \propto 1/|G|^2\) roughly and gradients shrink as the loss falls, it grows during training: McCandlish et al. measure increases of "an order of magnitude or more"; for an LSTM on One Billion Word it is 700 tokens at the start and about 100,000 averaged over the run <a href="https://arxiv.org/abs/1812.06162">[§3.1, Tab. 1]</a>. Later work finds it depends mainly on tokens seen, not parameter count: Zhang et al. (85M to 1.2B parameters on C4) and Bergsma et al. report power laws in dataset size, independent of model size <a href="https://arxiv.org/abs/2410.21676">[Zhang et al. 2024]</a>, <a href="https://arxiv.org/abs/2505.13738">[Bergsma et al. 2025]</a>. That fits the table: as token budgets grew from 300B to 33T, batches grew from 3.2M to 94M. Neither study reaches frontier scale.</p>
+
+  <div class="decision">
+    <div class="decision-title">Batch-size ramp</div>
+    <dl>
+      <dt>Problem</dt><dd>The critical batch is small early and large late. A large constant batch wastes tokens early (\(E = E_{\min}(1+B/B_{\text{crit}})\) with tiny \(B_{\text{crit}}\)); a small one limits hardware efficiency late.</dd>
+      <dt>Idea</dt><dd>Start small and increase, in doublings (PaLM, Llama 3) or a ramp over the first few hundred billion tokens (DeepSeek).</dd>
+      <dt>Why it works</dt><dd>PaLM's two reasons: small batches are more sample-efficient early and large ones give better gradient estimates later, and larger batches mean larger matmuls, which raise accelerator efficiency <a href="https://arxiv.org/abs/2204.02311">[PaLM §5]</a>. Llama 3 adds stability: "a lower batch size early in training to improve training stability" <a href="https://arxiv.org/abs/2407.21783">[§3.4.1]</a>. Cerebras raised its 13B model's batch from 720 to 1,080 sequences at 84B tokens when the train-validation gap began to grow, reading it as growing gradient noise <a href="https://arxiv.org/abs/2304.03208">[§2.3]</a>.</dd>
+      <dt>Evidence</dt><dd>Consistent adoption rather than an ablation; the noise-scale theory predicts the direction, and Llama 3 reports "few loss spikes".</dd>
+      <dt>Cost</dt><dd>More hyperparameters and an interaction with the learning-rate schedule: DeepSeek-V3 holds the rate at \(2.2\times10^{-4}\) while its batch grows 5×, consistent with the rate saturating once \(B \gg B_{\text{noise}}\).</dd>
+      <dt>Used by</dt><dd>GPT-3, PaLM, Llama 3, DeepSeek-V2, V3 and V4, Cerebras-GPT 13B, MiniCPM-1.2B (2M → 4M tokens).</dd>
+    </dl>
+  </div>
+
+  <h3 id="lr-batch">Learning rate as a function of batch size</h3>
+  <p>The same theory gives the learning-rate rule. For SGD, \(\varepsilon_{\text{opt}} \approx \varepsilon_{\max} B/B_{\text{noise}}\) when \(B \ll B_{\text{noise}}\) (linear scaling), saturating at \(\varepsilon_{\max}\) beyond. For Adam and RMSProp, McCandlish et al. observe \(\varepsilon_{\text{opt}} \propto B^{\alpha}\) with \(\alpha\) between 0.5 and 1.0 depending on the task, then roughly constant <a href="https://arxiv.org/abs/1812.06162">[§3.1]</a>; Malladi et al. derive the square-root rule from an SDE approximation (batch ×\(\kappa\), learning rate ×\(\sqrt\kappa\)) <a href="https://arxiv.org/abs/2205.10287">[Malladi et al. 2022]</a>. Cerebras-GPT found a μP-transferred rate holds when the batch is at or above critical, and below it the rate should shrink roughly in proportion to the batch <a href="https://arxiv.org/abs/2304.03208">[App. G.3]</a>. Interview summary: below \(B_{\text{crit}}\) raise the learning rate with the batch (\(\sqrt\kappa\) for Adam, empirically between \(\sqrt\kappa\) and \(\kappa\)); above it, do not.</p>
+
+  <h3 id="hp-laws">Fitted hyperparameter laws</h3>
+  <p>DeepSeek LLM fitted the best batch size and learning rate directly against the compute budget \(C = M\cdot D\), where \(M\) is non-embedding FLOPs per token including attention, \(M = 72\,n_{\text{layer}}d^2 + 12\,n_{\text{layer}}d\,l_{\text{seq}}\), using grid searches at \(10^{17}\) to \(2\times10^{19}\) FLOPs <a href="https://arxiv.org/abs/2401.02954">[DeepSeek LLM §3.1, Eq. 1 to 2]</a>:</p>
+  \[ \eta_{\text{opt}} = 0.3118\, C^{-0.1250}, \qquad B_{\text{opt}} = 0.2920\, C^{0.3271} \]
+  <p>The paper does not label the unit of \(B\) in the text we checked. Plugging in the released configs shows it is tokens: for the 7B model (\(n_{\text{layer}} = 30\), \(d = 4096\), \(l_{\text{seq}} = 4096\), 2T tokens) \(M = 4.23\times10^{10}\) and \(C = 8.46\times10^{22}\).</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Config</th><th class="num">\(C\) (FLOPs)</th><th class="num">\(B_{\text{opt}}\) from the fit</th><th class="num">\(B\) used</th><th class="num">\(\eta_{\text{opt}}\) from the fit</th><th class="num">\(\eta\) used</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek LLM 7B</td><td class="num">8.46e22</td><td class="num">9.2M</td><td class="num">9.4M</td><td class="num">4.25e-4</td><td class="num">4.2e-4</td></tr>
+      <tr><td>DeepSeek LLM 67B</td><td class="num">9.95e23</td><td class="num">20.7M</td><td class="num">18.9M</td><td class="num">3.12e-4</td><td class="num">3.2e-4</td></tr>
+      <tr><td>DeepSeek-V3 (extrapolation)</td><td class="num">3.29e24</td><td class="num">30.5M</td><td class="num">62.9M</td><td class="num">2.69e-4</td><td class="num">2.2e-4</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">The V3 row is our back-of-envelope (\(C = 6\cdot 37\text{B}\cdot 14.8\text{T}\) for an MoE, the fit extrapolated five orders of magnitude past its data); neither paper makes this claim. Within 2× of V3's choices says the laws are usable for planning, not exact.</p>
+  <p>The loss surface in \((B,\eta)\) is flat near the optimum: DeepSeek calls any configuration within 0.25% of the best loss near-optimal, and that region is a broad band <a href="https://arxiv.org/abs/2401.02954">[§3.1, Fig. 2 to 3]</a>, which is why a factor-of-two learning-rate error is not fatal. They note the fit ignores factors beyond compute, such as the model-versus-data split. Moonlight's grid-searched AdamW baseline used different exponents (\(\eta \propto C^{-0.0575}\), \(B \propto C^{0.414}\)) <a href="https://arxiv.org/abs/2502.16982">[Moonlight, App. B, Tab. 9]</a>: these fits are per-setup. One hardware caveat: MiniCPM argues that on a fixed cluster doubling the batch nearly doubles the step time, so the aim shifts from few steps to few tokens <a href="https://arxiv.org/abs/2404.06395">[MiniCPM §3.2, App. A.2]</a>.</p>
+</section>
+
+<section>
+  <h2 id="clip-spikes">Gradient clipping, monitoring and the loss-spike playbook</h2>
+
+  <p>A loss spike <span class="zh">损失尖峰</span> is a sudden rise in training loss, and the first line of defense is <strong>global-norm gradient clipping</strong> <span class="zh">梯度裁剪</span>, which rescales the whole gradient vector when its norm exceeds a threshold \(c\): \(g \leftarrow g\cdot\min(1, c/\|g\|_2)\). Every run that states a threshold uses \(c = 1.0\) (GPT-3, Llama 2, Cerebras-GPT, DeepSeek LLM/V2/V3, PaLM). Clipping by the <em>global</em> norm preserves the direction of the update, unlike clipping each coordinate.</p>
+
+  <div class="decision">
+    <div class="decision-title">Global-norm clipping at 1.0</div>
+    <dl>
+      <dt>Problem</dt><dd>A rare batch or a transient instability produces a gradient far larger than usual. It enters both \(m\) and \(v\), and moves the weights a long way.</dd>
+      <dt>Idea</dt><dd>Cap \(\|g\|_2\) at \(c\) before the optimizer sees it.</dd>
+      <dt>Why it works</dt><dd>It limits how much any single outlier step can contribute to \(m\) and \(v\). Because Adam divides by \(\sqrt{\hat v}\), a constant rescaling of all gradients changes nothing, so clipping only matters for steps that are large relative to their neighbors, which is exactly what you want.</dd>
+      <dt>Evidence</dt><dd>Universal in the tables above. But it is not sufficient: PaLM 540B still had about 20 loss spikes with clipping enabled <a href="https://arxiv.org/abs/2204.02311">[PaLM §5.1]</a>.</dd>
+      <dt>Cost</dt><dd>If \(\|g\|\) exceeds \(c\) on most steps, clipping silently becomes gradient normalization and changes the effective learning rate; a slowly drifting norm is hidden as well. Track the pre-clip norm and the fraction of clipped steps, not just the loss.</dd>
+      <dt>Used by</dt><dd>Every run above that reports a threshold.</dd>
+    </dl>
+  </div>
+
+  <h3 id="monitoring">What to monitor</h3>
+  <ul>
+    <li><strong>Loss</strong> on the training stream and on a fixed held-out batch, to tell data-order effects from model effects.</li>
+    <li><strong>Global and per-layer gradient norms, and the clipped fraction.</strong> The layer whose norm departs first is usually where a spike starts.</li>
+    <li><strong>Per-layer update-to-weight ratio.</strong> Under Adam each coordinate moves by about \(\eta\); with weight RMS 0.02 and \(\eta = 3\times10^{-4}\) that is 1.5% per step. Rule of thumb: inspect layers far above their neighbors.</li>
+    <li><strong>Attention and output logit magnitudes.</strong> K2 tracks the maximum attention logit per head; PaLM added an auxiliary loss \(10^{-4}\log^2 Z\) that keeps the softmax normalizer near 1 (<a href="11-stability-tweaks.html">page 11</a>).</li>
+    <li><strong>Adam's \(v\)</strong> (tiny values, low-precision underflow) and NaN counters, to separate numerical faults from dynamics.</li>
+  </ul>
+
+  <h3 id="playbook">The playbook</h3>
+  <ol>
+    <li><strong>Prepare before the run.</strong> Make training replayable: PaLM's batch contents are a function of the step number and the run is bitwise reproducible from any checkpoint. Checkpoint often: DeepSeek LLM saves asynchronously every 5 minutes. DeepSeek-V4 built deterministic kernels and notes that determinism helps researchers "pinpoint numerical causes" when loss spikes appear <a href="https://arxiv.org/abs/2606.19348">[V4 §3.3]</a>.</li>
+    <li><strong>Triage.</strong> Is it NaN/Inf or a finite spike? Hardware fault or dynamics? Which layer's activations or gradients jumped first?</li>
+    <li><strong>Roll back and skip.</strong> PaLM restarted from a checkpoint about 100 steps before the spike and skipped 200 to 500 batches; the loss did not spike again at that point. The same batches replayed from an <em>earlier</em> checkpoint did not spike, so the cause was the combination of those batches and the parameter state, not bad data alone <a href="https://arxiv.org/abs/2204.02311">[PaLM §5.1]</a>. This is a workaround, not a diagnosis.</li>
+    <li><strong>If it recurs, treat it as systemic,</strong> from cheap to expensive: lower the peak learning rate or lengthen warmup; lower \(\beta_2\) or raise \(\epsilon\) (stale second moment, above); add logit and activation control (z-loss, QK-norm, softcapping, <a href="11-stability-tweaks.html">page 11</a>); or remove the amplifier. DeepSeek-V4 found spikes "consistently tied to outliers in the MoE layers" with the router making them worse. It computes routing indices from parameters \(\Delta t\) steps old (anticipatory routing, activated only when a spike is detected, after a short rollback), and clamps the SwiGLU linear part to \([-10, 10]\) and its gate at 10 <a href="https://arxiv.org/abs/2606.19348">[V4 §4.2.3]</a>. Simple rollbacks "could temporarily restore" training but did not prevent recurrence.</li>
+    <li><strong>Check the data</strong> (duplicates, degenerate documents, a bad shard), but do not stop there, given the PaLM replay result.</li>
+  </ol>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th>What the report says about spikes</th></tr></thead>
+    <tbody>
+      <tr><td>PaLM 540B</td><td>About 20 spikes despite clipping; fixed by rollback and batch skipping <a href="https://arxiv.org/abs/2204.02311">[§5.1]</a></td></tr>
+      <tr><td>Llama 3 405B</td><td>"Few loss spikes" and no interventions needed for divergence, with the recipe described here (8,000-step warmup, cosine, batch 4M → 16M) <a href="https://arxiv.org/abs/2407.21783">[§3.4.1]</a></td></tr>
+      <tr><td>DeepSeek-V3</td><td>No irrecoverable spikes and no rollbacks over 14.8T tokens <a href="https://arxiv.org/abs/2412.19437">[Abstract, §1]</a></td></tr>
+      <tr><td>Kimi K2</td><td>Zero loss spikes over 15.5T tokens with MuonClip (<a href="#muon">Muon section</a>) <a href="https://arxiv.org/abs/2507.20534">[Abstract]</a></td></tr>
+      <tr><td>DeepSeek-V4</td><td>Notable instability at trillion-parameter scale; spikes tied to MoE outliers; fixed by anticipatory routing and SwiGLU clamping <a href="https://arxiv.org/abs/2606.19348">[§4.2.3]</a></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="mup">μP and hyperparameter transfer</h2>
+
+  <p>Nobody can sweep the learning rate of a 100B-parameter run. Two answers are in use: change the parametrization so the optimum stops moving with width (μP), or fit how the optimum moves and extrapolate (<a href="#hp-laws">above</a> and <a href="13-scaling-laws.html">page 13</a>).</p>
+
+  <h3 id="mup-problem">The problem, and the one-line derivation</h3>
+  <p>Under the standard parametrization (SP), each matrix is initialized with variance \(1/\text{fan\_in}\) and every layer gets the same learning rate. That keeps activations of order one <em>at initialization</em>, but Yang et al. show it makes them blow up in wide models <em>during training</em>, and the best learning rate shifts with width: for Transformers trained with Adam, widths 128 to 8192 have visibly different optima, and for an MLP the optimum moves by roughly an order of magnitude between widths 256 and 8192 <a href="https://arxiv.org/abs/2203.03466">[Yang et al. 2022, Fig. 1, Fig. 3]</a>.</p>
+  <p>Why, in three lines: let a hidden layer have width \(n\) and input \(x\) with \(O(1)\) coordinates. Adam changes each weight entry by about \(\eta\), correlated with \(x\) (the gradient is an outer product involving \(x\)), so the output change \(x\,\Delta W\) sums \(n\) coherent terms of size \(\eta\): it is \(O(\eta n)\). To keep it \(O(1)\) at every width, \(\eta\) must scale like \(1/n\) for hidden matrices <a href="https://arxiv.org/abs/2203.03466">[App. J.2]</a>. That is the core of the <strong>Maximal Update Parametrization</strong> <span class="zh">最大更新参数化</span> (μP): choose initialization, per-layer learning rates and multipliers so every layer's update changes its outputs by a width-independent amount.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Input weights and all biases</th><th>Hidden weights</th><th>Output weights</th></tr></thead>
+    <tbody>
+      <tr><td>init variance, SP</td><td class="num">\(1/\text{fan\_in}\)</td><td class="num">\(1/\text{fan\_in}\)</td><td class="num">\(1/\text{fan\_in}\)</td></tr>
+      <tr class="hl"><td>init variance, μP</td><td class="num">\(1/\text{fan\_in}\) (constant in width)</td><td class="num">\(1/\text{fan\_in}\)</td><td class="num">\(1/\text{fan\_in}^2\)</td></tr>
+      <tr><td>Adam learning rate, SP</td><td class="num">1</td><td class="num">1</td><td class="num">1</td></tr>
+      <tr class="hl"><td>Adam learning rate, μP</td><td class="num">1</td><td class="num">\(1/\text{fan\_in}\)</td><td class="num">\(1/\text{fan\_in}\)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: Yang et al. 2022, Table 3 (Adam column). Transformers also need attention logits scaled by \(1/d_{\text{head}}\) instead of \(1/\sqrt{d_{\text{head}}}\) (Definition 4.1). Entries are scalings with width, relative to a base width \(d_{\text{base}}\) at which μP equals SP.</p>
+  <p>In practice: a width multiplier \(m = d/d_{\text{base}}\); hidden weights get learning rate \(\eta_{\text{base}}/m\) and init variance \(\sigma^2_{\text{base}}/m\), logits are divided by \(m\), attention uses \(1/d_{\text{head}}\), and the embedding output gets a tunable multiplier <a href="https://arxiv.org/abs/2304.03208">[Cerebras-GPT, Tab. 14]</a>. MiniCPM's variant also scales the residual branches for depth: embedding × 12, block outputs × 1.4/\(\sqrt{L}\), plus width-scaled 2-D learning rates, init std and logits <a href="https://arxiv.org/abs/2404.06395">[MiniCPM, Tab. 7]</a>.</p>
+
+  <h3 id="mup-transfer">What transfers and what does not</h3>
+  <p>Table 1 of the μTransfer paper is worth memorizing. <strong>Transferable across width:</strong> optimization hyperparameters (learning rate, momentum, Adam \(\beta\), schedule shape), initialization scales, parameter multipliers. <strong>Not transferable:</strong> regularization such as dropout and weight decay. <strong>Transferred across</strong> depth, batch size, training time and sequence length, but these last four are only empirically validated, on Transformers <a href="https://arxiv.org/abs/2203.03466">[Yang et al. 2022, Tab. 1]</a>. The procedure is: put the target model in μP, tune a small proxy, copy the hyperparameters.</p>
+
+  <h3 id="mup-evidence">Evidence at practical scale</h3>
+  <ul>
+    <li><strong>μTransfer paper.</strong> Hyperparameters tuned on a 40M proxy outperformed the published numbers of GPT-3 6.7B, with tuning cost about 7% of pretraining; a 13M proxy did the same for BERT-large (350M) at the cost of one BERT-large pretraining <a href="https://arxiv.org/abs/2203.03466">[Abstract, §1]</a>.</li>
+    <li><strong>Cerebras-GPT.</strong> A random search on a 40M proxy (learning rate \(6\times10^{-3}\), init std 0.08, embedding multiplier 10) was reused unchanged for 111M to 2.7B. Averaged over sizes, μP models had 0.43% lower Pile test loss and 1.7% higher downstream accuracy than their standard-parametrization twins, and scattered much less around the scaling law (0.04% versus 0.66% standard deviation) <a href="https://arxiv.org/abs/2304.03208">[§3.3, App. G.2]</a>.</li>
+    <li><strong>MiniCPM.</strong> With μP width and depth scaling, the best base learning rate stayed near 0.01 from 0.04B to 0.5B parameters, and a spot check at 2.1B agreed <a href="https://arxiv.org/abs/2404.06395">[§3.3, Fig. 3]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">μP versus fitted hyperparameter laws</div>
+    <dl>
+      <dt>Problem</dt><dd>The best learning rate moves with model size and sweeping at target scale is unaffordable.</dd>
+      <dt>Idea</dt><dd>μP: reparametrize so the optimum is width-independent, tune small, transfer. Fitted laws: sweep at several small scales, fit power laws for the best \(\eta\) and \(B\) against compute, extrapolate.</dd>
+      <dt>Why it works</dt><dd>μP comes from an infinite-width limit. The fitted laws lean on the loss surface being flat near the optimum, so a factor-of-2 extrapolation error costs little.</dd>
+      <dt>Evidence</dt><dd>The μP results above; DeepSeek LLM's laws reproduce its own 7B and 67B configurations and land within 2× of V3's choices (<a href="#hp-laws">table</a>).</dd>
+      <dt>Cost</dt><dd>μP needs code changes and covers width cleanly, but not weight decay (Table 1), and decay interacts with it: with μP-scaled learning rates the best decay should <em>increase</em> with model size, and μP's gains fade late in training unless decay is adjusted <a href="https://arxiv.org/abs/2405.13698">[Wang &amp; Aitchison 2024]</a>. The batch must be at or above critical (Cerebras App. G.3). Fitted laws extrapolate over orders of magnitude and their exponents differ per setup.</dd>
+      <dt>Used by</dt><dd>μP: Cerebras-GPT, MiniCPM, the μTransfer runs; fitted laws: DeepSeek LLM, Moonlight's AdamW baseline. The largest published μP use we verified is 6.7B parameters; whether frontier labs use μP is not public, so do not assert it.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="muon">Muon: orthogonalized updates for hidden matrices</h2>
+
+  <p><strong>Muon</strong> is a matrix-aware optimizer proposed by Keller Jordan and collaborators <a href="https://kellerjordan.github.io/posts/muon/">[Jordan et al. 2024, blog post]</a>. It was shown to scale in Moonshot's Moonlight <a href="https://arxiv.org/abs/2502.16982">[Liu et al. 2025]</a>, trained the 1.04T-parameter Kimi K2 <a href="https://arxiv.org/abs/2507.20534">[Kimi Team 2025]</a> and, as of April 2026, most of DeepSeek-V4 <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-AI 2026]</a>: the first serious alternative to AdamW in frontier pretraining.</p>
+
+  <h3 id="muon-derivation">Where the update comes from</h3>
+  <p>Take a hidden weight \(W\in\R^{n\times m}\) with gradient \(G = \sum_i \sigma_i u_i v_i^\top\) (SVD). Which unit-size step \(O\) decreases the loss fastest depends on how size is measured; Muon's answer is orthogonalization <span class="zh">正交化</span>. With the Frobenius norm the best step is \(O = G/\|G\|_F\), which keeps the gradient's uneven spectrum: a few dominant directions carry the step. With the <em>spectral</em> norm (\(\|O\|_{\text{op}}\le 1\), the natural size of a linear map) we maximize \(\langle G, O\rangle = \sum_i \sigma_i\, u_i^\top O v_i\). Each term is at most \(\sigma_i\) because \(|u_i^\top O v_i|\le \|O\|_{\text{op}}\le1\), with equality for all \(i\) exactly when \(Ov_i = u_i\), that is, \(O = UV^\top\), the <strong>polar factor</strong> of \(G\) (all singular values set to 1). The step changes the layer's output by at most \(\eta\|x\|\) for any input \(x\), whatever the conditioning of \(G\). Moonlight describes Adam as steepest descent under an elementwise max-type norm that ignores matrix structure <a href="https://arxiv.org/abs/2502.16982">[Moonlight §2.1]</a>. Jordan's intuition, offered as speculation: momentum and Adam updates are nearly low-rank with a very high condition number, and orthogonalization increases the scale of "rare directions" that are small in the update but matter for learning. Supporting evidence from Moonlight: Muon-trained weights have higher singular-value entropy than AdamW-trained ones in more than 90% of matrices <a href="https://arxiv.org/abs/2502.16982">[§3.4]</a>.</p>
+
+  <p>The algorithm, for each 2-D hidden matrix (momentum \(\mu = 0.95\), Nesterov):</p>
+  <div class="eq-box">
+  \[
+  M_t = \mu M_{t-1} + G_t, \qquad O_t = \mathrm{NS}\bigl(\mu M_t + G_t\bigr) \approx UV^\top, \qquad W_t = (1-\eta_t\lambda)\,W_{t-1} - \eta_t\, s\, O_t
+  \]
+  <div class="eq-label">Muon. NS = Newton-Schulz orthogonalization; s is a shape-dependent scale (below); λ is decoupled weight decay</div>
+  </div>
+  <p>Only hidden weight matrices use Muon. Jordan's post says embeddings, the final classifier head, and any gains or biases "should be optimized by a standard method such as AdamW", without an argument. Our reasoning: an embedding table is a lookup (each row updates only when its token appears) and a gain is a vector, so "orthogonalize the matrix" has no natural meaning for them. DeepSeek-V4 keeps AdamW for exactly these, plus mHC's static biases and gates <a href="https://arxiv.org/abs/2606.19348">[V4 §2.4]</a>.</p>
+
+  <h3 id="newton-schulz">Newton-Schulz: orthogonalization with only matmuls</h3>
+  <p>An SVD per matrix per step is too slow on GPUs; Newton-Schulz iteration <span class="zh">牛顿-舒尔茨迭代</span> replaces it. For \(X = U\Sigma V^\top\), \(XX^\top = U\Sigma^2U^\top\), so one iteration acts on singular values only:</p>
+  \[ X \leftarrow aX + b\,(XX^\top)X + c\,(XX^\top)^2X \;=\; U\bigl(a\Sigma + b\Sigma^3 + c\Sigma^5\bigr)V^\top, \qquad \sigma \mapsto f(\sigma) = a\sigma + b\sigma^3 + c\sigma^5. \]
+  <p>Start from \(X_0 = G/\|G\|_F\); since \(\sigma_{\max}\le\|G\|_F\), every singular value is at most 1. The coefficients are chosen for speed, not exactness. Jordan's \((a,b,c) = (3.4445, -4.7750, 2.0315)\) maximizes the slope \(f'(0) = a\), so tiny singular values (\(\sigma\approx10^{-2}\) after normalization is common) are amplified quickly. The price: \(f(1) = 0.701\), so there is no fixed point at 1 and singular values bounce inside roughly \([0.68, 1.13]\). The reference code says the result is \(US'V^\top\) with \(S'_{ii}\sim\mathrm{Uniform}(0.5, 1.5)\), "which turns out not to hurt model performance at all relative to \(UV^\top\)". The classical cubic \((1.5, -0.5, 0)\) has \(f(1) = 1\), \(f'(1) = 0\) and converges to exactly 1, but its slope at 0 is only 1.5. DeepSeek-V4 combines them: 10 iterations, 8 with Jordan's coefficients "to drive rapid convergence, bringing the singular values close to 1", then 2 with \((2, -1.5, 0.5)\) (\(f(1)=1\), \(f'(1)=0\)) to "stabilize the singular values precisely at 1" <a href="https://arxiv.org/abs/2606.19348">[V4 §2.4]</a>. Moonlight found 10 iterations orthogonalize more accurately than 5 but give no better loss, and used 5 <a href="https://arxiv.org/abs/2502.16982">[§2.2]</a>.</p>
+
+  <p><strong>Worked numbers.</strong> The script computes singular values, as (min, median, max), of a 64×256 Gaussian matrix and of a 64×256 matrix with \(\sigma_i = 1/i\) (condition number 64, a stand-in for a low-effective-rank gradient) before and after Newton-Schulz (seed 0):</p>
+<pre><code class="language-python">import torch
+
+def ns(G, steps=5, coeffs=(3.4445, -4.7750, 2.0315)):
+    a, b, c = coeffs
+    X = G / (G.norm() + 1e-7)                      # sigma_max &lt;= ||G||_F, so every sigma &lt;= 1
+    tall = G.shape[0] &gt; G.shape[1]
+    if tall: X = X.T
+    for _ in range(steps):
+        A = X @ X.T                                # (min(n,m), min(n,m))
+        X = a * X + (b * A + c * A @ A) @ X        # sigma &lt;- a s + b s^3 + c s^5
+    return X.T if tall else X
+
+def q(M):                                          # (min, median, max) of the singular values
+    s = torch.linalg.svdvals(M).sort().values
+    return tuple(round(s[i].item(), 3) for i in (0, len(s) // 2, -1))
+
+torch.manual_seed(0)
+G = torch.randn(64, 256, dtype=torch.float64)                                  # Gaussian
+U, _ = torch.linalg.qr(torch.randn(64, 64, dtype=torch.float64))
+V, _ = torch.linalg.qr(torch.randn(256, 64, dtype=torch.float64))
+H = U @ torch.diag(1 / torch.arange(1, 65, dtype=torch.float64)) @ V.T         # sigma_i = 1/i
+for name, M in [("gaussian", G), ("1/i spectrum", H)]:
+    print(name, q(M / M.norm()), q(ns(M, 1)), q(ns(M, 3)), q(ns(M, 5)), q(ns(M, 5, (1.5, -0.5, 0.0))))
+</code></pre>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Matrix (64×256)</th><th class="num">\(X_0 = G/\|G\|_F\)</th><th class="num">1 iteration</th><th class="num">3 iterations</th><th class="num">5 iterations</th><th class="num">5, classical cubic</th></tr></thead>
+    <tbody>
+      <tr><td>Gaussian</td><td class="num">(0.063, 0.121, 0.182)</td><td class="num">(0.217, 0.407, 0.598)</td><td class="num">(0.682, 0.822, 1.115)</td><td class="num">(0.682, 0.761, 1.134)</td><td class="num">(0.453, 0.749, 0.916)</td></tr>
+      <tr class="hl"><td>\(\sigma_i \propto 1/i\)</td><td class="num">(0.012, 0.024, 0.783)</td><td class="num">(0.042, 0.084, 1.081)</td><td class="num">(0.485, 0.804, 1.202)</td><td class="num">(0.682, 0.900, 1.133)</td><td class="num">(0.093, 0.184, 1.000)</td></tr>
+    </tbody>
+  </table></div>
+  <p>In the second row the smallest singular value starts at 0.012 (a 64:1 spread) and five iterations amplify it 56× to 0.68, while the classical cubic has reached only 0.09. The final spread is \(1.133/0.682 = 1.66\), and \(UV^\top\) is matched to a relative Frobenius error of 0.17 (0.22 for the Gaussian). Ten iterations do not tighten the range (still \([0.68, 1.13]\)). With DeepSeek-V4's hybrid (8 quintic plus 2 of \((2,-1.5,0.5)\)) every singular value lands between 1.000 and 1.001.</p>
+
+  <p><strong>Cost.</strong> One iteration on an \(n\times m\) matrix (\(n\le m\)) costs \(2n^2m\) for \(XX^\top\), \(2n^3\) for \(A^2\) and \(2n^2m\) for \(BX\): \(4n^2m + 2n^3\) FLOPs. For Llama-3-8B, five iterations on every attention and MLP matrix are \(6.7\times10^{14}\) FLOPs per step, against \(6NB = 1.9\times10^{17}\) for forward plus backward at 4M tokens: 0.35% (0.09% at 16M). Jordan's bound is \(Tm/B\): 0.5% at 4M. Measured wall-clock overhead is higher because the matmuls are small and matrices must be gathered (Moonlight: 1% to 3% of forward-backward time).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 470" role="img" aria-labelledby="fig-14-2-title">
+<title id="fig-14-2-title">The Muon update pipeline: momentum, Nesterov look-ahead, five Newton-Schulz iterations, RMS rescaling and decoupled-weight-decay update, with the singular values of one example matrix before and after orthogonalization</title>
+<defs><marker id="arrow-14-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="10" y="14" width="360" height="48" rx="6"/>
+<text x="22" y="33" class="s-bold">gradient G</text>
+<text x="22" y="49" class="s-small s-muted">of one hidden weight matrix W, shape n × m</text>
+<rect class="s-box" x="10" y="74" width="360" height="48" rx="6"/>
+<text x="22" y="93" class="s-bold">momentum   M ← μ M + G</text>
+<text x="22" y="109" class="s-small s-muted">one buffer per weight (AdamW keeps two); μ = 0.95</text>
+<rect class="s-box" x="10" y="134" width="360" height="48" rx="6"/>
+<text x="22" y="153" class="s-bold">Nesterov look-ahead   x = μ M + G</text>
+<text x="22" y="169" class="s-small s-muted">spectrum of x is very uneven: a few large singular values</text>
+<rect class="s-a" x="10" y="194" width="360" height="62" rx="6"/>
+<text x="22" y="213" class="s-bold">Newton-Schulz, 5 iterations</text>
+<text x="22" y="229" class="s-small s-muted">X ← a X + b (X Xᵀ) X + c (X Xᵀ)² X, from X = x / ‖x‖_F</text>
+<text x="22" y="246" class="s-mono">(a, b, c) = (3.4445, −4.7750, 2.0315)</text>
+<rect class="s-box" x="10" y="268" width="360" height="48" rx="6"/>
+<text x="22" y="287" class="s-bold">rescale   O ← O · 0.2 · √max(n, m)</text>
+<text x="22" y="303" class="s-small s-muted">O has RMS about 1/√max(n, m); now 0.2 (V4: 0.18)</text>
+<rect class="s-box" x="10" y="328" width="360" height="48" rx="6"/>
+<text x="22" y="347" class="s-bold">update   W ← (1 − ηλ) W − η O</text>
+<text x="22" y="363" class="s-small s-muted">decoupled weight decay, so AdamW's η and λ carry over</text>
+<path class="s-line" d="M190.0,62 L190.0,74" marker-end="url(#arrow-14-2)"/>
+<path class="s-line" d="M190.0,122 L190.0,134" marker-end="url(#arrow-14-2)"/>
+<path class="s-line" d="M190.0,182 L190.0,194" marker-end="url(#arrow-14-2)"/>
+<path class="s-line" d="M190.0,256 L190.0,268" marker-end="url(#arrow-14-2)"/>
+<path class="s-line" d="M190.0,316 L190.0,328" marker-end="url(#arrow-14-2)"/>
+<rect class="s-plain s-dash" x="10" y="390" width="360" height="40" rx="6"/>
+<text x="22" y="407" class="s-small">Everything that is not a hidden matrix stays on AdamW:</text>
+<text x="22" y="422" class="s-small s-muted">embeddings, LM head, RMSNorm gains, biases</text>
+<text x="410.0" y="32" class="s-bold s-small">before: σᵢ of x / ‖x‖_F</text>
+<line class="s-line" x1="410.0" y1="158.0" x2="700.0" y2="158.0"/>
+<line class="s-line" x1="410.0" y1="40" x2="410.0" y2="158.0"/>
+<text x="404.0" y="162.0" text-anchor="end" class="s-small s-muted">0</text>
+<text x="404.0" y="116.6" text-anchor="end" class="s-small s-muted">0.5</text>
+<text x="404.0" y="71.2" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line s-dash" x1="410.0" y1="67.2" x2="700.0" y2="67.2" style="stroke-opacity:.6"/>
+<rect class="s-fill-muted" x="410.50" y="86.89" width="3.53" height="71.11" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="415.03" y="122.45" width="3.53" height="35.55" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="419.56" y="134.30" width="3.53" height="23.70" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="424.09" y="140.22" width="3.53" height="17.78" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="428.62" y="143.78" width="3.53" height="14.22" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="433.16" y="146.15" width="3.53" height="11.85" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="437.69" y="147.84" width="3.53" height="10.16" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="442.22" y="149.11" width="3.53" height="8.89" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="446.75" y="150.10" width="3.53" height="7.90" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="451.28" y="150.89" width="3.53" height="7.11" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="455.81" y="151.54" width="3.53" height="6.46" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="460.34" y="152.07" width="3.53" height="5.93" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="464.88" y="152.53" width="3.53" height="5.47" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="469.41" y="152.92" width="3.53" height="5.08" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="473.94" y="153.26" width="3.53" height="4.74" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="478.47" y="153.56" width="3.53" height="4.44" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="483.00" y="153.82" width="3.53" height="4.18" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="487.53" y="154.05" width="3.53" height="3.95" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="492.06" y="154.26" width="3.53" height="3.74" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="496.59" y="154.44" width="3.53" height="3.56" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="501.12" y="154.61" width="3.53" height="3.39" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="505.66" y="154.77" width="3.53" height="3.23" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="510.19" y="154.91" width="3.53" height="3.09" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="514.72" y="155.04" width="3.53" height="2.96" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="519.25" y="155.16" width="3.53" height="2.84" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="523.78" y="155.27" width="3.53" height="2.73" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="528.31" y="155.37" width="3.53" height="2.63" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="532.84" y="155.46" width="3.53" height="2.54" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="537.38" y="155.55" width="3.53" height="2.45" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="541.91" y="155.63" width="3.53" height="2.37" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="546.44" y="155.71" width="3.53" height="2.29" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="550.97" y="155.78" width="3.53" height="2.22" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="555.50" y="155.85" width="3.53" height="2.15" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="560.03" y="155.91" width="3.53" height="2.09" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="564.56" y="155.97" width="3.53" height="2.03" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="569.09" y="156.02" width="3.53" height="1.98" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="573.62" y="156.08" width="3.53" height="1.92" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="578.16" y="156.13" width="3.53" height="1.87" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="582.69" y="156.18" width="3.53" height="1.82" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="587.22" y="156.22" width="3.53" height="1.78" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="591.75" y="156.27" width="3.53" height="1.73" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="596.28" y="156.31" width="3.53" height="1.69" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="600.81" y="156.35" width="3.53" height="1.65" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="605.34" y="156.38" width="3.53" height="1.62" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="609.88" y="156.42" width="3.53" height="1.58" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="614.41" y="156.45" width="3.53" height="1.55" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="618.94" y="156.49" width="3.53" height="1.51" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="623.47" y="156.52" width="3.53" height="1.48" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="628.00" y="156.55" width="3.53" height="1.45" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="632.53" y="156.58" width="3.53" height="1.42" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="637.06" y="156.61" width="3.53" height="1.39" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="641.59" y="156.63" width="3.53" height="1.37" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="646.12" y="156.66" width="3.53" height="1.34" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="650.66" y="156.68" width="3.53" height="1.32" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="655.19" y="156.71" width="3.53" height="1.29" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="659.72" y="156.73" width="3.53" height="1.27" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="664.25" y="156.75" width="3.53" height="1.25" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="668.78" y="156.77" width="3.53" height="1.23" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="673.31" y="156.79" width="3.53" height="1.21" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="677.84" y="156.81" width="3.53" height="1.19" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="682.38" y="156.83" width="3.53" height="1.17" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="686.91" y="156.85" width="3.53" height="1.15" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="691.44" y="156.87" width="3.53" height="1.13" style="stroke-width:0"/>
+<rect class="s-fill-muted" x="695.97" y="156.89" width="3.53" height="1.11" style="stroke-width:0"/>
+<text x="700.0" y="174.0" text-anchor="end" class="s-small s-muted">index i, 1 to 64 (sorted)</text>
+<text x="410.0" y="242" class="s-bold s-small">after 5 iterations: σᵢ of O</text>
+<line class="s-line" x1="410.0" y1="368.0" x2="700.0" y2="368.0"/>
+<line class="s-line" x1="410.0" y1="250" x2="410.0" y2="368.0"/>
+<text x="404.0" y="372.0" text-anchor="end" class="s-small s-muted">0</text>
+<text x="404.0" y="326.6" text-anchor="end" class="s-small s-muted">0.5</text>
+<text x="404.0" y="281.2" text-anchor="end" class="s-small s-muted">1</text>
+<line class="s-line s-dash" x1="410.0" y1="277.2" x2="700.0" y2="277.2" style="stroke-opacity:.6"/>
+<rect class="s-fill-a" x="410.50" y="265.13" width="3.53" height="102.87" style="stroke-width:0"/>
+<rect class="s-fill-a" x="415.03" y="265.17" width="3.53" height="102.83" style="stroke-width:0"/>
+<rect class="s-fill-a" x="419.56" y="265.74" width="3.53" height="102.26" style="stroke-width:0"/>
+<rect class="s-fill-a" x="424.09" y="265.98" width="3.53" height="102.02" style="stroke-width:0"/>
+<rect class="s-fill-a" x="428.62" y="266.24" width="3.53" height="101.76" style="stroke-width:0"/>
+<rect class="s-fill-a" x="433.16" y="266.75" width="3.53" height="101.25" style="stroke-width:0"/>
+<rect class="s-fill-a" x="437.69" y="267.66" width="3.53" height="100.34" style="stroke-width:0"/>
+<rect class="s-fill-a" x="442.22" y="268.64" width="3.53" height="99.36" style="stroke-width:0"/>
+<rect class="s-fill-a" x="446.75" y="269.32" width="3.53" height="98.68" style="stroke-width:0"/>
+<rect class="s-fill-a" x="451.28" y="270.16" width="3.53" height="97.84" style="stroke-width:0"/>
+<rect class="s-fill-a" x="455.81" y="271.07" width="3.53" height="96.93" style="stroke-width:0"/>
+<rect class="s-fill-a" x="460.34" y="272.76" width="3.53" height="95.24" style="stroke-width:0"/>
+<rect class="s-fill-a" x="464.88" y="273.43" width="3.53" height="94.57" style="stroke-width:0"/>
+<rect class="s-fill-a" x="469.41" y="276.02" width="3.53" height="91.98" style="stroke-width:0"/>
+<rect class="s-fill-a" x="473.94" y="276.49" width="3.53" height="91.51" style="stroke-width:0"/>
+<rect class="s-fill-a" x="478.47" y="277.09" width="3.53" height="90.91" style="stroke-width:0"/>
+<rect class="s-fill-a" x="483.00" y="277.36" width="3.53" height="90.64" style="stroke-width:0"/>
+<rect class="s-fill-a" x="487.53" y="278.73" width="3.53" height="89.27" style="stroke-width:0"/>
+<rect class="s-fill-a" x="492.06" y="281.75" width="3.53" height="86.25" style="stroke-width:0"/>
+<rect class="s-fill-a" x="496.59" y="282.10" width="3.53" height="85.90" style="stroke-width:0"/>
+<rect class="s-fill-a" x="501.12" y="282.15" width="3.53" height="85.85" style="stroke-width:0"/>
+<rect class="s-fill-a" x="505.66" y="282.33" width="3.53" height="85.67" style="stroke-width:0"/>
+<rect class="s-fill-a" x="510.19" y="282.45" width="3.53" height="85.55" style="stroke-width:0"/>
+<rect class="s-fill-a" x="514.72" y="282.86" width="3.53" height="85.14" style="stroke-width:0"/>
+<rect class="s-fill-a" x="519.25" y="282.98" width="3.53" height="85.02" style="stroke-width:0"/>
+<rect class="s-fill-a" x="523.78" y="283.69" width="3.53" height="84.31" style="stroke-width:0"/>
+<rect class="s-fill-a" x="528.31" y="283.71" width="3.53" height="84.29" style="stroke-width:0"/>
+<rect class="s-fill-a" x="532.84" y="284.60" width="3.53" height="83.40" style="stroke-width:0"/>
+<rect class="s-fill-a" x="537.38" y="284.84" width="3.53" height="83.16" style="stroke-width:0"/>
+<rect class="s-fill-a" x="541.91" y="285.64" width="3.53" height="82.36" style="stroke-width:0"/>
+<rect class="s-fill-a" x="546.44" y="285.97" width="3.53" height="82.03" style="stroke-width:0"/>
+<rect class="s-fill-a" x="550.97" y="286.30" width="3.53" height="81.70" style="stroke-width:0"/>
+<rect class="s-fill-a" x="555.50" y="286.37" width="3.53" height="81.63" style="stroke-width:0"/>
+<rect class="s-fill-a" x="560.03" y="286.79" width="3.53" height="81.21" style="stroke-width:0"/>
+<rect class="s-fill-a" x="564.56" y="288.03" width="3.53" height="79.97" style="stroke-width:0"/>
+<rect class="s-fill-a" x="569.09" y="288.04" width="3.53" height="79.96" style="stroke-width:0"/>
+<rect class="s-fill-a" x="573.62" y="288.58" width="3.53" height="79.42" style="stroke-width:0"/>
+<rect class="s-fill-a" x="578.16" y="289.33" width="3.53" height="78.67" style="stroke-width:0"/>
+<rect class="s-fill-a" x="582.69" y="290.04" width="3.53" height="77.96" style="stroke-width:0"/>
+<rect class="s-fill-a" x="587.22" y="290.94" width="3.53" height="77.06" style="stroke-width:0"/>
+<rect class="s-fill-a" x="591.75" y="292.24" width="3.53" height="75.76" style="stroke-width:0"/>
+<rect class="s-fill-a" x="596.28" y="292.98" width="3.53" height="75.02" style="stroke-width:0"/>
+<rect class="s-fill-a" x="600.81" y="294.59" width="3.53" height="73.41" style="stroke-width:0"/>
+<rect class="s-fill-a" x="605.34" y="295.21" width="3.53" height="72.79" style="stroke-width:0"/>
+<rect class="s-fill-a" x="609.88" y="295.34" width="3.53" height="72.66" style="stroke-width:0"/>
+<rect class="s-fill-a" x="614.41" y="296.93" width="3.53" height="71.07" style="stroke-width:0"/>
+<rect class="s-fill-a" x="618.94" y="296.99" width="3.53" height="71.01" style="stroke-width:0"/>
+<rect class="s-fill-a" x="623.47" y="297.89" width="3.53" height="70.11" style="stroke-width:0"/>
+<rect class="s-fill-a" x="628.00" y="298.95" width="3.53" height="69.05" style="stroke-width:0"/>
+<rect class="s-fill-a" x="632.53" y="299.35" width="3.53" height="68.65" style="stroke-width:0"/>
+<rect class="s-fill-a" x="637.06" y="299.50" width="3.53" height="68.50" style="stroke-width:0"/>
+<rect class="s-fill-a" x="641.59" y="299.82" width="3.53" height="68.18" style="stroke-width:0"/>
+<rect class="s-fill-a" x="646.12" y="300.07" width="3.53" height="67.93" style="stroke-width:0"/>
+<rect class="s-fill-a" x="650.66" y="301.54" width="3.53" height="66.46" style="stroke-width:0"/>
+<rect class="s-fill-a" x="655.19" y="301.98" width="3.53" height="66.02" style="stroke-width:0"/>
+<rect class="s-fill-a" x="659.72" y="303.45" width="3.53" height="64.55" style="stroke-width:0"/>
+<rect class="s-fill-a" x="664.25" y="304.20" width="3.53" height="63.80" style="stroke-width:0"/>
+<rect class="s-fill-a" x="668.78" y="304.63" width="3.53" height="63.37" style="stroke-width:0"/>
+<rect class="s-fill-a" x="673.31" y="304.93" width="3.53" height="63.07" style="stroke-width:0"/>
+<rect class="s-fill-a" x="677.84" y="305.57" width="3.53" height="62.43" style="stroke-width:0"/>
+<rect class="s-fill-a" x="682.38" y="305.72" width="3.53" height="62.28" style="stroke-width:0"/>
+<rect class="s-fill-a" x="686.91" y="305.85" width="3.53" height="62.15" style="stroke-width:0"/>
+<rect class="s-fill-a" x="691.44" y="306.10" width="3.53" height="61.90" style="stroke-width:0"/>
+<rect class="s-fill-a" x="695.97" y="306.11" width="3.53" height="61.89" style="stroke-width:0"/>
+<text x="700.0" y="384.0" text-anchor="end" class="s-small s-muted">index i, 1 to 64 (sorted)</text>
+<text x="410.0" y="404" class="s-small">64 × 256 matrix with σᵢ ∝ 1/i (seed 0).</text>
+<text x="410.0" y="420" class="s-small">Before: σ_max/σ_min = 64, most σᵢ &lt; 0.05.</text>
+<text x="410.0" y="436" class="s-small">After: all σᵢ in [0.68, 1.13] (ratio 1.66).</text>
+<path class="s-line" d="M370,227 C400,227 370.0,236 402.0,236" marker-end="url(#arrow-14-2)" style="stroke-opacity:.6"/>
+</svg>
+    <figcaption><b>Figure 2.</b> The Muon pipeline for one hidden matrix (left) and what Newton-Schulz does to a spectrum (right). Momentum and Nesterov produce an update with a few large singular values; five iterations map every singular value into about \([0.68, 1.13]\), so no direction is starved; a rescale sets the RMS of the update to AdamW's; the last line is AdamW's decoupled decay. The bars are the real singular values of the \(\sigma_i\propto1/i\) matrix from the worked example (seed 0). The Nesterov, Newton-Schulz and rescale steps are those of Moonlight and DeepSeek-V4; V4 replaces the iteration with the 8+2 hybrid.</figcaption>
+  </figure>
+
+<pre><code class="language-python">def muon_step(W, G, buf, lr, mu=0.95, wd=0.1, rms=0.2):
+    """One Muon step for a 2-D hidden weight W (n, m). Returns (W_new, buf_new)."""
+    buf = mu * buf + G
+    O = ns(mu * buf + G)                                  # Nesterov look-ahead, then orthogonalize
+    O = O * rms * max(W.shape) ** 0.5                     # RMS(O) ~ 1/sqrt(max(n,m)) -> rms
+    return W * (1 - lr * wd) - lr * O, buf
+</code></pre>
+
+  <h3 id="muon-scaling">Moonlight: the two fixes that made Muon scale</h3>
+  <p>Jordan's version won small-scale speed records (NanoGPT 1.35× faster; CIFAR-10 from 3.3 to 2.6 A100-seconds, per the post) but its gain diminished at larger scale. Liu et al. found two causes and two fixes <a href="https://arxiv.org/abs/2502.16982">[Moonlight §2.2]</a>:</p>
+  <ol>
+    <li><strong>Weight decay.</strong> Without it, both the weights and the layer outputs grew in RMS until they exceeded bf16's range. On an 800M-parameter model trained for 100B tokens (about 5× the compute-optimal token count), vanilla Muon led early, but Muon with decoupled weight decay had lower validation loss by the end and beat AdamW. Fix: \(W \leftarrow W - \eta(O + \lambda W)\).</li>
+    <li><strong>Per-shape update RMS.</strong> AdamW's update has RMS of about 1 in theory and 0.2 to 0.4 measured. Muon's does not: for a full-rank \(A\times B\) matrix the polar factor has RMS \(\sqrt{1/\max(A,B)}\) (Lemma 1: \(X = UV^\top\) has \(\|X\|_F^2 = r\) over \(AB\) entries, so RMS \(=\sqrt{r/AB}\), and \(r = \min(A,B)\)). So updates are tiny for wide MLP matrices and too large for small matrices such as per-head KV projections in GQA or MLA. Fix: scale each update by \(0.2\sqrt{\max(A,B)}\), giving RMS 0.2 for every matrix. Bonus: this matches AdamW's typical update RMS, so <em>Muon can reuse AdamW's tuned learning rate and weight decay</em>. A sweep of the target RMS (0.05 to 0.8) found 0.2 and 0.4 best and about equal <a href="https://arxiv.org/abs/2502.16982">[App. A, Tab. 8]</a>.</li>
+  </ol>
+  <p>Jordan's original code used a different shape rule, \(\sqrt{\max(1, n/m)}\); the two agree up to a global factor when all matrices share one dimension. The drill implements both. Because Muon needs the whole gradient matrix, plain ZeRO-1 sharding does not apply: Moonlight's distributed Muon gathers shards, orthogonalizes, and keeps only the local slice of the update, at 1 to 1.25× the communication of distributed AdamW <a href="https://arxiv.org/abs/2502.16982">[§2.3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Hybrid Muon + AdamW</div>
+    <dl>
+      <dt>Problem</dt><dd>Adam-family updates ignore matrix structure and are dominated by a few directions; the aim is more loss progress per token.</dd>
+      <dt>Idea</dt><dd>Orthogonalize the momentum of each hidden 2-D matrix (Newton-Schulz), rescale to AdamW's update RMS, keep decoupled weight decay, and leave embeddings, the LM head and norm gains to AdamW.</dd>
+      <dt>Why it works</dt><dd>It is steepest descent under the spectral norm, and it lifts small-but-informative singular directions. The RMS rescale and weight decay make it a drop-in for AdamW's hyperparameters.</dd>
+      <dt>Evidence</dt><dd>Moonlight: about 52% of AdamW's training FLOPs to reach the same loss in compute-optimal scaling-law runs <a href="https://arxiv.org/abs/2502.16982">[§3.2, Fig. 1a]</a>. See the limits table below.</dd>
+      <dt>Cost</dt><dd>Needs the full matrix (awkward with sharding), 5 iterations of three matmuls, two optimizers to manage, a mismatch when fine-tuning a Muon-pretrained model with AdamW, and, as Kimi found, attention-logit growth.</dd>
+      <dt>Used by</dt><dd>Moonlight (3B-active, 16B-total MoE, 5.7T tokens), Kimi K2 (MuonClip), DeepSeek-V4-Flash and V4-Pro.</dd>
+    </dl>
+  </div>
+
+  <h3 id="muonclip">Kimi K2: MuonClip and QK-Clip</h3>
+  <p>Scaling Muon to K2 exposed a new failure. In a mid-scale run (9B active, 53B total parameters) with vanilla Muon, the maximum attention logit exceeded 1,000 within about 15,000 steps, a level the report says usually leads to significant loss spikes and occasional divergence. Existing fixes did not fit: soft-capping bounds the logits, but query-key dot products can still grow before the cap, and QK-Norm cannot be used with MLA because its keys are never materialized at inference (<a href="07-kv-efficient-attention.html#mla">page 07</a>) <a href="https://arxiv.org/abs/2507.20534">[K2 §2.1]</a>.</p>
+  <p><strong>QK-Clip</strong> acts on the weights after the update. For each head \(h\), with \(S^h_{\max} = \tfrac{1}{\sqrt d}\max_{X\in B}\max_{i,j} q_i^\top k_j\) computed in the forward pass, if \(S^h_{\max} > \tau\) it rescales that head's query and key weights by \(\gamma_h = \tau/S^h_{\max}\): \(W_q, W_k\) each by \(\sqrt{\gamma_h}\). For MLA it clips only the head-specific parts: \(q^C, k^C\) by \(\sqrt{\gamma_h}\), \(q^R\) by \(\gamma_h\), and leaves the shared rotary key \(k^R\) untouched so one head's clipping does not leak into others. Muon (with weight decay and the 0.2 RMS rule) plus QK-Clip is <strong>MuonClip</strong>; K2 used \(\tau = 100\) and pretrained on 15.5T tokens with zero loss spikes. QK-Clip was only transiently active: 12.7% of heads triggered it at least once in the first 70,000 steps, none afterward; the maximum logit sat at 100 early and decayed on its own after about 30% of training. A small ablation (0.5B active, 3B total) with an aggressive \(\tau = 30\) showed negligible effect on the loss <a href="https://arxiv.org/abs/2507.20534">[K2 §2.1, App. D]</a>.</p>
+  <p><strong>Why Muon in particular?</strong> K2's stated hypothesis: Adam's update is low-rank with a skewed spectrum, whereas Muon's has full effective rank with equal singular values, so weights and updates more often align on the same singular directions and singular values grow additively; and since logits are bilinear, \(q\cdot k = (xW_q)\cdot(xW_k)\), growth in either spectral norm compounds <a href="https://arxiv.org/abs/2507.20534">[K2 App. E]</a>.</p>
+
+  <h3 id="muon-v4">DeepSeek-V4: Muon at 1.6T parameters</h3>
+  <p>DeepSeek-V4 (1.6T parameters) also trains with Muon and differs from K2 in useful ways <a href="https://arxiv.org/abs/2606.19348">[V4 §2.4, §4.2.2, §3.4.1]</a> (details on <a href="28-deepseek-3-reasoning.html">page 28</a>):</p>
+  <ul>
+    <li><strong>What uses what.</strong> Muon for most modules; AdamW (\(\beta = 0.9/0.95\), \(\epsilon = 10^{-20}\), weight decay 0.1) for the embedding, the prediction head, the RMSNorm weights, and mHC's static biases and gates.</li>
+    <li><strong>Muon settings.</strong> Momentum 0.95, weight decay 0.1, Nesterov, update RMS rescaled to <strong>0.18</strong> (Moonlight used 0.2) by \(O\leftarrow O'\sqrt{\max(n,m)}\,\gamma\), so AdamW's learning rates are reused. Algorithm 1: \(W \leftarrow (1-\eta\lambda)W - \eta O\). The 8+2 hybrid Newton-Schulz above.</li>
+    <li><strong>Schedule.</strong> As in the <a href="#documented">table above</a>: peak \(2.7\times10^{-4}\) (Flash) or \(2.0\times10^{-4}\) (Pro), held for most of training, then cosine to a 10% floor.</li>
+    <li><strong>No QK-Clip.</strong> V4's attention applies RMSNorm directly to queries and KV entries, "which effectively prevents attention logits from exploding". That fits K2's story: the problem is spectral-norm growth of \(W_q, W_k\), and normalizing \(q\) and \(k\) removes its effect on the logits.</li>
+    <li><strong>Systems.</strong> Muon needs full gradient matrices, which conflicts with ZeRO. V4's hybrid ZeRO caps the ZeRO group for dense parameters and assigns whole matrices to ranks by a knapsack algorithm (padding under 10% memory overhead); extra data-parallel groups recompute the update redundantly. MoE experts are treated independently. Newton-Schulz is stable in BF16, so MoE gradients are stochastically rounded to BF16 for synchronization and summed in FP32 locally (<a href="15-distributed-training.html">page 15</a>). Its spikes were handled by anticipatory routing and SwiGLU clamping (<a href="#playbook">playbook</a>), not by the optimizer.</li>
+  </ul>
+  <p>V4 attributes "faster convergence and improved training stability" to Muon. In the sections we read there is no published AdamW-versus-Muon ablation at V4 scale, so this is a claim about outcomes, not a measured comparison.</p>
+
+  <h3 id="muon-evidence">Evidence and limits, stated honestly</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Claim</th><th>Source</th><th>Caveat</th></tr></thead>
+    <tbody>
+      <tr><td>About 2× compute efficiency (52% of the FLOPs to match AdamW)</td><td><a href="https://arxiv.org/abs/2502.16982">Moonlight §3.2</a></td><td>Own scaling-law runs on dense Llama-style models, with a grid-searched AdamW baseline: careful, but one lab's setup.</td></tr>
+      <tr><td>With independent, careful tuning, matrix optimizers (Muon, SOAP and others) speed up over AdamW by 1.4× at 0.1B and only 1.1× at 1.2B parameters</td><td><a href="https://arxiv.org/abs/2509.02046">Wen et al. 2025</a></td><td>Up to 1.2B parameters; the authors attribute earlier 1.4× to 2× claims to unequal tuning and limited evaluations. Neither study is at frontier scale.</td></tr>
+      <tr><td>Works stably at 1T parameters with the right tooling</td><td>K2, V4</td><td>Needed extra machinery (QK-Clip in K2; normalized q and k in V4). No controlled Muon-versus-AdamW ablation at that scale in the sections read.</td></tr>
+      <tr><td>Best results when pretraining and fine-tuning use the same optimizer</td><td><a href="https://arxiv.org/abs/2502.16982">Moonlight §3.5</a></td><td>With mismatched optimizers Muon shows no significant advantage. K2 recommends Muon for fine-tuning K2, which constrains open-weight users.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Summary: Muon plausibly improves token efficiency and cuts optimizer memory (for Llama-3-8B, 36.3 GB versus 64.2 GB of fp32 state, with embeddings, head and norms on AdamW), two frontier-scale runs used it successfully, and the size of the gain over a well-tuned AdamW at scale is unsettled.</p>
+</section>
+
+<section>
+  <h2 id="others">Other optimizers, in one table</h2>
+  <p>Muon is the alternative with frontier-scale use. The others below are the ones interviewers name. Every entry is the authors' own claim from the abstract, on the scales they tested.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Optimizer</th><th>Idea</th><th>Reported result (authors' claim)</th><th>Where it stands</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Adafactor</strong> <a href="https://arxiv.org/abs/1804.04235">[Shazeer &amp; Stern 2018]</a></td><td>Keep only per-row and per-column sums of the second moment; drop momentum; clip updates; increasing decay-rate schedule.</td><td>Adam-like training quality on large Transformers with sublinear optimizer memory.</td><td>PaLM used the unfactored form. Memory was the point, and it is less binding with ZeRO-style sharding.</td></tr>
+      <tr><td><strong>Lion</strong> <a href="https://arxiv.org/abs/2302.06675">[Chen et al. 2023]</a></td><td>Update is the sign of an interpolation of momentum and gradient; one state tensor.</td><td>Up to +2% ImageNet accuracy for ViT, up to 5× compute saved on JFT pre-training, up to 2.3× on diffusion.</td><td>Found by program search on proxy tasks; sign updates need a smaller learning rate than Adam. Headline gains are vision and diffusion, not LLM pretraining.</td></tr>
+      <tr><td><strong>Sophia</strong> <a href="https://arxiv.org/abs/2305.14342">[Liu et al. 2023]</a></td><td>Diagonal Hessian estimate, refreshed every few steps, as a preconditioner with element-wise clipping.</td><td>2× speedup over Adam in steps, compute and wall-clock time, on 125M to 1.5B GPT models.</td><td>Small scale (below 2B parameters).</td></tr>
+      <tr><td><strong>Shampoo, SOAP</strong> <a href="https://arxiv.org/abs/2409.11321">[Vyas et al. 2024]</a></td><td>Matrix preconditioning. Shampoo is equivalent to Adafactor in the eigenbasis of its preconditioner; SOAP runs Adam in that basis, with one extra hyperparameter (the preconditioning frequency).</td><td>Over 40% fewer iterations and over 35% less wall-clock than AdamW at 360M and 660M parameters (large batch); about 20% better than Shampoo.</td><td>Small scale; see the benchmark below.</td></tr>
+      <tr><td><strong>Adam-mini</strong> <a href="https://arxiv.org/abs/2406.16793">[Zhang et al. 2024]</a></td><td>One second-moment value (one learning rate) per parameter block chosen from the Hessian structure, instead of per coordinate; removes at least 99.9% of \(v\).</td><td>On par or better than AdamW with 50% less memory; 49.6% higher throughput pretraining Llama 2-7B on 2 A800 GPUs; tested from 39M to 13B.</td><td>A memory optimization, orthogonal to the question of a better direction.</td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: most of these do not beat a well-tuned AdamW at scale</div>
+    <p>Wen et al. re-ran the comparison with each optimizer tuned separately at each scale. They report that prior claims of 1.4× to 2× speedups over AdamW were obscured by "unequal hyperparameter tuning" and "limited or misleading evaluation setups", and that the best matrix-based optimizers (Muon, SOAP and relatives) reach 1.4× over AdamW at 0.1B parameters but only 1.1× at 1.2B <a href="https://arxiv.org/abs/2509.02046">[Wen et al. 2025]</a>. A second benchmark (Semenov et al. 2025) varies model size, batch size and training duration with each method tuned <a href="https://arxiv.org/abs/2509.01440">[Semenov et al. 2025]</a>; we did not verify its rankings. Run-to-run seed noise in loss is about 0.35% in Cerebras-GPT's runs <a href="https://arxiv.org/abs/2304.03208">[§3.3]</a>, so gains of a fraction of a percent need multiple seeds. A fair comparison tunes learning rate, decay, \(\beta\)'s and warmup for each optimizer at each scale, matches tokens and total FLOPs including optimizer overhead, and reports at several scales.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="recipe">A default recipe, and what to tune first</h2>
+  <ol>
+    <li><strong>Optimizer:</strong> AdamW with \(\beta = (0.9, 0.95)\), \(\epsilon = 10^{-8}\) (revisit above roughly 100B parameters), weight decay 0.1. <span class="unverified" title="Common convention (for example, PaLM used no biases at all); we did not check a primary source that states the exemption for the runs above. DeepSeek-V4 lists weight decay 0.1 for its AdamW groups, including RMSNorm weights.">Norm gains and biases are usually exempted from decay.</span></li>
+    <li><strong>Clipping:</strong> global norm 1.0, and log the pre-clip norm.</li>
+    <li><strong>Warmup:</strong> about 2,000 steps (0.2% to 0.5% of tokens); err long.</li>
+    <li><strong>Schedule:</strong> WSD or hold-then-cosine, with a floor of 10% of peak (Llama 3 goes to 1%, then linearly to 0 in the anneal). Plan the data-mixture change for the decay phase.</li>
+    <li><strong>Batch:</strong> start near 4M tokens, ramp to a value at or below your critical-batch estimate. Frontier values in 2025 to 2026 are 60M to 95M tokens for 15T to 33T-token runs.</li>
+    <li><strong>Learning rate:</strong> sweep on small models and transfer with μP or a fitted law. The optimum is broad, so a factor of 2 is affordable.</li>
+    <li><strong>Order of tuning:</strong> peak learning rate first, then warmup, then weight decay (as a timescale \(1/\eta\lambda\) against run length), then batch size; touch \(\beta_2\) and \(\epsilon\) only when spikes demand it.</li>
+    <li><strong>If you want Muon:</strong> hidden matrices only, update RMS 0.2 (or 0.18), momentum 0.95, same weight decay, and plan for attention-logit control (QK-Clip or normalized \(q\) and \(k\)).</li>
+  </ol>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"AdamW is Adam plus L2 regularization, and weight decay 0.1 is there to stop overfitting."</strong> Neither half is right. L2 inside Adam is divided by \(\sqrt{\hat v}\) and regularizes large-gradient weights less; AdamW shrinks the weights directly and its decay never enters \(m\) or \(v\). And LLM pretraining is a single pass: decay sets a timescale \(1/(\eta\lambda)\) over which weights forget old updates and, empirically, lowers training loss and improves stability.</li>
+    <li><strong>"Adam's default \(\beta_2 = 0.999\) is standard, so use it."</strong> Adam's paper default, yes. GPT-3, Llama 2 and every DeepSeek report use 0.95; PaLM used a schedule rising to 0.9999. There is no consensus, and the choice is about tracking a fast-changing gradient scale.</li>
+    <li><strong>"Warmup exists only because Adam's second moment is noisy at the start."</strong> That is one of two explanations (RAdam). The other (Kalra and Barkeshli) says it lets you use a larger peak learning rate by lowering sharpness. The 2,000-step warmups in practice are 100× longer than a \(\beta_2 = 0.95\) window, which sits awkwardly with the first explanation alone.</li>
+    <li><strong>"Cosine to zero is the standard schedule."</strong> Llama 2 ends at 10% of peak, Llama 3 at 1% then linear to 0 during a short anneal, DeepSeek-V3 and V4 hold a constant rate for most of training. A cosine schedule also locks you to a token budget.</li>
+    <li><strong>"A bigger batch always trains faster."</strong> Only up to the critical batch size. At \(B = B_{\text{crit}}\) you spend twice the minimum tokens; at \(4B_{\text{crit}}\) five times, for only a 20% cut in steps.</li>
+    <li><strong>"Gradient clipping prevents loss spikes."</strong> PaLM 540B had about 20 spikes with clipping on. Clipping bounds one step; spikes come from correlated updates (a stale \(\hat v\), attention-logit growth, MoE outliers).</li>
+    <li><strong>"μP means you never tune hyperparameters."</strong> You tune a small proxy. Weight decay is not transferred, the transferred rate assumes a batch at or above critical, and the published μP uses we verified stop at 6.7B parameters.</li>
+    <li><strong>"Muon replaces AdamW."</strong> Muon handles only hidden 2-D matrices; embeddings, the LM head and norm gains stay on AdamW. Its advantage over a well-tuned AdamW shrinks with scale in at least one independent study (1.4× at 0.1B to 1.1× at 1.2B), and it needs a plan for attention-logit growth.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Write the AdamW update. How does decoupled weight decay differ from L2 regularization?</summary>
+    <div class="answer">
+      <p>\(m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t\), \(v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2\); bias-corrected \(\hat m_t = m_t/(1-\beta_1^t)\), \(\hat v_t = v_t/(1-\beta_2^t)\); then \(\theta_t = (1-\eta_t\lambda)\theta_{t-1} - \eta_t\,\hat m_t/(\sqrt{\hat v_t}+\epsilon)\). Bias correction is needed because both averages start at zero; at \(t=1\) the step is exactly \(\eta\,\mathrm{sign}(g)\).</p>
+      <p>With L2 regularization the term \(\lambda'\theta\) is added to the gradient, so it flows into \(m\) and \(v\) and is divided by \(\sqrt{\hat v}\): a coordinate with a historically large gradient has a large \(\sqrt{\hat v}\) and is decayed <em>less</em>. Loshchilov and Hutter prove no L2 coefficient reproduces weight decay for any non-scalar preconditioner (Prop. 2). Under plain SGD the two coincide with \(\lambda' = \lambda/\eta\). Decoupled decay multiplies the weights by \((1-\eta\lambda)\) outside the adaptive step, so every weight decays at the same rate, and the best \(\lambda\) is nearly independent of the best \(\eta\). You can check any implementation against <code>torch.optim.AdamW</code>: the drill does exactly that.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> How much memory do the optimizer states take for an 8B-parameter model?</summary>
+    <div class="answer">
+      <p>Llama-3-8B has \(N = 8{,}030{,}261{,}248\) parameters. AdamW stores \(m\) and \(v\): \(2\times4N = 8N\) bytes in fp32, \(64.2\) GB (59.8 GiB). Mixed-precision training adds fp32 master weights, \(4N = 32.1\) GB, next to bf16 weights (\(2N = 16.1\) GB) and gradients (bf16 \(16.1\) GB or fp32 \(32.1\) GB): 16 to 20 bytes per parameter, 128 to 161 GB before activations, so an 8B model does not fit on one 80 GB GPU with plain AdamW (ZeRO/FSDP shard it, <a href="15-distributed-training.html">page 15</a>). DeepSeek-V3 keeps \(m, v\) in bf16 with no observed degradation, halving the moment cost to 32.1 GB.</p>
+      <p>Muon keeps one momentum buffer per hidden matrix: \(4\times 6{,}979{,}321{,}856 = 27.9\) GB, plus AdamW's 8 bytes for the embedding, head and norms (\(2\times525{,}336{,}576 + 266{,}240\) parameters, 8.4 GB): 36.3 GB against 64.2 GB.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why warmup? What happens without it?</summary>
+    <div class="answer">
+      <p>Two explanations, both tested only at small scale. (1) Early adaptive rates are noisy: \(\hat v_t\) averages \(t\) squared gradients, at \(t=1\) the ratio \(1/|g|\) has unbounded variance, so early steps are poorly scaled. Liu et al. (RAdam): without warmup a Transformer translation model stalls at training loss about 10 instead of below 3, and freezing everything but \(\hat v\) for 2,000 steps fixes it. (2) Sharpness: for Adam the pre-conditioned sharpness starts very high, so the peak learning rate is above the stability threshold at initialization; warmup lets sharpness fall so a larger target rate becomes usable (Kalra and Barkeshli), and initializing \(v_0 = g_0^2\) acts like an automatic warmup.</p>
+      <p>A useful check: if only (1) mattered, warmup would need about \(1/(1-\beta_2) = 20\) steps for \(\beta_2 = 0.95\), yet runs use 500 to 8,000 steps (about 0.2% to 0.5% of tokens), which favors (2) at least in part. Without warmup expect an early loss spike or divergence at the peak rate, or a permanently worse run. The cost of warmup is negligible, so err long.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does global-norm clipping at 1.0 do, and what would you monitor alongside it?</summary>
+    <div class="answer">
+      <p>It rescales the full gradient vector to norm at most 1 when it is larger: \(g\leftarrow g\min(1, 1/\|g\|)\), preserving direction. Because Adam divides by \(\sqrt{\hat v}\), rescaling <em>all</em> gradients equally changes little, so clipping only affects steps that are large relative to neighbors: it keeps an outlier out of \(m\) and \(v\). It is not a cure for spikes (PaLM had about 20 with clipping on).</p>
+      <p>Monitor the pre-clip norm and the clipped fraction (if most steps clip, you are silently running normalized gradient descent with an effective learning rate you did not choose), per-layer gradient norms, the per-layer update-to-weight ratio, maximum attention logits and output-logit magnitude.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why do LLMs use \(\beta_2 = 0.95\) rather than 0.999?</summary>
+    <div class="answer">
+      <p>\(\beta_2\) sets the window of the second-moment average: \(1/(1-\beta_2)\) is 1000 steps for 0.999 and 20 for 0.95. A step is millions of tokens, so 1000 steps is billions of tokens; if the gradient scale changes faster than that (early training, data shifts, the run-up to a spike), \(\hat v\) is stale and underestimates \(g^2\), and \(\hat m/\sqrt{\hat v}\) exceeds the size the learning rate assumes. Wortsman et al. saw spikes follow exactly this underestimate; Molybog et al. describe instability as Adam updates with large norm uncorrelated with descent. Hence 0.95 in GPT-3, Llama 2, Cerebras-GPT and all DeepSeek reports.</p>
+      <p>The trade-off: a 20-step window is noisy per coordinate, especially for rarely updated ones. PaLM argued this and used \(\beta_2 = 1-k^{-0.8}\) (0.996 at step 1,000, 0.9999 at step 100,000) plus clipping and a z-loss. Both work, none of the reports ablates it, so present 0.95 as a convergent convention motivated by spike resistance, not as a proven optimum.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Cosine versus WSD: why has WSD become popular?</summary>
+    <div class="answer">
+      <p>Cosine ties the whole curve to a fixed total \(T\); MiniCPM showed the lowest loss comes when the period equals the training length, so a finished cosine run cannot be extended and a data-scaling curve needs one full run per point. WSD (warmup, long stable phase at peak, short decay of about 10% of steps) separates "how far to train" from "how to finish": a stable-phase checkpoint can be extended, or annealed at any time to get a finished model, and the decayed loss matches what a cosine run of that length would reach (MiniCPM: 10% decay suffices, 2.5% does not). That makes scaling-law sweeps cheap (a 0.036B model matched a 0.17B at about 4× compute) and allows continued pretraining. Hägele et al. confirm constant learning rate plus cooldown scales like cosine.</p>
+      <p>The decay phase is also where the data mixture changes to higher quality (annealing, <a href="12-pretraining-data.html">page 12</a>; Llama 3 anneals linearly to 0 over its last 40M tokens with checkpoint averaging). Caveats: decay shape and length become hyperparameters; MiniCPM says WSD on large models was not fully explored; one study finds linear decay to zero beats cosine to 10% (610M model, 80 tokens per parameter, claimed 60% compute saving). In practice frontier recipes (DeepSeek-V3, Kimi K2, V4) hold peak learning rate for about two thirds of training and decay at the end.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you pick batch size and learning rate for a new scale? (design)</summary>
+    <div class="answer">
+      <p><strong>Batch.</strong> Estimate the critical batch, \(B_{\text{crit}}\approx\mathrm{tr}(\Sigma)/|G|^2\) (the gradient noise scale), from small runs; it grows during training and mainly with tokens seen. Ramp: start near 4M tokens (Llama, PaLM at 1M) and grow, ending at or below \(B_{\text{crit}}\); above it tokens are wasted (\(E = E_{\min}(1+B/B_{\text{crit}})\)). Sanity-check against precedent: 60M to 95M tokens for 15T to 33T-token runs in 2025 and 2026, or DeepSeek's fit \(B_{\text{opt}} = 0.292\,C^{0.327}\) (tokens; 20.7M for its 67B run). Hardware also constrains: per-device batch and pipeline microbatches.</p>
+      <p><strong>Learning rate.</strong> Do not sweep at target scale. Either parametrize with μP and transfer a proxy's optimum (regularization such as weight decay is not transferred; keep batch at or above critical), or fit \(\eta_{\text{opt}}(C)\) from grid searches at small scales (DeepSeek: \(0.3118\,C^{-0.125}\)) and extrapolate. Use the flatness of the optimum (DeepSeek's near-optimal band is broad) to accept a factor-of-2 error. When you change batch by \(\kappa\) below critical, scale the rate by about \(\sqrt\kappa\) for Adam; above critical do not scale it.</p>
+      <p><strong>Then</strong> fix warmup (about 2,000 steps), schedule (WSD or hold plus decay), clipping 1.0, and validate with a run at 1% to 3% of final compute while watching gradient norms and clip fraction.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Define the critical batch size. What does training at 4× the critical batch cost? (calculate)</summary>
+    <div class="answer">
+      <p>Minibatch noise makes the optimal step \(\varepsilon_{\text{opt}}(B) = \varepsilon_{\max}/(1+B_{\text{noise}}/B)\), with \(B_{\text{noise}} = \mathrm{tr}(H\Sigma)/G^\top HG\). Below \(B_{\text{noise}}\) doubling the batch halves the steps; above it steps barely fall. Across a whole run, steps \(S\) and examples \(E\) satisfy \((S/S_{\min}-1)(E/E_{\min}-1) = 1\) and \(B_{\text{crit}} = E_{\min}/S_{\min}\approx B_{\text{noise}}\).</p>
+      <p>Substituting \(E = BS\) with \(b = B/B_{\text{crit}}\) gives \(S/S_{\min} = 1 + 1/b\) and \(E/E_{\min} = 1+b\). At \(b=1\): 2× tokens and 2× steps. At \(b=4\): tokens \(\times 5\), steps \(\times1.25\). Batch ramps exist because \(B_{\text{crit}}\) rises by 10× or more over training.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is μP and what problem does it solve?</summary>
+    <div class="answer">
+      <p>Under the standard parametrization the optimal learning rate depends on width, so you cannot tune small and reuse. The reason: with Adam each hidden-weight entry moves by about \(\eta\), and the output change \(x\Delta W\) sums \(n\) coherent terms, so it grows like \(\eta n\). The Maximal Update Parametrization sets initialization, per-layer learning rates and multipliers as functions of width so each layer's update has width-independent effect: for Adam, hidden and output weights get learning rate \(\propto 1/\text{fan\_in}\), the output layer initializes with variance \(1/\text{fan\_in}^2\), attention uses \(1/d_{\text{head}}\), and input weights and biases are unchanged. Then the optimum learning rate (and init scale, momentum, schedule shape) transfers zero-shot from a small proxy: 40M-parameter tuning beat GPT-3 6.7B's published settings at about 7% of its pretraining cost; Cerebras-GPT and MiniCPM used it.</p>
+      <p>Limits: weight decay and dropout do not transfer; depth, batch and duration transfer only empirically; the transferred rate assumes batch at or above critical; and many labs fit hyperparameter scaling laws instead (DeepSeek). Verified μP use is up to 6.7B parameters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain Muon. Why orthogonalize the update?</summary>
+    <div class="answer">
+      <p>For a hidden matrix with gradient \(G = U\Sigma V^\top\), the update that maximizes \(\langle G, O\rangle\) subject to spectral norm \(\|O\|_{\text{op}}\le1\) is \(O = UV^\top\): every singular value set to 1. So Muon takes SGD momentum \(M\) (with Nesterov), orthogonalizes it, and steps \(W \leftarrow (1-\eta\lambda)W - \eta\,s\,O\). Momentum and Adam updates are nearly low-rank with a huge condition number; orthogonalizing amplifies the small but informative directions. It also bounds the layer's output change by \(\eta\|x\|\), a scale that ignores the conditioning of \(G\).</p>
+      <p>The orthogonalization uses Newton-Schulz, not an SVD: \(X\leftarrow aX + b(XX^\top)X + c(XX^\top)^2X\), which maps each singular value by \(f(\sigma)=a\sigma+b\sigma^3+c\sigma^5\), from \(X_0 = G/\|G\|_F\), with \((3.4445,-4.7750,2.0315)\) for 5 iterations in bf16 (three matmuls each, about 0.35% of a step's FLOPs for Llama-3-8B at 4M tokens). Only hidden 2-D matrices use it; embeddings, LM head and norms stay on AdamW. Moonlight added weight decay and an RMS rescale so AdamW's hyperparameters carry over; Kimi K2 and DeepSeek-V4 trained at 1T+ parameters with it. Evidence on the gain over tuned AdamW is mixed (about 2× compute in Moonlight's runs; 1.4× at 0.1B shrinking to 1.1× at 1.2B in an independent study).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> The loss spikes at step 80K of a large run. What do you do? (debugging)</summary>
+    <div class="answer">
+      <p>First triage: NaN/Inf or finite? Hardware fault, or dynamics? Check which layer's gradient norm, activation or attention logit moved first, and the clipped fraction. Then the standard remedy, PaLM's: restart from a checkpoint about 100 steps before the spike and skip the 200 to 500 batches around it. PaLM showed the same batches replayed from an earlier checkpoint did not spike, so the cause is data \(\times\) parameter state; this is a workaround, not a diagnosis (it presumes a deterministic data order and frequent checkpoints).</p>
+      <p>If spikes recur, go systemic, cheap to expensive: lower peak learning rate or lengthen warmup; lower \(\beta_2\) or raise \(\epsilon\) (a stale second moment underestimates \(g^2\)); add logit and activation control (z-loss, QK-norm, softcapping, QK-Clip with Muon); for MoE, look at routing and outliers (DeepSeek-V4: anticipatory routing plus SwiGLU clamping to \([-10,10]\), because simple rollbacks did not stop recurrence). Also check data shards, but do not stop there.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Read DeepSeek-V3's schedule: what is the learning rate at 12T tokens, and roughly how many optimizer steps did the run take? (calculate)</summary>
+    <div class="answer">
+      <p>Warmup 0 to \(2.2\times10^{-4}\) over 2K steps, flat to 10T tokens, cosine to \(2.2\times10^{-5}\) over the next 4.3T, then 333B at \(2.2\times10^{-5}\) and 167B at \(7.3\times10^{-6}\) (total 14.8T). At 12T: \(p = 2/4.3 = 0.465\), \(\tfrac12(1+\cos 0.465\pi) = 0.555\), so \(\eta = 2.2\times10^{-5} + 1.98\times10^{-4}\times0.555 = 1.32\times10^{-4}\).</p>
+      <p>Steps: the final batch is \(15{,}360\times4096 = 62.9\)M tokens, reached after a ramp over 469B tokens from 3,072 sequences. If the ramp is linear in steps (mean 37.7M tokens per step) it takes \(469\text{B}/37.7\text{M}\approx 12{,}400\) steps; the remaining \(14.33\text{T}/62.9\text{M}\approx 227{,}800\) steps: about 240,000 steps in total (235K to 265K over all ramps). Warmup (2K steps, about 33B tokens) is 0.22% of the run.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> What two changes did Moonlight make to scale Muon? Derive the RMS of Muon's update and say why the target is 0.2.</summary>
+    <div class="answer">
+      <p>(1) Weight decay \(W\leftarrow W - \eta(O+\lambda W)\): without it, weights and layer-output RMS kept growing past bf16's range; in an over-trained 800M model (100B tokens) vanilla Muon led early but decayed Muon and AdamW were better later. (2) Per-matrix update scale. For a full-rank \(A\times B\) matrix, \(O = UV^\top\) has \(\|O\|_F^2 = r = \min(A,B)\) over \(AB\) entries, so \(\mathrm{RMS}(O) = \sqrt{\min(A,B)/(AB)} = \sqrt{1/\max(A,B)}\) (Lemma 1). That makes updates tiny for wide MLP matrices and large for small matrices such as per-head KV projections. Multiplying by \(0.2\sqrt{\max(A,B)}\) makes every matrix's update RMS equal to 0.2.</p>
+      <p>Why 0.2: AdamW's update RMS is 1 in theory (less in practice, since \(\beta_1&lt;\beta_2\) and \(\epsilon>0\)) and measures 0.2 to 0.4 in Moonlight's runs; matching it lets Muon reuse AdamW's learning rate and decay with no retuning. A sweep found 0.2 and 0.4 best and about equal. DeepSeek-V4 uses 0.18. With five quintic iterations the actual RMS is 0.86 to 0.90 of \(1/\sqrt{\max}\) in our numerical example, because the singular values sit in \([0.68,1.13]\) rather than at 1.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why does Muon make attention logits explode, what is QK-Clip, and why does DeepSeek-V4 not need it?</summary>
+    <div class="answer">
+      <p>Kimi K2 saw maximum attention logits above 1,000 in a mid-scale vanilla-Muon run. Logit soft-capping does not stop the pre-cap growth and QK-Norm does not work with MLA (keys are not materialized). Their hypothesis: Adam updates have a skewed, low-rank spectrum, while Muon's updates are full rank with equal singular values, so weights and updates more often align on the same singular directions and singular values grow; since \(q\cdot k = (xW_q)\cdot(xW_k)\) is bilinear, growth in either spectral norm compounds.</p>
+      <p>QK-Clip: after each update, per head, if the observed maximum logit \(S^h_{\max}\) exceeds \(\tau\), multiply the query and key weights by \(\sqrt{\gamma_h}\) each with \(\gamma_h = \tau/S^h_{\max}\) (for MLA, \(q^C,k^C\) by \(\sqrt{\gamma_h}\), \(q^R\) by \(\gamma_h\), the shared \(k^R\) untouched). K2 used \(\tau = 100\): 15.5T tokens, no loss spikes, and it fired for 12.7% of heads in the first 70K steps and never afterward. DeepSeek-V4 applies RMSNorm directly to queries and KV entries, which bounds the logits regardless of \(W_q, W_k\) norms, so it dropped QK-Clip. (Its MoE spikes were handled separately.)</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Do optimizers beyond AdamW win at scale? What is the evidence, and how would you run a fair comparison? (trade-offs)</summary>
+    <div class="answer">
+      <p>For: Moonlight reports about 52% of AdamW's FLOPs to match the loss in compute-optimal runs, Lion, Sophia and SOAP report roughly 1.7× to 5× gains on their tasks, and Kimi K2 and DeepSeek-V4 adopted Muon at 1T+ parameters. Against: Wen et al. tuned every optimizer separately and found the best matrix-based methods give 1.4× at 0.1B shrinking to 1.1× at 1.2B, blaming earlier claims on unequal tuning and limited evaluations. The frontier reports include no public controlled ablation at their scale, and Muon's practical costs (full-matrix sharding, mismatch with AdamW fine-tuning, attention-logit control) are real.</p>
+      <p>A fair protocol: tune peak learning rate, weight decay, \(\beta\)'s and warmup per optimizer per scale (learning-rate optima differ by optimizer, so blind transfer is unfair); match tokens and count optimizer FLOPs and communication; use the same schedule family, including the decay; test at several scales and batch sizes; use several seeds (run-to-run loss noise is about 0.35% in one study); compare validation loss and downstream metrics; and report wall-clock as well as tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Nothing overfits in single-pass pretraining, so why does weight decay 0.1 matter, and how should it change with scale? (calculate)</summary>
+    <div class="answer">
+      <p>Unroll \(\theta_t = (1-\eta\lambda)\theta_{t-1} - \eta u_t\): the weights are an exponential average of recent Adam directions with timescale \(\tau = 1/(\eta\lambda)\) steps. It bounds weight growth (equilibrium \(\mathrm{RMS}(\theta)\approx r\sqrt{\eta/2\lambda}\) for uncorrelated updates of RMS \(r\)) and sets how long old updates persist; for LLMs the measured effect is lower training loss and better stability, not regularization (D'Angelo et al.), and Moonlight's Muon needed it to keep weights within bf16 range.</p>
+      <p>Numbers for Llama 2 7B: \(\eta = 3\times10^{-4}\), \(\lambda = 0.1\): \(\tau = 33{,}333\) steps, 6.7% of 500,000 steps; as the cosine decays \(\eta\) to \(3\times10^{-5}\), \(\tau\) grows to 333,333 steps (67% of the run). So decay and learning-rate schedule interact. Scaling rules: Wang and Aitchison find the best timescale in epochs roughly constant, so the best \(\lambda\) shrinks as the dataset grows and (with μP learning rates) grows with model size; Bergsma et al. find the best \(\tau/\text{run length}\) follows a power law in tokens per parameter. Practical rule: when you change learning rate, batch or run length, recompute \(\eta\lambda\) against the run length rather than reusing \(\lambda\).</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>AdamW and LR schedules.</strong> Implement <code>adamw_step</code> (functional, with bias correction and decoupled decay, compared step by step against <code>torch.optim.AdamW</code> including both moment tensors) and <code>lr_schedule</code> for cosine, WSD and DeepSeek-style step decay (cosine is also checked against <code>CosineAnnealingLR</code>). An interviewer would expect both in about 20 minutes. <span class="ex-path">exercises/drills/optim.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Newton-Schulz and a Muon step.</strong> Implement <code>newton_schulz</code> (either matrix orientation, arbitrary coefficients) and <code>muon_step</code> (momentum, Nesterov, orthogonalization, shape-independent update RMS, decoupled decay). The tests check that singular values land in roughly \([0.7, 1.15]\), that the output is close to the SVD polar factor, that \((2,-1.5,0.5)\) with many iterations converges to it exactly, and that the update RMS is the same for four different matrix shapes. Budget 25 to 40 minutes; the reasoning about why it is <code>max(n, m)</code> is what the interviewer is really asking. <span class="ex-path">exercises/drills/optim.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_optim.py</code>; add <code>--solutions</code> to check the reference implementations.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/1711.05101">Loshchilov &amp; Hutter (2019). Decoupled Weight Decay Regularization.</a> <a href="https://arxiv.org/abs/1412.6980">Kingma &amp; Ba (2015). Adam: A Method for Stochastic Optimization.</a> <span class="why">Why read them: Algorithm 2 and Proposition 2 of AdamW, and §2 to 3 of Adam (trust-region step, bias correction).</span></li>
+    <li><a href="https://arxiv.org/abs/1908.03265">Liu et al. (2020). On the Variance of the Adaptive Learning Rate and Beyond.</a> <a href="https://arxiv.org/abs/2406.09405">Kalra &amp; Barkeshli (2024). Why Warmup the Learning Rate? Underlying Mechanisms and Improvements.</a> <span class="why">Why read them: the two competing explanations of warmup, with the experiments that separate them.</span></li>
+    <li><a href="https://arxiv.org/abs/2404.06395">Hu et al. (2024). MiniCPM.</a> <span class="why">Why read it: WSD (§4), the model wind tunnel, and one of the few public μP recipes with numbers (Table 7).</span></li>
+    <li><a href="https://arxiv.org/abs/1812.06162">McCandlish et al. (2018). An Empirical Model of Large-Batch Training.</a> <span class="why">Why read it: the noise-scale derivation (§2), the steps-versus-examples trade-off, and why the critical batch grows during training.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.03466">Yang et al. (2022). Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer.</a> <span class="why">Why read it: Tables 1 and 3 (what transfers and the μP rules) and the Appendix J derivation.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.02954">DeepSeek-AI (2024). DeepSeek LLM.</a> <span class="why">Why read it: §2.3 (multi-step schedule) and §3.1 (hyperparameter scaling laws); read alongside <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 §4.2</a> for the modern schedule.</span></li>
+    <li><a href="https://arxiv.org/abs/2502.16982">Liu et al. (2025). Muon is Scalable for LLM Training (Moonlight).</a> <a href="https://kellerjordan.github.io/posts/muon/">Jordan et al. (2024). Muon: An optimizer for hidden layers in neural networks (blog post).</a> <span class="why">Why read them: the algorithm and code, then the two scaling fixes (weight decay, update RMS) and Lemma 1.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: §2.1 (MuonClip, QK-Clip) and Appendix E (why Muon inflates logits).</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read it: §2.4 (Muon with the 8+2 hybrid Newton-Schulz), §3.4.1 (Muon with ZeRO), §4.2 (training setups and spike mitigation).</span></li>
+    <li><a href="https://arxiv.org/abs/2509.02046">Wen et al. (2025). Fantastic Pretraining Optimizers and Where to Find Them.</a> <span class="why">Why read it: how to compare optimizers fairly, and why the speedups shrink with scale.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>AdamW: \(m = \beta_1 m + (1-\beta_1)g\), \(v = \beta_2 v + (1-\beta_2)g^2\), hats divide by \(1-\beta^t\), \(\theta \leftarrow (1-\eta\lambda)\theta - \eta\hat m/(\sqrt{\hat v}+\epsilon)\). First step is \(\eta\,\mathrm{sign}(g)\). Decay is outside the adaptive term (L2 in Adam is not weight decay).</li>
+      <li>Defaults: \(\beta = (0.9, 0.95)\), \(\epsilon = 10^{-8}\) (Llama 2: \(10^{-5}\); V4: \(10^{-20}\)), weight decay 0.1, clip 1.0, warmup 2,000 steps (0.2% to 0.5% of tokens). Weight-decay timescale \(\tau = 1/(\eta\lambda)\): 33K steps for Llama 2 7B at peak.</li>
+      <li>Memory, 8B model: fp32 \(m,v\) = 64.2 GB (8 B/param); with master weights, weights and grads 16 to 20 B/param (128 to 161 GB). V3 keeps moments in bf16. Muon: 1 buffer (36.3 GB total with AdamW on embeddings and head).</li>
+      <li>Warmup: two explanations (noisy early \(\hat v\) versus sharpness and larger usable peak LR). The \(\beta_2 = 0.95\) window is 20 steps, warmup is 25 to 400× longer.</li>
+      <li>Schedules: cosine to 10% (Llama 2) or 1% (Llama 3); DeepSeek LLM step decay ×0.316 at 80% and ×0.1 at 90% (V2: about 60%/90%); WSD with about 10% decay (MiniCPM). V3: 2.2e-4 flat to 10T, cosine to 2.2e-5 over 4.3T, 333B at 2.2e-5, 167B at 7.3e-6; about 240K steps; LR at 12T = 1.32e-4.</li>
+      <li>Batch: \(E = E_{\min}(1+B/B_{\text{crit}})\), \(S = S_{\min}(1+B_{\text{crit}}/B)\); at \(B_{\text{crit}}\): 2× tokens and steps. \(B_{\text{crit}}\) grows 10× or more in training, so ramp (V3: 12.6M → 62.9M tokens). Recent runs: 62.9M (V3), 67M (K2), 75.5M and 94.4M (V4). Adam: LR ∝ \(\sqrt{B}\) below critical.</li>
+      <li>DeepSeek LLM fits (C = non-embedding FLOPs): \(\eta = 0.3118\,C^{-0.125}\), \(B = 0.2920\,C^{0.3271}\) tokens; optimum is flat (within 0.25% over a broad band).</li>
+      <li>Spikes: clipping is necessary but not sufficient (PaLM ~20 spikes). Playbook: triage, rollback about 100 steps and skip 200 to 500 batches, then lower LR / lower \(\beta_2\) or raise \(\epsilon\) / logit control / routing fixes. Monitor pre-clip norm, clip fraction, per-layer grads, max attention logit.</li>
+      <li>μP (Adam): hidden and output LR ∝ 1/width, output init var \(1/\text{fan\_in}^2\), attention \(1/d_{\text{head}}\); transfers LR, init, schedule; not weight decay; needs batch at or above critical; verified use up to 6.7B (μTransfer), 2.7B (Cerebras), 2.4B (MiniCPM).</li>
+      <li>Muon: \(M \leftarrow \mu M + G\); \(O = \mathrm{NS}(\mu M + G) \approx UV^\top\); \(W \leftarrow (1-\eta\lambda)W - \eta\,0.2\sqrt{\max(n,m)}\,O\). NS: \(X_0 = G/\|G\|_F\), \(X \leftarrow aX + b(XX^\top)X + c(XX^\top)^2X\), \((a,b,c) = (3.4445, -4.7750, 2.0315)\), 5 iterations, \(f(1) = 0.701\), singular values end in about \([0.68, 1.13]\). V4: 8 iterations plus 2 of \((2,-1.5,0.5)\), RMS 0.18. Hidden 2-D matrices only.</li>
+      <li>Muon evidence: Moonlight about 52% of AdamW FLOPs; Wen et al. 1.4× at 0.1B down to 1.1× at 1.2B. Kimi K2: MuonClip, \(\tau = 100\), 15.5T tokens, zero spikes. V4: no QK-Clip (RMSNorm on q and KV), hybrid ZeRO with knapsack assignment.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

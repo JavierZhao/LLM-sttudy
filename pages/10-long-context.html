@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Long context: extension &amp; evaluation · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="10" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part II · Modern architecture · Page 10</div>
+  <h1>Long context: extension &amp; evaluation</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~60 min</span>
+    <span>Prereqs: <a href="05-positional-encoding.html">05 RoPE</a>, <a href="06-decoding-kv-cache.html">06 KV cache</a>, <a href="07-kv-efficient-attention.html">07 KV-efficient attention</a>, <a href="09-beyond-full-attention.html">09 Beyond full attention</a></span>
+  </div>
+  <p class="lede">Models are pretrained on 4K to 8K tokens and shipped with 128K to 1M. This page covers how the gap is closed (rescaling RoPE frequencies, staged continued pretraining, long-document data) and how to check whether the model uses what it claims to accept: perplexity, needle tests, RULER, HELMET and their limits.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>RoPE scaling at a whiteboard:</strong> PI, the NTK-aware base change \(b' = b\,s^{d/(d-2)}\), YaRN's ramp and temperature, Llama 3.1's <code>llama3</code> rule. Expect "which frequency pairs does each method change, and by how much?" with real numbers (\(d_h = 128\), \(b = 10^4\), \(s = 8\)).</li>
+    <li><strong>Named recipes with numbers:</strong> Llama 3 (8K to 128K in six stages, about 800B tokens), DeepSeek-V3 (YaRN \(s = 40\), two runs of 1,000 steps), Qwen2.5-1M, and DeepSeek-V4's native 1M schedule.</li>
+    <li><strong>Why staged, and how you know a stage is done:</strong> quadratic cost, scarce long documents, and the gate Llama 3 used (short-context recovery plus needle retrieval).</li>
+    <li><strong>Data:</strong> how many tokens (0.5B to 5B in one study, 800B in another), how to mix long and short, and where the literature disagrees.</li>
+    <li><strong>Evaluation skepticism:</strong> why 100% needle-in-a-haystack means little, what RULER's effective length is, what HELMET and NoLiMa add, and how to design a suite for a paper claiming a better long-context architecture.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Write PI, NTK-aware scaling, YaRN and the Llama 3.1 rule as per-pair frequency rules, and compute which of the 64 pairs change, and the resulting wavelengths, for a given head dimension, base and scale.</li>
+    <li>Derive \(b' = b\,s^{d/(d-2)}\) and the YaRN temperature \(\sqrt{1/t} = 0.1\ln s + 1\) for any \(s\), and explain the two ramp conventions in circulation.</li>
+    <li>Describe how Llama 3, DeepSeek-V3, Qwen2.5-1M, Gemma 3 and DeepSeek-V4 reached long context: stage lengths, RoPE bases, token budgets, and what each checked before moving on.</li>
+    <li>Compute prefill FLOPs, KV memory and decode step time for Llama-3-8B at 8K and 128K, and explain why long-context training is staged.</li>
+    <li>Choose and defend a long-context data mix, and state what is known about packing, document masking and short-context regressions.</li>
+    <li>Interpret NIAH, RULER, LongBench v2, HELMET and NoLiMa results, and design an evaluation suite that separates retrieval, reasoning and regression.</li>
+    <li>Implement the frequency rules and a needle-in-a-haystack grid in the drill.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="why-staged">Why long context is a separate, late stage</h2>
+
+  <p>A <strong>long context</strong> <span class="zh">长上下文</span> model accepts a <strong>context window</strong> <span class="zh">上下文窗口</span> of 128K to 1M tokens, but is almost never trained at that length from the first step. Three forces push the same way.</p>
+
+  <p><strong>Compute.</strong> With causal attention and FlashAttention (nothing of size \(T \times T\) is stored), prefill of \(T\) tokens costs the weight matmuls, linear in \(T\), plus attention, quadratic in \(T\). Each query at position \(t\) does \(4 n_h d_h t\) FLOPs per layer (scores and weighted values), and summing over \(t\) gives \(2 n_h d_h T^2\):</p>
+
+  <div class="eq-box">
+  \[ F_{\text{prefill}}(T) \;=\; \underbrace{2\,N_{\text{mm}}\,T}_{\text{weights}} \;+\; \underbrace{2\,L\,n_h d_h\,T^2}_{\text{attention}}, \qquad T^\star = \frac{N_{\text{mm}}}{L\,n_h d_h} \]
+  <div class="eq-label">\(N_{\text{mm}}\) = parameters that take part in matmuls; \(T^\star\) is where attention FLOPs equal weight FLOPs</div>
+  </div>
+
+  <p>For Llama-3-8B, \(N_{\text{mm}} = 7.50\)B (<a href="06-decoding-kv-cache.html">page 06</a>) and \(L\,n_h d_h = 32 \cdot 4096 = 2^{17}\), so \(T^\star = 7.504\times10^{9}/131{,}072 \approx 57\text{K}\). FLOPs count a multiply-add as 2, and the causal mask is counted as half a square.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Llama-3-8B, bf16</th><th class="num">\(T = 8{,}192\)</th><th class="num">\(T = 131{,}072\)</th><th class="num">Ratio</th></tr></thead>
+    <tbody>
+      <tr><td>weight FLOPs \(2 N_{\text{mm}} T\)</td><td class="num">\(1.229\times10^{14}\)</td><td class="num">\(1.967\times10^{15}\)</td><td class="num">16×</td></tr>
+      <tr><td>attention FLOPs \(2^{18} T^2\)</td><td class="num">\(1.759\times10^{13}\) (12.5%)</td><td class="num">\(4.504\times10^{15}\) (69.6%)</td><td class="num">256×</td></tr>
+      <tr class="hl"><td><strong>prefill total</strong></td><td class="num">\(1.405\times10^{14}\)</td><td class="num">\(6.471\times10^{15}\)</td><td class="num">46×</td></tr>
+      <tr><td>prefill time at 50% of 989.4 TFLOP/s</td><td class="num">0.28 s</td><td class="num">13.1 s</td><td class="num"></td></tr>
+      <tr><td>KV cache, one sequence (128 KiB per token)</td><td class="num">1 GiB</td><td class="num">16 GiB</td><td class="num">16×</td></tr>
+      <tr><td>batch-1 decode step (weights 16.06 GB + KV) at 3.35 TB/s</td><td class="num">5.11 ms (196 tok/s)</td><td class="num">9.92 ms (101 tok/s)</td><td class="num">1.9×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Arithmetic: \(2^{18}\cdot 8192^2 = 1.759\times10^{13}\); \(2^{18}\cdot 131072^2 = 4.504\times10^{15}\); \(2\cdot 7.504\times10^{9}\cdot 131072 = 1.967\times10^{15}\). KV: \(32\cdot2\cdot8\cdot128\cdot2\) B \(=131{,}072\) B per token (<a href="07-kv-efficient-attention.html#why-kv">page 07</a>), times 131,072 tokens \(= 2^{34}\) B. Decode: KV bytes \(1.07\) GB and \(17.18\) GB, over \(3.35\) TB/s, plus the \(4.79\) ms weight read (<a href="06-decoding-kv-cache.html">page 06</a>). Real kernels skip masked blocks and run below 50% of peak, so read the ratios, not the seconds.</p>
+
+  <p>So a 16× longer sequence costs 46× more to prefill, the cache alone at 128K outweighs the weights (16 GiB against 15 GiB), and a batch-1 decode step slows from 196 to 101 tokens per second in the bandwidth-bound regime. Training pays the same quadratic term on every step. Llama 3's report says it directly: "We do not train on long sequences earlier because the compute in self-attention layers grows quadratically in the sequence length" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.2]</a>.</p>
+
+  <p><strong>Data.</strong> Long documents are rare and skewed toward a few domains. In SlimPajama about 30% of documents exceed 4K tokens, but books and code dominate the long tail <a href="https://arxiv.org/abs/2402.10171">[Fu et al. 2024, §3]</a>. Counting only documents of at least 64K tokens, ProLong's authors find 98.8B tokens in concatenated code repositories, 33.2B in books, 15.3B in CommonCrawl, 5.2B in arXiv, 2.8B in GitHub files and almost none in Wikipedia, StackExchange or C4 <a href="https://arxiv.org/abs/2410.02660">[Gao et al. 2024, Tab. 3]</a>. A from-scratch run at 128K would either repeat this small pool or fill sequences with concatenated unrelated documents.</p>
+
+  <p><strong>Quality.</strong> At a fixed token budget, shorter training contexts give better standard-benchmark scores in a controlled study of 1B-parameter models on 100B tokens (contexts from 512 to 16K). The authors' SkyLadder schedule, which grows the window from 8 tokens up to the target, gains up to 3.7% on standard benchmarks and up to 22% training time at 32K <a href="https://arxiv.org/abs/2503.15450">[Zhu et al. 2025, Abstract, Tab. 8]</a>. A caution: these are small models on academic corpora, and the effect has not been shown at frontier scale.</p>
+
+  <p>The standard recipe follows: <strong>pretrain short</strong> (4K to 8K) for almost all tokens, then <strong>continue pretraining</strong> <span class="zh">继续预训练</span> at longer lengths for a small fraction of the budget (Llama 3: about 800B of 15.6T tokens, 5%; DeepSeek-V3: 119K of 2,788K GPU-hours, 4.3% <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 1]</a>), then fine-tune. Xiong et al. measured the saving directly: switching from 4K to 32K sequences at 80% of training cost \(2.270\times10^{22}\) FLOPs against \(3.783\times10^{22}\) for 32K from the start, 40% less, with similar long-task quality <a href="https://arxiv.org/abs/2309.16039">[Xiong et al. 2023, Tab. 10]</a>. The one frontier exception is DeepSeek-V4, which grows the sequence length inside pretraining (4K, 16K, 64K, 1M) and needs sparse and compressed attention to afford it (<a href="#recipes">recipes below</a>).</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A jet has tens to a few hundred constituents, so the \(T^2\) term never mattered and the set was small enough to attend over fully. Here \(T\) spans four orders of magnitude and the cost model changes with it: below about 57K tokens an 8B model is weight-bound, above it attention dominates. Also, your tagger had no positions, so a longer jet changed nothing about how any pair of particles scored. In a RoPE model the score of a pair depends on their offset, so lengths never seen in training are an out-of-distribution problem by construction.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="extrapolation">Why running a short-context RoPE model longer fails</h2>
+
+  <p><strong>Extrapolation</strong> <span class="zh">外推</span> means running at lengths beyond training. <strong>Interpolation</strong> <span class="zh">插值</span> means squeezing the longer range into the range the model has seen. <a href="05-positional-encoding.html#length-generalization">Page 05</a> derives why extrapolation fails for RoPE (angles the network never saw, and attention dilution); we use its notation (\(\theta_i = b^{-2i/d_h}\), wavelength \(\lambda_i = 2\pi/\theta_i\), row vectors, \(R_t R_j^\top = R_{t-j}\)) and add only what the rescaling methods need.</p>
+
+  <p><strong>1. Some pairs never finish a turn in training.</strong> A pair with \(\lambda_i > L\) covers less than one rotation over the training context, so during training it is close to a smooth position-dependent channel rather than a periodic one. The YaRN authors argue such pairs can carry absolute position, while pairs with \(\lambda_i \ll L\) carry only relative order <a href="https://arxiv.org/abs/2309.00071">[Peng et al. 2023, §3.2]</a>. At \(d_h = 128\), \(b = 10^4\), \(L = 4096\), that is 18 of 64 pairs (pairs 46 to 63). The slowest pair reaches 0.47 rad at 4,096 tokens, 3.78 rad at 32K and 15.1 rad at 128K (<a href="05-positional-encoding.html#ood-angles">page 05</a>), so most of its extended range is phase the network never saw.</p>
+
+  <p><strong>2. Offsets near the training length are barely trained even inside it.</strong> Relative offset \(i\) occurs \(f(i) = \sum_{s \in \text{corpus}} \max(|s| - i, 0)\) times, which falls off quickly when most documents are short. With a 2,048-token training length on SlimPajama, offsets of 1,536 or more make up under 5% of position indices, and the STRING authors report that open models' effective context is usually under half their training length: Llama 3.1's needle retrieval degrades once position indices pass about 90K, and most failures sit in the first third of the document <a href="https://arxiv.org/abs/2410.18745">[An et al. 2024, §2-3]</a>. Being trained at a length does not mean being trained <em>well</em> at it.</p>
+
+  <p><strong>3. The softmax gets flatter.</strong> With \(N\) roughly equal distractors a fixed logit margin \(\Delta\) buys weight \(e^{\Delta}/(e^{\Delta} + N - 1)\) (<a href="05-positional-encoding.html#dilution">page 05</a>). A model calibrates its sharpness to the lengths it saw. YaRN's temperature addresses this directly (next section).</p>
+
+  <p>Rescaling methods target the first and third failures. The second, and the model's need to <em>learn to use</em> distant tokens, is why every serious recipe also trains.</p>
+</section>
+
+<section>
+  <h2 id="rope-scaling">RoPE rescaling: PI, NTK-aware, YaRN, llama3, LongRoPE</h2>
+
+  <h3 id="rule-view">One view: a per-pair slow-down</h3>
+  <p>Every method below maps the trained frequencies \(\theta_i\) to new ones \(\theta'_i = \theta_i / f_i\), where the <strong>slow-down factor</strong> \(f_i \in [1, s]\) depends on the pair, and \(s = L'/L\) is the ratio of target to training context. Some add a scalar on the attention logits. The methods differ only in \(f_i\):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Slow-down \(f_i\)</th><th>Fastest pair</th><th>Slowest pair</th><th>Needs training?</th></tr></thead>
+    <tbody>
+      <tr><td>Position Interpolation (PI)</td><td>\(s\) for every \(i\)</td><td>\(\div s\)</td><td>\(\div s\)</td><td>yes, short (hundreds of steps)</td></tr>
+      <tr><td>NTK-aware</td><td>\(s^{2i/(d-2)}\) (base change)</td><td>unchanged</td><td>\(\div s\)</td><td>works zero-shot at small \(s\); fine-tunes worse than PI</td></tr>
+      <tr><td>Base increase (ABF)</td><td>\((b'/b)^{2i/d}\), \(b'\) chosen empirically</td><td>unchanged</td><td>\(\div (b'/b)^{(d-2)/d}\)</td><td>yes, continued pretraining</td></tr>
+      <tr><td>YaRN (NTK-by-parts)</td><td>ramp on \(\lambda_i / L\), plus a logit temperature</td><td>unchanged</td><td>\(\div s\)</td><td>zero-shot (dynamic) or 400 steps</td></tr>
+      <tr><td><code>llama3</code> (Llama 3.1)</td><td>same ramp as YaRN, no temperature</td><td>unchanged</td><td>\(\div\) <code>factor</code></td><td>released config</td></tr>
+      <tr><td>LongRoPE</td><td>searched \(f_i\), plus an unscaled prefix</td><td>searched</td><td>searched</td><td>search, then fine-tune</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="pi">Position Interpolation: shrink every angle</h3>
+  <p>PI <a href="https://arxiv.org/abs/2306.15595">[Chen et al. 2023, Eq. 4]</a> replaces position \(m\) by \(mL/L' = m/s\) inside RoPE. Because \(\theta_i (m/s) = (\theta_i/s)\, m\), this is \(f_i = s\) for all pairs:</p>
+  <div class="eq-box">
+  \[ \theta'_i = \frac{\theta_i}{s}, \qquad \text{so } \lambda'_i = s\,\lambda_i \text{ for every pair.} \]
+  <div class="eq-label">The maximum angle any pair reaches at \(L'\) equals what it reached at \(L\) in training</div>
+  </div>
+  <p class="small muted">Notation check: the YaRN paper's §2.3 writes PI as \(g(m) = s\cdot m\) while defining \(s = L'/L\); its Appendix A.1 and Chen et al. have \(mL/L'\), which is what we use here.</p>
+  <p><strong>Why it works.</strong> The score as a function of offset, \(a(u) = \operatorname{Re}\sum_j h_j e^{\mathrm{i} u\theta_j}\), is a sum of sinusoids: smooth between integer offsets, unconstrained outside \([0, L]\). Interpolating stays between offsets the model already handles, and Chen et al. bound the error there by \(\tfrac{d}{32\ln b}\max_j|h_j|\), about 600 times below the extrapolation bound <a href="https://arxiv.org/abs/2306.15595">[§2.3]</a> (<a href="05-positional-encoding.html#remedies">page 05</a>). Empirically, 1,000 steps take LLaMA 7B to 65B to 32K, with passkey retrieval reaching the full target window after 200 steps <a href="https://arxiv.org/abs/2306.15595">[Tab. 3-4]</a>.</p>
+  <p><strong>Its cost.</strong> Neighboring tokens' angles now differ by \(\theta_i/s\) instead of \(\theta_i\). The fastest pair, 1 rad per token (57.3°), turns 0.125 rad (7.2°) per token at \(s = 8\), so the distinctions between nearby tokens that fast pairs provide are squeezed 8×. Chen et al. see 0.01 to 0.05 perplexity loss inside the original window, and at 8K every zero-shot benchmark they list stays within about 2 points of the original except BoolQ, which they attribute to needing close attention to word order in a short passage (BoolQ, base 76.1: 73.2, 69.8, 64.7 at 8K, 16K, 32K; other tasks fall further at 16K and 32K, for example Race-M 55.7 to 50.1 at 32K) <a href="https://arxiv.org/abs/2306.15595">[Tab. 5]</a>. The YaRN paper notes PI fine-tunes reliably only to about \(s = 8\) <a href="https://arxiv.org/abs/2309.00071">[§3.1]</a>.</p>
+
+  <h3 id="ntk">NTK-aware scaling: change the base, not the positions</h3>
+  <p>The idea, from an open-source forum post later written up in the YaRN paper, is to spread the interpolation over pairs: leave fast pairs alone and slow slow pairs more. The simplest such family is a base change. Require the fastest pair (\(i = 0\)) unchanged and the slowest pair (\(i = d/2 - 1\), exponent \(2i/d = (d-2)/d\)) slowed by exactly \(s\):</p>
+  \[ b'^{-(d-2)/d} = \frac{b^{-(d-2)/d}}{s} \;\;\Longrightarrow\;\; \boxed{\,b' = b\, s^{\,d/(d-2)}\,}, \qquad f_i = \Big(\frac{b'}{b}\Big)^{2i/d} = s^{\,2i/(d-2)}. \]
+  <p>This is Eq. 22 of the YaRN paper <a href="https://arxiv.org/abs/2309.00071">[App. A.2]</a>. For \(d = 128\), \(s = 8\): \(b' = 8^{128/126}\,b = 8.268\,b\), so \(10^4 \to 82{,}685\), and \(f_i = 8^{i/63}\), a geometric ladder from 1 to 8.</p>
+  <p><strong>Its flaw.</strong> Only the slowest pair is truly interpolated. Pair \(i\) has a trained angle range \(L\theta_i\) but at \(L'\) sees \(L'\theta_i / f_i = (s/f_i)\,L\theta_i\), so any pair with \(f_i < s\) is <em>extrapolated</em> by \(s/f_i\). That is harmless for fast pairs, whose phase wraps many times, and harmful for pairs whose wavelength is near \(L\): pair 45 (\(\lambda = 4{,}080\)) has \(f = 8^{45/63} = 4.42\) and sees 1.81× its trained range. The YaRN paper reports that fine-tuning with NTK-aware scaling ends up worse than PI, and that \(s\) has to be set above the true ratio because some pairs are extrapolated to out-of-bound values <a href="https://arxiv.org/abs/2309.00071">[App. A.2]</a>.</p>
+  <p><strong>Dynamic scaling</strong> recomputes the scale from the current length \(l\): \(s = \max(1, l/L)\) at each forward pass, so short inputs are untouched and long ones degrade gracefully instead of falling off a cliff at \(L'\); with NTK-aware scaling this is "Dynamic NTK" <a href="https://arxiv.org/abs/2309.00071">[§3.4]</a>. Hugging Face's <code>dynamic</code> type uses \(b\,\big(f\,l/L - (f-1)\big)^{d/(d-2)}\) with \(f\) the configured factor <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py">[<code>modeling_rope_utils.py</code>]</a>. The catch is the KV cache: the rotation of every earlier key changes whenever \(s\) changes, so the cache must hold unrotated keys (or be recomputed) <a href="https://arxiv.org/abs/2309.00071">[§3.4]</a>, at odds with the "cache rotated keys" habit of <a href="05-positional-encoding.html#rope-cost">page 05</a>.</p>
+
+  <h3 id="yarn">YaRN: treat pairs by wavelength, and fix the temperature</h3>
+  <p>YaRN's two observations are about <em>which pairs to touch</em>. Pairs with many turns inside \(L\) (\(\lambda \ll L\)) resolve local order and are needed at full resolution: do not interpolate them. Pairs with \(\lambda \geq L\) never complete a turn: interpolate them by the full \(s\), so no extrapolation remains. Pairs in between get a blend. With \(r_i = L/\lambda_i\), the number of turns pair \(i\) makes in the original context <a href="https://arxiv.org/abs/2309.00071">[Peng et al. 2023, Eq. 10-13]</a>:</p>
+  <div class="eq-box">
+  \[ \gamma_i = \operatorname{clip}\!\Big(\frac{r_i - \alpha}{\beta - \alpha},\, 0,\, 1\Big), \qquad \theta'_i = (1-\gamma_i)\,\frac{\theta_i}{s} + \gamma_i\,\theta_i . \]
+  <div class="eq-label">\(r_i \le \alpha\): fully interpolated. \(r_i \ge \beta\): untouched. Suggested for the LLaMA family: \(\alpha = 1\), \(\beta = 32\)</div>
+  </div>
+  <p>The Hugging Face parameters <code>beta_fast</code> \(= \beta = 32\) and <code>beta_slow</code> \(= \alpha = 1\) are named for the rotation counts they bound, which is why the mapping looks reversed. Set \(\alpha = 1, \beta = 32\) with \(L = 4096\): pairs with wavelength under \(L/32 = 128\) tokens keep their frequency, pairs above 4,096 tokens are divided by \(s\).</p>
+
+  <p><strong>The temperature.</strong> YaRN also multiplies the logits: \(\softmax\big(q^\top k / (t\sqrt{d_h})\big)\) with</p>
+  \[ \sqrt{1/t} = 0.1\ln s + 1 . \]
+  <p>The authors fit this constant by minimizing perplexity against \(s\) for LLaMA 7B to 65B without fine-tuning, and found it also works "fairly well" for Llama 2 <a href="https://arxiv.org/abs/2309.00071">[§3.3, Eq. 15]</a>. It is implemented for free by scaling both \(q\) and \(k\) by \(\sqrt{1/t}\), for example by scaling the cos and sin tables, so the logits are multiplied by \(1/t = (0.1\ln s + 1)^2\).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">\(s\)</th><th class="num">\(\ln s\)</th><th class="num">\(\sqrt{1/t}\) (amplitude on \(q\) and \(k\))</th><th class="num">\(1/t\) (multiplier on logits)</th><th class="num">\(t\)</th></tr></thead>
+    <tbody>
+      <tr><td class="num">4</td><td class="num">1.3863</td><td class="num">1.1386</td><td class="num">1.2965</td><td class="num">0.771</td></tr>
+      <tr><td class="num">8</td><td class="num">2.0794</td><td class="num">1.2079</td><td class="num">1.4591</td><td class="num">0.685</td></tr>
+      <tr class="hl"><td class="num">40</td><td class="num">3.6889</td><td class="num">1.3689</td><td class="num">1.8739</td><td class="num">0.534</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>Why a temperature at all (our derivation, not the paper's).</strong> Under the dilution model, the needle's weight is about \(e^{\Delta}/N\). Going from \(N\) to \(sN\) keys and wanting the same weight requires the margin to grow by \(\ln s\): \(\Delta' = \Delta + \ln s\). A logit multiplier \(m\) gives \(m\Delta = \Delta + \ln s\), so \(m = 1 + \ln s/\Delta\). YaRN's fit is \(m = (1 + 0.1\ln s)^2 \approx 1 + 0.2\ln s\), which corresponds to an effective margin \(\Delta \approx 5\) nats. The same argument motivates Llama 4's logarithmic query scaling and Scalable-Softmax (<a href="05-positional-encoding.html#hybrids">page 05</a>). It is a heuristic: the constant was fitted, not derived, and other models may want another value.</p>
+
+  <h3 id="ramps">A trap: two ramps are both called YaRN</h3>
+  <p>The paper's \(\gamma\) is linear in \(r_i = L/\lambda_i\), that is linear in frequency. The reference implementation (Hugging Face <code>rope_type="yarn"</code>, and DeepSeek-V3's <code>precompute_freqs_cis</code>) instead finds the two boundary pair <em>indices</em> and ramps linearly in the index, which is linear in log-wavelength <a href="https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py">[DeepSeek-V3 <code>model.py</code>]</a>:</p>
+  \[ \text{low} = \Big\lfloor \tfrac{d\,\ln\!\big(L/(\beta\,2\pi)\big)}{2\ln b} \Big\rfloor, \quad \text{high} = \Big\lceil \tfrac{d\,\ln\!\big(L/(\alpha\,2\pi)\big)}{2\ln b} \Big\rceil, \quad \gamma_i = 1 - \operatorname{clip}\!\Big(\tfrac{i - \text{low}}{\text{high} - \text{low}}, 0, 1\Big). \]
+  <p>The endpoints agree (same set of untouched and fully interpolated pairs, up to rounding). The middle does not. At \(d = 128\), \(b = 10^4\), \(s = 8\), \(L = 4096\), pair 32 is slowed by 3.56 under the paper's ramp and 1.68 under the code's, and at pair 40 the two disagree by 6.45 against 3.06, a factor 2.1. Neither is "wrong", but a model fine-tuned with one and served with the other is silently different. The drill implements both (<code>ramp="wavelength"</code> and <code>ramp="index"</code>). Llama 3.1's <code>llama3</code> rule (below) uses the paper's form.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 452" role="img" aria-labelledby="fig-10-1-title">
+<title id="fig-10-1-title">Per-pair slow-down factor of each RoPE rescaling method against the pair's original wavelength, for head dimension 128, base 10,000, scale 8, original context 4,096</title>
+<text x="12" y="16" class="s-small s-muted">slow-down factor θ<tspan baseline-shift="sub" font-size="9">i</tspan> / θ′<tspan baseline-shift="sub" font-size="9">i</tspan> (1 = untouched, s = 8 = fully interpolated)</text>
+<line class="s-line" x1="80" y1="374.0" x2="660" y2="374.0" opacity="0.25"/>
+<text x="72" y="378.0" text-anchor="end" class="s-small s-mono">0</text>
+<line class="s-line" x1="80" y1="314.0" x2="660" y2="314.0" opacity="0.25"/>
+<text x="72" y="318.0" text-anchor="end" class="s-small s-mono">2</text>
+<line class="s-line" x1="80" y1="254.0" x2="660" y2="254.0" opacity="0.25"/>
+<text x="72" y="258.0" text-anchor="end" class="s-small s-mono">4</text>
+<line class="s-line" x1="80" y1="194.0" x2="660" y2="194.0" opacity="0.25"/>
+<text x="72" y="198.0" text-anchor="end" class="s-small s-mono">6</text>
+<line class="s-line" x1="80" y1="134.0" x2="660" y2="134.0" opacity="0.25"/>
+<text x="72" y="138.0" text-anchor="end" class="s-small s-mono">8</text>
+<line class="s-line" x1="122.8" y1="374" x2="122.8" y2="379"/>
+<text x="122.8" y="393" text-anchor="middle" class="s-small s-mono">10</text>
+<line class="s-line" x1="265.0" y1="374" x2="265.0" y2="379"/>
+<text x="265.0" y="393" text-anchor="middle" class="s-small s-mono">100</text>
+<line class="s-line" x1="407.2" y1="374" x2="407.2" y2="379"/>
+<text x="407.2" y="393" text-anchor="middle" class="s-small s-mono">1K</text>
+<line class="s-line" x1="549.4" y1="374" x2="549.4" y2="379"/>
+<text x="549.4" y="393" text-anchor="middle" class="s-small s-mono">10K</text>
+<line class="s-line" x1="80" y1="104" x2="80" y2="374"/>
+<line class="s-line" x1="80" y1="374" x2="660" y2="374"/>
+<text x="370" y="414" text-anchor="middle" class="s-small">original wavelength λ<tspan baseline-shift="sub" font-size="9">i</tspan> = 2π b<tspan baseline-shift="super" font-size="9">2i/d</tspan> in tokens (log scale; one point per pair, fastest at left)</text>
+<line class="s-line s-dash" x1="280.2" y1="104" x2="280.2" y2="374"/>
+<text x="280.2" y="98" text-anchor="middle" class="s-small s-bold">λ = L/32 = 128</text>
+<line class="s-line s-dash" x1="494.2" y1="104" x2="494.2" y2="374"/>
+<text x="494.2" y="98" text-anchor="middle" class="s-small s-bold">λ = L = 4,096</text>
+<polyline class="s-line-c" points="94.1,134.0 103.0,134.0 111.9,134.0 120.8,134.0 129.7,134.0 138.5,134.0 147.4,134.0 156.3,134.0 165.2,134.0 174.1,134.0 183.0,134.0 191.9,134.0 200.7,134.0 209.6,134.0 218.5,134.0 227.4,134.0 236.3,134.0 245.2,134.0 254.1,134.0 263.0,134.0 271.8,134.0 280.7,134.0 289.6,134.0 298.5,134.0 307.4,134.0 316.3,134.0 325.2,134.0 334.0,134.0 342.9,134.0 351.8,134.0 360.7,134.0 369.6,134.0 378.5,134.0 387.4,134.0 396.3,134.0 405.1,134.0 414.0,134.0 422.9,134.0 431.8,134.0 440.7,134.0 449.6,134.0 458.5,134.0 467.3,134.0 476.2,134.0 485.1,134.0 494.0,134.0 502.9,134.0 511.8,134.0 520.7,134.0 529.5,134.0 538.4,134.0 547.3,134.0 556.2,134.0 565.1,134.0 574.0,134.0 582.9,134.0 591.8,134.0 600.6,134.0 609.5,134.0 618.4,134.0 627.3,134.0 636.2,134.0 645.1,134.0 654.0,134.0" stroke-width="2.4"/>
+<polyline class="s-line-b" points="94.1,344.0 103.0,343.0 111.9,342.0 120.8,340.9 129.7,339.8 138.5,338.6 147.4,337.4 156.3,336.2 165.2,334.9 174.1,333.6 183.0,332.3 191.9,330.9 200.7,329.4 209.6,327.9 218.5,326.4 227.4,324.8 236.3,323.1 245.2,321.4 254.1,319.7 263.0,317.8 271.8,315.9 280.7,314.0 289.6,312.0 298.5,309.9 307.4,307.8 316.3,305.5 325.2,303.2 334.0,300.9 342.9,298.4 351.8,295.9 360.7,293.2 369.6,290.5 378.5,287.7 387.4,284.8 396.3,281.8 405.1,278.8 414.0,275.6 422.9,272.3 431.8,268.8 440.7,265.3 449.6,261.7 458.5,257.9 467.3,254.0 476.2,250.0 485.1,245.8 494.0,241.5 502.9,237.1 511.8,232.5 520.7,227.7 529.5,222.8 538.4,217.7 547.3,212.5 556.2,207.1 565.1,201.5 574.0,195.7 582.9,189.7 591.8,183.5 600.6,177.1 609.5,170.5 618.4,163.7 627.3,156.6 636.2,149.3 645.1,141.8 654.0,134.0" stroke-width="2.4"/>
+<polyline class="s-line-d s-dash" points="94.1,344.0 103.0,344.0 111.9,344.0 120.8,344.0 129.7,344.0 138.5,344.0 147.4,344.0 156.3,344.0 165.2,344.0 174.1,344.0 183.0,344.0 191.9,344.0 200.7,344.0 209.6,344.0 218.5,344.0 227.4,344.0 236.3,344.0 245.2,344.0 254.1,344.0 263.0,344.0 271.8,344.0 280.7,343.8 289.6,339.6 298.5,335.0 307.4,329.8 316.3,324.1 325.2,317.7 334.0,310.8 342.9,303.2 351.8,295.1 360.7,286.3 369.6,277.0 378.5,267.2 387.4,256.9 396.3,246.2 405.1,235.3 414.0,224.2 422.9,213.0 431.8,201.9 440.7,191.0 449.6,180.4 458.5,170.1 467.3,160.3 476.2,151.1 485.1,142.3 494.0,134.2 502.9,134.0 511.8,134.0 520.7,134.0 529.5,134.0 538.4,134.0 547.3,134.0 556.2,134.0 565.1,134.0 574.0,134.0 582.9,134.0 591.8,134.0 600.6,134.0 609.5,134.0 618.4,134.0 627.3,134.0 636.2,134.0 645.1,134.0 654.0,134.0" stroke-width="2.4"/>
+<polyline class="s-line-a" points="94.1,344.0 103.0,344.0 111.9,344.0 120.8,344.0 129.7,344.0 138.5,344.0 147.4,344.0 156.3,344.0 165.2,344.0 174.1,344.0 183.0,344.0 191.9,344.0 200.7,344.0 209.6,344.0 218.5,344.0 227.4,344.0 236.3,344.0 245.2,344.0 254.1,344.0 263.0,344.0 271.8,344.0 280.7,343.0 289.6,341.8 298.5,340.6 307.4,339.3 316.3,337.9 325.2,336.4 334.0,334.8 342.9,332.9 351.8,331.0 360.7,328.8 369.6,326.4 378.5,323.7 387.4,320.7 396.3,317.3 405.1,313.4 414.0,309.0 422.9,303.9 431.8,297.9 440.7,290.8 449.6,282.2 458.5,271.7 467.3,258.4 476.2,241.2 485.1,218.0 494.0,184.9 502.9,134.0 511.8,134.0 520.7,134.0 529.5,134.0 538.4,134.0 547.3,134.0 556.2,134.0 565.1,134.0 574.0,134.0 582.9,134.0 591.8,134.0 600.6,134.0 609.5,134.0 618.4,134.0 627.3,134.0 636.2,134.0 645.1,134.0 654.0,134.0" stroke-width="2.8"/>
+<line class="s-line-c" x1="12" y1="38" x2="46" y2="38" stroke-width="2.6"/>
+<text x="54" y="42" class="s-small">PI: every pair ÷ 8</text>
+<line class="s-line-b" x1="350" y1="38" x2="384" y2="38" stroke-width="2.6"/>
+<text x="392" y="42" class="s-small">NTK-aware: pair i slowed by 8<tspan baseline-shift="super" font-size="9">i/63</tspan></text>
+<line class="s-line-a" x1="12" y1="58" x2="46" y2="58" stroke-width="2.6"/>
+<text x="54" y="62" class="s-small">YaRN, reference-code ramp (linear in i)</text>
+<line class="s-line-d s-dash" x1="350" y1="58" x2="384" y2="58" stroke-width="2.6"/>
+<text x="392" y="62" class="s-small">YaRN, paper ramp (linear in r = L/λ)</text>
+<text x="80" y="436" class="s-small"><tspan class="s-bold">Pair 32</tspan> (λ = 628): PI ÷ 8.00, NTK-aware ÷ 2.88, YaRN ÷ 3.56 (paper ramp) or ÷ 1.68 (code ramp).</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Slow-down factor per RoPE pair (one point per pair) against its original wavelength, \(d_h = 128\), \(b = 10^4\), \(s = 8\), \(L = 4096\), \(\alpha = 1\), \(\beta = 32\). PI slows every pair by 8. NTK-aware slows pair \(i\) by \(8^{i/63}\), so mid-wavelength pairs are slowed less than 8 and are extrapolated. YaRN leaves pairs with wavelength under 128 untouched, fully interpolates those at or above about 4,096, and blends in between; the solid and dashed curves show the reference-code and paper ramps, which meet at both ends and differ inside (pair 40 is slowed 3.06× against 6.45×).</figcaption>
+  </figure>
+
+<pre><code class="language-python">import math, torch
+
+def theta(d, base):                                   # (d/2,) float64: 1, ..., base^(-(d-2)/d)
+    return base ** (-torch.arange(0, d, 2, dtype=torch.float64) / d)
+
+def slowdown(method, d=128, base=1e4, s=8.0, L=4096, alpha=1.0, beta=32.0):
+    """f_i = theta_i / theta'_i per pair (1 = untouched, s = fully interpolated)."""
+    n = d // 2
+    if method == "pi":
+        return torch.full((n,), s, dtype=torch.float64)
+    if method == "ntk":                               # b' = b * s^(d/(d-2))  =>  f_i = s^(i/(n-1))
+        return theta(d, base) / theta(d, base * s ** (d / (d - 2)))
+    if method == "yarn":                              # the paper's ramp: linear in r = L / wavelength
+        r = L / (2 * math.pi / theta(d, base))        # turns each pair makes inside the original context
+        g = ((r - alpha) / (beta - alpha)).clamp(0, 1)    # 1 = keep, 0 = interpolate
+        return 1.0 / ((1 - g) / s + g)                # theta'_i = (1-g) theta_i/s + g theta_i
+    raise ValueError(method)
+
+# YaRN also multiplies both q and k by 0.1*ln(s) + 1 (for example through the cos/sin tables)
+</code></pre>
+
+  <h3 id="worked-wavelengths">Worked numbers: what each method does to the wavelengths</h3>
+  <p>Take \(d_h = 128\) (64 pairs), \(b = 10^4\), \(s = 8\), and for YaRN \(L = 4096\), \(\alpha = 1\), \(\beta = 32\). Unmodified, pair 0 has wavelength \(2\pi = 6.28\) tokens and pair 63 has \(2\pi \cdot 10^{4\cdot 126/128} = 54{,}410\) tokens. Since \(\lambda'_i = f_i\lambda_i\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th class="num">Pair 0 (fastest)</th><th class="num">Pair 32 (\(\lambda = 628\))</th><th class="num">Pair 63 (slowest)</th><th class="num">Pairs untouched / blended / fully \(\div 8\)</th></tr></thead>
+    <tbody>
+      <tr><td>none</td><td class="num">6.28</td><td class="num">628</td><td class="num">54,410</td><td class="num">64 / 0 / 0</td></tr>
+      <tr><td>PI</td><td class="num">50.27</td><td class="num">5,027</td><td class="num">435,281</td><td class="num">0 / 0 / 64</td></tr>
+      <tr><td>NTK-aware (\(b' = 82{,}685\))</td><td class="num">6.28</td><td class="num">1,806 (\(\times 2.875\))</td><td class="num">435,281</td><td class="num">1 / 62 / 1</td></tr>
+      <tr><td>YaRN, paper ramp</td><td class="num">6.28</td><td class="num">2,238 (\(\times 3.56\))</td><td class="num">435,281</td><td class="num">21 / 25 / 18</td></tr>
+      <tr class="hl"><td>YaRN, code ramp</td><td class="num">6.28</td><td class="num">1,054 (\(\times 1.68\))</td><td class="num">435,281</td><td class="num">21 / 25 / 18</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Wavelengths in tokens. YaRN untouched pairs are 0 to 20 (wavelength at most 112, against \(L/32 = 128\)), fully interpolated pairs are 46 to 63 (wavelength at least 4,712, against \(L = 4096\)); under the paper ramp pair 45 (wavelength 4,080) is blended but already within 0.01 of fully interpolated, while under the code ramp it is still slowed only 6.3×. Every method that touches the slowest pair gives 435,281 = \(8 \times 54{,}410\).</p>
+  <p>Read across the rows: PI and YaRN differ at the fast end (PI moves the fastest pair from 6.3 to 50 tokens per turn; YaRN and NTK leave it), while NTK-aware and YaRN agree at both extremes and differ only in how the middle is bridged.</p>
+
+  <h3 id="llama3-rule">Llama 3.1's <code>llama3</code> rule</h3>
+  <p>Llama 3 raised the RoPE base to 500,000 at the start of pretraining, citing Xiong et al. <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.2]</a>. The Llama 3.1 release additionally ships a <code>rope_scaling</code> entry: <code>rope_type="llama3"</code>, <code>factor</code> 8, <code>low_freq_factor</code> 1, <code>high_freq_factor</code> 4, <code>original_max_position_embeddings</code> 8192, with <code>rope_theta</code> 500,000 and <code>max_position_embeddings</code> 131,072 <a href="https://huggingface.co/unsloth/Llama-3.1-8B/blob/main/config.json">[config, mirror]</a>. The Hugging Face implementation is short:</p>
+
+<pre><code class="language-python"># transformers/modeling_rope_utils.py, _compute_llama3_parameters (abridged)
+low_freq_wavelen  = old_context_len / low_freq_factor      # 8192 / 1 = 8192
+high_freq_wavelen = old_context_len / high_freq_factor     # 8192 / 4 = 2048
+wavelen = 2 * math.pi / inv_freq
+inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+smoothed = (1 - smooth) * inv_freq_llama / factor + smooth * inv_freq_llama
+is_medium = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+inv_freq_llama = torch.where(is_medium, smoothed, inv_freq_llama)   # attention_factor stays 1.0
+</code></pre>
+
+  <p>Read it as YaRN's paper ramp with \(\alpha\) = <code>low_freq_factor</code> = 1, \(\beta\) = <code>high_freq_factor</code> = 4, \(L\) = 8,192, \(s\) = <code>factor</code> = 8, and no temperature: \(r_i = L/\lambda_i\), \(\gamma = (r_i - 1)/3\), \(\theta' = (1-\gamma)\theta/8 + \gamma\theta\). (In medium-band pairs <code>inv_freq_llama</code> equals <code>inv_freq</code>, so the code's blend is exactly that. The drill's tests assert the equivalence.) At \(d_h = 128\), \(b = 5\times10^5\): the wavelength thresholds are 2,048 and 8,192, so pairs 0 to 28 (29 pairs) are untouched, pairs 29 to 34 (6 pairs, slowed by 1.21, 1.55, 2.03, 2.70, 3.68, 5.26) are blended, and pairs 35 to 63 (29 pairs) are divided by 8. The slowest wavelength goes from 2.56M to 20.5M tokens. YaRN's \(\beta = 32\) would leave only 19 pairs untouched at this base and \(L\), so Meta chose a much smaller \(\beta\).</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: <code>factor</code> is not \(L'/L\)</div>
+    <p>Llama 3.1 has <code>factor</code> 8 on an 8,192 original length, which would nominally reach 65,536, yet it advertises 131,072. Llama 3.2 1B ships <code>factor</code> 32 with the same 8,192, and page 05 lists Llama 4 Scout at 16. The base was already 500,000, so the model needed less slowing than the ratio implies, and the factor is best treated as a tuned slow-down for the slow pairs. <span class="unverified" title="The Llama 3 report we read describes only the base change to 500,000 and the staged schedule, not the rope_scaling entry. Whether the 128K checkpoints were trained with the rescaled frequencies, or only served with them, is not stated in the text we read.">Meta does not document how this entry was chosen, or whether the checkpoints were trained with it.</span></p>
+  </aside>
+
+  <h3 id="abf">Raising the base during training (ABF), and how far to raise it</h3>
+  <p>Xiong et al.'s "adjusted base frequency" raises \(b\) (10,000 to 500,000 for Llama 2) and trains through it, with results already in <a href="05-positional-encoding.html#rope-base">page 05</a>. The open question is how far. Two recent data points say the analytic rules undershoot. ProLong ablates the base at 64K: for Llama-3-8B (base 500K) the long-context average is 29.1 at 0.5M, 48.7 at 4M and 54.6 at 8M, with needle-style recall going 25.8, 81.3, 96.0, while a Dynamic-NTK-style rule suggests about 4M. At 512K, the rule suggests 64M and 128M and 256M did slightly better on average (57.7 and 57.8 against 57.6) <a href="https://arxiv.org/abs/2410.02660">[Gao et al. 2024, App. B.1, Tab. 18-19]</a>. ProLong ships 8M for the 64K stage and 128M for the 512K stage. Qwen2.5-1M raises the base at every stage: 10K to 1M, 1M at 64K, 5M at 128K, 10M at 256K <a href="https://arxiv.org/abs/2501.15383">[Qwen2.5-1M, §3]</a>. Base-raising and YaRN-style ramps also compose: UltraLong starts from Llama-3.1-8B-Instruct (base 500K, <code>factor</code> 8) and extends to 1M, 2M, 4M with YaRN scales 128, 256, 512 at \(\alpha = 1\), \(\beta = 4\), and reports it beating an NTK-aware base of \(3.58\times10^9\) at long lengths (RULER average below 1M: 80.17 against 76.62), while NTK-aware was slightly better below 128K (86.91 against 85.63) <a href="https://arxiv.org/abs/2504.06214">[Xu et al. 2025, §3.1, §6, Tab. 3]</a>.</p>
+
+  <h3 id="longrope">LongRoPE: search the factors</h3>
+  <p>If the ideal \(f_i\) is unknown, search for it. LongRoPE <a href="https://arxiv.org/abs/2402.13753">[Ding et al. 2024, §3]</a> makes two departures from the formulas above. (1) The factors \(\lambda_i\) (their name for \(f_i\)) are free parameters searched in \([1, 1.25\,s]\) in steps of 0.01 under a monotonicity constraint \(\lambda_i \le \lambda_{i+1}\), with an evolutionary search whose initial population contains the PI, NTK and YaRN factors, scored by perplexity on long samples. (2) The first \(\hat n\) positions (up to 256) are not rescaled, echoing the observation that initial tokens receive large attention (<a href="#failure-modes">attention sinks</a>). Then a progressive schedule reaches 2,048K tokens: search and fine-tune to 256K (LLaMA2: 400 steps at 128K, then 600 at 256K), then a <em>second</em> search on the fine-tuned model to 2,048K with no further fine-tuning, a total extension of 512×. Because rescaling hurts short inputs, they re-search factors for 4K and 8K and switch factor sets by input length at inference.</p>
+  <p>LongRoPE2 <a href="https://arxiv.org/abs/2502.20082">[Shang et al. 2025]</a> adds a hypothesis: higher RoPE dimensions are undertrained, so the "critical dimension" beyond which pairs stay out of distribution sits earlier than the analytic value (30 rather than 35 for LLaMA3-8B, 25 rather than 31 for Phi3-mini). Its search is scored on "needle" tokens only, and mixed-context-window training uses the original RoPE on short sequences and the rescaled RoPE on long ones. It reports extending LLaMA3-8B to 128K with 10B tokens (Meta used about 800B) while retaining over 98.5% of short-context performance, and a RULER score of 82.03 at 128K against 73.40 (LongRoPE), 73.19 (NTK) and 49.39 (YaRN). Read that with care: the comparison is inside the authors' own mid-training setup, the YaRN baseline improves to 71.46 when given their corrected critical dimension (Tab. 5), and switching between factor sets forces a one-time KV-cache recomputation, which the paper lists as a limitation <a href="https://arxiv.org/abs/2502.20082">[App. B]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Frequency rescaling for a longer window</div>
+    <dl>
+      <dt>Problem</dt><dd>Pairs whose wavelength exceeds the trained context, and offsets beyond it, carry phases the model never saw, and the softmax flattens with length.</dd>
+      <dt>Idea</dt><dd>Slow the pairs down by \(f_i \in [1, s]\): uniformly (PI), geometrically (NTK-aware, ABF), by wavelength class with a temperature (YaRN), or by search (LongRoPE). Then train briefly.</dd>
+      <dt>Why it works</dt><dd>Slower pairs revisit angles the network already handles, so extension becomes interpolation. Leaving fast pairs alone preserves local order. The remaining error is absorbed by continued training.</dd>
+      <dt>Evidence</dt><dd>PI: 1,000 steps to 32K <a href="https://arxiv.org/abs/2306.15595">[Chen et al.]</a>. YaRN: 400 steps to 64K (\(s = 16\)) plus 200 to 128K (\(s = 32\)), 256 + 128 A100-hours for a 7B, against 640 for PI at 16K, 6,400 for Code Llama's base change at about 100K and 64,000 for Llama 2 Long at about 50K <a href="https://arxiv.org/abs/2309.00071">[Peng et al., Tab. 4]</a>. Short-task damage at 16× on LLaMA-7B (MMLU 35.7 base): PI 25.9, NTK-aware 27.7, NTK-by-parts 32.7, YaRN 30.0 <a href="https://arxiv.org/abs/2309.00071">[Tab. 2]</a>.</dd>
+      <dt>Cost</dt><dd>Still needs long-data training for robust use, only heuristic constants (\(\alpha\), \(\beta\), the temperature, the base), some short-context loss, and (for length-dependent schemes) KV-cache bookkeeping.</dd>
+      <dt>Used by</dt><dd>Llama 3.1 (ramp, no temperature), DeepSeek-V3 and Kimi K2 (YaRN), Qwen2.5 and Qwen3 (ABF in training, YaRN plus DCA at inference), Gemma 3 (PI-like factor 8 on global layers), Phi-3-family models (the Hugging Face <code>longrope</code> rope type).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="recipes">How named models did it</h2>
+
+  <p>The pieces above combine into a recurring skeleton: short pretraining, a RoPE change, one or more continued-pretraining stages on long data, a check after each stage, and long-aware fine-tuning. The details differ, and so do the tokens spent.</p>
+
+  <h3 id="llama3-recipe">Llama 3: six stages, gated on two checks</h3>
+  <p>Llama 3 405B pretrained on 15.6T tokens at 8K (4K sequences early, 8K after 252M tokens) with RoPE base 500,000. Then "we increased context length gradually in six stages, starting from the original 8K context window and ending in the final 128K context window", on about 800B tokens, moving to the next stage only after the model "has successfully adapted": (1) short-context evaluations "recovered completely" and (2) the model "perfectly solves needle in a haystack tasks up to that length" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.4.2]</a>. The report gives neither the intermediate lengths nor the per-stage token counts. Two implementation facts matter:</p>
+  <ul>
+    <li><strong>Document masks.</strong> Llama 3 masks attention between documents packed into one sequence, and found this "limited impact during standard pre-training" but "important in continued pre-training on very long sequences" <a href="https://arxiv.org/abs/2407.21783">[§3.2]</a>. At 128K, a sequence holds dozens of unrelated documents, and letting every token attend to all of them adds noise and cross-document "dependencies" that do not exist.</li>
+    <li><strong>Context parallelism.</strong> The 128K stage ran TP 8, CP 16, PP 16, DP 8 on 16,384 GPUs, with 16M tokens per batch (16 sequences of 131,072 per DP rank), 380 TFLOPs per GPU and 38% MFU, against 43% MFU at 8K on 8,192 GPUs <a href="https://arxiv.org/abs/2407.21783">[Tab. 4]</a>. See <a href="#systems">systems</a>.</li>
+  </ul>
+  <p>Fine-tuning needed care too: "naively applying our existing SFT recipe with only short-context data resulted in significant regressions in long-context capabilities from pre-training". The fix was synthetic long data at 0.1% of the SFT mix: question answering over long documents (QA pairs generated from random 8K chunks, whole document as context), hierarchical summarization, and reasoning over code repositories (identify which files depend on a removed key file), bucketed at 16K, 32K, 64K and 128K. DPO stayed short-context only <a href="https://arxiv.org/abs/2407.21783">[§4.3.4]</a>. Reported results: multi-needle retrieval 98.8 (8B), 97.5 (70B), 98.1 (405B), and InfiniteBench En.MC 65.1, 78.2, 83.4 <a href="https://arxiv.org/abs/2407.21783">[Tab. 2, 21]</a>.</p>
+
+  <h3 id="deepseek-v3-recipe">DeepSeek-V3: YaRN on the RoPE key</h3>
+  <p>After 14.8T tokens at 4K, V3 applies YaRN and runs two phases of 1,000 steps each, 4K to 32K to 128K. The hyperparameters are identical in both phases: \(s = 40\), \(\alpha = 1\), \(\beta = 32\), \(\sqrt{t} = 0.1\ln s + 1\) as printed in the report. Phase 1 uses sequence length 32K and batch size 1,920, phase 2 uses 128K and 480, and the learning rate is 7.3e-6 for both, equal to the final pretraining learning rate <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.3]</a>. If the batch size counts sequences, as in V3's pretraining (15,360 sequences of 4,096, 62.9M tokens), then \(1{,}920 \times 32{,}768 = 480 \times 131{,}072 = 62.9\)M tokens per step: the same tokens per batch throughout, about 63B tokens per phase and 126B in total, 0.85% of pretraining. The extension cost 119K of 2,788K H800 GPU-hours.</p>
+
+  <p><strong>Why "applied exclusively to the decoupled shared key \(k^R\)".</strong> In MLA (<a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>) the content path \(q^C, k^C\) is position-free so that weight absorption works, and RoPE lives only in the 64-dimensional \(q^R\) (per head) and \(k^R\) (shared). There is nothing positional in the 128 content dimensions to rescale; the only frequency table in the whole attention is the one that rotates those 64 dimensions. The reference code shows the details <a href="https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py">[<code>inference/model.py</code>]</a>:</p>
+  <ul>
+    <li>The table is built for <code>dim = qk_rope_head_dim = 64</code>, so 32 pairs at base 10,000 (slowest wavelength \(2\pi\cdot10^{4\cdot62/64} = 47{,}117\) tokens), and is used to rotate <em>both</em> \(q^R\) and \(k^R\). The report's wording is loose: a relative rotation needs both sides on the same frequencies.</li>
+    <li>It uses the <em>code</em> ramp. With \(L = 4096\), \(\alpha = 1\), \(\beta = 32\): \(\text{low} = \lfloor 10.47 \rfloor = 10\) and \(\text{high} = \lceil 22.51 \rceil = 23\), so pairs 0 to 10 (11 pairs) are untouched, pairs 11 to 22 (12) are blended and pairs 23 to 31 (9) are divided by 40, taking the slowest wavelength to 1.88M tokens.</li>
+    <li>The temperature is not folded into cos and sin. The code multiplies the softmax scale of the <em>whole</em> 192-dimensional logit by \(\text{mscale}^2\): \(\text{mscale} = 0.1\ln 40 + 1 = 1.3689\), so the scale becomes \(192^{-1/2} \times 1.8739 = 0.1352\). Scaling only the rotated slice would rescale \(q^R\cdot k^R\) but not \(q^C\cdot k^C\); scaling the softmax scale rescales the sum.</li>
+    <li>It is <em>static</em>: the rescaled table and scale are chosen at construction when <code>max_seq_len &gt; original_seq_len</code>, so a 100-token prompt sees the extended model too. The config carries <code>factor</code> 40, <code>original_max_position_embeddings</code> 4096, <code>beta_fast</code> 32, <code>beta_slow</code> 1, <code>mscale</code> 1.0 and <code>max_position_embeddings</code> 163,840 (\(= 4096\times40\)) <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json">[config]</a>. Note 128K is 0.8 of that nominal range.</li>
+  </ul>
+  <p>On evaluation, V3 reports perfect needle retrieval to 128K after SFT (its Fig. 8), LongBench v2 accuracy 48.7 against GPT-4o 48.1, Claude-3.5-Sonnet 41.0, Qwen2.5-72B 39.4 and Llama-3.1-405B 36.1, and FRAMES 73.3 <a href="https://arxiv.org/abs/2412.19437">[Tab. 6]</a>. Its pretraining packs documents "but do[es] not incorporate cross-sample attention masking" (§4.1), the opposite choice from Llama 3.</p>
+
+  <h3 id="qwen-recipe">Qwen2.5-1M and Qwen3: base schedule plus inference-time extrapolation</h3>
+  <p>Qwen2.5-1M uses five stages: 4,096, then 32,768 (base raised from 10,000 to 1,000,000 with ABF), then 65,536 (base 1M), 131,072 (5M) and 262,144 (10M). In the last three stages 75% of sequences are at the current maximum length and 25% shorter. Because natural text "prioritize[s] local coherence", the data adds synthetic long-range tasks: fill-in-the-middle, keyword- and position-based paragraph retrieval, and paragraph reordering. The authors ran RULER at the end of each stage, and the table is a model of a readiness check <a href="https://arxiv.org/abs/2501.15383">[Qwen2.5-1M, §3, Tab. 2]</a>:</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-10-2-title">
+<title id="fig-10-2-title">RULER average of Qwen2.5-14B-1M by evaluation length after each of its four long-context pretraining stages</title>
+<text x="12" y="16" class="s-small s-muted">RULER average score (13 tasks) of Qwen2.5-14B-1M checkpoints, by evaluation length</text>
+<line class="s-line" x1="80" y1="300.0" x2="500" y2="300.0" opacity="0.25"/>
+<text x="72" y="304.0" text-anchor="end" class="s-small s-mono">30</text>
+<line class="s-line" x1="80" y1="261.4" x2="500" y2="261.4" opacity="0.25"/>
+<text x="72" y="265.4" text-anchor="end" class="s-small s-mono">40</text>
+<line class="s-line" x1="80" y1="222.9" x2="500" y2="222.9" opacity="0.25"/>
+<text x="72" y="226.9" text-anchor="end" class="s-small s-mono">50</text>
+<line class="s-line" x1="80" y1="184.3" x2="500" y2="184.3" opacity="0.25"/>
+<text x="72" y="188.3" text-anchor="end" class="s-small s-mono">60</text>
+<line class="s-line" x1="80" y1="145.7" x2="500" y2="145.7" opacity="0.25"/>
+<text x="72" y="149.7" text-anchor="end" class="s-small s-mono">70</text>
+<line class="s-line" x1="80" y1="107.1" x2="500" y2="107.1" opacity="0.25"/>
+<text x="72" y="111.1" text-anchor="end" class="s-small s-mono">80</text>
+<line class="s-line" x1="80" y1="68.6" x2="500" y2="68.6" opacity="0.25"/>
+<text x="72" y="72.6" text-anchor="end" class="s-small s-mono">90</text>
+<line class="s-line" x1="80" y1="30.0" x2="500" y2="30.0" opacity="0.25"/>
+<text x="72" y="34.0" text-anchor="end" class="s-small s-mono">100</text>
+<line class="s-line" x1="80.0" y1="300" x2="80.0" y2="305"/>
+<text x="80.0" y="319" text-anchor="middle" class="s-small s-mono">4K</text>
+<line class="s-line" x1="164.0" y1="300" x2="164.0" y2="305"/>
+<text x="164.0" y="319" text-anchor="middle" class="s-small s-mono">8K</text>
+<line class="s-line" x1="248.0" y1="300" x2="248.0" y2="305"/>
+<text x="248.0" y="319" text-anchor="middle" class="s-small s-mono">16K</text>
+<line class="s-line" x1="332.0" y1="300" x2="332.0" y2="305"/>
+<text x="332.0" y="319" text-anchor="middle" class="s-small s-mono">32K</text>
+<line class="s-line" x1="416.0" y1="300" x2="416.0" y2="305"/>
+<text x="416.0" y="319" text-anchor="middle" class="s-small s-mono">64K</text>
+<line class="s-line" x1="500.0" y1="300" x2="500.0" y2="305"/>
+<text x="500.0" y="319" text-anchor="middle" class="s-small s-mono">128K</text>
+<line class="s-line" x1="80" y1="30" x2="80" y2="300"/>
+<line class="s-line" x1="80" y1="300" x2="500" y2="300"/>
+<text x="290" y="340" text-anchor="middle" class="s-small">evaluation length (tokens)</text>
+<line class="s-line s-dash" x1="80" y1="85.5" x2="500" y2="85.5"/>
+<text x="86" y="80.5" class="s-small s-muted">85.6: RULER pass mark</text>
+<polyline class="s-line-c" points="80.0,42.3 164.0,50.4 248.0,45.8 332.0,60.1 416.0,121.0 500.0,270.7" stroke-width="2.2"/>
+<circle class="s-fill-c" cx="416.0" cy="121.0" r="3.5"/>
+<circle class="s-fill-c" cx="500.0" cy="270.7" r="3.5"/>
+<polyline class="s-line-b" points="80.0,43.5 164.0,47.4 248.0,54.7 332.0,58.9 416.0,81.3 500.0,199.7" stroke-width="2.2"/>
+<circle class="s-fill-b" cx="416.0" cy="81.3" r="3.5"/>
+<circle class="s-fill-b" cx="500.0" cy="199.7" r="3.5"/>
+<polyline class="s-line-d" points="80.0,43.5 164.0,45.8 248.0,57.0 332.0,58.5 416.0,57.0 500.0,92.5" stroke-width="2.2"/>
+<circle class="s-fill-d" cx="416.0" cy="57.0" r="3.5"/>
+<circle class="s-fill-d" cx="500.0" cy="92.5" r="3.5"/>
+<polyline class="s-line-a" points="80.0,47.0 164.0,53.9 248.0,56.6 332.0,52.8 416.0,61.2 500.0,77.8" stroke-width="2.8"/>
+<circle class="s-fill-a" cx="416.0" cy="61.2" r="3.5"/>
+<circle class="s-fill-a" cx="500.0" cy="77.8" r="3.5"/>
+<text x="510" y="274.7" class="s-small s-bold s-tc">37.6</text>
+<text x="510" y="203.7" class="s-small s-bold s-tb">56.0</text>
+<text x="510" y="105.5" class="s-small s-bold s-td">83.8</text>
+<text x="510" y="71.8" class="s-small s-bold s-ta">87.6</text>
+<text x="545" y="68" class="s-small s-bold">after training stage</text>
+<line class="s-line-c" x1="545" y1="84" x2="571" y2="84" stroke-width="2.6"/>
+<text x="579" y="82" class="s-small">32K</text>
+<text x="579" y="95" class="s-small s-muted">RoPE base 1M</text>
+<line class="s-line-b" x1="545" y1="110" x2="571" y2="110" stroke-width="2.6"/>
+<text x="579" y="108" class="s-small">64K</text>
+<text x="579" y="121" class="s-small s-muted">RoPE base 1M</text>
+<line class="s-line-d" x1="545" y1="136" x2="571" y2="136" stroke-width="2.6"/>
+<text x="579" y="134" class="s-small">128K</text>
+<text x="579" y="147" class="s-small s-muted">RoPE base 5M</text>
+<line class="s-line-a" x1="545" y1="162" x2="571" y2="162" stroke-width="2.6"/>
+<text x="579" y="160" class="s-small">256K</text>
+<text x="579" y="173" class="s-small s-muted">RoPE base 10M</text>
+<text x="80" y="362" class="s-small">Training at 256K raises the 128K score from 83.8 to 87.6 and is the first checkpoint above the pass mark there.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> RULER average of Qwen2.5-14B-1M at each evaluation length after each pretraining stage (Tab. 2 of the report). Each stage lifts the curve at the lengths near its own training length; the 256K stage also improves 128K (83.8 to 87.6) even though 128K is shorter than its training length. The dashed line is RULER's pass mark from the RULER paper, drawn only for orientation, since the two papers' evaluation harnesses may differ.</figcaption>
+  </figure>
+
+  <p>Post-training uses two-stage SFT (first short data up to 32,768 tokens, then a mix up to 262,144, with synthetic long queries answered by an agent framework that reads chunk by chunk), and an offline preference stage using only short samples (up to 8,192 tokens), which still raised LongBench-Chat by 0.20 to 0.75 points. At inference, <strong>Dual Chunk Attention</strong> plus YaRN's attention scaling extends a model trained to 256K to 1M with no further training, and sparse attention with chunked prefill gives a 3× to 7× prefill speedup at 1M. The reported RULER at 128K is 92.2 for Qwen2.5-14B-Instruct-1M against 65.8 for GPT-4o-mini, with short-context benchmarks close to the 128K versions <a href="https://arxiv.org/abs/2501.15383">[Tab. 4, 6]</a>. The released 7B has <code>rope_theta</code> \(10^7\) and <code>max_position_embeddings</code> 1,010,000 <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-1M">[model card]</a>.</p>
+  <p>Qwen3 is the same skeleton at smaller scale: 30T tokens at 4,096, about 5T higher-quality tokens at 4,096, then "hundreds of billions of tokens" at 32,768 (75% between 16K and 32K), base 10,000 to 1,000,000, and YaRN plus DCA at inference for a fourfold extension to 128K <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §3.2]</a>. Its RULER at 128K with YaRN factor 4 is 77.4 for Qwen3-8B and 90.6 for Qwen3-235B-A22B in non-thinking mode; thinking mode scores a little lower, which the authors attribute to reasoning text interfering with retrieval (Tab. 23).</p>
+
+  <h3 id="gemma-recipe">Gemma 3 and 4: make the long layers few</h3>
+  <p>Gemma 3 pretrains at 32K and takes the 4B, 12B and 27B models to 128K "at the end of pre-training while rescaling RoPE", in a process similar to PI with a factor of 8. Global layers use base 1M and local layers 10K, in a 5:1 local:global pattern with 1,024-token windows. Ablations found little perplexity effect from the ratio or window, while the KV overhead at 32K context falls from about 60% of memory ("global only") to under 15% (1:3, window 1,024); the models "generalize to 128K, but rapidly degrade as we continue to scale" <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §5.2-5.3]</a>. Gemma 4 keeps 5:1 (4:1 for the smallest), uses partial RoPE with \(p = 0.25\) on global layers and plain RoPE on local layers, reuses keys as values in global layers, and shares KV across layers, which the report credits with cutting the global KV footprint by up to 37.5%. Its RULER at 128K (no thinking) is 96.4 for the 31B, against 66.0 for Gemma 3 27B <a href="https://arxiv.org/abs/2607.02770">[Gemma 4, §2, Tab. 9]</a>. Both are architecture answers to the cost curves of <a href="#why-staged">the first section</a>, developed on <a href="09-beyond-full-attention.html">page 09</a>.</p>
+
+  <h3 id="v4-recipe">DeepSeek-V4: native 1M inside pretraining</h3>
+  <p>V4 is the state of the art recipe on this page, and it inverts the standard skeleton <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §4.1-4.2]</a>. Training starts at 4K and the sequence length grows to 16K, 64K and then 1M during pretraining (V4-Flash on 32T tokens, V4-Pro on 33T). Attention is dense for the first 1T tokens (V4-Pro has a longer dense phase); sparse attention is introduced at the 64K stage after a short warm-up of the lightning indexer, and kept for the rest. Unlike V3, it uses sample-level attention masking. Long documents are curated, "prioritizing scientific papers, technical reports". Each attention layer applies RoPE to the last 64 of its 512 dimensions and, because keys and values share the entry, rotates the same slice of each attention output by position \(-t\) (<a href="05-positional-encoding.html#rope-where">page 05</a>). <span class="unverified" title="The passages of the report we read do not mention YaRN, a RoPE base, or a separate context-extension step; we could not search the full text.">We did not find a separate extension stage or a YaRN setting in the report.</span> The efficiency side (27% of V3.2's single-token FLOPs and 10% of its KV cache at 1M) is on <a href="07-kv-efficient-attention.html#after-mla">page 07</a>.</p>
+  <p>Long-context results, with a caveat that the authors re-ran Claude Opus 4.6 and Gemini 3.1 Pro themselves "to standardize the configuration" and did not evaluate GPT-5.4 because its API failed on many queries <a href="https://arxiv.org/abs/2606.19348">[§5.3.1-5.3.2, Tab. 6-7]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>1M-token benchmark</th><th class="num">DeepSeek-V4-Pro-Max</th><th class="num">Claude Opus 4.6 Max</th><th class="num">Gemini 3.1 Pro High</th></tr></thead>
+    <tbody>
+      <tr><td>MRCR 1M (MMR)</td><td class="num">83.5</td><td class="num">92.9</td><td class="num">76.3</td></tr>
+      <tr><td>CorpusQA 1M (accuracy)</td><td class="num">62.0</td><td class="num">71.7</td><td class="num">53.8</td></tr>
+    </tbody>
+  </table></div>
+  <p>V4-Flash-Max scores 78.7 and 60.5. The authors' own reading: retrieval on the 8-needle MRCR curve "remains highly stable" within 128K, degradation "becomes visible beyond the 128K mark", yet 1M retrieval stays "remarkably strong" (their Fig. 9); V4-Pro is ahead of Gemini 3.1 Pro and behind Opus 4.6 on both.</p>
+
+  <h3 id="recipe-table">Side by side</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th>Short stage</th><th>Extension path</th><th>RoPE change</th><th>Long-stage tokens</th><th>Notable</th></tr></thead>
+    <tbody>
+      <tr><td>Llama 3 405B</td><td>8K, 15.6T tokens</td><td>six stages to 128K, gated</td><td>base 500K from the start; 3.1 config: <code>llama3</code> rule, factor 8</td><td>~800B</td><td>document masks; CP 16; SFT with 0.1% synthetic long data</td></tr>
+      <tr><td>DeepSeek-V3</td><td>4K, 14.8T</td><td>4K, 32K, 128K; 1,000 steps each</td><td>YaRN \(s = 40\) on the 64 RoPE dims</td><td>~126B (derived); 119K GPU-hours</td><td>static YaRN; \(\text{mscale}^2\) on the whole logit; no cross-sample mask</td></tr>
+      <tr><td>Qwen2.5-1M</td><td>4K, then 32K</td><td>4K, 32K, 64K, 128K, 256K; DCA + YaRN to 1M</td><td>ABF: 10K, 1M, 1M, 5M, 10M</td><td>not stated in the sections read</td><td>synthetic long-range tasks; 75/25 length mix</td></tr>
+      <tr><td>Qwen3</td><td>4K, 35T</td><td>32K in the last stage</td><td>ABF 10K to 1M; YaRN + DCA at inference</td><td>"hundreds of billions"</td><td>thinking mode scores lower on RULER</td></tr>
+      <tr><td>Gemma 3</td><td>32K</td><td>128K at end of pretraining</td><td>PI-like factor 8; global base 1M, local 10K</td><td>not stated</td><td>5:1 local:global, 1,024 window</td></tr>
+      <tr><td>ProLong-8B</td><td>Llama-3-8B (8K)</td><td>64K (20B), then 512K (20B)</td><td>base \(8\times10^6\), then \(1.28\times10^8\)</td><td>40B</td><td>60% long / 40% short; document masks; SFT on short data only</td></tr>
+      <tr><td>UltraLong-8B</td><td>Llama-3.1-8B-Instruct</td><td>one step to 1M, 2M or 4M</td><td>YaRN \(\alpha = 1, \beta = 4\), \(s = 128, 256, 512\)</td><td>1B</td><td>separators, no cross-doc mask; short SFT</td></tr>
+      <tr><td>LongRoPE2 (LLaMA3-8B)</td><td>8K</td><td>mid-training to 128K</td><td>searched factors, mixed windows</td><td>10B</td><td>original RoPE kept for short inputs</td></tr>
+      <tr><td>DeepSeek-V4-Pro</td><td>4K</td><td>4K, 16K, 64K, 1M inside pretraining</td><td>partial RoPE (64 dims) + inverse RoPE on outputs</td><td>33T total</td><td>dense first 1T tokens, sparse from 64K; sample-level masking</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2 id="data">Data: how much, what mix, how to pack</h2>
+
+  <h3 id="how-much">How many long tokens?</h3>
+  <p>Budgets in the table span four orders of magnitude, because the goals differ. Fu et al. continue LLaMA-2 7B at 80K on per-source-upsampled SlimPajama and track needle accuracy at up to 128K as the token count grows: 37.8% at 100M tokens, 59.0% at 300M, 81.1% at 500M, 85.3% at 1B, 88.0% at 5B and 84.0% at 10B, where the model starts to overfit its 80K range (GPT-4 128K: 87.1%). Their conclusion is that "500 million to 5 billion tokens are enough" for retrieval anywhere in 128K, because the capability is mostly already acquired in pretraining <a href="https://arxiv.org/abs/2402.10171">[Fu et al. 2024, Fig. 1, 3]</a>. Xiong et al. used 400B tokens, Llama 3 about 800B, ProLong 40B, UltraLong 1B. The gap is not a contradiction: passkey-style retrieval is cheap to unlock, while robust use on realistic tasks, with short-context quality preserved, is what the larger budgets buy. ProLong gets long-context results above Llama-3.1-8B-Instruct on most HELMET categories with 5% of its long-context tokens, but stresses that it evaluates after SFT and on downstream tasks, not on needles <a href="https://arxiv.org/abs/2410.02660">[Gao et al. 2024, §6]</a>.</p>
+
+  <h3 id="mix">The mixture</h3>
+  <p><strong>Upsample long documents per domain, do not reweight domains.</strong> Fu et al. keep SlimPajama's domain proportions (67% CommonCrawl, 15% C4, 4.5% each GitHub, Wikipedia, Books, 2.5% arXiv, 2% StackExchange) and raise the share of documents longer than 4K <em>inside each domain</em> from about 30% to about 70%. The alternatives change the domain mix as a side effect, because long documents concentrate in books and code. Upsampling books alone cuts book loss by 0.175 at 0 to 4K tokens but raises loss on C4 (+0.010), CommonCrawl (+0.016), StackExchange (+0.021) and GitHub (+0.029); per-source upsampling is the most balanced, with no domain worse by more than 0.008 at 0 to 4K and six of seven domains better at 4K to 128K <a href="https://arxiv.org/abs/2402.10171">[Tab. 5]</a>.</p>
+  <p><strong>Keep a large share of high-quality short data.</strong> ProLong's ablations, with Llama-3-8B and 5B tokens at 64K: 60% long data and 40% short data is best on average; more long data helps at first and then hurts, short-task performance falls monotonically with the long fraction, and evaluated after SFT, all-long training is a poor initialization. The long part is best as a 1:1 mix of code repositories and books (books help in-context learning, summarization and re-ranking, code helps needle-style recall), and the short part matters: their curated "ShortMix" beats SlimPajama, FineWeb-Edu and DCLM as the short component on both long and short scores, notably GSM8K (46.6 against 39.4 to 41.9 for the others) <a href="https://arxiv.org/abs/2410.02660">[§3, Tab. 4-6]</a>. In a head-to-head at 5B tokens the ProLong mix beats the Fu et al. mix (long-task average 54.6 against 51.8 after SFT), though that comparison is by ProLong's authors.</p>
+  <p><strong>Data quality may matter more than length.</strong> Xiong et al. found that removing most long text from Llama 2's mix still recovers most of the long-task gain, and that upsampling existing long text had no consistent advantage: the new mix's gains "mostly come from the quality of the data itself" <a href="https://arxiv.org/abs/2309.16039">[Tab. 7-8, §4.2]</a>. Three studies, three emphases: domain-balanced length upsampling, short/long balance, and quality. They agree that a naive "only long documents" corpus is the wrong answer.</p>
+  <p><strong>Synthetic long-range data is contested.</strong> Qwen2.5-1M adds synthetic retrieval and reordering tasks during pretraining, and Llama 3 mixes 0.1% synthetic long data into SFT. ProLong finds synthetic long instruction data does not help and adding even 1% hurts, and UltraLong also fine-tunes on short data only. ProLong's hypotheses: earlier work under-trained the long stage so synthetic data acted as extra long training, and Llama 3's short SFT set is much larger and can afford to be diluted <a href="https://arxiv.org/abs/2410.02660">[§5, Tab. 8]</a>. Treat it as an open question tied to how much long pretraining came first.</p>
+  <p><strong>Train longer than you evaluate.</strong> Switching ProLong from 64K to 512K training, at the same extra 4B tokens, improved every long category at a 64K evaluation length (recall 95.0 to 98.5, re-ranking 28.0 to 32.9) <a href="https://arxiv.org/abs/2410.02660">[Tab. 7]</a>; Qwen2.5-1M's last stage gave the same at 128K (Figure 2). ProLong's toy argument: a document of \(nd\) tokens contains \((n-1)(d-1)\) more distance-\(d\) dependencies than \(n\) documents of \(d\) tokens.</p>
+
+  <h3 id="packing">Packing and masking at long lengths</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Choice</th><th>Who</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Pack, attend across documents</td><td>DeepSeek-V3; UltraLong (special separator tokens)</td><td>UltraLong: without separators RULER (below 1M) drops from 80.17 to 79.15 <a href="https://arxiv.org/abs/2504.06214">[Tab. 3]</a></td></tr>
+      <tr><td>Document (sample-level) masks</td><td>Llama 3, ProLong, DeepSeek-V4</td><td>ProLong: long-task average 53.6 to 54.6, short 64.9 to 65.5, re-ranking 20.4 to 29.4 <a href="https://arxiv.org/abs/2410.02660">[Tab. 20]</a>; Llama 3: "important in continued pre-training on very long sequences"</td></tr>
+      <tr><td>Intra-document + window schedule</td><td>SkyLadder</td><td>IntraDoc best packing at every context size in a 1B study, partly because it shortens the average context <a href="https://arxiv.org/abs/2503.15450">[§3.3]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>Reasons to mask, beyond noise: attention compute drops from \(T^2\) to \(\sum_d \ell_d^2\) over the document lengths \(\ell_d\), and a mask makes the query see only text that can be relevant. Reasons not to: it needs a varlen kernel or a block-sparse mask (and with context parallelism a mask-aware scheme, one reason Llama 3 chose all-gather CP), and in UltraLong's setting (one epoch on 1B tokens) full attention with separators did well. The evidence is mixed and setting-dependent.</p>
+
+  <h3 id="regression">Short-context regressions and how to prevent them</h3>
+  <p>Measured damage from extension depends on the method and the training. PI on LLaMA-7B loses 0.01 to 0.05 perplexity and stays within about 2 points of the original on every listed benchmark except BoolQ at 8K, with larger drops at longer targets (BoolQ 76.1 to 73.2 at 8K and 64.7 at 32K). YaRN at \(s = 16\) then \(32\) on Llama 2 7B: MMLU 43.8, 42.5, 41.7, and a 0.49% average drop over four benchmarks between \(s = 16\) and \(s = 32\) <a href="https://arxiv.org/abs/2309.00071">[Tab. 3]</a>. In LongRoPE2's setup on Phi3-mini (original: MMLU 70.78, GSM8K 78.54), plain YaRN falls to 63.22 and 57.39, NTK to 66.43 and 63.99, LongRoPE to 67.26 and 67.17, and LongRoPE2 holds 70.04 and 73.62 <a href="https://arxiv.org/abs/2502.20082">[Tab. 4]</a>. What works, roughly in order of how often it appears:</p>
+  <ol>
+    <li><strong>Mix in high-quality short data</strong> during the long stage (ProLong's 40%; Llama 3's second gate, "short-context evaluations have recovered completely").</li>
+    <li><strong>Keep the short-input model unchanged</strong> when possible: dynamic scaling below \(L\), LongRoPE's per-length factor sets, or LongRoPE2's original RoPE on short windows during training (cost: two RoPE configurations to serve, and a KV recompute when the length crosses the switch).</li>
+    <li><strong>Small stages, checked each time</strong> (Llama 3's six stages; Qwen2.5-1M's RULER table).</li>
+    <li><strong>Start from an instruct model or restore instruction data</strong> afterwards: ProLong initializes its final model from Llama-3-8B-Instruct, which helped short-context scores.</li>
+    <li><strong>Mind SFT.</strong> Llama 3 saw long-context regressions from short-only SFT, ProLong and UltraLong did not: the answer depends on how strong the long pretraining was.</li>
+  </ol>
+  <p>Static YaRN as in V3 changes behavior at every length, so its short-context numbers need to be reported alongside the long ones; page 27 covers V3's full evaluation.</p>
+</section>
+
+<section>
+  <h2 id="systems">Systems for long sequences</h2>
+  <p>The distributed-training details are on <a href="15-distributed-training.html">page 15</a> and the kernels on <a href="16-gpus-kernels.html">page 16</a>. What a model builder needs to know here:</p>
+
+  <p><strong>Context parallelism</strong> <span class="zh">上下文并行</span> shards the sequence across GPUs. Llama 3 splits each sequence into \(2\times\text{CP}\) chunks and gives rank \(i\) chunks \(i\) and \(2\text{CP}-1-i\), which balances the causal mask's uneven work. It then <em>all-gathers</em> K and V and computes attention for the local Q chunk. The all-gather latency sits on the critical path, but the paper gives two reasons that it is acceptable: it supports arbitrary masks such as document masks with little effort, and with GQA the gathered K and V tensors are much smaller than Q, so \(O(S^2)\) attention dwarfs an \(O(S)\) all-gather <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</p>
+
+  <p><strong>Ring Attention</strong> <span class="zh">环形注意力</span> <a href="https://arxiv.org/abs/2310.01889">[Liu et al. 2023]</a> instead passes KV blocks around a ring, so each device holds one query block and receives key-value blocks from its neighbor while computing on the current one. With block size \(c\) tokens and hidden size \(d\), each block step does \(4dc^2\) FLOPs and moves \(4cd\) bytes, so the transfer hides behind compute when \(4dc^2/F \ge 4cd/B\), that is \(c \ge F/B\) (compute rate over link bandwidth). Per-device activation memory is \(6bch\) bytes, independent of total length, so context grows with device count. Their Table 2 puts the minimum sequence per device (\(6c\)) at 6.2K tokens for A100s on NVLink but 149.5K for A100s on InfiniBand, a reminder that the trick needs fast links. Table 3 reports, for a 7B model, 4,096K tokens on 32 A100s against 128K for the memory-efficient baseline (32×) and 8,192K on a TPUv4-1024 against 16K (512×). Both schemes are exact; they differ in mask flexibility (all-gather) versus never materializing full K and V on one device (ring).</p>
+
+  <p><strong>Training throughput.</strong> Llama 3's MFU drops from 43% at 8K to 38% at 128K even with CP. Xiong et al. measured about 17% speed loss going from 4K to 16K sequences for a 70B model, and Fu et al. found 80K training only about 3× slower than 4K in an IO-bound setup with CPU offloading <a href="https://arxiv.org/abs/2309.16039">[§2.1]</a>, <a href="https://arxiv.org/abs/2402.10171">[§4]</a>: at that scale the quadratic term is partly hidden behind other costs, until it is not.</p>
+
+  <p><strong>Chunked prefill</strong> <span class="zh">分块预填充</span> processes a long prompt in chunks, each attending to the cache built so far (the end-aligned mask of <a href="07-kv-efficient-attention.html#gqa">page 07</a>), which bounds peak activation memory and lets decode requests interleave with a long prefill. Qwen2.5-1M's serving stack combines it with sparse attention for the 3× to 7× prefill speedup at 1M, and the recommended vLLM setup is <code>enable_chunked_prefill=True</code> with <code>max_num_batched_tokens=131072</code>. Its KV cache alone is large: Qwen2.5-7B has 28 layers, 4 KV heads and head dimension 128, so \(28\cdot2\cdot4\cdot128\cdot2 = 57{,}344\) B per token, 54 GiB at 1,010,000 tokens, and the model card asks for at least 120 GB of VRAM across GPUs <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-1M">[model card]</a>. Cache-reduction levers (MLA, quantization, windows) are in <a href="07-kv-efficient-attention.html#other-levers">page 07</a> and <a href="17-inference-serving.html">page 17</a>.</p>
+</section>
+
+<section>
+  <h2 id="evaluation">Evaluation: what each test measures</h2>
+
+  <p>A long-context claim has three separable parts: the model can <em>access</em> a fact placed far away, can <em>use</em> it (compose, aggregate, reason), and has <em>not lost</em> short-context quality or speed. Each benchmark below covers some of these and hides others.</p>
+
+  <h3 id="ppl">Perplexity: necessary, not sufficient</h3>
+  <p>Loss on long documents is cheap and smooth, and it should fall with context length. Xiong et al. fit validation loss as a power law in context length, \(\mathcal{L}(c) = (\alpha/c)^{\beta} + \gamma\) up to 32,768 tokens for each Llama 2 Long size <a href="https://arxiv.org/abs/2309.16039">[Xiong et al., Fig. 1]</a>, and per-position loss curves (their App. C) show whether loss "explodes" beyond the training length (it does for plain Llama 2 past 4,096, not with ABF). But averaged loss is dominated by tokens that need only local context. Fu et al. compare the original data mixture with per-source length upsampling: validation losses at 1K, 16K, 32K, 64K and 128K differ by at most 0.01 (1.80, 1.56, 1.42, 1.33, 1.37 against 1.80, 1.56, 1.41, 1.32, 1.36), yet the original mixture "performs badly on precise retrieval", which is why they recommend the needle test <a href="https://arxiv.org/abs/2402.10171">[Fig. 4]</a>. Men et al.'s extension with small base kept low perplexity to 128K while failing to retrieve from 1K back (<a href="05-positional-encoding.html#remedies">page 05</a>). Use loss as a regression alarm and a per-position sanity check, never as the headline.</p>
+
+  <h3 id="niah">Needle in a haystack: a floor, not a ceiling</h3>
+  <p>Needle in a haystack (NIAH) <span class="zh">大海捞针</span> inserts one short fact at depth \(d\) into filler text of length \(T\) and asks for it, giving a \(d \times T\) grid (the drill builds this grid). It tests one thing, exact retrieval of a near-unique string. Llama 3 reports 100% retrieval at every depth and length, DeepSeek-V3 a fully green grid to 128K (its Fig. 8), Qwen2.5-14B-1M perfect passkey retrieval to 1M, and UltraLong-8B 100% up to 4M tokens. Such a result is now table stakes. Why it means little on its own:</p>
+  <ul>
+    <li><strong>The needle is a low-entropy signal.</strong> The needle is near-unique in mostly irrelevant text, so success can reduce to matching a rare string. In HELMET's data most models score either near 100% or near 0% on it, leaving nothing to rank; its Spearman correlation with a realistic long-QA benchmark (InfiniteBench QA, 35 instruction-tuned models) is 0.63, against 0.81 for RULER's multi-key NIAH and 0.88 for HotpotQA in a retrieval-augmented setup <a href="https://arxiv.org/abs/2410.02694">[Yen et al. 2025, §3.1, Fig. 4]</a>.</li>
+    <li><strong>Passing it does not transfer even to nearby retrieval.</strong> Llama 3.1 70B scores 100.00 on InfiniteBench passkey retrieval at 128K but 2.22 on key-value retrieval, a task that is also plain lookup (the STRING paper's Table 3; a training-free position remapping lifts the second to 76.07) <a href="https://arxiv.org/abs/2410.18745">[An et al. 2024]</a>.</li>
+    <li><strong>Literal overlap does the work.</strong> NoLiMa measures the ROUGE-1 precision between question and needle context at 0.905 for vanilla NIAH and 0.069 for its own design, where questions and needles share almost no words and linking them needs a world-knowledge hop <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al. 2025, Tab. 1]</a>.</li>
+  </ul>
+
+  <h3 id="ruler">RULER and the effective context length</h3>
+  <p>RULER <a href="https://arxiv.org/abs/2404.06654">[Hsieh et al. 2024]</a> generates 13 synthetic tasks in four categories at controllable lengths: <strong>retrieval</strong> (single-key, multi-key with distractor needles, multi-value and multi-query variants), <strong>multi-hop tracing</strong> (variable tracking: follow \(X_2 = X_1\), \(X_3 = X_2\), ... to list every name bound to a value), <strong>aggregation</strong> (common and frequent words extraction, a proxy for summarization) and <strong>question answering</strong> (SQuAD and HotpotQA with distractor paragraphs). It runs 500 examples per task at 4K, 8K, 16K, 32K, 64K and 128K with greedy decoding. Its headline definition is the <strong>effective context length</strong> <span class="zh">有效上下文长度</span>: the largest tested length at which the average score still exceeds a fixed pass mark, Llama-2-7B's 85.6% at 4K (the drill's <code>effective_length</code>).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 381" role="img" aria-labelledby="fig-10-3-title">
+<title id="fig-10-3-title">Claimed context length versus RULER effective context length for eleven models</title>
+<text x="12" y="16" class="s-small s-muted">claimed context (outline) vs RULER effective context (solid), log scale; pass mark 85.6</text>
+<line class="s-line" x1="204.4" y1="38" x2="204.4" y2="319" opacity="0.25"/>
+<text x="204.4" y="335" text-anchor="middle" class="s-small s-mono">4K</text>
+<line class="s-line" x1="313.3" y1="38" x2="313.3" y2="319" opacity="0.25"/>
+<text x="313.3" y="335" text-anchor="middle" class="s-small s-mono">16K</text>
+<line class="s-line" x1="422.2" y1="38" x2="422.2" y2="319" opacity="0.25"/>
+<text x="422.2" y="335" text-anchor="middle" class="s-small s-mono">64K</text>
+<line class="s-line" x1="531.1" y1="38" x2="531.1" y2="319" opacity="0.25"/>
+<text x="531.1" y="335" text-anchor="middle" class="s-small s-mono">256K</text>
+<line class="s-line" x1="640.0" y1="38" x2="640.0" y2="319" opacity="0.25"/>
+<text x="640.0" y="335" text-anchor="middle" class="s-small s-mono">1M</text>
+<text x="142" y="59" text-anchor="end" class="s-small">Gemini-1.5-Pro</text>
+<rect class="s-box" x="150" y="47" width="486.3" height="18" rx="3"/>
+<rect class="s-a" x="150" y="47" width="326.7" height="18" rx="3"/>
+<text x="642.3" y="60" class="s-small s-mono">1M → >128K</text>
+<text x="142" y="84" text-anchor="end" class="s-small">GLM4 (9B)</text>
+<rect class="s-box" x="150" y="72" width="486.3" height="18" rx="3"/>
+<rect class="s-a" x="150" y="72" width="272.2" height="18" rx="3"/>
+<text x="642.3" y="85" class="s-small s-mono">1M → 64K</text>
+<text x="142" y="109" text-anchor="end" class="s-small">LWM (7B)</text>
+<rect class="s-box" x="150" y="97" width="486.3" height="18" rx="3"/>
+<rect class="s-a" x="150" y="97" width="0.0" height="18" rx="3"/>
+<text x="642.3" y="110" class="s-small s-mono">1M → <4K</text>
+<text x="142" y="134" text-anchor="end" class="s-small">Yi (34B)</text>
+<rect class="s-box" x="150" y="122" width="359.9" height="18" rx="3"/>
+<rect class="s-a" x="150" y="122" width="217.8" height="18" rx="3"/>
+<text x="515.9" y="135" class="s-small s-mono">200K → 32K</text>
+<text x="142" y="159" text-anchor="end" class="s-small">GPT-4</text>
+<rect class="s-box" x="150" y="147" width="326.7" height="18" rx="3"/>
+<rect class="s-a" x="150" y="147" width="272.2" height="18" rx="3"/>
+<text x="482.7" y="160" class="s-small s-mono">128K → 64K</text>
+<text x="142" y="184" text-anchor="end" class="s-small">Llama 3.1 (70B)</text>
+<rect class="s-box" x="150" y="172" width="326.7" height="18" rx="3"/>
+<rect class="s-a" x="150" y="172" width="272.2" height="18" rx="3"/>
+<text x="482.7" y="185" class="s-small s-mono">128K → 64K</text>
+<text x="142" y="209" text-anchor="end" class="s-small">Qwen2 (72B)</text>
+<rect class="s-box" x="150" y="197" width="326.7" height="18" rx="3"/>
+<rect class="s-a" x="150" y="197" width="217.8" height="18" rx="3"/>
+<text x="482.7" y="210" class="s-small s-mono">128K → 32K</text>
+<text x="142" y="234" text-anchor="end" class="s-small">Command-R+ (104B)</text>
+<rect class="s-box" x="150" y="222" width="326.7" height="18" rx="3"/>
+<rect class="s-a" x="150" y="222" width="217.8" height="18" rx="3"/>
+<text x="482.7" y="235" class="s-small s-mono">128K → 32K</text>
+<text x="142" y="259" text-anchor="end" class="s-small">Llama 3.1 (8B)</text>
+<rect class="s-box" x="150" y="247" width="326.7" height="18" rx="3"/>
+<rect class="s-a" x="150" y="247" width="217.8" height="18" rx="3"/>
+<text x="482.7" y="260" class="s-small s-mono">128K → 32K</text>
+<text x="142" y="284" text-anchor="end" class="s-small">Mixtral-8x22B</text>
+<rect class="s-box" x="150" y="272" width="272.2" height="18" rx="3"/>
+<rect class="s-a" x="150" y="272" width="217.8" height="18" rx="3"/>
+<text x="428.2" y="285" class="s-small s-mono">64K → 32K</text>
+<text x="142" y="309" text-anchor="end" class="s-small">Mistral-v0.2 (7B)</text>
+<rect class="s-box" x="150" y="297" width="217.8" height="18" rx="3"/>
+<rect class="s-a" x="150" y="297" width="163.3" height="18" rx="3"/>
+<text x="373.8" y="310" class="s-small s-mono">32K → 16K</text>
+<rect class="s-box" x="150" y="343" width="22" height="12" rx="2"/><text x="178" y="353" class="s-small">claimed</text>
+<rect class="s-a" x="250" y="343" width="22" height="12" rx="2"/><text x="278" y="353" class="s-small">effective (largest tested length scoring ≥ 85.6)</text>
+<text x="12" y="371" class="s-small s-muted">Gemini-1.5-Pro was still passing at the longest length tested (128K). LWM fails at 4K, the shortest length tested.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Claimed against RULER effective context length (RULER paper, Tab. 3; effective = largest tested length with average score at least 85.6). Almost every model, including strong ones, is effective at half or less of its claim. The paper's summary: all models claim 32K or more, yet only about half maintain satisfactory performance at 32K.</figcaption>
+  </figure>
+
+  <p>The paper's error analysis of Yi-34B (200K) names failure modes worth testing for in any architecture: brittleness to needle type (UUID values fail at more than 128K while word-number pairs pass), failure to ignore distractor needles (about 40 points lost at 256K in the hardest version), incomplete retrieval when many values must be returned, and copying from context or falling back on parametric knowledge <a href="https://arxiv.org/abs/2404.06654">[§5]</a>. Its stated limits: no control over needle depth, no proof that the synthetic tasks track real ones, and 4K scores that are not perfect. Newer models clear the bar: Qwen2.5-14B-Instruct-1M scores 92.2 at 128K <a href="https://arxiv.org/abs/2501.15383">[Tab. 4]</a> and Gemma 4 31B scores 96.4 <a href="https://arxiv.org/abs/2607.02770">[Tab. 9]</a>. Note that RULER is close to saturated at 128K for the best models, so its main use is now as a stage gate and for smaller models.</p>
+
+  <h3 id="niah-nolima">NoLiMa: remove the literal match</h3>
+  <p>NoLiMa <a href="https://arxiv.org/abs/2502.05167">[Modarressi et al., ICML 2025]</a> keeps the haystack and needle but writes questions whose keywords are associated with the needle's rather than equal to them, in one-hop and two-hop variants. Its "effective length" is the longest length with a score above 85% of the model's own base score at 250 to 1K tokens.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Claimed</th><th class="num">Effective (NoLiMa)</th><th class="num">Base score</th><th class="num">At 32K</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-4o</td><td class="num">128K</td><td class="num">8K</td><td class="num">99.3</td><td class="num">69.7</td></tr>
+      <tr><td>GPT-4.1</td><td class="num">1M</td><td class="num">16K</td><td class="num">97.0</td><td class="num">79.8</td></tr>
+      <tr><td>Llama 3.3 70B</td><td class="num">128K</td><td class="num">2K</td><td class="num">97.3</td><td class="num">42.7</td></tr>
+      <tr><td>Gemini 1.5 Pro</td><td class="num">2M</td><td class="num">2K</td><td class="num">92.6</td><td class="num">48.2</td></tr>
+      <tr><td>Claude 3.5 Sonnet</td><td class="num">200K</td><td class="num">4K</td><td class="num">87.5</td><td class="num">29.8</td></tr>
+      <tr><td>Gemma 3 27B</td><td class="num">128K</td><td class="num">&lt;1K</td><td class="num">88.6</td><td class="num">9.5</td></tr>
+      <tr class="hl"><td>Llama 4 Scout</td><td class="num">10M</td><td class="num">1K</td><td class="num">81.7</td><td class="num">21.6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">NoLiMa Tab. 3 and 10 (Tab. 10 covers the newer models). Eleven of the thirteen models in the main table fall below half of their base score at 32K. In the authors' needle-depth analysis, one-hop needles show a lost-in-the-middle dip at 32K, while for two-hop needles performance depends more on total context length than on needle position, which they attribute to attention being overwhelmed when no surface cues connect question and needle.</p>
+
+  <h3 id="lost-middle">Lost in the middle: position matters</h3>
+  <p>Liu et al. put the one relevant document at each position among 10, 20 or 30 retrieved documents and measured multi-document QA. Accuracy forms a U: for GPT-3.5-Turbo with 20 documents, 75.8% when the answer document is first, 53.8% when it is tenth and 63.2% when it is last, and the middle value is below the 56.1% it scores with <em>no documents at all</em>. Extended-context variants (16K, 100K) perform the same as their short versions whenever the input fits in both; putting the query before and after the documents fixes synthetic key-value retrieval but not multi-document QA; and reader accuracy saturates far before retriever recall, with more than 20 documents adding only about 1.5% for GPT-3.5-Turbo and 1% for Claude-1.3 <a href="https://arxiv.org/abs/2307.03172">[Liu et al. 2023, §2-6]</a>. The lesson survives model generations even though the magnitude changes: report performance <em>by position</em>, not just by length (RULER does not; NIAH grids do). The practical consequence for RAG is ordering: rerank and truncate rather than append.</p>
+
+  <h3 id="realistic">Realistic multi-task suites</h3>
+  <p><strong>HELMET</strong> <a href="https://arxiv.org/abs/2410.02694">[Yen et al. 2025]</a> covers seven application-style categories (synthetic recall, retrieval-augmented generation, many-shot in-context learning, passage re-ranking, generation with citations, long-document QA, summarization) at 8K to 128K with controllable lengths, model-based metrics for open-ended outputs and few-shot prompts so base models can be scored. Over 59 models it finds: categories correlate only moderately (in-context learning against the others: Spearman 0.34 to 0.61 at 128K); open models trail closed ones mainly on re-ranking and citation, by 30 to 40 points, with the gap widening at length; and RAG tasks give the best cheap proxy for development <a href="https://arxiv.org/abs/2410.02694">[§3, Fig. 5-6]</a>.</p>
+  <p><strong>LongBench v2</strong> <a href="https://arxiv.org/abs/2412.15204">[Bai et al. 2024]</a> has 503 multiple-choice questions over contexts of 8K to 2M words (median 54K words) in six categories: single- and multi-document QA, in-context learning, dialogue history, code repositories, structured data. Questions were written by 97 annotators (24 of them also reviewers) and kept only if the three screening LLMs did not all answer correctly and a human reviewer could not answer within 3 minutes with search. Human experts reach 53.7% in 15 minutes, the best direct-answer model 50.1%, and o1-preview, which reasons longer, 57.7%. The authors' reading is that these tasks need reasoning and inference-time compute, not just retrieval. Two cautions: 503 items give wide confidence intervals, and the task mix differs across length buckets, so compare models within a bucket.</p>
+
+  <h3 id="frontier-evals">What frontier reports use in 2026</h3>
+  <p>As of September 2026, the long-context sections of frontier reports lean on: OpenAI's MRCR (<span class="unverified" title="Expansion recalled from Vodrahalli et al. 2024 (Michelangelo); not checked in this session.">multi-round coreference resolution</span>, an in-context retrieval task with several near-identical needles) and CorpusQA at 1M tokens (DeepSeek-V4, above), and RULER at 32K and 128K plus LOFT text retrieval, GraphWalks and MTOB translation from a half or full grammar book (about 128K and 256K tokens; Gemma 4, Tab. 9). A January 2026 preprint, EverMemBench-S, targets the "literal needle" weakness with collision-tested near-miss hard negatives and multi-document gold evidence over a 326M-token bank, and decouples evidence <em>access</em> from answer <em>use</em>. Among dense retrievers, the best (Qwen3-Embedding-8B) falls from 0.93 to 0.68 SR@10 from 64K to 326M tokens, and strict multi-source recall from 0.80 to 0.30. In full-context QA (judge score 0 to 5), Gemini-3-Pro-Preview goes 3.55, 3.45, 3.28 at 64K, 256K, 1M, and the linear-attention hybrid Kimi-Linear-48B-A3B goes 3.42, 3.38, 3.22 <a href="https://arxiv.org/abs/2601.20276">[Lin et al. 2026, Tab. 3-4]</a>. One benchmark, an LLM judge, one preprint: a data point, not a ranking.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Test</th><th>Measures</th><th>Blind spots</th></tr></thead>
+    <tbody>
+      <tr><td>Per-position loss</td><td>does loss keep falling, without blow-up, past the trained length</td><td>dominated by local tokens; two very different models can tie</td></tr>
+      <tr><td>NIAH / passkey grid</td><td>exact retrieval of one string by depth and length</td><td>saturated; literal match; single needle</td></tr>
+      <tr><td>RULER</td><td>multi-needle, tracking, aggregation, QA at 4K to 128K; effective length</td><td>synthetic; no depth control; near ceiling for the best models at 128K</td></tr>
+      <tr><td>NoLiMa</td><td>retrieval without lexical overlap</td><td>short (32K to 128K in the paper); associative hops only</td></tr>
+      <tr><td>HELMET</td><td>seven application categories, base and instruct models</td><td>128K cap; model-based metrics add cost and noise</td></tr>
+      <tr><td>LongBench v2</td><td>hard multiple-choice reasoning, 8K to 2M words</td><td>503 items; mixed lengths per task</td></tr>
+      <tr><td>MRCR, CorpusQA (1M)</td><td>retrieval with near-duplicates; corpus-level QA at 1M</td><td>vendor-run comparisons; API failures and configuration differences</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="decision">
+    <div class="decision-title">A long-context evaluation suite for an architecture paper</div>
+    <dl>
+      <dt>Problem</dt><dd>A new architecture (sparse, hybrid, compressed, linear) can win on perplexity and needles while losing on tasks that use context, or win on quality while its cost advantage is not measured.</dd>
+      <dt>Idea</dt><dd>Report six things: (1) per-position loss at 1×, 2× and 4× the training length, and loss on long-dependency tokens; (2) a controlled grid of depth × length with distractors and non-literal needles (RULER multi-key, multi-value, variable tracking, aggregation; NoLiMa-style); (3) realistic tasks (HELMET categories, LongBench v2), scored after the same SFT for every model; (4) a short-context regression suite; (5) cost at each length: prefill and decode throughput, KV or state bytes; (6) claimed against effective length with an explicit pass mark.</dd>
+      <dt>Why it works</dt><dd>It separates access from use (2 against 3), quality from cost (5), and long from short (4), and it does not let one saturated number carry the paper.</dd>
+      <dt>Evidence</dt><dd>Needle and loss numbers disagree with downstream behavior (Fu et al.; HELMET's correlations); the recipe moves scores as much as many architecture changes (ProLong's data-mix and RoPE-base ablations), so baselines must share data, token budget and RoPE treatment.</dd>
+      <dt>Cost</dt><dd>Several long-context runs per model, some with model-based metrics; HELMET and RULER at 128K take real GPU hours.</dd>
+      <dt>Used by</dt><dd>Increasingly by every long-context report: Llama 3 (needle plus ZeroSCROLLS and InfiniteBench), Gemma 4 (RULER, LOFT, GraphWalks, MTOB), DeepSeek-V4 (MRCR, CorpusQA, plus efficiency at 1M).</dd>
+    </dl>
+  </div>
+
+  <p>Concrete advice for a paper on an efficient architecture: put fixed-size-state models (linear attention, SSMs) on the recall-heavy tasks, where they are expected to be weakest (<a href="09-beyond-full-attention.html">page 09</a>), report quality against cost rather than quality alone, keep the training recipe identical across compared models, give confidence intervals (Llama 3 reports 95% intervals for its long-context pretraining evaluations, Tab. 14), and check contamination for public benchmarks.</p>
+</section>
+
+<section>
+  <h2 id="failure-modes">Failure modes and open problems</h2>
+
+  <ul>
+    <li><strong>Effective length falls short of the window.</strong> RULER (Figure 3), NoLiMa (Llama 4 Scout at 10M claimed: 21.6 at 32K) and STRING's position-frequency argument (<a href="#extrapolation">above</a>) say the same thing: tokens near the end of the trained range are seen too rarely. Open: fix it in training (longer sequences than the evaluation length, per ProLong; loss reweighting toward long offsets) rather than by inference-time remapping such as STRING, which lifts Llama 3.1 70B from 66.6 to 81.7 on RULER at 128K without training.</li>
+    <li><strong>Recency and primacy bias.</strong> The U-shaped position curve, and the finding that RoPE layers concentrate on recent tokens while NoPE layers retrieve (<a href="05-positional-encoding.html#hybrids">page 05</a>).</li>
+    <li><strong>Attention sinks.</strong> A softmax must sum to one, so when no key matches, mass goes somewhere. Xiao et al. show that Llama-2-13B on a 65K-token PG19 book, with a 1,024-token window and the first token's KV evicted, has perplexity 5,158, but keeping four initial tokens ("sinks") with 1,020 recent ones gives 5.40 (window recomputation: 5.43); replacing the four tokens with linebreaks gives 5.60, so it is position, not content. Pretraining with a dedicated learnable sink token makes a single sink enough: in their 160M models the sink-token model reaches 18.01 with the sink plus 1,023 recent tokens (1,235 without it), while the model trained without one needs four initial tokens to reach 18.01 (19.90 with one). It is not context extension: StreamEval accuracy falls to zero once the query-answer distance exceeds the cache size <a href="https://arxiv.org/abs/2309.17453">[Xiao et al. 2024, §3, App. C]</a>. Modern models bake sinks in: DeepSeek-V4 adds a learnable per-head sink logit to the softmax denominator in its CSA and HCA core attention (their Eq. 27), so a head can attend to "nothing" (gpt-oss does the same, <a href="31-mistral-gemma-gptoss.html">page 31</a>). LongRoPE's unscaled prefix \(\hat n\) exploits the same effect.</li>
+    <li><strong>Short-context regression</strong>, and its dependence on how SFT is done (<a href="#regression">above</a>).</li>
+    <li><strong>Retrieval versus reasoning.</strong> Passing retrieval does not mean answering questions that need synthesis: LongBench v2 needs reasoning tokens to beat humans, Qwen3's thinking mode scores below its non-thinking mode on average RULER at every model size (Tab. 23: 235B-A22B 92.2 against 95.0), and in DeepSeek's own comparison table every model scores lower on CorpusQA 1M than on MRCR 1M (V4-Pro-Max 62.0 against 83.5, Opus 4.6 71.7 against 92.9; the metrics differ, so this is suggestive only).</li>
+    <li><strong>Length generalization beyond training.</strong> Gemma 3 generalizes to 128K after rescaling but "rapidly degrades" beyond; rescaling methods buy a multiple of the trained length, not unbounded length. Extrapolation beyond the trained window remains unsolved without more training.</li>
+    <li><strong>Data.</strong> Natural text has weak long-range dependence (Qwen's motivation for synthetic tasks); whether synthetic long data helps depends on how much real long training preceded it (the Llama 3 / ProLong disagreement). Open: which dependencies to train on.</li>
+    <li><strong>Architecture as the fix.</strong> The systems in <a href="09-beyond-full-attention.html">page 09</a> attack the cost curve of the first section directly: sliding-window plus global layers (Gemma 3: KV overhead 60% to under 15% at 32K, little perplexity change), RoPE/NoPE hybrids (RULER at 256K: 74.8 against 57.1 in Cohere's study, <a href="05-positional-encoding.html#hybrids">page 05</a>), sparse selection, compression (DeepSeek-V4's 10% KV at 1M), linear and SSM hybrids. Whether these match dense attention on <em>use</em> at 1M, not just access, is the open question the evaluation section is for.</li>
+    <li><strong>Beyond one context.</strong> At 100M-token corpora (EverMemBench-S, 326M) the working systems are retrieval plus long context, and retrieval quality degrades with scale and interference: the benchmark shows a widening gap between finding one relevant document and finding all of them.</li>
+  </ul>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"The scale factor is target length over trained length."</strong> Only in the textbook. Llama 3.1's <code>factor</code> is 8 on an 8,192 original length yet the model advertises 131,072; Llama 3.2 uses 32; DeepSeek-V3's 40 does match \(163{,}840/4{,}096\). Treat it as a tuned slow-down, and read the config for what the ramp does.</li>
+    <li><strong>"NTK-aware scaling is interpolation."</strong> It interpolates only the slowest pair. Every other pair with \(f_i &lt; s\) sees an angle range \(s/f_i\) times its trained one (1.81× for pair 45 at \(s = 8\)). YaRN's \(\alpha\)-clamp exists to remove exactly this.</li>
+    <li><strong>"YaRN is NTK-aware plus a temperature."</strong> It is wavelength-dependent interpolation (NTK-by-parts) plus a temperature, and two ramps circulate: the paper's is linear in \(L/\lambda\), the reference code's is linear in pair index. A model tuned with one and served with the other differs silently.</li>
+    <li><strong>"A positional-encoding trick extends the context."</strong> Cheap rescaling gets passkey-level retrieval (PI: 200 steps for passkey at 32K). Robust use on realistic tasks needs billions of tokens of long data (ProLong: 40B; Llama 3: about 800B), and evaluating after SFT.</li>
+    <li><strong>"100% on needle-in-a-haystack means the model uses 128K."</strong> Llama 3.1 70B has 100.00 on passkey and 2.22 on key-value retrieval; almost every model on RULER is effective at half its claim or less; NoLiMa cuts most models below half of their baseline at 32K.</li>
+    <li><strong>"Falling perplexity with length shows the context is used."</strong> Averaged loss is dominated by local tokens; two recipes with the same losses had very different retrieval.</li>
+    <li><strong>"Train on long documents, and more of them is better."</strong> All-long mixes hurt after SFT and on short tasks (ProLong: best at 60% long); books alone hurt other domains (Fu et al.); quality may matter more than length (Xiong et al.).</li>
+    <li><strong>"Sliding windows plus sinks give unlimited context."</strong> They give stable perplexity on unbounded streams, not access to evicted content: accuracy falls to zero beyond the cache.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why not just pretrain at 128K from the first step?</summary>
+    <div class="answer">
+      <p><strong>Cost:</strong> attention FLOPs grow with \(T^2\) while weight FLOPs grow with \(T\). For Llama-3-8B, prefill at 128K costs 46× that at 8K for 16× the tokens, and attention is 70% of it (12.5% at 8K). The crossover is \(T^\star = N_{\text{mm}}/(L n_h d_h) \approx 57\text{K}\). KV cache and activations also grow linearly, forcing context parallelism. <strong>Data:</strong> long documents are scarce and skewed to books and code (about 98.8B tokens of 64K+ code-repo documents against 5.2B of arXiv in ProLong's counts), so a from-scratch 128K run either repeats a small pool or packs unrelated text. <strong>Quality:</strong> at a fixed token budget, shorter training contexts scored higher on standard benchmarks in a 1B study (SkyLadder).</p>
+      <p>So everyone trains short first and spends a small fraction on the long stage (Llama 3: about 800B of 15.6T tokens, 5%; DeepSeek-V3: 4.3% of GPU-hours). Xiong et al. measured 40% FLOP savings for the same long-task quality. The exception is DeepSeek-V4, which grows the sequence length inside pretraining (4K, 16K, 64K, 1M) and uses sparse and compressed attention to make that affordable.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate: Llama-3-8B's prefill FLOPs and KV cache at 8K and at 128K.</summary>
+    <div class="answer">
+      <p>\(F(T) = 2N_{\text{mm}}T + 2Ln_hd_hT^2\) with \(N_{\text{mm}} = 7.504\)B and \(L n_h d_h = 2^{17}\). At \(T = 8192\): weights \(1.229\times10^{14}\), attention \(2^{18}\cdot 8192^2 = 1.759\times10^{13}\), total \(1.405\times10^{14}\) (0.28 s at 50% of 989.4 TFLOP/s). At \(T = 131072\): weights \(1.967\times10^{15}\), attention \(4.504\times10^{15}\), total \(6.471\times10^{15}\) (13.1 s). Ratio 46×.</p>
+      <p>KV: \(2\cdot 32\cdot 8\cdot 128\cdot 2 = 131{,}072\) B per token, so 1 GiB at 8K and 16 GiB at 128K per sequence. A batch-1 decode step reads weights (16.06 GB) plus the cache: 4.79 + 0.32 = 5.1 ms at 8K, 4.79 + 5.13 = 9.9 ms at 128K, about 196 and 101 tokens per second at 3.35 TB/s. For a 128K-context batch of 4 the cache is 64 GiB, more than the weights, which is what <a href="07-kv-efficient-attention.html">page 07</a>'s designs attack.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is YaRN's attention temperature, and what are its values for \(s = 4, 8, 40\)?</summary>
+    <div class="answer">
+      <p>YaRN multiplies the pre-softmax logits by \(1/t\), with \(\sqrt{1/t} = 0.1\ln s + 1\): a longer context means more keys and a flatter softmax, and the fitted constant sharpens it back. Implemented by scaling both \(q\) and \(k\) by \(\sqrt{1/t}\) (for instance in the cos and sin tables) so it costs nothing. Values: \(s = 4\): amplitude 1.1386, logits ×1.2965; \(s = 8\): 1.2079, ×1.4591; \(s = 40\): 1.3689, ×1.8739. The constant was fitted on LLaMA 7B to 65B by minimizing perplexity without fine-tuning. A heuristic reading: keeping a needle's weight constant as \(N \to sN\) needs margin \(+\ln s\), so \(m = 1 + \ln s/\Delta\); YaRN's fit matches \(\Delta \approx 5\) nats. DeepSeek-V3 applies \(1.8739\) to the softmax scale of the entire logit rather than to cos and sin.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why can't a RoPE model trained on 8K tokens just run at 32K?</summary>
+    <div class="answer">
+      <p>Three reasons, separable. (1) <em>Unseen phases.</em> With \(b = 5\times10^5\), \(d_h = 128\), 29 of the 64 pairs (35 to 63) have wavelength above 8,192, so they never complete a turn in training (the slowest covers 0.02 rad, about 1.15°). At 32K it covers 0.08 rad: the network is asked about phases outside its training range, and the score \(a(u) = \operatorname{Re}\sum_j h_j e^{\mathrm{i}u\theta_j}\) is unconstrained there (Chen et al. show fitted curves within \([-1,1]\) on \([0,L]\) that exceed 8,000 outside). (2) <em>Undertrained offsets.</em> Offset \(i\) is seen \(\sum_s \max(|s|-i, 0)\) times, so offsets near 8K are rare even in training; STRING measures effective length below half of training length for many open models. (3) <em>Dilution.</em> The softmax over 4× more keys is flatter for the same logit margins.</p>
+      <p>Fixes address (1) and (3): rescale frequencies (PI, NTK/ABF, YaRN) so extended positions map to trained phases, add a temperature, and then train on long data, which is the only fix for (2) and for learning to <em>use</em> distant tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compare Position Interpolation, NTK-aware scaling and YaRN.</summary>
+    <div class="answer">
+      <p>All three set \(\theta'_i = \theta_i/f_i\) and differ in \(f_i\). <strong>PI</strong> (位置插值): \(f_i = s\) for all pairs, so no pair exceeds its trained angle range, but the fastest pairs are slowed 8× at \(s = 8\) and neighboring tokens crowd (7.2° per token instead of 57.3° for pair 0). It needs about 1,000 steps and fine-tunes reliably only to \(s \approx 8\). <strong>NTK-aware:</strong> change the base so pair 0 is unchanged and the last pair is slowed by exactly \(s\): \(b' = b\,s^{d/(d-2)}\), \(f_i = s^{2i/(d-2)}\), a geometric ladder (\(10^4 \to 82{,}685\) at \(d = 128\), \(s = 8\)). Fast pairs are preserved, but only the slowest is truly interpolated, and mid-wavelength pairs (pair 45: 1.81×) are extrapolated, so it works zero-shot at small \(s\) and fine-tunes worse than PI. <strong>YaRN:</strong> classify pairs by turns in the trained context \(r_i = L/\lambda_i\): \(r \le \alpha = 1\) fully interpolated, \(r \ge \beta = 32\) untouched, linear blend between, plus the logit temperature \((0.1\ln s + 1)^2\). No extrapolation remains, fast pairs are intact, and it needed 400 steps for 64K (256 A100-hours for a 7B). At \(d = 128\), \(b = 10^4\), \(L = 4096\), \(s = 8\): 21 pairs untouched, 25 blended, 18 divided by 8.</p>
+      <p>Caveats: \(\alpha\), \(\beta\), the temperature and the base are fitted heuristics; there are two ramp conventions (paper linear in \(r\); code linear in index); and none replaces long-data training.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why does DeepSeek apply YaRN only to the decoupled RoPE key?</summary>
+    <div class="answer">
+      <p>Because that is the only place position exists. MLA's content path (\(q^C\), \(k^C\), from the 512-dim latent) is position-free so weight absorption works; RoPE is confined to \(q^R\) (per head) and the shared \(k^R\), 64 dimensions (page 07). The only frequency table in the whole attention is the one rotating those 64 dimensions, so that is what YaRN rescales: \(s = 40\), \(\alpha = 1\), \(\beta = 32\). Two details: \(q^R\) uses the same modified table (a relative rotation needs both sides), and in the reference code the temperature is applied as \(\text{mscale}^2 = 1.8739\) on the softmax scale of the whole 192-dimensional logit, not just the rotated slice. In the code the ramp is over 32 pairs at base 10,000: pairs 0 to 10 untouched, 11 to 22 blended, 23 to 31 divided by 40 (slowest wavelength 47K to 1.88M tokens). It is applied statically at construction time, so short inputs also see the extended model.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How much long-context data do you need, and how should you mix it?</summary>
+    <div class="answer">
+      <p><strong>Amount depends on the goal.</strong> Needle-level retrieval unlocks with 0.5B to 5B tokens (Fu et al.: needle accuracy 59.0% at 300M, 81.1% at 500M, 88.0% at 5B for LLaMA-2 7B post-trained on 80K; at 10B it "seems to overfit" and drops to 84.0%). Robust downstream use, evaluated after SFT, took 40B for ProLong-8B and about 800B (5% of pretraining) for Llama 3 405B; UltraLong got to 1M to 4M with 1B tokens by starting from an already-128K model. <strong>Mix:</strong> (a) upsample long documents <em>within</em> each domain and keep the domain proportions (Fu: about 30% to 70% long per domain; upsampling only books helps books and hurts C4, CommonCrawl, StackExchange, GitHub); (b) keep about 40% high-quality short data (ProLong: 60/40 best; short-task scores fall monotonically with the long share; the choice of short mix matters, GSM8K 46.6 against 39.4 to 41.9 for the alternatives); (c) long sources 1:1 books and code repositories (code for recall, books for in-context learning and summarization); (d) train longer than you evaluate (512K training improved 64K results); (e) use document masks at long lengths (Llama 3, ProLong), noting that UltraLong's separator-only approach also worked. Evidence conflicts on synthetic long data (Llama 3 and Qwen use it; ProLong says it hurts), and Xiong et al. argue that quality outweighs length.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A model scores 100% on needle-in-a-haystack at 128K. What does that tell you, and what would you test next?</summary>
+    <div class="answer">
+      <p>It tells you exact retrieval of one near-unique string works at every tested depth at that length, with no evidence of a hard positional failure. It does not tell you the model can ignore distractors, retrieve several facts, follow a chain, aggregate, or reason: Llama 3.1 70B has 100.00 on passkey and 2.22 on key-value retrieval at 128K; HELMET finds NIAH's correlation with a realistic long-QA benchmark is 0.63 (RULER multi-key 0.81, RAG QA 0.88); RULER finds most models effective at half their claim. Next: (1) RULER's multi-key, multi-value, multi-query, variable tracking and aggregation to get an effective length; (2) a non-literal needle test (NoLiMa) since literal overlap is the crutch; (3) position-controlled results, since lost-in-the-middle is a depth effect; (4) realistic tasks (HELMET categories, LongBench v2) after the same SFT; (5) short-context regression; (6) cost. Also check the prompt format and tokenizer used for length, and repeat over needles and haystacks: single grids are noisy.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain Llama 3.1's <code>rope_scaling</code> of type <code>llama3</code>. Is it YaRN?</summary>
+    <div class="answer">
+      <p>Config: base 500,000, <code>factor</code> 8, <code>low_freq_factor</code> 1, <code>high_freq_factor</code> 4, <code>original_max_position_embeddings</code> 8192. Wavelength thresholds: \(8192/1 = 8192\) and \(8192/4 = 2048\). Pairs with wavelength below 2,048 (0 to 28) keep their frequency, pairs above 8,192 (35 to 63) are divided by 8, and pairs between (29 to 34) blend with \(w = (8192/\lambda_i - 1)/(4-1)\): \(\theta' = (1-w)\theta/8 + w\theta\). That is exactly YaRN's paper ramp with \(\alpha = 1\), \(\beta = 4\), \(s = 8\), \(L = 8192\), but with no attention temperature (<code>attention_factor</code> is 1.0). It differs from YaRN in Hugging Face and DeepSeek-V3 in two ways: \(\beta\) is 4 rather than 32 and the ramp is linear in \(L/\lambda\), not in pair index. The slowest wavelength moves from 2.56M to 20.5M tokens. <code>factor</code> is not \(L'/L\): 8 × 8192 = 65,536 but the model advertises 131,072, because the base was already raised to 500K. The Llama 3 report describes the base change and staged training, not this entry.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does long-context continued pretraining affect short-context benchmarks, and how do you prevent regressions?</summary>
+    <div class="answer">
+      <p>Position rescaling squeezes the angle range that short inputs use, and long-data training shifts the data distribution, so short benchmarks can fall. Measured: PI on LLaMA-7B, up to about 2% at 8K and BoolQ 76.1 to 64.7 at 32K; YaRN on Llama 2 7B, MMLU 43.8 to 42.5 (\(s = 16\)) to 41.7 (\(s = 32\)); on Phi3-mini, plain YaRN takes GSM8K from 78.5 to 57.4 while LongRoPE2 keeps 73.6. Prevention: mix about 40% high-quality short data (ProLong) and evaluate short benchmarks as a gate (Llama 3 required "recovered completely" before each stage advance); keep short inputs on the original RoPE (LongRoPE2 mixed-window training, LongRoPE per-length factors, dynamic scaling below \(L\), at the price of two RoPE configurations and a KV recompute at the switch); move in small stages; start from an instruct model or restore instruction data; and design SFT carefully (short-only SFT regressed Llama 3's long-context ability but not ProLong's). Also report short-context numbers next to long ones for static schemes such as V3's YaRN.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design an evaluation suite for a paper claiming a better long-context architecture.</summary>
+    <div class="answer">
+      <p>Controls first: identical data, token budget, training lengths, RoPE treatment and SFT for every compared model; the ProLong ablations show data mix and RoPE base move long-context scores by tens of points. Then, in order: (1) <strong>training-time diagnostics</strong>, per-position loss at 1×, 2×, 4× the training length, and loss on tokens that need long context; (2) <strong>controlled synthetic grid</strong> by depth × length with distractors and non-literal needles: RULER (multi-key, multi-value, variable tracking, aggregation), a NoLiMa-style set, and position-controlled retrieval; report effective length at a stated pass mark; (3) <strong>realistic tasks</strong> after the same SFT: HELMET categories (RAG, re-ranking, citation, long QA, summarization, ICL), LongBench v2, and at 1M a corpus-level QA and an MRCR-style task; (4) <strong>short-context regression</strong>: MMLU, GSM8K, code; (5) <strong>cost at each length</strong>: prefill and decode throughput, KV or state bytes, plotted with quality; (6) <strong>statistics</strong>: enough examples for confidence intervals (LongBench v2's 503 items are few), seeds if training is cheap, contamination checks. For an architecture with fixed-size state or sparse access include recall-heavy tasks where it is expected to be weakest. State claimed versus effective length, and beyond-training-length generalization.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design: you must train a new 7B-class model for 1M-token context on 15T tokens. Lay out the schedule and say what you would check.</summary>
+    <div class="answer">
+      <p>First quantify dense attention at 1M: per-token FLOPs are \(2N_{\text{mm}} + 2Ln_hd_hT\); for an 8B like Llama-3-8B, \(1.5\times10^{10} + 2.75\times10^{11}\), about 18× the short-context cost, and 128 KiB × \(2^{20}\) = 128 GiB of KV per sequence. So either accept a very short long stage or change the attention: local:global layers with short windows (Gemma 3: KV overhead 60% to under 15% at 32K), sparse selection, or compression (V4: 10% of V3.2's KV at 1M). Schedule: 4K to 8K for most of the tokens; then either staged lengths (V4: 4K, 16K, 64K, 1M, with dense attention early and sparse from 64K; Qwen2.5-1M: 32K, 64K, 128K, 256K) or a gradual window (SkyLadder); spend on the order of 1% to 5% of tokens on long stages. RoPE: raise the base per stage (Qwen2.5-1M: 1M, 1M, 5M, 10M; ProLong: 8M, then 128M) rather than trust a formula. Data: 60/40 long/short with per-domain length upsampling, books plus code repositories, high-quality short mix, document masks, train at a length above your evaluation length. Parallelism: context parallelism for the long stages. Gates after each stage: short-context recovery, then RULER/HELMET-subset at the trained length, then position-controlled retrieval; fix regressions before the next stage. SFT: short data first, then small amounts of long data, verifying whether synthetic long data helps or hurts in your setting.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why is a model's effective context length shorter than its window, and what can you do about it?</summary>
+    <div class="answer">
+      <p>STRING's account: with relative positions, offset \(i\) occurs \(f(i) = \sum_s \max(|s|-i, 0)\) times, so \(f(i) = L - i\) even for full-length sequences, and much lower for real length distributions. For a 2,048-token training length on SlimPajama, offsets of 1,536 and more make up under 5% of position indices. Controlled runs (TinyLlama 1.3B, 1T tokens) show effective length tracking the frequency of the corresponding offsets, and open models fail mostly when the needle is in the first third of the document (Llama 3.1: beyond about 90K). NoLiMa adds an attention-side account: without lexical overlap, retrieval degrades with length even at fixed offset. Remedies: train on sequences longer than the target (ProLong: 512K training helps at 64K; Qwen2.5-1M's 256K stage lifts 128K RULER from 83.8 to 87.6); upsample long documents; use tail-offset remapping at inference (STRING: Llama 3.1 70B RULER 66.6 to 81.7 at 128K; DCA in Qwen); architectures with local RoPE layers plus NoPE global layers, or sparse and compressed attention, so far offsets are handled by a few layers or by selection; and search RoPE factors with needle-focused objectives (LongRoPE2). Diagnose it with per-depth results.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compare Ring Attention with all-gather context parallelism. Why did Llama 3 pick all-gather?</summary>
+    <div class="answer">
+      <p>Both shard the sequence and compute exact attention. <strong>Ring:</strong> each device keeps its query block and rotates K/V blocks around a ring, overlapping the transfer with blockwise attention. Overlap requires block size \(c \ge F/B\) (FLOPs per second over link bytes per second), per-device activation memory is \(6bch\) bytes, independent of total length, and the minimum useful sequence per device is \(6c\): 6.2K tokens for A100s on NVLink, 149.5K for A100s on InfiniBand. <strong>All-gather:</strong> gather K and V, then compute local Q against them; the gather latency is exposed. Llama 3 split each sequence into \(2\times\)CP chunks (rank \(i\) gets chunks \(i\) and \(2\text{CP}-1-i\)) for causal load balance and chose all-gather for two reasons: arbitrary masks such as document masks are easy, and GQA makes K and V small compared with Q, while attention costs \(O(S^2)\) against \(O(S)\) for the gather, so the exposed latency is negligible. The trade is peak memory (full K and V on each device) against simplicity and mask support. With 8 KV heads and 128K tokens, K and V for one layer are 128K × 8 × 128 × 2 tensors of 2 bytes, 512 MiB per layer, small next to the compute.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>RoPE scaling and a needle grid.</strong> Implement, in one module, the frequency rules of this page as plain tensor functions: <code>inv_freq</code> and <code>wavelengths</code>, <code>pi_scale</code>, <code>ntk_base</code>, <code>yarn_inv_freq</code> with both ramp conventions, <code>yarn_mscale</code> and <code>llama3_inv_freq</code>; then <code>effective_length</code> (RULER's pass-mark rule, with a strict variant) and <code>make_niah_prompts</code>, which builds an exact-length depth × length grid of prompts without a model. The tests check every method against a scalar-loop reference, that all methods reduce to vanilla at \(s = 1\), the regimes (untouched, blended, interpolated pair counts for Llama 3.1 and DeepSeek-V3), that the <code>llama3</code> rule equals YaRN's paper ramp with \(\alpha = 1, \beta = 4\), and needle placement. An interviewer would expect <code>inv_freq</code>, PI, NTK and YaRN in about 25 minutes and the whole module in 40. <span class="ex-path">exercises/drills/rope_scaling.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_rope_scaling.py</code>; add <code>--solutions</code> to check the reference. Then reproduce Figure 1 and the wavelength table with your functions, and run <code>make_niah_prompts</code> on a real text with a tokenizer of your choice to build a grid for your own experiments.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2309.00071">Peng, Quesnelle, Fan, Shippole (2023). YaRN: Efficient Context Window Extension of Large Language Models.</a> <span class="why">Why read it: Eq. 10 to 15 (ramp, temperature), App. A.2 (the base-change derivation), Tab. 2 to 4 (short-task cost, GPU-hours). Then read the reference code for the other ramp.</span></li>
+    <li><a href="https://arxiv.org/abs/2306.15595">Chen et al. (2023). Extending Context Window of Large Language Models via Position Interpolation.</a> <span class="why">Why read it: the interpolation bound, the passkey protocol for effective window, and the cost accounting.</span></li>
+    <li><a href="https://arxiv.org/abs/2309.16039">Xiong et al. (2023). Effective Long-Context Scaling of Foundation Models.</a> <span class="why">Why read it: ABF against PI (Tab. 5), data-mix ablations (Tab. 7 to 8), the curriculum FLOP table (Tab. 10).</span></li>
+    <li><a href="https://arxiv.org/abs/2402.13753">Ding et al. (2024). LongRoPE: Extending LLM Context Window Beyond 2 Million Tokens</a>, with <a href="https://arxiv.org/abs/2502.20082">LongRoPE2 (Shang et al. 2025)</a>. <span class="why">Why read it: searched non-uniform factors, the progressive 256K to 2,048K schedule, and the critical-dimension argument.</span></li>
+    <li><a href="https://arxiv.org/abs/2402.10171">Fu et al. (2024). Data Engineering for Scaling Language Models to 128K Context.</a> <span class="why">Why read it: per-source length upsampling (Tab. 5), token-count scaling (Fig. 3), loss versus needle (Fig. 4).</span></li>
+    <li><a href="https://arxiv.org/abs/2410.02660">Gao, Wettig, Yen, Chen (2024). How to Train Long-Context Language Models (Effectively).</a> <span class="why">Why read it: the most careful ablations of data mix, RoPE base, document masks and SFT, with HELMET-based evaluation after SFT.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models</a> (§3.2, §3.3.2, §3.4.2, §4.3.4), with the <a href="https://arxiv.org/abs/2501.15383">Qwen2.5-1M Technical Report</a> (2025). <span class="why">Why read it: staged extension with gates, all-gather context parallelism, long SFT data (Llama 3); per-stage RULER table and inference-time extrapolation (Qwen).</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report</a> (§4.3), with <a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4 (2026)</a> (§4.1 to 4.2, §5.3). <span class="why">Why read it: YaRN on the decoupled RoPE dimensions; native 1M pretraining with dense-then-sparse attention.</span></li>
+    <li><a href="https://arxiv.org/abs/2404.06654">Hsieh et al. (2024). RULER: What's the Real Context Size of Your Long-Context Language Models?</a> <span class="why">Why read it: task design, the effective-length definition, and the failure-mode analysis.</span></li>
+    <li><a href="https://arxiv.org/abs/2410.02694">Yen et al. (2025). HELMET</a>, <a href="https://arxiv.org/abs/2412.15204">Bai et al. (2024). LongBench v2</a>, <a href="https://arxiv.org/abs/2502.05167">Modarressi et al. (2025). NoLiMa</a>. <span class="why">Why read it: why synthetic tasks mislead (HELMET's correlations), hard reasoning at length (LongBench v2), and retrieval without literal match (NoLiMa).</span></li>
+  </ol>
+  <p class="small muted">Also cited above: <a href="https://arxiv.org/abs/2307.03172">Lost in the Middle</a>, <a href="https://arxiv.org/abs/2310.01889">Ring Attention</a>, <a href="https://arxiv.org/abs/2309.17453">StreamingLLM</a>, <a href="https://arxiv.org/abs/2410.18745">STRING</a>, <a href="https://arxiv.org/abs/2503.15450">SkyLadder</a>, <a href="https://arxiv.org/abs/2504.06214">UltraLong</a>, <a href="https://arxiv.org/abs/2505.09388">Qwen3</a>, <a href="https://arxiv.org/abs/2503.19786">Gemma 3</a>, <a href="https://arxiv.org/abs/2607.02770">Gemma 4</a>, <a href="https://arxiv.org/abs/2601.20276">EverMemBench-S</a>.</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Frequency view:</strong> \(\theta'_i = \theta_i/f_i\), \(f_i \in [1, s]\), \(s = L'/L\). PI: \(f_i = s\). NTK-aware: \(b' = b\,s^{d/(d-2)}\), \(f_i = s^{2i/(d-2)}\). YaRN: \(r_i = L/\lambda_i\), \(\gamma = \operatorname{clip}((r-\alpha)/(\beta-\alpha), 0, 1)\), \(\theta' = (1-\gamma)\theta/s + \gamma\theta\), \(\alpha = 1\), \(\beta = 32\); temperature \(\sqrt{1/t} = 0.1\ln s + 1\) (1.139, 1.208, 1.369 for \(s = 4, 8, 40\); logits ×1.297, 1.459, 1.874).</li>
+      <li><strong>Worked case</strong> (\(d_h = 128\), \(b = 10^4\), \(L = 4096\), \(s = 8\)): slowest wavelength 54,410 to 435,281 tokens; PI slows the fastest pair 6.3 to 50.3, others leave it. YaRN: 21 pairs untouched, 25 blended, 18 divided by 8. NTK-aware \(b' = 82{,}685\); pair 45 extrapolated 1.81×.</li>
+      <li><strong>Two YaRN ramps:</strong> paper is linear in \(L/\lambda\); Hugging Face and DeepSeek-V3 code is linear in pair index between \(\lfloor\cdot\rfloor\) and \(\lceil\cdot\rceil\) boundaries. \(\alpha\) is <code>beta_slow</code>, \(\beta\) is <code>beta_fast</code>.</li>
+      <li><strong>Llama 3.1:</strong> base 500K; <code>llama3</code>: factor 8, low 1, high 4, \(L = 8192\): pairs 0 to 28 untouched, 29 to 34 blended, 35 to 63 divided by 8; equals YaRN's paper ramp with \(\alpha = 1\), \(\beta = 4\), no temperature. <code>factor</code> is not \(L'/L\).</li>
+      <li><strong>DeepSeek-V3:</strong> YaRN \(s = 40\), \(\alpha = 1\), \(\beta = 32\) on the 64 RoPE dims (pairs 0 to 10 / 11 to 22 / 23 to 31), \(\text{mscale}^2 = 1.874\) on the whole logit, static; 2 × 1,000 steps (32K at batch 1,920, 128K at 480), LR 7.3e-6; 119K of 2,788K GPU-hours.</li>
+      <li><strong>Recipes:</strong> Llama 3: 8K to 128K, 6 stages, ~800B tokens, gate = short-context recovery + needle; document masks; SFT with 0.1% synthetic long data. Qwen2.5-1M: 4K, 32K, 64K, 128K, 256K; base 1M, 1M, 5M, 10M; DCA + YaRN to 1M. DeepSeek-V4: 4K, 16K, 64K, 1M inside pretraining; dense first 1T tokens, sparse from 64K; sample-level masks.</li>
+      <li><strong>Costs, Llama-3-8B:</strong> prefill \(2N_{\text{mm}}T + 2^{18}T^2\): \(1.405\times10^{14}\) at 8K, \(6.471\times10^{15}\) at 128K (46×); attention overtakes weights at 57K; KV 1 GiB to 16 GiB; batch-1 decode 196 to 101 tok/s.</li>
+      <li><strong>Data:</strong> 0.5B to 5B tokens unlock needles (Fu); 40B (ProLong) to 800B (Llama 3) for robust use. Upsample long per domain; 60% long (books:code 1:1) / 40% short; train longer than you evaluate; base 8M at 64K, 128M at 512K.</li>
+      <li><strong>Eval:</strong> perplexity is a regression alarm; NIAH saturates (passkey 100 / KV retrieval 2.2 for Llama 3.1 70B); RULER: 13 tasks, 4 categories, pass mark 85.6, most models effective at half their claim; NoLiMa: no literal match, 11 of 13 models below half at 32K; HELMET: 7 categories; LongBench v2: human 53.7, best direct-answer model 50.1, o1-preview 57.7.</li>
+      <li><strong>Sinks:</strong> windowed cache without the first tokens explodes (PPL 5,158); 4 sink tokens restore 5.40; not context extension. Position-controlled results are required (lost in the middle: 75.8 / 53.8 / 63.2 for GPT-3.5, closed book 56.1).</li>
+      <li><strong>Systems:</strong> context parallelism (all-gather: mask-flexible, GQA keeps K/V small; ring: overlap needs \(c \ge F/B\)); chunked prefill; Qwen2.5-7B at 1M: 57,344 B/token, 54 GiB of KV.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

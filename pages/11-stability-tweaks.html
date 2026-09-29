@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Training stability &amp; modern tweaks · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="11" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part II · Modern architecture · Page 11</div>
+  <h1>Training stability &amp; modern tweaks</h1>
+  <div class="meta">
+    <span class="badge p1">P1</span>
+    <span>~50 min</span>
+    <span>Prereqs: <a href="03-attention.html">03 Attention</a>, <a href="04-transformer-block.html">04 Transformer block</a>, <a href="05-positional-encoding.html">05 RoPE</a></span>
+  </div>
+  <p class="lede">Much of what separates a 2019 transformer from a 2026 one is guard rails: small changes that keep attention logits, output logits, activations and gradients in range over trillions of tokens. This page gives each tweak its failure mode, mechanism, evidence and adopters, and ends with two changes to the residual path and the objective that DeepSeek relies on: manifold-constrained hyper-connections and multi-token prediction.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>"Your loss spiked at step 40K, what do you do?"</strong> They want a ranked plan: preserve, roll back and skip, read the leading indicators (gradient norm, max attention logit, output-logit drift, Adam state), then fix the root cause and validate it cheaply.</li>
+    <li><strong>"Why QK-norm?"</strong> The mechanism (logits are bilinear in the weights, so they grow quadratically), the bound it gives (\(g^2\sqrt{d_h}\)), why it goes before RoPE, and why it does not fit MLA.</li>
+    <li><strong>What each logit control actually bounds.</strong> z-loss pins \(\log Z\) but not sharpness. Soft-capping bounds range but not sharpness. QK-norm bounds attention logits but not the output softmax. QK-clip bounds weights after the update.</li>
+    <li><strong>Norm placement from memory:</strong> pre-norm, Gemma's pre+post, OLMo 2's output-norm, and what each does to the residual stream.</li>
+    <li><strong>Recent architecture:</strong> mHC (doubly stochastic mixing, Sinkhorn, cost), attention sinks and gated attention, and DeepSeek's multi-token prediction with its ablation numbers.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Triage a loss spike with a checklist of leading indicators, and choose between rollback-and-skip and a structural fix.</li>
+    <li>Explain attention-logit growth and output-logit drift, and say why both can be reproduced in small models at high learning rate.</li>
+    <li>Write QK-norm, z-loss and soft-capping from memory, and derive the logit bound \(g^2\sqrt{d_h}\) for QK-norm.</li>
+    <li>Draw post-norm, pre-norm, sandwich and OLMo 2 blocks, and say what each bounds.</li>
+    <li>State mHC's constraint, prove that doubly stochastic mixing is non-expansive, and estimate the cost of \(n\) residual streams.</li>
+    <li>Explain why attention sinks form and compare sink tokens, learned sink logits and Qwen's gated attention.</li>
+    <li>Write DeepSeek-V3's sequential multi-token-prediction objective, and state what it costs and what the ablation shows.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="spikes">Loss spikes, divergence and small-scale proxies</h2>
+
+  <p>Training stability <span class="zh">训练稳定性</span> is the property that a run keeps making progress at the learning rate you chose. It fails in three shapes. A <strong>loss spike</strong> <span class="zh">损失尖峰</span> is a sudden jump of the loss, followed by recovery or divergence. A <strong>slow divergence</strong> is a loss that climbs when the learning rate is too high for the model size, the regime Wortsman et al. study (they say they do not study spikes) <a href="https://arxiv.org/abs/2309.14322">[Wortsman et al. 2023, §1, fn. 1]</a>. A <strong>slow drift</strong> is a gradient, output or logit norm that grows quietly and turns into divergence late: Chameleon saw failures after as much as 20 to 30% of training <a href="https://arxiv.org/abs/2405.09818">[Chameleon, §2.3]</a>. All three worsen with scale. PaLM 540B spiked about 20 times despite gradient clipping <span class="zh">梯度裁剪</span>, and smaller PaLMs never did <a href="https://arxiv.org/abs/2204.02311">[PaLM, §5.1]</a>. The ST-MoE authors add the practical problem: small models are rarely unstable, and large unstable runs are too expensive to repeat over enough seeds <a href="https://arxiv.org/abs/2202.08906">[ST-MoE, §3]</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A tagger run takes hours, so you rerun it with five seeds and keep a learning rate that never diverged. A frontier run is one shot lasting weeks. Every method here is either validated at small scale first (the proxy method below) or comes with a cheap recovery story, like PaLM's rollback.</p>
+  </aside>
+
+  <h3 id="spike-responses">What labs did when it happened</h3>
+  <ul>
+    <li><strong>PaLM.</strong> With no principled fix, the team restarted from a checkpoint roughly 100 steps before the spike and skipped roughly 200 to 500 batches. Data alone was not the cause: replaying those batches from an earlier checkpoint did not spike, so a spike needs specific batches <em>and</em> a particular parameter state <a href="https://arxiv.org/abs/2204.02311">[§5.1]</a>. This was cheap because training was bitwise reproducible and each batch was a function of the step number <a href="https://arxiv.org/abs/2204.02311">[§5]</a>. PaLM also used \(\beta_2 = 1 - k^{-0.8}\) (rare embedding tokens have poorly estimated second moments over short windows), no biases, and the z-loss of <a href="#zloss">the next section</a>.</li>
+    <li><strong>OPT-175B.</strong> Lower the LR and restart from an earlier checkpoint where the dynamic loss scaler was still healthy; tighten clipping from 1.0 to 0.3. Separately, hardware failures caused 35+ manual and 70+ automatic restarts, so not every stall is an optimization problem <a href="https://arxiv.org/abs/2205.01068">[OPT, §2.5]</a>.</li>
+    <li><strong>DeepSeek.</strong> V3 reports no irrecoverable spikes and no rollbacks in 14.8T tokens <a href="https://arxiv.org/abs/2412.19437">[V3, Abstract]</a>. V4 found that rollbacks restore state but spikes recur; they were "consistently tied to outliers in the MoE layers", amplified by routing. Fixes: <em>Anticipatory Routing</em> (routing indices from earlier parameters \(\theta_{t-\Delta t}\), about 20% overhead, so enabled only after a detector triggers a short rollback) and <em>SwiGLU clamping</em> (linear branch to \([-10, 10]\), gate branch capped at 10). The mechanism is not understood <a href="https://arxiv.org/abs/2606.19348">[V4, §4.2.3]</a>.</li>
+  </ul>
+
+  <h3 id="diagnostics">The diagnostic list</h3>
+  <p>A rollback is a mitigation, not a diagnosis. The habit that pays is logging leading indicators <em>before</em> the run needs them.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Suspect</th><th>Log this</th><th>Response</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Data</td><td>Per-batch loss and gradient norm; repeated n-grams</td><td>Filter, mask, skip</td><td>OLMo 2: spike batches held long repeated n-grams; filtering documents with 32+ repeats and masking them cut spikes but not all <a href="https://arxiv.org/abs/2501.00656">[§3.1]</a>.</td></tr>
+      <tr><td>LR, Adam state</td><td>Update RMS, gradient-norm trend</td><td>Longer warm-up <span class="zh">学习率预热</span>, lower peak LR, \(\beta_2 \approx 0.95\), tighter clipping</td><td>Longer warm-up lowers LR sensitivity <a href="https://arxiv.org/abs/2309.14322">[Wortsman, Fig. 5]</a>; OPT clipped at 0.3.</td></tr>
+      <tr><td>Adam \(\epsilon\)</td><td>Gradient RMS versus \(\epsilon\)</td><td>\(\epsilon\) well below gradient scale</td><td>Gradients shrink with scale, so \(10^{-8}\) can be too big <a href="https://arxiv.org/abs/2309.14322">[Wortsman, §1]</a>. OLMo 2 moved from \(10^{-5}\) to \(10^{-8}\) <a href="https://arxiv.org/abs/2501.00656">[§3.4.1]</a>; V4 uses \(10^{-20}\).</td></tr>
+      <tr><td>Attention logits</td><td>Max logit per layer and head; entropy</td><td>QK-norm, QK-clip, logit cap</td><td>A quadratic fit of max logit versus size predicted a divergence <a href="https://arxiv.org/abs/2309.14322">[Wortsman, §3.3]</a>. Kimi K2: above 1000 under vanilla Muon <a href="https://arxiv.org/abs/2507.20534">[§2.1]</a>.</td></tr>
+      <tr><td>Output logits</td><td>Mean logit, \(\log Z\), last-layer norm</td><td>z-loss, final-logit cap</td><td>Chameleon: output-norm growth is "strongly correlated with predicting future loss divergence" <a href="https://arxiv.org/abs/2405.09818">[Fig. 5a]</a>.</td></tr>
+      <tr><td>Precision, hardware</td><td>fp16 loss scale; bf16 roundoff in softmax and router; node health</td><td>Upcast softmax, router, loss; cordon nodes</td><td>OPT: loss-scale collapse and last-layer activation spikes preceded divergence. ST-MoE: bf16 roundoff in router exponentials <a href="https://arxiv.org/abs/2202.08906">[§3.4]</a>.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">The optimizer-level playbook (schedules, clipping, Muon) is on <a href="14-optimization.html">page 14</a>; precision formats on <a href="15-distributed-training.html">page 15</a>.</p>
+
+  <h3 id="proxies">Small-scale proxies: measure instability where it is cheap</h3>
+  <p>Wortsman et al. reproduce two documented large-scale instabilities in small models by raising the learning rate, and show the large-scale fixes work there too <a href="https://arxiv.org/abs/2309.14322">[Abstract, §3.1]</a>. Their instrument is <strong>LR sensitivity</strong>: train at each \(\eta\) on a log grid (3e-4 to 3e-1 in half-decades) and take</p>
+
+  \[ \mathrm{LRS} = \E_{\eta}\big[\min\big(\ell(A(\eta)),\, \ell_0\big)\big] - \ell^{*}, \qquad \ell^{*} = \min_{\eta}\, \ell(A(\eta)), \]
+
+  <p>where \(A(\eta)\) is the trained model, \(\ell\) its final validation loss and \(\ell_0\) the loss at initialization, which caps the penalty for diverged runs <a href="https://arxiv.org/abs/2309.14322">[§2.2]</a>. Findings:</p>
+  <ul>
+    <li><strong>Attention-logit growth.</strong> Without QK-layernorm the largest stable LR shrinks with model size; with it, a 1.2B model trains at LR 0.3 <a href="https://arxiv.org/abs/2309.14322">[Fig. 1]</a>. The growth comes from the norms of queries and keys, not their alignment, and it also occurs with a pointwise (softmax-free) attention. The culprit is the bilinear form \(x W_q W_k^\top x^\top\), which is quadratic in parameter scale (App. C, E).</li>
+    <li><strong>Output-logit divergence.</strong> Reproduced at 2.4M parameters and LR 0.1. A z-loss of \(10^{-4}\) fixes it; weight decay <span class="zh">权重衰减</span> also helps at larger sizes <a href="https://arxiv.org/abs/2309.14322">[§3.1.2]</a>.</li>
+    <li><strong>Prediction.</strong> A quadratic fit of max attention logit versus size at each LR flagged every run that passed \(10^4\) as divergent, and correctly predicted that a 4.8B model would diverge at LR \(10^{-2}\) without QK-layernorm <a href="https://arxiv.org/abs/2309.14322">[§3.3]</a>.</li>
+    <li><strong>Other knobs.</strong> Longer warm-up and decoupled weight decay lower LR sensitivity; \(\mu\)P fixes the best LR across width but does not remove the need for QK-layernorm; depth raises sensitivity faster than width <a href="https://arxiv.org/abs/2309.14322">[§3.2]</a>.</li>
+  </ul>
+  <p><strong>Caveats.</strong> The metric ignores the scale of the loss and breaks if an intervention changes what the LR means (App. B). Small-scale conclusions can also reverse at scale <a href="https://arxiv.org/abs/2202.08906">[ST-MoE, §9]</a>. A proxy is cheap to falsify, not proof.</p>
+
+  <h3 id="entropy-numbers">Worked numbers: why big logits kill attention</h3>
+  <p>One query over \(T = 1024\) keys, where one key has logit \(\Delta\) above the other 1023 (at 0): \(p_{\text{top}} = e^{\Delta}/(e^{\Delta} + 1023)\). The entropy collapses over a range of about 10 in logit:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Gap \(\Delta\)</th><th class="num">\(p_{\text{top}}\)</th><th class="num">Entropy (nats)</th><th class="num">Share of \(\ln 1024 = 6.931\)</th></tr></thead>
+    <tbody>
+      <tr><td class="num">0</td><td class="num">0.00098</td><td class="num">6.931</td><td class="num">100%</td></tr>
+      <tr><td class="num">2</td><td class="num">0.0072</td><td class="num">6.923</td><td class="num">99.9%</td></tr>
+      <tr><td class="num">5</td><td class="num">0.127</td><td class="num">6.432</td><td class="num">92.8%</td></tr>
+      <tr><td class="num">10</td><td class="num">0.956</td><td class="num">0.489</td><td class="num">7.1%</td></tr>
+      <tr><td class="num">20</td><td class="num">0.999998</td><td class="num">0.000044</td><td class="num">0.0006%</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Exact: \(H = -p\ln p - (1-p)\ln\frac{1-p}{1023}\).</p>
+
+  <p>Real failures are far beyond this table: an 8B ViT reached attention logits above 50,000 <a href="https://arxiv.org/abs/2302.05442">[ViT-22B, App. B]</a>, and in Wortsman's runs everything past \(10^4\) diverged. The forward pass becomes a hard argmax and the loss surface sharpens. Zhai et al. show that entropy collapse coincides with large gradient norms and a Hessian eigenvalue past the stability threshold, that a 10x temperature cut during ViT warm-up alone induces instability, and that the attainable entropy has a lower bound shrinking exponentially with the spectral norm of the logit matrix <a href="https://arxiv.org/abs/2303.06296">[Zhai et al. 2023, Fig. 2, Thm. 3.1]</a>. They note that a causal link is not established.</p>
+</section>
+
+<section>
+  <h2 id="qk-norm">QK-norm and the other ways to control attention logits</h2>
+
+  <p><strong>QK-norm</strong> normalizes each query and key vector, per head and position, before the dot product. With RMS normalization and learned gains \(g_q, g_k \in \R^{d_h}\):</p>
+
+  \[ \hat q = g_q \odot \frac{q}{\sqrt{\tfrac{1}{d_h}\lVert q \rVert^2 + \epsilon}}, \qquad \hat k = g_k \odot \frac{k}{\sqrt{\tfrac{1}{d_h}\lVert k \rVert^2 + \epsilon}}, \qquad z_{tj} = \frac{\hat q_t \cdot \hat k_j}{\sqrt{d_h}} \]
+
+<pre><code class="language-python">def qk_norm_attention(q, k, v, g_q, g_k):
+    # q, k, v: (B, n_h, T, d_h); g_q, g_k: (d_h,), shared across heads
+    rms = lambda x, g: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * g
+    q, k = rms(q, g_q), rms(k, g_k)                    # unit RMS per head and position, then a learned gain
+    scores = q @ k.transpose(-1, -2) / q.shape[-1] ** 0.5
+    causal = torch.ones(q.shape[-2], k.shape[-2], dtype=torch.bool).tril()
+    return scores.masked_fill(~causal, float("-inf")).softmax(-1) @ v
+</code></pre>
+
+  <h3 id="qk-history">Origin and adopters</h3>
+  <p>Henry et al. (2020) proposed \(\ell_2\)-normalized queries and keys with a learnable scalar in place of \(1/\sqrt d\) for low-resource translation <a href="https://arxiv.org/abs/2010.04245">[Henry et al. 2020]</a>. The stability case came from ViT-22B: at about 8B parameters and Adam \(10^{-3}\) the loss diverged within a few thousand steps as attention logits passed 50,000. LayerNorm on \(q\) and \(k\) fixed it and kept LR \(10^{-3}\) usable at larger sizes, where the earlier recipe had cut it to \(4\times10^{-4}\) for ViT-H <a href="https://arxiv.org/abs/2302.05442">[Dehghani et al. 2023, §2, App. B]</a>. Adopters:</p>
+  <ul>
+    <li><strong>Chameleon</strong> 7B and 34B: essential; the 7B diverged after about 20% of an epoch without it <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. <strong>OLMo 2</strong>, <strong>Gemma 3</strong> (it "replaced the soft-capping of Gemma 2 with QK-norm") and <strong>Qwen3</strong> (removed QKV bias, added QK-Norm "to ensure stable training") <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.1]</a>, <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>, <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §2]</a>.</li>
+    <li><strong>DeepSeek-V4</strong> normalizes each query head and the single compressed KV entry just before core attention, which "avoids exploding attention logits", so it does not use QK-Clip <a href="https://arxiv.org/abs/2606.19348">[V4, §2.3.3, §2.4]</a>.</li>
+  </ul>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th>Normalized over</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Wortsman et al.</td><td>each head, \(d_h\) gains shared across heads (slightly better than full width)</td><td><a href="https://arxiv.org/abs/2309.14322">[Fig. E.8]</a></td></tr>
+      <tr><td>OLMo 2</td><td>the whole projected width \(n_h d_h\), before the head split</td><td><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/olmo2/modeling_olmo2.py">[transformers, olmo2]</a></td></tr>
+      <tr><td>Gemma 3, Qwen3</td><td>each head (\(d_h\)), before RoPE</td><td><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py">[gemma3]</a>, <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py">[qwen3]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Implementation rows are from the Hugging Face <code>transformers</code> files read in September 2026; the Qwen3 file comments "unlike olmo, only on the head dim".</p>
+
+  <h3 id="qk-bound">The bound</h3>
+  <p>Without normalization the logit is bilinear in the weights, \(x_t W_q W_k^\top x_j^\top\) up to the \(1/\sqrt{d_h}\) scale: multiply both matrices by 10 and it grows 100x, and nothing in the loss stops it. With QK-norm the pre-gain vectors have RMS 1, hence norm \(\sqrt{d_h}\). Split off the gains and apply Cauchy-Schwarz:</p>
+
+  <div class="eq-box">
+  \[ |z_{tj}| \;\le\; \frac{1}{\sqrt{d_h}}\; \max_i |g_{q,i}\, g_{k,i}| \cdot \lVert \hat q^{0}_t \rVert \, \lVert \hat k^{0}_j \rVert \;=\; \sqrt{d_h}\; \max_i |g_{q,i}\, g_{k,i}| \;\overset{g_q = g_k = g}{=}\; \frac{g^2 d_h}{\sqrt{d_h}} = g^2 \sqrt{d_h} \]
+  <div class="eq-label">\(\hat q^{0}, \hat k^{0}\) are the unit-RMS vectors before the gains; the bound holds for any weights</div>
+  </div>
+
+  <p>For \(d_h = 128\): \(g = 1\) gives \(|z| \le 11.31\) and \(g = 2\) gives 45.25; the largest-to-smallest weight ratio in a row is at most \(e^{2g^2\sqrt{d_h}}\), which is \(e^{22.6} \approx 6.7\times10^9\) at \(g=1\), still very sharp. At initialization, random unit-RMS vectors give logits with standard deviation 1 (we measured 0.998 at \(d_h = 128\)), so the bound is a worst case that costs nothing until a head needs it. What changed is that sharpness can now grow only through the gains, \(d_h\) scalars per layer, not through two full matrices. They can still grow, which is why QK-layernorm lowers LR sensitivity without removing its growth with scale <a href="https://arxiv.org/abs/2309.14322">[Wortsman, Fig. 1]</a>.</p>
+
+  <h3 id="qk-rope-mla">Interaction with RoPE and with MLA</h3>
+  <p><strong>Norm before rotation.</strong> Gemma 3 and Qwen3 normalize, then apply <a href="05-positional-encoding.html#rope">RoPE</a>. Rotations preserve norm, so the RMS is the same either way; the order matters for the gains. The identity \(R_t R_j^\top = R_{t-j}\) needs the dotted vectors to be rotations of \(\hat q, \hat k\). A per-dimension gain applied <em>after</em> rotation would scale the two coordinates of a rotating pair differently and break it; applied <em>before</em>, it is part of \(\hat q, \hat k\) and the identity holds exactly (our reasoning).</p>
+  <p><strong>MLA.</strong> Kimi K2 says QK-Norm "is not applicable to multi-head latent attention (MLA), because its Key matrices are not fully materialized during inference" <a href="https://arxiv.org/abs/2507.20534">[K2, §2.1]</a>. That follows from <a href="07-kv-efficient-attention.html#absorption">weight absorption</a>: decode never forms per-head keys, and a nonlinear norm cannot be absorbed into \(W^{UK}\). V2 and V3 instead put RMSNorm on the compressed latents and scaling factors at the width bottlenecks <a href="https://arxiv.org/abs/2412.19437">[V3, §4.2]</a>, which bounds the latent but not the product of up-projections (our reading). K2 added QK-Clip, below. V4 dropped MLA for a shared-KV MQA whose single KV entry is materialized, and says this "allows us to directly apply RMSNorm" on queries and KV entries <a href="https://arxiv.org/abs/2606.19348">[V4, §2.4]</a>. The attention variant decided which stabilizer was available.</p>
+
+  <div class="decision">
+    <div class="decision-title">QK-norm</div>
+    <dl>
+      <dt>Problem</dt><dd>Attention logits are bilinear in the weights and grow quadratically; past a few thousand, rows are one-hot and training diverges at high LR or scale.</dd>
+      <dt>Idea</dt><dd>RMS-normalize each query and key per head, with a learned gain.</dd>
+      <dt>Why it works</dt><dd>\(|z| \le g^2\sqrt{d_h}\) for any weights; the quadratic weight-scale dependence is gone.</dd>
+      <dt>Evidence</dt><dd>ViT-22B at 8B <a href="https://arxiv.org/abs/2302.05442">[App. B]</a>; 1.2B model at LR 0.3 <a href="https://arxiv.org/abs/2309.14322">[Wortsman, Fig. 1]</a>; Chameleon-7B diverges without it <a href="https://arxiv.org/abs/2405.09818">[Fig. 5b]</a>. OLMo 2 saw a gain only together with output-norm <a href="https://arxiv.org/abs/2501.00656">[§3.3.2]</a>.</dd>
+      <dt>Cost</dt><dd>Two fused norms and \(d_h\) gains per layer; caps sharpness at \(g^2\sqrt{d_h}\); incompatible with absorbed MLA; leaves the output softmax alone.</dd>
+      <dt>Used by</dt><dd>ViT-22B, Chameleon, OLMo 2, Gemma 3, Qwen3, DeepSeek-V4.</dd>
+    </dl>
+  </div>
+
+  <h3 id="softcap">Soft-capping</h3>
+  <p>Gemma 2 bounds logits with \(\operatorname{softcap}(z) = c \tanh(z/c)\), with \(c = 50\) for attention and \(c = 30\) for final logits <a href="https://arxiv.org/abs/2408.00118">[Gemma 2, §2]</a>. Gemma 3 replaced it with QK-norm, citing ViT-22B, Wortsman et al. and Chameleon <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>. Why:</p>
+  <ul>
+    <li><strong>It bounds range, not sharpness.</strong> With cap 50, one key at 50 and 8,191 at 0 gives \(1 - p_{\text{top}} = 1.6 \times 10^{-18}\), entropy about \(8\times10^{-17}\) nats: still one-hot.</li>
+    <li><strong>Saturation kills the signal.</strong> The derivative \(1 - \tanh^2(z/c)\) is 0.42 at \(z = c\), 0.071 at \(2c\) and \(1.8\times10^{-4}\) at \(5c\). Kimi: "the dot products between queries and keys can still grow excessively before capping is applied" <a href="https://arxiv.org/abs/2507.20534">[K2, §2.1]</a>.</li>
+    <li><strong>The final-logit cap bounds drift.</strong> With \(|z_v| < 30\) and \(V = 256{,}128\) (\(\ln V = 12.45\)), \(\log Z \in (-17.5,\, 42.5)\) by construction (our arithmetic): the job of a z-loss, with the same saturating gradient.</li>
+  </ul>
+
+  <h3 id="qk-clip">QK-clip (MuonClip)</h3>
+  <p>Kimi K2 saw exploding attention logits "more frequently with Muon but less with AdamW"; a 9B-activated, 53B-total run with vanilla Muon had max logits above 1000 <a href="https://arxiv.org/abs/2507.20534">[K2, §2.1, Fig. 2]</a>. QK-Clip leaves the forward pass alone and rescales weights after each update. Per head, with max logit \(S^h_{\max}\) over the batch and threshold \(\tau\):</p>
+
+  <div class="eq-box">
+  \[ \text{if } S^h_{\max} > \tau:\quad \gamma_h = \frac{\tau}{S^h_{\max}},\qquad W^h_{q^C} \leftarrow \sqrt{\gamma_h}\, W^h_{q^C},\quad W^h_{k^C} \leftarrow \sqrt{\gamma_h}\, W^h_{k^C},\quad W^h_{q^R} \leftarrow \gamma_h\, W^h_{q^R} \]
+  <div class="eq-label">MLA: the shared rotary key \(k^R\) is untouched, so clipping one head cannot affect the others</div>
+  </div>
+
+  <p>Each factor pair scales the head's logit by exactly \(\gamma_h\), so \(S^h_{\max}\) drops to \(\tau\). Clipping is per head because only a small subset explode. In K2 (\(\tau = 100\)) logits were capped early and decayed by themselves after about 30% of training; 12.7% of heads ever triggered in the first 70K steps and none afterwards. \(\tau = 30\) on a 0.5B/3B model left the loss unchanged. K2 reports 15.5T tokens without a spike <a href="https://arxiv.org/abs/2507.20534">[K2, Abstract, App. D]</a>. K2's hypothesis for why Muon is worse: its update has equal singular values (full effective rank), so it is more likely than Adam's to align with the top singular directions of \(W\), and \(W_q W_k^\top\) squares the effect <a href="https://arxiv.org/abs/2507.20534">[App. E]</a>. See <a href="14-optimization.html">page 14</a> for Muon and <a href="32-frontier-open-models.html">page 32</a> for K2.</p>
+</section>
+
+<section>
+  <h2 id="zloss">z-loss: the freedom of the final softmax</h2>
+
+  <p>The softmax is invariant to a constant shift: \(\softmax(z + c) = \softmax(z)\). Cross-entropy therefore has a direction with exactly zero gradient, and nothing anchors \(\log Z = \log\sum_v e^{z_v}\). Chameleon traced late divergences to this: with weights shared across modalities, each "competes" by nudging norms up, harmless until values leave bf16's effective range; in text-only training the same failure is called logit drift <a href="https://arxiv.org/abs/2405.09818">[Chameleon, §2.3]</a>. PaLM's fix is a penalty on the normalizer:</p>
+
+  \[ \mathcal L = \mathcal L_{\mathrm{CE}} + \lambda \cdot \frac{1}{N}\sum_{t=1}^{N} \big(\log Z_t\big)^2 \]
+
+  <p>PaLM used \(\lambda = 10^{-4}\) "to encourage the softmax normalizer \(\log(Z)\) to be close to 0", which "increases the stability of training" <a href="https://arxiv.org/abs/2204.02311">[PaLM, §5]</a>. Because it ties embeddings, PaLM also scales pre-softmax logits by \(1/\sqrt n\). Later coefficients: \(10^{-4}\) (Wortsman et al.), \(10^{-5}\) (Chameleon <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>), and for OLMo 2 <span class="unverified" title="The OLMo 2 paper is inconsistent: Sec. 3.3.3 says 10^-4 while Table 1 lists 10^-5; we did not resolve which value the released runs used.">the text says \(10^{-4}\) while Table 1 lists \(10^{-5}\)</span> <a href="https://arxiv.org/abs/2501.00656">[§3.3.3]</a>. On router logits it is ST-MoE's <em>router z-loss</em>, \(c_z = 10^{-3}\) <a href="https://arxiv.org/abs/2202.08906">[§3.3]</a> (<a href="08-mixture-of-experts.html">page 08</a>).</p>
+
+<pre><code class="language-python">def lm_loss_with_z(logits, labels, z_coef=1e-4):
+    logits = logits.float()                                    # never exponentiate bf16 logits
+    log_z = torch.logsumexp(logits, dim=-1)                    # (B, T), shared with the CE
+    ce = (log_z - logits.gather(-1, labels[..., None]).squeeze(-1)).mean()
+    return ce + z_coef * log_z.pow(2).mean()
+</code></pre>
+
+  <h3 id="z-numbers">Worked numbers: how big is the penalty?</h3>
+  <p>The gradient is \(\partial_{z_v}\, \lambda \log^2 Z = 2\lambda \log Z \cdot p_v\): it lowers <em>all</em> logits in proportion to their probability, so the ranking of tokens barely changes. It acts on the free direction only. At Llama-3-8B initialization \(\log Z \approx \ln V + \tfrac12\sigma^2 = 11.76 + 0.82 = 12.58\) (<a href="04-transformer-block.html#init">page 04</a>).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">\(\log Z\)</th><th class="num">Penalty at \(\lambda = 10^{-4}\)</th><th class="num">Gradient factor \(2\lambda\log Z\)</th><th>Comment</th></tr></thead>
+    <tbody>
+      <tr><td class="num">0</td><td class="num">0</td><td class="num">0</td><td>normalized logits</td></tr>
+      <tr><td class="num">5</td><td class="num">0.0025</td><td class="num">0.0010</td><td></td></tr>
+      <tr><td class="num">12.58</td><td class="num">0.0158</td><td class="num">0.0025</td><td>Llama-3-8B at init, against CE \(\approx 12.6\)</td></tr>
+      <tr><td class="num">15</td><td class="num">0.0225</td><td class="num">0.0030</td><td>0.3% of \(p_v\), against the CE gradient \(p_v - y_v\)</td></tr>
+      <tr><td class="num">30</td><td class="num">0.090</td><td class="num">0.0060</td><td>about 4% of a 2.5-nat loss</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The term is tiny when healthy and grows only when \(\log Z\) drifts. Drift matters because bf16 has 8 bits of precision: the spacing is 1.0 on \([128, 256)\) and 4.0 near 1000 (checked with <code>torch</code>; ST-MoE's Fig. 2 lists 8.0 on \([1024, 2048)\)). Logits near 200 cannot express differences below one nat. ST-MoE's example: ten logits at 128 and one at 128.5, where a rounding error of 0.5 changes the output probability by 36% <a href="https://arxiv.org/abs/2202.08906">[§3.4, fn. 7]</a>. <strong>Gotchas.</strong> QK-norm "does not solve the problem of logit shift in the final softmax", so Chameleon used both <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>. And OLMo 2 found FlashAttention's fused z-loss and a pure-PyTorch one gave the same forward value but different backward passes, and retrained from the divergence point after dropping the fused version <a href="https://arxiv.org/abs/2501.00656">[§3.3.3, Fig. 8]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">z-loss</div>
+    <dl>
+      <dt>Problem</dt><dd>Cross-entropy is blind to a constant logit shift, so \(\log Z\) can drift until bf16 roundoff corrupts the softmax.</dd>
+      <dt>Idea</dt><dd>Penalize \((\log Z)^2\) with a small coefficient.</dd>
+      <dt>Why it works</dt><dd>It acts only on the shift direction, at gradient \(2\lambda\log Z\cdot p\), so predictions are unaffected.</dd>
+      <dt>Evidence</dt><dd>PaLM \(\lambda = 10^{-4}\) <a href="https://arxiv.org/abs/2204.02311">[§5]</a>; fixes the 2.4M-model divergence <a href="https://arxiv.org/abs/2309.14322">[Fig. 4]</a>; Chameleon-34B needed it but not dropout <a href="https://arxiv.org/abs/2405.09818">[Fig. 6c]</a>; router version slightly improved quality <a href="https://arxiv.org/abs/2202.08906">[Table 4]</a>.</dd>
+      <dt>Cost</dt><dd>One reduction already computed for the loss; a coefficient (\(10^{-5}\) to \(10^{-3}\) in the sources above).</dd>
+      <dt>Used by</dt><dd>PaLM, OLMo 2, Chameleon; router version in ST-MoE and MoE recipes.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="norm-placement">Norm placement, residual scaling and embeddings</h2>
+
+  <p><a href="04-transformer-block.html#pre-norm">Page 04</a> covers why pre-norm replaced post-norm and how initialization scales the residual writes. This section adds what came after: normalizing the <em>output</em> of each sublayer, and the embedding-side fixes.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 350" role="img" aria-labelledby="fig-11-1-title">
+<title id="fig-11-1-title">Four ways to place normalization around a residual sublayer: post-norm, pre-norm, sandwich (pre and post) and OLMo 2 output-norm</title>
+<defs><marker id="arrow-11-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="94" y="18" text-anchor="middle" class="s-bold">Post-norm</text>
+<text x="108" y="40" text-anchor="middle" class="s-small s-muted">x</text>
+<circle cx="108" cy="62" r="3" class="s-fill-muted"/>
+<line class="s-line" x1="108" y1="62" x2="108" y2="78" marker-end="url(#arrow-11-1)"/>
+<rect class="s-box" x="70" y="78" width="76" height="32" rx="6"/>
+<text x="108" y="99" text-anchor="middle" class="s-small">F</text>
+<line class="s-line" x1="108" y1="110" x2="108" y2="119" marker-end="url(#arrow-11-1)"/>
+<circle cx="108" cy="128" r="9" class="s-plain"/>
+<text x="108" y="132" text-anchor="middle" class="s-small">+</text>
+<path class="s-line-c" d="M108,62 L38,62 L38,128 L99,128" marker-end="url(#arrow-11-1)"/>
+<line class="s-line" x1="108" y1="137" x2="108" y2="151" marker-end="url(#arrow-11-1)"/>
+<rect class="s-b" x="70" y="151" width="76" height="32" rx="6"/>
+<text x="108" y="172" text-anchor="middle" class="s-small">LN</text>
+<line class="s-line" x1="108" y1="183" x2="108" y2="250" marker-end="url(#arrow-11-1)"/>
+<text x="108" y="264" text-anchor="middle" class="s-small s-muted">y</text>
+<text x="94" y="288" text-anchor="middle" class="s-mono">y = LN(x + F(x))</text>
+<text x="94" y="306" text-anchor="middle" class="s-small s-muted">original Transformer</text>
+<text x="272" y="18" text-anchor="middle" class="s-bold">Pre-norm</text>
+<text x="286" y="40" text-anchor="middle" class="s-small s-muted">x</text>
+<circle cx="286" cy="62" r="3" class="s-fill-muted"/>
+<line class="s-line" x1="286" y1="62" x2="286" y2="78" marker-end="url(#arrow-11-1)"/>
+<rect class="s-a" x="248" y="78" width="76" height="32" rx="6"/>
+<text x="286" y="99" text-anchor="middle" class="s-small">norm</text>
+<line class="s-line" x1="286" y1="110" x2="286" y2="126" marker-end="url(#arrow-11-1)"/>
+<rect class="s-box" x="248" y="126" width="76" height="32" rx="6"/>
+<text x="286" y="147" text-anchor="middle" class="s-small">F</text>
+<line class="s-line" x1="286" y1="158" x2="286" y2="167" marker-end="url(#arrow-11-1)"/>
+<circle cx="286" cy="176" r="9" class="s-plain"/>
+<text x="286" y="180" text-anchor="middle" class="s-small">+</text>
+<path class="s-line-c" d="M286,62 L216,62 L216,176 L277,176" marker-end="url(#arrow-11-1)"/>
+<line class="s-line" x1="286" y1="185" x2="286" y2="250" marker-end="url(#arrow-11-1)"/>
+<text x="286" y="264" text-anchor="middle" class="s-small s-muted">y</text>
+<text x="272" y="288" text-anchor="middle" class="s-mono">y = x + F(N(x))</text>
+<text x="272" y="306" text-anchor="middle" class="s-small s-muted">GPT-2, Llama, Qwen</text>
+<text x="450" y="18" text-anchor="middle" class="s-bold">Sandwich</text>
+<text x="464" y="40" text-anchor="middle" class="s-small s-muted">x</text>
+<circle cx="464" cy="62" r="3" class="s-fill-muted"/>
+<line class="s-line" x1="464" y1="62" x2="464" y2="78" marker-end="url(#arrow-11-1)"/>
+<rect class="s-a" x="426" y="78" width="76" height="32" rx="6"/>
+<text x="464" y="99" text-anchor="middle" class="s-small">norm</text>
+<line class="s-line" x1="464" y1="110" x2="464" y2="126" marker-end="url(#arrow-11-1)"/>
+<rect class="s-box" x="426" y="126" width="76" height="32" rx="6"/>
+<text x="464" y="147" text-anchor="middle" class="s-small">F</text>
+<line class="s-line" x1="464" y1="158" x2="464" y2="174" marker-end="url(#arrow-11-1)"/>
+<rect class="s-a" x="426" y="174" width="76" height="32" rx="6"/>
+<text x="464" y="195" text-anchor="middle" class="s-small">norm</text>
+<line class="s-line" x1="464" y1="206" x2="464" y2="215" marker-end="url(#arrow-11-1)"/>
+<circle cx="464" cy="224" r="9" class="s-plain"/>
+<text x="464" y="228" text-anchor="middle" class="s-small">+</text>
+<path class="s-line-c" d="M464,62 L394,62 L394,224 L455,224" marker-end="url(#arrow-11-1)"/>
+<line class="s-line" x1="464" y1="233" x2="464" y2="250" marker-end="url(#arrow-11-1)"/>
+<text x="464" y="264" text-anchor="middle" class="s-small s-muted">y</text>
+<text x="450" y="288" text-anchor="middle" class="s-mono">y = x + N(F(N(x)))</text>
+<text x="450" y="306" text-anchor="middle" class="s-small s-muted">Gemma 2 and 3</text>
+<text x="628" y="18" text-anchor="middle" class="s-bold">Output-norm</text>
+<text x="642" y="40" text-anchor="middle" class="s-small s-muted">x</text>
+<circle cx="642" cy="62" r="3" class="s-fill-muted"/>
+<line class="s-line" x1="642" y1="62" x2="642" y2="78" marker-end="url(#arrow-11-1)"/>
+<rect class="s-box" x="604" y="78" width="76" height="32" rx="6"/>
+<text x="642" y="99" text-anchor="middle" class="s-small">F</text>
+<line class="s-line" x1="642" y1="110" x2="642" y2="126" marker-end="url(#arrow-11-1)"/>
+<rect class="s-a" x="604" y="126" width="76" height="32" rx="6"/>
+<text x="642" y="147" text-anchor="middle" class="s-small">norm</text>
+<line class="s-line" x1="642" y1="158" x2="642" y2="167" marker-end="url(#arrow-11-1)"/>
+<circle cx="642" cy="176" r="9" class="s-plain"/>
+<text x="642" y="180" text-anchor="middle" class="s-small">+</text>
+<path class="s-line-c" d="M642,62 L572,62 L572,176 L633,176" marker-end="url(#arrow-11-1)"/>
+<line class="s-line" x1="642" y1="185" x2="642" y2="250" marker-end="url(#arrow-11-1)"/>
+<text x="642" y="264" text-anchor="middle" class="s-small s-muted">y</text>
+<text x="628" y="288" text-anchor="middle" class="s-mono">y = x + N(F(x))</text>
+<text x="628" y="306" text-anchor="middle" class="s-small s-muted">OLMo 2, Chameleon-34B</text>
+<rect class="s-a" x="20" y="326" width="14" height="12" rx="2"/><text x="40" y="336" class="s-small">norm N on the branch (stream untouched)</text>
+<rect class="s-b" x="290" y="326" width="14" height="12" rx="2"/><text x="310" y="336" class="s-small">norm on the residual stream</text>
+<line class="s-line-c" x1="500" y1="332" x2="530" y2="332"/><text x="538" y="336" class="s-small">skip path (identity)</text>
+</svg>
+    <figcaption><b>Figure 1.</b> One residual sublayer \(F\) (attention or FFN) under four norm placements. Post-norm puts a LayerNorm on the stream itself, so every write and every gradient passes through it. Pre-norm keeps the skip path (green) an identity. Sandwich adds a norm on the way out. OLMo 2 drops the input norm and keeps only the output norm, so whatever \(F\) computes, the vector added to the stream has a bounded RMS.</figcaption>
+  </figure>
+
+  <h3 id="sandwich-olmo">Sandwich norm and OLMo 2's output-norm</h3>
+  <p><strong>Gemma 2 and 3</strong> use RMSNorm "to normalize the input and output of each transformer sub-layer" <a href="https://arxiv.org/abs/2408.00118">[Gemma 2, §2]</a>, four norms per layer in Gemma 3's code <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py">[transformers, gemma3]</a>. <strong>OLMo 2</strong> keeps only the output side:</p>
+
+  \[ h = x + \RMSNorm\big(\mathrm{Attn}(x)\big), \qquad x_{\text{out}} = h + \RMSNorm\big(\mathrm{MLP}(h)\big) \]
+
+  <p>The reordering comes from Swin Transformer V2's "residual-post-norm" <a href="https://arxiv.org/abs/2111.09883">[Liu et al. 2021]</a> via Chameleon. OLMo 2 found that neither reordering nor QK-norm alone gave good results, but together they cut the gradient-norm spike score (percentage of values at least 7 standard deviations above a rolling 1,000-step average) from 0.108 to 0.069 <a href="https://arxiv.org/abs/2501.00656">[§3.3.2, Fig. 7]</a>. Chameleon-34B still diverged with the Llama-2 ordering plus QK-norm and dropout, and needed the reordering, which "bounds the norm growth of the feedforward block, which can become additionally problematic given the multiplicative nature of the SwiGLU activation" <a href="https://arxiv.org/abs/2405.09818">[§2.3]</a>.</p>
+  <p><strong>Why bounding the write helps.</strong> In pre-norm, \(F(\mathrm{LN}(x))\) has no ceiling: a gated FFN can write a huge vector, and every later LayerNorm divides by a norm dominated by it. LLaMA2-7B's massive activations reach 2,622 against a median of 0.2 <a href="https://arxiv.org/abs/2402.17762">[Sun et al. 2024, Table 1]</a>, and the Qwen gating study traces them to early-layer FFN outputs carried by the residual stream, consistent with normalizing FFN outputs first <a href="https://arxiv.org/abs/2505.06708">[Qiu et al. 2025, §4.3]</a>. One consequence (our reasoning): the branch can no longer start near zero, since \(\RMSNorm\) of a tiny vector still has unit RMS, which fits OLMo 2 dropping depth-scaled initialization (<a href="04-transformer-block.html#init">page 04</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Output-norm (sandwich and OLMo 2 style)</div>
+    <dl>
+      <dt>Problem</dt><dd>Sublayer outputs are unbounded, so one bad sublayer (often a SwiGLU FFN) can inflate the stream and destabilize later norms and gradients.</dd>
+      <dt>Idea</dt><dd>Normalize what each sublayer writes: on the output (OLMo 2) or on input and output (Gemma).</dd>
+      <dt>Why it works</dt><dd>The write's RMS is set by a learned gain, not by the sublayer's internal scale.</dd>
+      <dt>Evidence</dt><dd>Chameleon-34B stable only after reordering <a href="https://arxiv.org/abs/2405.09818">[Fig. 6c]</a>; OLMo 2 spike score 0.108 to 0.069 with QK-norm <a href="https://arxiv.org/abs/2501.00656">[§3.3.2]</a>.</dd>
+      <dt>Cost</dt><dd>One or two extra norms per sublayer; changes how initialization should scale writes; did not work well with dropout in Chameleon.</dd>
+      <dt>Used by</dt><dd>Gemma 2 and 3, OLMo 2, Chameleon-34B. Llama, Qwen, gpt-oss and DeepSeek keep plain pre-norm.</dd>
+    </dl>
+  </div>
+
+  <h3 id="deepnorm">DeepNorm: scaling the residual for extreme depth</h3>
+  <p>DeepNet attacks post-LN transformers that will not train past a few dozen layers, tracing the failure to an exploding <em>model update</em>: for vanilla post-LN, \(\lVert\Delta F\rVert = O(\sum_i \lVert\Delta\theta_i\rVert)\) accumulates over sublayers. DeepNorm up-weights the skip path and down-weights branch initialization:</p>
+
+  \[ x_{l+1} = \mathrm{LN}\big(\alpha\, x_l + G_l(x_l)\big), \qquad \text{decoder-only: } \alpha = (2M)^{1/4},\ \beta = (8M)^{-1/4} \]
+
+  <p>with \(M\) layers, and \(\beta\) scaling the initialization of the FFN, value and output projections <a href="https://arxiv.org/abs/2203.00555">[Wang et al. 2022, §4, App. C]</a>. For \(M = 32\): \(\alpha = 2.83\), \(\beta = 0.25\). They train 1,000 layers, and a 200-layer 3.2B model beats a 48-layer 12B one by 5 BLEU on multilingual translation; pre-LN loses 0.5 to 1.0 BLEU against converged post-LN <a href="https://arxiv.org/abs/2203.00555">[§5, Tab. 1, 3]</a>. Independent evidence is mixed: Zhai et al. could not reproduce stable 100-layer DeepNorm (two of three seeds diverged) <a href="https://arxiv.org/abs/2303.06296">[App. F.2]</a>. Mainstream LLMs stayed with pre-norm.</p>
+
+  <h3 id="embeddings-stability">Embeddings: keep the shortcut large</h3>
+  <p>Takase et al. bound gradients through the sublayer Jacobians and reach two conditions for spike-free pre-LN training: <strong>small sublayer outputs</strong> (the usual small init) and a <strong>large shortcut</strong>, meaning the stream entering layer 1, the token embedding, should have standard deviation near 1. The original Transformer multiplied embeddings by \(\sqrt d\) <a href="https://arxiv.org/abs/1706.03762">[Vaswani et al. 2017, §3.4]</a>; many implementations dropped it. Restoring it (or applying LayerNorm to embeddings, as BLOOM did) removed spikes: at 13B and LR \(3\times10^{-4}\) the vanilla run could not be trained while scaled embeddings trained fine, and spikes grew with width because the default std \(\propto 1/\sqrt d\) shrinks the shortcut <a href="https://arxiv.org/abs/2312.16903">[Takase et al. 2024, §4 to §5]</a>. Gemma 3's code multiplies embeddings by \(\sqrt{d_{\text{model}}}\); PaLM initializes embeddings from \(\mathcal N(0,1)\) and compensates with the \(1/\sqrt n\) logit scale <a href="https://arxiv.org/abs/2204.02311">[§5]</a>.</p>
+  <p>OLMo 2 excluded embeddings from weight decay for the same reason: decay shrinks embeddings, in early layers the stream <em>is</em> the embedding, and \(\partial\,\mathrm{LN}(x)/\partial x \propto 1/\lVert x\rVert\), so small embeddings give large gradients. Spike score fell from 0.16 to 0.092 <a href="https://arxiv.org/abs/2501.00656">[§3.4.2, Fig. 10]</a>.</p>
+</section>
+
+<section>
+  <h2 id="hyper-connections">Hyper-connections and manifold-constrained hyper-connections</h2>
+
+  <p>A residual stream <span class="zh">残差连接</span> is a bus of width \(d\) that every layer reads and writes. <strong>Hyper-connections</strong> <span class="zh">超连接</span> (HC; ByteDance, ICLR 2025) widen it into \(n\) parallel streams with learned mixing. DeepSeek's <strong>manifold-constrained hyper-connections</strong> <span class="zh">流形约束超连接</span> (mHC; Xie et al., arXiv December 2025) constrain the mixing so it stays stable at scale, and DeepSeek-V4 uses it with \(n = 4\) <a href="https://arxiv.org/abs/2606.19348">[V4, §2.2]</a>.</p>
+
+  <h3 id="hc-form">The form</h3>
+  <p>Let \(X_l \in \R^{n\times d}\) hold the \(n\) streams. A layer \(F\) (attention or MoE, \(d \to d\)) becomes</p>
+
+  <div class="eq-box">
+  \[ X_{l+1} \;=\; H^{\mathrm{res}}_l\, X_l \;+\; \big(H^{\mathrm{post}}_l\big)^{\!\top}\, F\!\big(H^{\mathrm{pre}}_l\, X_l\big), \qquad H^{\mathrm{res}} \in \R^{n\times n},\ \ H^{\mathrm{pre}}, H^{\mathrm{post}} \in \R^{1\times n} \]
+  <div class="eq-label">\(H^{\mathrm{pre}}\) reads the streams into one \(d\)-vector, \(H^{\mathrm{post}}\) writes the output back, \(H^{\mathrm{res}}\) mixes the streams <a href="https://arxiv.org/abs/2512.24880">[mHC, Eq. 3]</a></div>
+  </div>
+
+  <p>(V4 names them \(A_l, B_l, C_l\).) With \(n = 1\) this is the ordinary residual: pre-norm and post-norm are non-trainable special cases <a href="https://arxiv.org/abs/2409.19606">[Zhu et al. 2025, §3.1]</a>. The layer still sees a \(d\)-dimensional input, so FLOPs barely change. In HC the coefficients are a static part plus an input-dependent part (a linear map of the RMS-normalized streams with small learned gates), initialized to reproduce a pre-norm residual <a href="https://arxiv.org/abs/2409.19606">[§2.1 to §2.3]</a>. <strong>What HC bought:</strong> pre-norm and post-norm sit at two ends of a seesaw (representation collapse versus vanishing gradients), and HC learns the connection strengths. On OLMoE-1B-7B (500B tokens), dynamic HC with \(n = 4\) converged 1.8x faster and gained 6 points on ARC-Challenge; on OLMo-1B, \(n = 1\) was worse than baseline, \(n = 4\) helped most, \(n = 8\) added little; extra parameters were 0.03% <a href="https://arxiv.org/abs/2409.19606">[Fig. 1, Tab. 1, 7]</a>.</p>
+
+  <h3 id="hc-breaks">Why unconstrained HC breaks at scale</h3>
+  <p>Unroll the recursion. In a plain residual net, \(x_L = x_l + \sum_i F_i\): the shallow signal arrives <em>unchanged</em> (the identity mapping). In HC it is multiplied by a product of mixing matrices:</p>
+  \[ X_L = \Big(\prod_{i=1}^{L-l} H^{\mathrm{res}}_{L-i}\Big) X_l + \sum_{i=l}^{L-1} \Big(\prod_{j=1}^{L-1-i} H^{\mathrm{res}}_{L-j}\Big) H^{\mathrm{post}\top}_i\, F_i\big(H^{\mathrm{pre}}_i X_i\big) \]
+  <p>Unconstrained, that product amplifies or attenuates exponentially in depth. On 27B MoE models, HC showed a loss surge near step 12K with a gradient-norm spike, and the composite's "Amax Gain Magnitude" (largest absolute row sum for the forward signal, column sum for the backward gradient) peaked near 3,000. With the mHC constraint the maximum was about 1.6, three orders of magnitude lower <a href="https://arxiv.org/abs/2512.24880">[mHC, §3.1, Figs. 2, 3, 7]</a>.</p>
+
+  <h3 id="mhc-constraint">The constraint: doubly stochastic mixing</h3>
+  <p>mHC restricts \(H^{\mathrm{res}}\) to the <em>Birkhoff polytope</em>: non-negative matrices with every row and column summing to 1, that is, <strong>doubly stochastic</strong> <span class="zh">双随机矩阵</span> matrices. \(H^{\mathrm{pre}} = \sigma(\cdot)\) and \(H^{\mathrm{post}} = 2\sigma(\cdot)\) stay non-negative to avoid cancellation. Three whiteboard properties, for \(B \ge 0\) with \(B\mathbf 1 = \mathbf 1\) and \(\mathbf 1^\top B = \mathbf 1^\top\):</p>
+  <ol>
+    <li><strong>Non-expansive.</strong> The max row sum \(\lVert B\rVert_\infty\) and max column sum \(\lVert B\rVert_1\) both equal 1, so \(\lVert B\rVert_2 \le \sqrt{\lVert B\rVert_1 \lVert B\rVert_\infty} = 1\).</li>
+    <li><strong>Closed under products.</strong> \((B_1 B_2)\mathbf 1 = \mathbf 1\), likewise for columns, so any depth of composition stays doubly stochastic.</li>
+    <li><strong>Mean-preserving.</strong> \(\mathbf 1^\top (BX) = \mathbf 1^\top X\): mixing moves signal between streams but conserves the total, the multi-stream identity mapping <a href="https://arxiv.org/abs/2512.24880">[mHC, §4.1]</a>.</li>
+  </ol>
+  <p>To produce such a matrix from a raw output \(\tilde H\), mHC runs <strong>Sinkhorn-Knopp</strong>: \(M^{(0)} = \exp(\tilde H)\), then alternate row and column normalization, \(t_{\max} = 20\) iterations <a href="https://arxiv.org/abs/2512.24880">[mHC, §4.2]</a>, as in V4 <a href="https://arxiv.org/abs/2606.19348">[§2.2]</a>. Twenty iterations only approximate the projection, so gains are near 1, not exactly 1.</p>
+
+<pre><code class="language-python">def sinkhorn(logits, iters=20):
+    m = logits.exp()                                   # positive matrix, (..., n, n)
+    for _ in range(iters):
+        m = m / m.sum(-2, keepdim=True)                # columns sum to 1
+        m = m / m.sum(-1, keepdim=True)                # rows sum to 1 (last op: rows are exact)
+    return m
+
+class MHC(nn.Module):
+    """One mHC step around a sublayer. x: (B, T, n, d) streams; layer: (B, T, d) -> (B, T, d)."""
+    def __init__(self, d, n, layer, iters=20):
+        super().__init__()
+        self.n, self.iters, self.layer = n, iters, layer
+        self.w_pre = nn.Linear(n * d, n, bias=False)
+        self.w_post = nn.Linear(n * d, n, bias=False)
+        self.w_res = nn.Linear(n * d, n * n, bias=False)
+        self.s_pre, self.s_post = nn.Parameter(torch.zeros(n)), nn.Parameter(torch.zeros(n))
+        self.s_res = nn.Parameter(3.0 * torch.eye(n))          # Sinkhorn(3I) is close to the identity
+        self.alpha = nn.Parameter(torch.full((3,), 0.01))       # small gates on the dynamic parts
+        for w in (self.w_pre, self.w_post, self.w_res):
+            nn.init.normal_(w.weight, std=0.02)
+
+    def forward(self, x):
+        B, T, n, d = x.shape
+        xf = x.reshape(B, T, n * d)
+        xh = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)            # RMSNorm of the flattened streams
+        a = torch.sigmoid(self.alpha[0] * self.w_pre(xh) + self.s_pre)            # H_pre  >= 0, (B, T, n)
+        c = 2 * torch.sigmoid(self.alpha[2] * self.w_post(xh) + self.s_post)      # H_post in (0, 2)
+        b = sinkhorn(self.alpha[1] * self.w_res(xh).view(B, T, n, n) + self.s_res, self.iters)
+        y = self.layer((a.unsqueeze(-1) * x).sum(-2))                             # read: n streams -> one d-vector
+        return b @ x + c.unsqueeze(-1) * y.unsqueeze(-2)                          # write: mix streams, add output
+</code></pre>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-11-2-title">
+<title id="fig-11-2-title">Manifold-constrained hyper-connections with four residual streams: read with H_pre, write with H_post, mix streams with a doubly stochastic H_res</title>
+<defs><marker id="arrow-11-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="12" y="56" width="78" height="28" rx="5"/>
+<text x="51" y="74" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l,1</tspan></text>
+<rect class="s-box" x="630" y="56" width="78" height="28" rx="5"/>
+<text x="669" y="74" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1,1</tspan></text>
+<rect class="s-box" x="12" y="94" width="78" height="28" rx="5"/>
+<text x="51" y="112" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l,2</tspan></text>
+<rect class="s-box" x="630" y="94" width="78" height="28" rx="5"/>
+<text x="669" y="112" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1,2</tspan></text>
+<rect class="s-box" x="12" y="132" width="78" height="28" rx="5"/>
+<text x="51" y="150" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l,3</tspan></text>
+<rect class="s-box" x="630" y="132" width="78" height="28" rx="5"/>
+<text x="669" y="150" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1,3</tspan></text>
+<rect class="s-box" x="12" y="170" width="78" height="28" rx="5"/>
+<text x="51" y="188" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l,4</tspan></text>
+<rect class="s-box" x="630" y="170" width="78" height="28" rx="5"/>
+<text x="669" y="188" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1,4</tspan></text>
+<text x="345" y="36" text-anchor="middle" class="s-bold">H<tspan baseline-shift="sub" font-size="9">res</tspan>: doubly stochastic mixing (n × n)</text>
+<rect class="s-c" x="250" y="46" width="190" height="172" rx="8"/>
+<line class="s-line-a" x1="90" y1="70" x2="250" y2="70"/>
+<line class="s-line-c" x1="250" y1="70" x2="440" y2="70"/>
+<line class="s-line-a" x1="440" y1="70" x2="630" y2="70" marker-end="url(#arrow-11-2)"/>
+<line class="s-line-a" x1="90" y1="108" x2="250" y2="108"/>
+<line class="s-line-c" x1="250" y1="108" x2="440" y2="108"/>
+<line class="s-line-a" x1="440" y1="108" x2="630" y2="108" marker-end="url(#arrow-11-2)"/>
+<line class="s-line-a" x1="90" y1="146" x2="250" y2="146"/>
+<line class="s-line-c" x1="250" y1="146" x2="440" y2="146"/>
+<line class="s-line-a" x1="440" y1="146" x2="630" y2="146" marker-end="url(#arrow-11-2)"/>
+<line class="s-line-a" x1="90" y1="184" x2="250" y2="184"/>
+<line class="s-line-c" x1="250" y1="184" x2="440" y2="184"/>
+<line class="s-line-a" x1="440" y1="184" x2="630" y2="184" marker-end="url(#arrow-11-2)"/>
+<line class="s-line-c s-dash" x1="272" y1="70" x2="322" y2="108"/><line class="s-line-c s-dash" x1="272" y1="108" x2="322" y2="70"/>
+<line class="s-line-c s-dash" x1="272" y1="146" x2="322" y2="184"/><line class="s-line-c s-dash" x1="272" y1="184" x2="322" y2="146"/>
+<line class="s-line-c s-dash" x1="368" y1="108" x2="418" y2="146"/><line class="s-line-c s-dash" x1="368" y1="146" x2="418" y2="108"/>
+<text x="345" y="208" text-anchor="middle" class="s-small">rows and columns sum to 1, entries ≥ 0</text>
+<circle cx="170" cy="70" r="3" class="s-fill-muted"/>
+<circle cx="545" cy="70" r="8" class="s-plain"/><text x="545" y="74" text-anchor="middle" class="s-small">+</text>
+<circle cx="170" cy="108" r="3" class="s-fill-muted"/>
+<circle cx="545" cy="108" r="8" class="s-plain"/><text x="545" y="112" text-anchor="middle" class="s-small">+</text>
+<circle cx="170" cy="146" r="3" class="s-fill-muted"/>
+<circle cx="545" cy="146" r="8" class="s-plain"/><text x="545" y="150" text-anchor="middle" class="s-small">+</text>
+<circle cx="170" cy="184" r="3" class="s-fill-muted"/>
+<circle cx="545" cy="184" r="8" class="s-plain"/><text x="545" y="188" text-anchor="middle" class="s-small">+</text>
+<line class="s-line" x1="170" y1="70" x2="170" y2="253"/>
+<rect class="s-a" x="104" y="253" width="132" height="30" rx="6"/>
+<text x="170" y="272" text-anchor="middle" class="s-small">H<tspan baseline-shift="sub" font-size="9">pre</tspan> = σ(·), 1 × n</text>
+<line class="s-line" x1="236" y1="268" x2="266" y2="268" marker-end="url(#arrow-11-2)"/>
+<rect class="s-box" x="268" y="253" width="182" height="30" rx="6"/>
+<text x="359" y="272" text-anchor="middle" class="s-small">layer F: attention or MoE (d → d)</text>
+<line class="s-line" x1="450" y1="268" x2="477" y2="268" marker-end="url(#arrow-11-2)"/>
+<rect class="s-a" x="479" y="253" width="132" height="30" rx="6"/>
+<text x="545" y="272" text-anchor="middle" class="s-small">H<tspan baseline-shift="sub" font-size="9">post</tspan> = 2σ(·), n × 1</text>
+<line class="s-line" x1="545" y1="253" x2="545" y2="194" marker-end="url(#arrow-11-2)"/>
+<line class="s-line s-dash" x1="545" y1="184" x2="545" y2="80"/>
+<line class="s-line s-dash" x1="545" y1="184" x2="545" y2="118"/>
+<line class="s-line s-dash" x1="545" y1="184" x2="545" y2="156"/>
+<text x="12" y="316" class="s-small">x<tspan baseline-shift="sub" font-size="9">l+1</tspan> = H<tspan baseline-shift="sub" font-size="9">res</tspan> x<tspan baseline-shift="sub" font-size="9">l</tspan> + H<tspan baseline-shift="sub" font-size="9">post</tspan><tspan baseline-shift="super" font-size="9">T</tspan> F(H<tspan baseline-shift="sub" font-size="9">pre</tspan> x<tspan baseline-shift="sub" font-size="9">l</tspan>),   x<tspan baseline-shift="sub" font-size="9">l</tspan> ∈ R<tspan baseline-shift="super" font-size="9">n×d</tspan>,   n = 4 in DeepSeek-V4</text>
+<text x="12" y="336" class="s-small">H_res = Sinkhorn-Knopp(exp(raw)): 20 alternating row and column normalizations, so ‖H_res‖₂ ≤ 1</text>
+<text x="12" y="354" class="s-small s-muted">and products of such matrices stay doubly stochastic. Dynamic coefficients: raw = α · (RMSNorm(vec x_l) W) + static bias.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> mHC with \(n = 4\) streams. The blue streams carry the residual signal. A small branch (below) reads them with \(H^{\mathrm{pre}}\), runs the layer, and writes back with \(H^{\mathrm{post}}\). The green block mixes streams with a doubly stochastic \(H^{\mathrm{res}}\). Only the mixing block sits on the identity-like path, which is why constraining it restores the stability of plain residuals.</figcaption>
+  </figure>
+
+  <p><strong>A toy check</strong> (our simulation). Multiply 122 random \(4\times4\) matrices (61 blocks times two sublayers), each \(I + 0.25\,G\) with \(G_{ij}\sim\mathcal N(0,1)\): the largest absolute row sum of the product was \(1.7\times10^4\), \(3.2\times10^5\) and \(1.2\times10^4\) over three seeds. Pushing the same \(G\) through 20 Sinkhorn iterations of \(3I + 0.5\,G\) gave row sums of 1.0000 and column sums within 0.002 of 1 in all three. The real model's 3,000 sits inside that exploding range; the constraint removes it.</p>
+
+  <h3 id="mhc-cost">Cost, evidence and use</h3>
+  <ul>
+    <li><strong>Memory traffic is the real cost.</strong> Per token and layer a residual merge reads \(2C\) and writes \(C\) elements; HC reads \((5n+1)C + n^2 + 2n\) and writes \((3n+1)C + n^2 + 2n\), about \(21C\) and \(13C\) at \(n = 4\), that is 10.5x and 13x more, plus an \(n\)-times wider stream to store and send between pipeline stages <a href="https://arxiv.org/abs/2512.24880">[mHC, §3.2, Tab. 2]</a>. Fused kernels, recomputation and a DualPipe overlap bring it to 6.7% overhead at \(n = 4\) <a href="https://arxiv.org/abs/2512.24880">[§1, §4.3]</a>.</li>
+    <li><strong>Parameters are negligible.</strong> At V4-Flash's \(d = 4096\) a module holds \(W^{\mathrm{pre}}, W^{\mathrm{post}} \in \R^{nd\times n}\) and \(W^{\mathrm{res}} \in \R^{nd\times n^2}\): \(65{,}536 + 65{,}536 + 262{,}144\) plus 27 small parameters, about 393K. Assuming one module per sublayer, 43 layers give 33.8M, 0.012% of 284B (our arithmetic).</li>
+    <li><strong>Evidence is modest and internal.</strong> On 27B MoE models mHC finished 0.021 below baseline loss; in the ablation \(H^{\mathrm{res}}\) alone gave \(-0.022\) against \(-0.027\) for all three mappings, so most of the gain is residual mixing <a href="https://arxiv.org/abs/2512.24880">[Tab. 1, §5.2]</a>. These are the authors' own runs. V4 uses mHC at 284B and 1.6T parameters, with AdamW for the mHC static biases and gates and Muon for most matrices <a href="https://arxiv.org/abs/2606.19348">[§2.4]</a> (<a href="28-deepseek-3-reasoning.html">page 28</a>).</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Manifold-constrained hyper-connections</div>
+    <dl>
+      <dt>Problem</dt><dd>A single-width residual stream limits layer-to-layer exchange; unconstrained multi-stream mixing (HC) helps but its composite mapping does not preserve signal and blew up at 27B.</dd>
+      <dt>Idea</dt><dd>Keep \(n\) streams, mix with a doubly stochastic \(H^{\mathrm{res}}\) (Sinkhorn-Knopp, 20 iterations), keep read and write weights non-negative.</dd>
+      <dt>Why it works</dt><dd>Doubly stochastic matrices are non-expansive, closed under products and mean-preserving: the identity-mapping guarantee at any depth.</dd>
+      <dt>Evidence</dt><dd>Gain about 3,000 (HC) versus about 1.6 (mHC); no loss surge; loss 0.021 below baseline at 27B <a href="https://arxiv.org/abs/2512.24880">[§5]</a>.</dd>
+      <dt>Cost</dt><dd>About 10x residual traffic unfused, \(n\times\) stream activations, 6.7% overhead optimized, kernel engineering.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V4 (\(n_{\mathrm{hc}} = 4\), \(t_{\max} = 20\)); HC itself in the OLMo and OLMoE experiments.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="sinks-gating">Attention sinks, learned sink logits and gated attention</h2>
+
+  <h3 id="why-sinks">Why sinks form</h3>
+  <p>Softmax weights are non-negative and sum to 1, so a head must put its mass <em>somewhere</em> even when no key is relevant. Xiao et al. find LLMs dump the surplus on the first few tokens, which every later query sees. With Llama-2-13B, plain window attention has perplexity 5,158; keeping the KV of 4 initial tokens plus the 1,020 most recent restores 5.40, and replacing those four tokens with newlines still gives 5.60, so position, not content, matters <a href="https://arxiv.org/abs/2309.17453">[StreamingLLM, Tab. 1]</a>. The companion effect is <strong>massive activations</strong>: in LLaMA2-7B a few hidden entries reach 2,622 against a median of 0.2, on the first token and first delimiter. Zeroing them makes perplexity infinite; setting them to their mean changes nothing, so they act as fixed biases that attract attention <a href="https://arxiv.org/abs/2402.17762">[Sun et al. 2024, §2 to §4]</a>. The Qwen study hypothesizes that shrinking them helps stability because large values are more exposed to bf16 error <a href="https://arxiv.org/abs/2505.06708">[§4.3]</a>. Long-context handling is on <a href="10-long-context.html">page 10</a>.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>If your tagger had a learnable class token that every particle attends to, you already used a global slot. Sink tokens are the same device for a different reason: a harmless place for softmax mass the head does not need. Vision transformers found the same thing, which StreamingLLM likens to ViT registers.</p>
+  </aside>
+
+  <h3 id="sink-fixes">The fixes</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Fix</th><th>Mechanism</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Sink token</td><td>A learnable token at the start of every sample absorbs surplus mass</td><td>160M model: keeping only that token gives streaming perplexity 18.01; vanilla needs two or more initial tokens for 18.05 <a href="https://arxiv.org/abs/2309.17453">[Tab. 3]</a></td></tr>
+      <tr><td>Softmax off by one</td><td>Denominator \(1 + \sum_j e^{x_j}\) (a token with zero key and value)</td><td>Only partial: the model still used other initial tokens <a href="https://arxiv.org/abs/2309.17453">[Tab. 3]</a></td></tr>
+      <tr><td>Learned sink logit per head</td><td>\(s_{h,j} = e^{z_{h,j}} / (\sum_k e^{z_{h,k}} + e^{z'_h})\): total attention can go near 0</td><td>gpt-oss: "a learned bias in the denominator of the softmax" <a href="https://arxiv.org/abs/2508.10925">[card, §2.2]</a>; DeepSeek-V4, same form <a href="https://arxiv.org/abs/2606.19348">[§2.3.3]</a></td></tr>
+      <tr><td>Key and value bias</td><td>Learnable \(k', v'\) appended to keys and values</td><td>GPT-2: massive activations vanish at equal quality <a href="https://arxiv.org/abs/2402.17762">[Sun et al., §4.3]</a></td></tr>
+      <tr><td>Gated attention</td><td>Sigmoid gate on the attention output</td><td>First-token attention 46.7% to 4.8% <a href="https://arxiv.org/abs/2505.06708">[Fig. 2]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>The sink logit is the cheapest: \(n_h\) scalars per layer, which gpt-oss says works "similar to off-by-one attention and attention sinks", letting a head "pay no attention to any tokens" (<a href="31-mistral-gemma-gptoss.html">page 31</a>).</p>
+
+  <h3 id="gated-attention">Gated attention (Qwen)</h3>
+  <p>Qiu et al. (Qwen, 2025) compared 30 gating variants on 15B MoE (2.54B activated) and 1.7B dense models trained on up to 3.5T tokens. The winner is an elementwise, head-specific sigmoid gate on the attention output, computed from the same token's pre-normed hidden state \(X\):</p>
+  \[ Y' = Y \odot \sigma\!\big(X W_\theta\big) \]
+  <p>where \(Y\) is the scaled dot-product attention output before the output projection <a href="https://arxiv.org/abs/2505.06708">[Eq. 5, position G1]</a>. On the 15B MoE at 400B tokens (Table 1): perplexity 6.026 to 5.761, MMLU 58.79 to 60.82, GSM8K 52.92 to 55.27, at 201M added parameters (1.3%) and under 2% wall time; a <em>headwise</em> gate costs 1.6M and reaches 5.792.</p>
+  <ul>
+    <li><strong>Stability.</strong> At 3.5T tokens the gate largely removes loss spikes. With 48 layers and peak LR \(8\times10^{-3}\), the baseline degrades to 9.195 at 400B tokens and diverges at 1T; the gated model reaches 7.325 and 7.078 <a href="https://arxiv.org/abs/2505.06708">[Tab. 2]</a>.</li>
+    <li><strong>Sinks.</strong> First-token attention falls from 46.7% to 4.8% and the largest hidden activation from 1,053 to 94; after YaRN to 128K, RULER improves from 31.65 to 58.82 (Tabs. 4, 5).</li>
+    <li><strong>Why:</strong> (i) per head, \(W_V^k W_O^k\) is one low-rank linear map, and the gate adds non-linearity between them; (ii) the gates are sparse (mean 0.116) and query-dependent, so a head can silence itself. An input-independent gate keeps the sink (first-token share 0.364); a head-shared or value gate leaves it high (0.301, 0.297). Massive activations are not a prerequisite for sinks.</li>
+  </ul>
+  <p>The Qwen paper does not compare against learned sink logits, so the two are unranked. A sink logit changes the <em>normalization</em> (one scalar per head); a gate rescales the <em>output</em> per token and channel (more expressive, about 1% of parameters). Qwen3 itself uses QK-norm <a href="https://arxiv.org/abs/2505.09388">[§2]</a> (<a href="30-qwen.html">page 30</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Gated attention</div>
+    <dl>
+      <dt>Problem</dt><dd>Attention has no "do nothing" option, so heads park mass on sinks, models carry massive activations and can spike; \(W_V W_O\) is a linear low-rank bottleneck.</dd>
+      <dt>Idea</dt><dd>Multiply each head's output by a query-dependent sigmoid gate.</dd>
+      <dt>Why it works</dt><dd>Non-linearity between \(W_V\) and \(W_O\), plus sparse gating that lets a head output near zero.</dd>
+      <dt>Evidence</dt><dd>15B MoE: perplexity 6.026 to 5.761, MMLU +2.0; sinks 46.7% to 4.8%; larger stable LR; RULER 128K 31.65 to 58.82 <a href="https://arxiv.org/abs/2505.06708">[Qiu et al.]</a>.</dd>
+      <dt>Cost</dt><dd>+1.3% parameters (elementwise) or +0.01% (headwise), under 2% latency.</dd>
+      <dt>Used by</dt><dd>The Qwen study's released models; we did not verify adoption in production LLMs.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="mtp">Multi-token prediction</h2>
+
+  <p>The standard objective trains position \(t\) to predict only \(x_{t+1}\). <strong>Multi-token prediction</strong> <span class="zh">多 token 预测</span> (MTP) adds losses for \(x_{t+2}, \dots\) as auxiliary targets. It is an objective change, not a stability fix, but DeepSeek-V3 and V4 use it and interviews ask about it next to these tweaks.</p>
+
+  <h3 id="mtp-gloeckle">Gloeckle et al. 2024: parallel heads</h3>
+  <p>A shared trunk produces \(z_t\), and \(n\) independent heads (one transformer layer each, shared unembedding) predict \(x_{t+1}, \dots, x_{t+n}\). Materializing \(n\) logit tensors of size \(V\) is the memory bottleneck, so the paper runs forward and backward through one head at a time, cutting peak memory from \(O(nV + d)\) to \(O(V + d)\) <a href="https://arxiv.org/abs/2404.19737">[Gloeckle et al., §2]</a>.</p>
+  <ul>
+    <li><strong>Scale matters.</strong> At 0.3B and 0.6B on code, MTP was worse than baseline (0.3B, \(n=4\): MBPP pass@1 1.0 versus 1.8). At 13B it solved 12% more HumanEval and 17% more MBPP problems <a href="https://arxiv.org/abs/2404.19737">[Abstract, Fig. 3, Tab. S7]</a>. \(n = 4\) was best at 7B (MBPP 33.8 versus 30.0, Tab. 1).</li>
+    <li><strong>Free draft heads.</strong> Self-speculative decoding ran 3.0x faster on code and 2.7x on text for a 7B model with 4 heads (§3.2).</li>
+    <li><strong>Why (the authors' speculation).</strong> Teacher forcing "latches on local patterns and overlooks 'hard' decisions"; an \(n\)-token loss weights a hard choice point by \(n(n+1)/2\) through its correlates, against \(n\) for inconsequential transitions (§5).</li>
+  </ul>
+
+  <h3 id="mtp-v3">DeepSeek-V3: sequential modules that keep the causal chain</h3>
+  <p>V3 differs in one respect: "we sequentially predict additional tokens and keep the complete causal chain at each prediction depth" <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §2.2]</a>. Depth \(k\) takes the previous depth's hidden state and the embedding of the token \(k\) steps ahead:</p>
+
+  <div class="eq-box">
+  \[ h'^{k}_i = M_k\big[\RMSNorm(h^{k-1}_i);\ \RMSNorm(\mathrm{Emb}(t_{i+k}))\big], \qquad h^{k}_{1:T-k} = \mathrm{TRM}_k\big(h'^{k}_{1:T-k}\big), \qquad P^{k}_{i+k+1} = \mathrm{OutHead}(h^{k}_i) \]
+  \[ \mathcal L^{k}_{\mathrm{MTP}} = -\frac{1}{T}\sum_{i=k+2}^{T+1} \log P^{k}_i[t_i], \qquad \mathcal L_{\mathrm{MTP}} = \frac{\lambda}{D}\sum_{k=1}^{D} \mathcal L^{k}_{\mathrm{MTP}} \]
+  <div class="eq-label">\(M_k \in \R^{d\times 2d}\); \(h^{0}\) is the main model's final hidden state; embedding and output head are shared with the main model</div>
+  </div>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-11-3-title">
+<title id="fig-11-3-title">DeepSeek-V3 multi-token prediction at depth 1: the main model predicts the next token, and an MTP module combines the main hidden state with the embedding of the next token to predict the token after it, sharing embedding and output head</title>
+<defs><marker id="arrow-11-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="12" y="22" class="s-bold">Main model (next-token prediction)</text>
+<rect class="s-plain" x="12" y="40" width="52" height="34" rx="6"/><text x="38.0" y="61" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+<line class="s-line" x1="64" y1="57" x2="84" y2="57" marker-end="url(#arrow-11-3)"/>
+<rect class="s-c" x="86" y="40" width="92" height="34" rx="6"/><text x="132.0" y="54" text-anchor="middle" class="s-small">embedding</text><text x="132.0" y="68" text-anchor="middle" class="s-small">(shared)</text>
+<line class="s-line" x1="178" y1="57" x2="198" y2="57" marker-end="url(#arrow-11-3)"/>
+<rect class="s-box" x="200" y="40" width="150" height="34" rx="6"/><text x="275.0" y="61" text-anchor="middle" class="s-small">transformer blocks × L</text>
+<line class="s-line" x1="350" y1="57" x2="370" y2="57" marker-end="url(#arrow-11-3)"/>
+<rect class="s-plain" x="372" y="40" width="52" height="34" rx="6"/><text x="398.0" y="61" text-anchor="middle" class="s-small">h<tspan baseline-shift="super" font-size="9">0</tspan><tspan baseline-shift="sub" font-size="9">i</tspan></text>
+<line class="s-line" x1="424" y1="57" x2="444" y2="57" marker-end="url(#arrow-11-3)"/>
+<rect class="s-c" x="446" y="40" width="92" height="34" rx="6"/><text x="492.0" y="54" text-anchor="middle" class="s-small">output head</text><text x="492.0" y="68" text-anchor="middle" class="s-small">(shared)</text>
+<line class="s-line" x1="538" y1="57" x2="558" y2="57" marker-end="url(#arrow-11-3)"/>
+<rect class="s-plain" x="560" y="40" width="150" height="34" rx="6"/><text x="635.0" y="61" text-anchor="middle" class="s-small">predicts x<tspan baseline-shift="sub" font-size="9">i+1</tspan>  (L<tspan baseline-shift="sub" font-size="9">main</tspan>)</text>
+<text x="12" y="132" class="s-bold">MTP module, depth 1 (training only)</text>
+<rect class="s-plain s-dash" x="4" y="140" width="712" height="160" rx="8"/>
+<rect class="s-plain" x="12" y="226" width="60" height="34" rx="6"/><text x="42.0" y="247" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">i+1</tspan></text>
+<line class="s-line" x1="72" y1="243" x2="92" y2="243" marker-end="url(#arrow-11-3)"/>
+<rect class="s-c" x="94" y="226" width="92" height="34" rx="6"/><text x="140.0" y="240" text-anchor="middle" class="s-small">embedding</text><text x="140.0" y="254" text-anchor="middle" class="s-small">(shared)</text>
+<line class="s-line" x1="186" y1="243" x2="206" y2="243" marker-end="url(#arrow-11-3)"/>
+<rect class="s-a" x="208" y="226" width="150" height="34" rx="6"/><text x="283.0" y="247" text-anchor="middle" class="s-small">RMSNorm(Emb(x<tspan baseline-shift="sub" font-size="9">i+1</tspan>))</text>
+<rect class="s-a" x="208" y="158" width="150" height="34" rx="6"/><text x="283.0" y="179" text-anchor="middle" class="s-small">RMSNorm(h<tspan baseline-shift="super" font-size="9">0</tspan><tspan baseline-shift="sub" font-size="9">i</tspan>)</text>
+<path class="s-line" d="M398,74 L398,116 L283,116 L283,158" marker-end="url(#arrow-11-3)"/>
+<line class="s-line" x1="358" y1="175" x2="380" y2="175"/>
+<line class="s-line" x1="358" y1="243" x2="380" y2="243"/>
+<rect class="s-box" x="380" y="158" width="36" height="102" rx="6"/>
+<text x="398.0" y="206" text-anchor="middle" class="s-small">cat</text><text x="398.0" y="221" text-anchor="middle" class="s-small">2d</text>
+<line class="s-line" x1="416" y1="209" x2="430" y2="209" marker-end="url(#arrow-11-3)"/>
+<rect class="s-box" x="432" y="192" width="66" height="34" rx="6"/><text x="465.0" y="213" text-anchor="middle" class="s-small">M: 2d → d</text>
+<line class="s-line" x1="498" y1="209" x2="514" y2="209" marker-end="url(#arrow-11-3)"/>
+<rect class="s-box" x="516" y="192" width="66" height="34" rx="6"/><text x="549.0" y="213" text-anchor="middle" class="s-small">block TRM<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<line class="s-line" x1="582" y1="209" x2="598" y2="209" marker-end="url(#arrow-11-3)"/>
+<rect class="s-plain" x="600" y="192" width="40" height="34" rx="6"/><text x="620.0" y="213" text-anchor="middle" class="s-small">h<tspan baseline-shift="super" font-size="9">1</tspan><tspan baseline-shift="sub" font-size="9">i</tspan></text>
+<line class="s-line" x1="640" y1="209" x2="654" y2="209" marker-end="url(#arrow-11-3)"/>
+<rect class="s-c" x="656" y="188" width="56" height="42" rx="6"/><text x="684.0" y="206" text-anchor="middle" class="s-small">head</text><text x="684.0" y="220" text-anchor="middle" class="s-small">(shared)</text>
+<text x="712" y="252" text-anchor="end" class="s-small">predicts x<tspan baseline-shift="sub" font-size="9">i+2</tspan></text>
+<text x="712" y="270" text-anchor="end" class="s-small">loss L<tspan baseline-shift="sub" font-size="9">MTP</tspan></text>
+<text x="12" y="326" class="s-small">Total loss = L_main + (λ / D) Σ_k L_MTP^k. V3 and V4 use D = 1, with λ = 0.3, then 0.1 later in training.</text>
+<text x="12" y="344" class="s-small">Depth 2 would take h¹ (not h⁰) and Emb(x_{i+2}), so the causal chain is kept. The module is dropped at inference,</text>
+<text x="12" y="362" class="s-small">or reused as a speculative-decoding draft. Green boxes are the same parameters as in the main model.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One position of DeepSeek-V3's depth-1 MTP module. The main model predicts \(x_{i+1}\) from \(h^0_i\). The module fuses \(h^0_i\) with the embedding of the next token \(x_{i+1}\), so it must predict \(x_{i+2}\) knowing what came next. Embedding and head (green) are the main model's parameters, so the module adds one block and one \(2d\to d\) projection.</figcaption>
+  </figure>
+
+<pre><code class="language-python">def mtp_loss(hidden, targets, depth_modules, embed, head, lam=0.3):
+    # hidden: (B, T, d) main-model states; targets[:, i] = x_{i+1}; modules are chained
+    B, T, _ = hidden.shape
+    total, h_prev = hidden.new_zeros(()), hidden
+    for k, module in enumerate(depth_modules, start=1):
+        n = T - k                                        # the last k positions have no k-ahead label
+        emb_next = embed(targets[:, k - 1:k - 1 + n])    # Emb(x_{i+k}), shared table
+        labels = targets[:, k:k + n]                     # x_{i+k+1}
+        h_k = module(h_prev[:, :n], emb_next)            # chain: input is the previous depth's output
+        logits = head(h_k)                               # shared head
+        total = total + F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+        h_prev = h_k
+    return lam / len(depth_modules) * total
+</code></pre>
+  <p class="small muted">This averages over the \(n\) valid positions per depth where V3's equation divides by \(T\), a constant factor. The drill implements exactly this.</p>
+
+  <p><strong>Configuration.</strong> V3 uses \(D = 1\), \(\lambda = 0.3\) for the first 10T tokens and 0.1 for the last 4.8T <a href="https://arxiv.org/abs/2412.19437">[V3, §4.2]</a>. V4 keeps the MTP configuration "identical to that of DeepSeek-V3", with \(\lambda = 0.3\) for most of training and 0.1 once learning-rate decay starts <a href="https://arxiv.org/abs/2606.19348">[V4, §2, §4.2]</a>. At inference the module is either discarded or reused for speculative decoding: second-token acceptance is 85% to 90%, giving 1.8x tokens per second <a href="https://arxiv.org/abs/2412.19437">[V3, §5.4.3]</a> (<a href="17-inference-serving.html">page 17</a>). The report's two motivations are hedged: MTP "densifies the training signals and may improve data efficiency", and it "may enable the model to pre-plan its representations".</p>
+
+  <h3 id="mtp-evidence">Evidence and cost</h3>
+  <p>DeepSeek-V3's ablation compares two MoE baselines with and without a depth-1 module, same data otherwise <a href="https://arxiv.org/abs/2412.19437">[V3, §4.5.1, Tab. 4]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Benchmark</th><th class="num">Small MoE (15.7B, 2.4B active, 1.33T tokens)</th><th class="num">Large MoE (228.7B, 20.9B active, 540B tokens)</th></tr></thead>
+    <tbody>
+      <tr><td>Pile-test BPB (lower is better)</td><td class="num">0.729 to 0.729</td><td class="num">0.658 to 0.657</td></tr>
+      <tr><td>BBH</td><td class="num">39.0 to 41.4</td><td class="num">70.0 to 70.7</td></tr>
+      <tr><td>MMLU</td><td class="num">50.0 to 53.3</td><td class="num">67.5 to 66.6</td></tr>
+      <tr><td>DROP</td><td class="num">39.2 to 41.3</td><td class="num">68.5 to 70.6</td></tr>
+      <tr><td>TriviaQA</td><td class="num">56.9 to 57.7</td><td class="num">67.0 to 67.3</td></tr>
+      <tr><td>NaturalQuestions</td><td class="num">22.7 to 22.3</td><td class="num">27.2 to 28.5</td></tr>
+      <tr class="hl"><td>HumanEval</td><td class="num">20.7 to 26.8</td><td class="num">44.5 to 53.7</td></tr>
+      <tr><td>MBPP</td><td class="num">35.8 to 36.8</td><td class="num">61.6 to 62.2</td></tr>
+      <tr class="hl"><td>GSM8K</td><td class="num">25.4 to 31.4</td><td class="num">72.3 to 74.0</td></tr>
+      <tr><td>MATH</td><td class="num">10.7 to 12.6</td><td class="num">38.6 to 39.8</td></tr>
+    </tbody>
+  </table></div>
+  <p>Of 20 cells, 17 improve, one ties (small-model BPB) and two get worse (MMLU on the large model, \(-0.9\); NaturalQuestions on the small one, \(-0.4\)). The gains concentrate on generative code and math (HumanEval \(+6.1\) and \(+9.2\)) while perplexity barely moves, as in Gloeckle et al. Read it critically: single runs without variance, from the adopting lab, and the largest ablation saw 540B tokens against 14.8T for the final model.</p>
+  <ul>
+    <li><strong>Parameters.</strong> The V3 repository lists 671B main-model weights plus 14B for the MTP module, 2.1% more <a href="https://github.com/deepseek-ai/DeepSeek-V3/blob/main/README.md">[README]</a>. The \(2d \to d\) projection is only \(7168 \times 14336 = 102.8\)M, so the rest is the block and any embedding and head copies stored with it.</li>
+    <li><strong>Training FLOPs.</strong> Per token the extra head is \(2 \times 129{,}280 \times 7168 = 1.85\) GFLOP, the projection 0.21 GFLOP, and the block about 1.2 GFLOP <span class="unverified" title="Assumes the MTP block is an ordinary MoE block like the main model's layers (187M MLA parameters plus 1 shared and 8 routed experts of 44M); the V3 paper only says 'a Transformer block'.">assuming an ordinary MoE block</span>: about 3.2 GFLOP against 74 GFLOP (\(2\times37\)B) for the main forward pass, roughly 4% (our estimate).</li>
+    <li><strong>Memory.</strong> One extra \((B\times T\times V)\) logits tensor per depth. V3 puts the shallowest and deepest layers on the same pipeline rank so the shared embedding and head are physically shared with the module <a href="https://arxiv.org/abs/2412.19437">[§3.2.3]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Multi-token prediction (DeepSeek-V3 style)</div>
+    <dl>
+      <dt>Problem</dt><dd>Next-token prediction gives one training signal per position and, under teacher forcing, favors local patterns over decisions with long-range consequences.</dd>
+      <dt>Idea</dt><dd>Add a chained module that predicts the token after next from the main hidden state plus the next token's embedding, with shared embedding and head, and weight its loss by \(\lambda\).</dd>
+      <dt>Why it works</dt><dd>More supervision per token and pressure to encode information about upcoming tokens. The mechanism is argued, not proved.</dd>
+      <dt>Evidence</dt><dd>V3 ablation: 17 of 20 comparisons better, HumanEval up to \(+9.2\) <a href="https://arxiv.org/abs/2412.19437">[Tab. 4]</a>. Parallel heads at 13B: +12% HumanEval, +17% MBPP <a href="https://arxiv.org/abs/2404.19737">[Gloeckle et al.]</a>.</dd>
+      <dt>Cost</dt><dd>About 2% parameters, roughly 4% training FLOPs (our estimate), extra logits memory; free at inference if dropped. Can hurt small models.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3 and V4 (depth 1); the module doubles as a speculative-decoding draft.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="checklist">Checklist: tweak, failure mode, cost, adopters</h2>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Tweak</th><th>Failure mode addressed</th><th>Cost</th><th>Adopters</th></tr></thead>
+    <tbody>
+      <tr><td>QK-norm</td><td>Attention-logit growth, entropy collapse</td><td>Two fused norms, \(d_h\) gains; not with absorbed MLA</td><td>ViT-22B, Chameleon, OLMo 2, Gemma 3, Qwen3, V4</td></tr>
+      <tr><td>QK-clip</td><td>Logit explosion under Muon (esp. MLA)</td><td>Per-head max-logit statistic, weight rescale after update</td><td>Kimi K2 (\(\tau = 100\))</td></tr>
+      <tr><td>Logit soft-capping</td><td>Unbounded logit range</td><td>Saturating gradient; extra op in kernel</td><td>Gemma 2 (50 and 30), dropped in Gemma 3</td></tr>
+      <tr><td>z-loss</td><td>Output-logit drift, \(\log Z\) growth</td><td>Negligible; one coefficient</td><td>PaLM (\(10^{-4}\)), OLMo 2, Chameleon (\(10^{-5}\))</td></tr>
+      <tr><td>Router z-loss</td><td>Router-logit roundoff in bf16</td><td>Negligible</td><td>ST-MoE (\(10^{-3}\)); MoE recipes (<a href="08-mixture-of-experts.html">page 08</a>)</td></tr>
+      <tr><td>Output-norm or sandwich norm</td><td>Unbounded sublayer writes, stream norm growth</td><td>1 to 2 extra norms per sublayer; changes init behavior</td><td>Gemma 2 and 3, OLMo 2, Chameleon-34B</td></tr>
+      <tr><td>Embedding scale, no decay on embeddings</td><td>Small shortcut, large early-layer gradients</td><td>None</td><td>Gemma (\(\sqrt d\)), OLMo 2</td></tr>
+      <tr><td>DeepNorm</td><td>Post-LN failure at hundreds of layers</td><td>Constants \(\alpha, \beta\) from depth</td><td>DeepNet research models</td></tr>
+      <tr><td>Adam \(\epsilon\), \(\beta_2\), warm-up, clipping</td><td>Tiny updates or early-training instability</td><td>Hyperparameters</td><td>PaLM \(\beta_2\) schedule; OLMo 2 \(\epsilon\); V4 \(\epsilon = 10^{-20}\)</td></tr>
+      <tr><td>mHC</td><td>Residual-stream bottleneck; HC's unstable mixing</td><td>About 10x residual traffic unfused; 6.7% overhead optimized</td><td>DeepSeek-V4 (\(n = 4\))</td></tr>
+      <tr><td>Sink logit or sink token</td><td>Sinks, massive activations</td><td>\(n_h\) scalars per layer</td><td>gpt-oss, DeepSeek-V4</td></tr>
+      <tr><td>Gated attention</td><td>Sinks, spikes, low-rank \(W_V W_O\)</td><td>+1.3% params (elementwise), under 2% time</td><td>Qwen study models</td></tr>
+      <tr><td>MTP</td><td>Sparse training signal; enables speculative decoding</td><td>+2% params, about 4% FLOPs</td><td>DeepSeek-V3, V4</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"QK-norm makes the model stable."</strong> It bounds attention logits only. The output softmax still needs z-loss or a logit cap, and Chameleon used both. Wortsman et al. also find that LR sensitivity with QK-norm still grows with scale.</li>
+    <li><strong>"Soft-capping stops attention from collapsing."</strong> It bounds the range of logits, not their sharpness. With a cap of 50, a row with one key at the cap and 8,191 at 0 is still one-hot (\(1-p = 1.6\times10^{-18}\)), and saturated logits get almost no gradient.</li>
+    <li><strong>"z-loss changes what the model predicts."</strong> It acts on the shift direction that cross-entropy ignores. At \(\lambda = 10^{-4}\) and \(\log Z = 15\) its gradient is 0.3% of the probabilities, versus the cross-entropy gradient \(p - y\).</li>
+    <li><strong>"Loss spikes come from bad data."</strong> Sometimes (OLMo 2's repeated n-grams), but PaLM replayed the offending batches from an earlier checkpoint and saw no spike. It takes specific data <em>and</em> a specific parameter state.</li>
+    <li><strong>"A rollback fixes it."</strong> It restores the state. DeepSeek-V4 reports that spikes recurred after rollbacks until they added Anticipatory Routing and SwiGLU clamping.</li>
+    <li><strong>"mHC is just a wider residual stream."</strong> The constraint is the contribution. Unconstrained hyper-connections lost stability at 27B (loss surge near step 12K, gain near 3,000). Doubly stochastic mixing keeps the composite gain near 1.</li>
+    <li><strong>"Attention sinks are a bug to delete."</strong> They are how heads discard surplus softmax mass. Evict the sink tokens from the KV cache and perplexity goes from 5.40 to 5,158. The fixes give heads another place to put the mass.</li>
+    <li><strong>"MTP is free."</strong> It is free at inference only if you discard the module. In training it adds parameters (14B for V3), roughly 4% FLOPs by our estimate, and logits memory, and it can hurt small models.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is QK-norm and what failure mode does it prevent?</summary>
+    <div class="answer">
+      <p>QK-norm RMS-normalizes each query and key vector per head, with a learned gain, before the dot product: \(z = (g_q \odot q/\mathrm{RMS}(q)) \cdot (g_k \odot k/\mathrm{RMS}(k))/\sqrt{d_h}\). It prevents <strong>attention-logit growth</strong>. Logits are bilinear in \(W_q\) and \(W_k\), so they grow quadratically with weight scale. At high learning rate or large size they reach \(10^3\) to \(10^5\) (a ViT-22B-scale run saw over 50,000; Wortsman et al. saw divergence once max logits passed \(10^4\)). Softmax rows then become one-hot, the head turns into a hard argmax and the loss surface sharpens, and training diverges.</p>
+      <p>With QK-norm the logit is bounded by \(g^2\sqrt{d_h}\) for any weights (11.3 for \(d_h = 128\), \(g = 1\)). Evidence: ViT-22B at 8B, Chameleon-7B (diverges without it), a 1.2B model at LR 0.3. Caveats: it does not touch the output softmax (that needs z-loss), and it does not apply to absorbed MLA.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does z-loss regularize and why does it help? Compute its size for \(\log Z = 15\) at \(\lambda = 10^{-4}\).</summary>
+    <div class="answer">
+      <p>z-loss adds \(\lambda (\log Z)^2\) per position, where \(\log Z\) is the log-sum-exp of the output logits. The softmax is invariant to adding a constant to all logits, so cross-entropy gives no signal on \(\log Z\) and it can drift, especially with shared weights or high LR. Large logits are then represented coarsely in bf16 (spacing 1.0 in \([128, 256)\)), and softmax differences get corrupted, which can end in divergence. The penalty pins \(\log Z\) near 0.</p>
+      <p>Size: \(10^{-4} \times 15^2 = 0.0225\) nats, small next to a loss of a few nats. Gradient: \(2\lambda\log Z \cdot p_v = 3\times10^{-3}\, p_v\), compared with the CE gradient \(p_v - y_v\). It lowers all logits in proportion to their probability, so the ranking of tokens is unchanged. At Llama-3-8B initialization \(\log Z \approx 12.6\), so the term is 0.016.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What did PaLM do about loss spikes, and what did it conclude about their cause?</summary>
+    <div class="answer">
+      <p>PaLM 540B had about 20 spikes despite gradient clipping at 1.0, at irregular intervals and none in the smaller models. With no principled fix, the team restarted from a checkpoint about 100 steps before the spike and skipped roughly 200 to 500 batches; the loss did not spike again at that point. This was cheap because training was bitwise deterministic and batches were a function of the step number. It concluded the cause was not bad data per se: replaying the same batches from an earlier checkpoint did not spike, so spikes need the combination of specific batches and a particular parameter state. Preventive settings included a z-loss of \(10^{-4}\), \(\beta_2 = 1 - k^{-0.8}\), no biases, and Adafactor.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Your loss spiked and diverged at step 40K of a 7B run. Walk through your debugging and mitigation.</summary>
+    <div class="answer">
+      <p><strong>1. Triage (minutes).</strong> Is it real? Check for NaN or inf, fp16 loss-scale collapse (OPT), and hardware faults. Do not overwrite the last good checkpoint.</p>
+      <p><strong>2. Mitigate.</strong> Roll back to a checkpoint before onset, skip or reshuffle the offending data (PaLM: about 100 steps back, skip 200 to 500 batches), and if it recurs, lower the LR or tighten clipping (OPT: 1.0 to 0.3). This is cheap and often works, but it is not a diagnosis. DeepSeek-V4 saw spikes recur after rollbacks.</p>
+      <p><strong>3. Read the leading indicators</strong>, which should already be logged: gradient-norm trend (OLMo 2: gradient spikes precede loss spikes), per-layer max attention logit and entropy, mean logit, \(\log Z\) and last-layer norm (Chameleon: output-norm growth predicts divergence), Adam update RMS and \(\epsilon\) versus gradient scale, and the spike batch's contents (repeated n-grams).</p>
+      <p><strong>4. Match root cause to fix.</strong> Attention logits: QK-norm (architecture, so it needs a restart), or QK-clip if using Muon with MLA. Output drift: z-loss or a logit cap. Stream-norm growth: output-norm. Early-training spikes: longer warm-up, lower peak LR, \(\beta_2 = 0.95\), embedding scale. Data: filter and mask. Loss-side and optimizer-side changes can be applied on a rollback; architectural ones cannot.</p>
+      <p><strong>5. Validate cheaply.</strong> Reproduce at small scale with an LR-sensitivity sweep and check that the fix widens the stable LR range before spending a restart at 7B.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Soft-capping versus QK-norm: what are the trade-offs?</summary>
+    <div class="answer">
+      <p>Soft-capping (Gemma 2) applies \(c\tanh(z/c)\) to scores (\(c = 50\)) and final logits (\(c = 30\)). It is a stateless clip that bounds logits to \((-c, c)\). QK-norm normalizes \(q\) and \(k\), bounding the logit by \(g^2\sqrt{d_h}\).</p>
+      <p><strong>Against capping.</strong> It bounds range, not sharpness: with cap 50 a head can still be exactly one-hot (\(1 - p \approx 10^{-18}\)). Saturation kills the gradient (\(1 - \tanh^2\) is 0.07 at \(2c\) and \(2\times10^{-4}\) at \(5c\)), so the parameters cannot shrink the logits, and Kimi notes that dot products can still grow before the cap acts. It needs an extra op inside the attention kernel. <strong>For capping.</strong> It also bounds the <em>final</em> logits, which QK-norm does not, and bounds \(\log Z\) by construction. <strong>For QK-norm.</strong> The gradient flows fully, the logit bound is tight and weight-independent, and it stabilizes at higher LR (ViT-22B, Wortsman). Gemma 3 replaced capping with it. <strong>Limits of QK-norm.</strong> Not compatible with absorbed MLA, and it needs z-loss for the output softmax.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why do attention sinks form, and what are the fixes?</summary>
+    <div class="answer">
+      <p><strong>Why.</strong> Softmax weights are non-negative and sum to 1, so a head must place its mass somewhere even when no key is relevant. Autoregressive models learn to dump the surplus on the first tokens, which every later query can see. Position, not content, matters: replacing the first four tokens with newlines gives perplexity 5.60 against 5.40. Deleting them from a sliding-window KV cache breaks the model (perplexity 5,158 for Llama-2-13B). The companion effect is massive activations (LLaMA2-7B: 2,622 against a median 0.2) that act as fixed biases and attract attention.</p>
+      <p><strong>Fixes.</strong> (1) Keep the sink tokens in the cache (StreamingLLM: 4 tokens). (2) Train with a learnable sink token. (3) Softmax off by one (a zero key and value), which helps only partly. (4) A learned per-head sink logit in the denominator (gpt-oss, DeepSeek-V4), which lets a head's total attention go to about 0. (5) Explicit key and value biases, which remove massive activations. (6) Gated attention: a query-dependent sigmoid gate on the output cut first-token attention from 46.7% to 4.8% and the largest hidden activation from 1,053 to 94.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is multi-token prediction, and why did DeepSeek-V3 use it?</summary>
+    <div class="answer">
+      <p>MTP adds training losses for tokens beyond the next one. Gloeckle et al. use \(n\) parallel heads on a shared trunk. V3 uses sequential modules that keep the causal chain: depth \(k\) fuses the previous depth's hidden state with the embedding of \(x_{i+k}\) (each RMS-normalized, concatenated, projected by \(M_k \in \R^{d\times2d}\)), runs one transformer block, and predicts \(x_{i+k+1}\) through the shared head. V3 uses depth 1, with \(\lambda = 0.3\) then 0.1.</p>
+      <p><strong>Why:</strong> a denser training signal (may improve data efficiency), possibly better planning in the representations, and a free speculative-decoding draft (85% to 90% second-token acceptance, 1.8x tokens per second). <strong>Evidence:</strong> 17 of 20 comparisons improve on two MoE sizes (HumanEval +6.1 and +9.2; MMLU −0.9 on the large one). <strong>Costs:</strong> about 14B extra parameters (2%), roughly 4% training FLOPs by our estimate, extra logits memory; the module is dropped at inference unless used for drafting. Caveat: single-run evidence from the adopting lab, and Gloeckle et al. found MTP hurts small models.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the bound on attention logits under QK-norm. What is it for \(d_h = 128\) with gains of 2, and what does it imply?</summary>
+    <div class="answer">
+      <p>After RMS normalization each vector has RMS 1 and norm \(\sqrt{d_h}\). Write \(\hat q = g_q \odot u\), \(\hat k = g_k \odot w\) with \(\lVert u\rVert = \lVert w\rVert = \sqrt{d_h}\). Then \(|\hat q\cdot\hat k| = |\sum_i g_{q,i}g_{k,i}u_iw_i| \le \max_i|g_{q,i}g_{k,i}|\,\lVert u\rVert\lVert w\rVert = d_h \max_i |g_{q,i}g_{k,i}|\) by Cauchy-Schwarz. Dividing by \(\sqrt{d_h}\): \(|z| \le \sqrt{d_h}\max_i|g_{q,i}g_{k,i}|\), which is \(g^2\sqrt{d_h}\) for equal scalar gains.</p>
+      <p>For \(d_h = 128\), \(g = 2\): \(4 \times 11.31 = 45.25\). A row's weight ratio is at most \(e^{2\times45.25} = e^{90.5}\), still extremely sharp, so expressivity is not the constraint; the point is that sharpness is now controlled by \(d_h\) gain parameters instead of two weight matrices. Without QK-norm the bound is \(\lVert x_t\rVert\lVert x_j\rVert\,\lVert W_q\rVert_2\lVert W_k\rVert_2/\sqrt{d_h}\), quadratic in weight scale. At initialization, random unit-RMS vectors give logits with standard deviation 1, far below the bound.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Write the block for pre-norm, Gemma's pre+post norm and OLMo 2's output-norm. What does each bound, and what does it cost?</summary>
+    <div class="answer">
+      <p><strong>Pre-norm:</strong> \(y = x + F(\mathrm{N}(x))\). The skip path is an identity, which fixes post-norm's gradient problems, but \(F\)'s output is unbounded, so an outlier write inflates the stream. <strong>Gemma 2 and 3:</strong> \(y = x + \mathrm{N}(F(\mathrm{N}(x)))\), four norms per layer, and the written vector has RMS set by a gain. <strong>OLMo 2:</strong> \(h = x + \mathrm{N}(\mathrm{Attn}(x))\), \(x_{\text{out}} = h + \mathrm{N}(\mathrm{MLP}(h))\), so the input norm is dropped and the write is bounded. The reordering came from Swin V2, and Chameleon-34B needed it: it bounds the norm growth of the SwiGLU block. OLMo 2's spike score fell 0.108 to 0.069 only with QK-norm added.</p>
+      <p><strong>Cost:</strong> more norms, and the branch can no longer start near zero (a norm of a tiny vector is still unit RMS), which interacts with initialization; OLMo 2 dropped depth-scaled init. Chameleon found output-norm did not work well with dropout.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why must QK-norm be applied before RoPE, and why is it awkward for MLA? What does DeepSeek do instead?</summary>
+    <div class="answer">
+      <p><strong>Before RoPE.</strong> RoPE rotates 2-D pairs by position-dependent angles, and \(R_tR_j^\top = R_{t-j}\) needs the dotted vectors to be rotations of \(\hat q, \hat k\). A per-dimension gain applied after rotation would scale the two coordinates of a pair differently and break the relative-position structure. Applied before, it is part of \(\hat q\) and \(\hat k\). Rotations preserve norm, so the RMS itself does not care. Gemma 3 and Qwen3 normalize per head before RoPE.</p>
+      <p><strong>MLA.</strong> With weight absorption, decode never materializes per-head keys, and a nonlinear norm cannot be absorbed into \(W^{UK}\); Kimi K2 says QK-Norm is "not applicable" to MLA. DeepSeek V2 and V3 used RMSNorm on the compressed latents and scaling factors at bottlenecks (which bounds the latent but not the up-projection product). Kimi K2 added QK-Clip, a per-head weight rescale. DeepSeek-V4 changed the attention to a shared-KV MQA whose KV entry is materialized, and applies per-head RMSNorm on queries and the KV entry, dropping QK-Clip.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Explain hyper-connections and mHC. What does mHC constrain and why, and what does it cost? Prove the key property.</summary>
+    <div class="answer">
+      <p>HC widens the residual stream into \(n\) streams \(X \in \R^{n\times d}\): \(X_{l+1} = H^{\mathrm{res}}X_l + H^{\mathrm{post}\top}F(H^{\mathrm{pre}}X_l)\). \(H^{\mathrm{pre}}\) reads the streams into one \(d\)-vector, \(H^{\mathrm{post}}\) writes the layer output back, \(H^{\mathrm{res}}\) mixes the streams; with \(n=1\) it is the ordinary residual. Gains: 1.8x faster convergence on OLMoE-1B-7B, at negligible parameter cost.</p>
+      <p><strong>Problem:</strong> unrolled over depth the shallow signal is multiplied by \(\prod H^{\mathrm{res}}\), which unconstrained is not the identity, so signals blow up or vanish: at 27B, HC had a loss surge near step 12K and a composite gain near 3,000. <strong>mHC</strong> forces \(H^{\mathrm{res}}\) to be doubly stochastic (Sinkhorn-Knopp on \(\exp(\tilde H)\), 20 iterations) and \(H^{\mathrm{pre}}=\sigma\), \(H^{\mathrm{post}}=2\sigma\) non-negative. <strong>Proof:</strong> for \(B\ge0\), \(B\mathbf1=\mathbf1\), \(\mathbf1^\top B=\mathbf1^\top\): max row sum and max column sum are both 1, so \(\lVert B\rVert_2\le\sqrt{\lVert B\rVert_1\lVert B\rVert_\infty}=1\); \((B_1B_2)\mathbf1=\mathbf1\) gives closure, so any product stays non-expansive; and \(\mathbf1^\top BX=\mathbf1^\top X\) conserves the stream total. <strong>Cost:</strong> residual traffic rises from \(2C\) reads and \(C\) writes to about \(21C\) and \(13C\) at \(n=4\) unless fused, plus wider streams and pipeline traffic; DeepSeek reports 6.7% overhead after fused kernels, recomputation and DualPipe overlap. Since 20 iterations are approximate, gains are about 1.6 at worst, not exactly 1.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: a 30B MoE is training with Muon, and the max attention logit reaches 800 by step 5K, though the loss is still smooth. What are your options and trade-offs?</summary>
+    <div class="answer">
+      <p>Treat it as a leading indicator. Kimi K2's mid-scale Muon run had max logits above 1000, a level that "usually result[s] in instability during training, including significant loss spikes and occasional divergence". Log per-head max logits so you know how many heads are affected (K2: only a subset; 12.7% ever triggered clipping).</p>
+      <ul>
+        <li><strong>QK-Clip (weights-only).</strong> Rescale \(W_q, W_k\) per head after each step when \(S_{\max}^h > \tau\): \(\gamma = \tau/S_{\max}^h\), \(\sqrt\gamma\) on each factor (\(\gamma\) on the rotary query, shared rotary key untouched for MLA). Forward pass unchanged, works with MLA, and self-deactivates (K2: \(\tau = 100\), inactive after about 70K steps); \(\tau = 30\) left loss unchanged at small scale. Needs one extra statistic per head and a \(\tau\) choice.</li>
+        <li><strong>QK-norm.</strong> Stateless, tight bound and full gradient, but changes the architecture (restart) and is incompatible with absorbed MLA. Best if the attention is MHA or GQA, or a shared-KV MQA as in V4.</li>
+        <li><strong>Soft-cap.</strong> Bounds range but saturates the gradient and does not stop sharpness. Weakest option.</li>
+        <li><strong>Lower LR or longer warm-up.</strong> Cheap, but costs the token efficiency Muon was chosen for.</li>
+      </ul>
+      <p>Recommendation: QK-Clip if the run cannot restart or uses MLA, QK-norm for a new architecture, and validate on a small proxy with an aggressive \(\tau\) first. Muon's full-rank updates plausibly inflate spectral norms faster than Adam's (K2's hypothesis), so expect the problem to persist as scale grows.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compare a learned sink logit (gpt-oss, V4) with Qwen's gated attention. How does each remove the need for a sink token, and how would you decide between them?</summary>
+    <div class="answer">
+      <p><strong>Sink logit:</strong> add \(e^{z'_h}\) to the softmax denominator, one learned scalar per head, so the head's attention weights can sum to less than 1, approaching 0. It removes the normalization constraint that forces mass onto a token. Cost: \(n_h\) scalars per layer, nothing else. It does not change what the head outputs when it does attend.</p>
+      <p><strong>Gated attention:</strong> multiply the attention output by \(\sigma(XW_\theta)\), elementwise, per head, dependent on the current token. The gate learns sparse (mean 0.116) query-dependent scaling, so a head can silence itself per channel; it also adds non-linearity between \(W_V\) and \(W_O\). Ablations show head-specific, query-dependent, sparse gating is what removes sinks (first-token share 46.7% to 4.8%); an input-independent gate does not (0.364), and neither does a gate on the values (0.297). Cost: +1.3% parameters (elementwise) or +0.01% (headwise), under 2% latency; benefits also include quality (perplexity 6.026 to 5.761) and larger stable LR.</p>
+      <p><strong>Deciding.</strong> The Qwen paper does not compare against learned sink logits, so there is no head-to-head to cite. Sink logits are nearly free and target only the normalization problem. A gate costs more and buys more (quality, stability, long-context robustness), but the evidence is one study. Test both on a proxy and measure sink share, max activations, LR tolerance and long-context accuracy.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design a cheap experiment to decide whether a stability tweak (say, output-norm) is worth adopting in a 70B run. What can and cannot small models tell you?</summary>
+    <div class="answer">
+      <p>Use Wortsman et al.'s protocol. Train a ladder of small models (a few million to a few hundred million parameters) with and without the tweak over a log grid of learning rates (three decades), and compute LR sensitivity and the best loss. A tweak that helps stability should <em>widen the stable LR range</em> without raising the best loss, and the gap should grow with size. Log per-layer max attention logit, output norm, gradient norm and \(\log Z\); extrapolate them across the ladder as Wortsman et al. did (quadratic fit of max logit, threshold \(10^4\)) to predict where the baseline breaks. Add at least a few seeds, since instability is stochastic (ST-MoE: 4 of 6 baseline runs were stable).</p>
+      <p><strong>Limits.</strong> Small models are rarely unstable at reasonable LRs, so you must raise the LR to expose failures, and that may probe a different regime. Effects can reverse with scale (ST-MoE). LR sensitivity is blind to loss scale and misleading if the tweak changes the meaning of LR. It cannot tell you about interactions with the optimizer, precision, MoE routing or data quality that only appear at scale (V4's routing-related spikes). So adopt only tweaks with a mechanism you understand, plus a cheap rollback plan.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Stability primitives.</strong> Implement <code>rms_norm</code> (float32 statistics, dtype preserved), <code>qk_norm_attention</code> (RMS-normalize per head with shared gains, then causal attention; the tests check the scale invariance that is the point of QK-norm, and the \(g^2\sqrt{d_h}\) bound), <code>z_loss</code> (float32 log-sum-exp, optional mask), <code>softcap</code> (must not overflow for huge inputs) and <code>attention_entropy</code> (finite values and gradients at exact zeros, which a naive \(p\log p\) gets wrong). An interviewer would expect these five in about 25 minutes. <span class="ex-path">exercises/drills/stability.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Multi-token prediction.</strong> In the same file, complete <code>MTPDepth.forward</code> (two RMSNorms with gains, concatenate, project \(2d\to d\), block) and <code>mtp_loss</code> (depth-\(k\) alignment of embeddings and labels, the chain from one depth to the next, shared embedding and head, and the \(\lambda/D\) average). The test compares against a loop-based reference for depth 1 and 2 and checks that the shared parameters receive gradients. Budget about 25 minutes; the alignment indices are where interviews go wrong. <span class="ex-path">exercises/drills/stability.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_stability.py</code>; add <code>--solutions</code> to check the reference.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2204.02311">Chowdhery et al. (2022). PaLM: Scaling Language Modeling with Pathways.</a> <span class="why">Why read it: §5 and §5.1 give the z-loss, the \(\beta_2\) schedule, and the restart-and-skip response to spikes.</span></li>
+    <li><a href="https://arxiv.org/abs/2309.14322">Wortsman et al. (2023). Small-scale proxies for large-scale Transformer training instabilities.</a> <span class="why">Why read it: the LR-sensitivity method and the small-scale reproductions of logit growth and logit drift.</span></li>
+    <li><a href="https://arxiv.org/abs/2302.05442">Dehghani et al. (2023). Scaling Vision Transformers to 22 Billion Parameters.</a> <span class="why">Why read it: the QK-normalization origin story and its Appendix B evidence.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.00656">OLMo Team (2025). 2 OLMo 2 Furious.</a> <span class="why">Why read it: §3 is a rare open account of spike causes, ablations and the spike-score metric.</span></li>
+    <li><a href="https://arxiv.org/abs/2503.19786">Gemma Team (2025). Gemma 3 Technical Report.</a> <span class="why">Why read it: the replacement of Gemma 2's soft-capping by QK-norm, and pre+post norm (Gemma 2, <a href="https://arxiv.org/abs/2408.00118">2408.00118</a>, has the cap values).</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: §2.1 and App. D to E for QK-Clip, the MLA rules and the Muon logit-explosion hypothesis.</span></li>
+    <li><a href="https://arxiv.org/abs/2512.24880">Xie et al. (2026). mHC: Manifold-Constrained Hyper-Connections.</a> <span class="why">Why read it: the doubly stochastic constraint, the gain measurements and the systems cost. Pair with the original <a href="https://arxiv.org/abs/2409.19606">Hyper-Connections</a> paper and DeepSeek-V4 <a href="https://arxiv.org/abs/2606.19348">§2.2</a>.</span></li>
+    <li><a href="https://arxiv.org/abs/2505.06708">Qiu et al. (2025). Gated Attention for Large Language Models.</a> <span class="why">Why read it: the gate-position ablations and the sink, activation and stability analysis.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: §2.2 (MTP equations), §4.5.1 (ablation Table 4), §5.4.3 (acceptance rate).</span></li>
+    <li><a href="https://arxiv.org/abs/2404.19737">Gloeckle et al. (2024). Better &amp; Faster Large Language Models via Multi-token Prediction.</a> <span class="why">Why read it: the parallel-head original, its scale dependence and the choice-point argument.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>Failure shapes: spike, slow divergence, slow norm drift. Spikes grow with scale (PaLM: about 20 at 540B, none smaller). Data <em>and</em> parameter state cause them.</li>
+      <li>PaLM response: restart about 100 steps back, skip 200 to 500 batches. OPT: lower LR, clip 1.0 to 0.3, restart where the loss scale is healthy. V4: rollback alone is not enough (Anticipatory Routing, SwiGLU clamp to \([-10,10]\)).</li>
+      <li>Log before you need it: grad norm, max attention logit and entropy, mean logit and \(\log Z\), last-layer norm, Adam update RMS and \(\epsilon\).</li>
+      <li>LR sensitivity: \(\E_\eta[\min(\ell(\eta),\ell_0)] - \ell^*\) over 3e-4 to 3e-1. Max attention logit above \(10^4\) meant divergence (Wortsman).</li>
+      <li>QK-norm: \(\hat q = g_q\odot q/\mathrm{RMS}(q)\), per head, before RoPE. \(|z|\le g^2\sqrt{d_h}\) (11.31 for \(d_h=128\), \(g=1\)). Not for absorbed MLA. OLMo 2 normalizes full width; Gemma 3 and Qwen3 per head.</li>
+      <li>Entropy of a row with one key \(\Delta\) above 1023 others: 6.93 nats at \(\Delta=0\), 6.43 at 5, 0.49 at 10.</li>
+      <li>z-loss: \(\lambda\log^2 Z\), \(\lambda = 10^{-4}\) (PaLM), \(10^{-5}\) (Chameleon), router \(10^{-3}\). Gradient \(2\lambda\log Z\,p_v\). \(\log Z=15\) gives 0.0225. bf16 spacing is 1.0 on \([128,256)\).</li>
+      <li>Soft-cap: \(c\tanh(z/c)\), Gemma 2: 50 (attention), 30 (final); dropped in Gemma 3. Bounds range, not sharpness; gradient \(1-\tanh^2\).</li>
+      <li>QK-clip (Kimi K2): if \(S^h_{\max}>\tau\), \(\gamma=\tau/S^h_{\max}\); \(\sqrt\gamma\) on \(W_{q^C}, W_{k^C}\), \(\gamma\) on \(W_{q^R}\), shared \(k^R\) untouched; \(\tau=100\).</li>
+      <li>Norms: pre \(x+F(N(x))\); Gemma \(x+N(F(N(x)))\); OLMo 2 \(x+N(F(x))\) (spike score 0.108 to 0.069 with QK-norm). DeepNorm \(\alpha=(2M)^{1/4}\), \(\beta=(8M)^{-1/4}\). Embeddings: scale by \(\sqrt d\), no weight decay on them.</li>
+      <li>mHC: \(X_{l+1}=H^{res}X_l+H^{post\top}F(H^{pre}X_l)\); \(H^{res}\) doubly stochastic via Sinkhorn (20 iters), \(H^{pre}=\sigma\), \(H^{post}=2\sigma\). \(\lVert B\rVert_2\le1\), closed under products. Gain about 3,000 (HC) versus about 1.6 (mHC). \(n=4\); traffic \(21C/13C\) versus \(2C/C\); 6.7% overhead. Loss \(-0.021\) at 27B.</li>
+      <li>Sinks: softmax must sum to 1. Window attention without the first 4 tokens: perplexity 5,158 versus 5.40. Fixes: sink token, sink logit \(e^{z'_h}\) in the denominator (gpt-oss, V4), key and value bias, gated attention.</li>
+      <li>Gated attention: \(Y'=Y\odot\sigma(XW_\theta)\); PPL 6.026 to 5.761, first-token attention 46.7% to 4.8%, RULER 128K 31.65 to 58.82; +1.3% params.</li>
+      <li>MTP (V3): \(h'^k_i = M_k[\mathrm N(h^{k-1}_i);\, \mathrm N(\mathrm{Emb}(t_{i+k}))]\) with N = RMSNorm, shared embed and head, \(D=1\), \(\lambda=0.3\to0.1\). Ablation: 17 of 20 better, HumanEval +6.1 and +9.2. 14B extra parameters; second-token acceptance 85 to 90%, 1.8x TPS.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

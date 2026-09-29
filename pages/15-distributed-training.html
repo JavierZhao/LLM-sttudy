@@ -1,0 +1,1396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Memory, precision &amp; parallelism · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="15" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part III · Pretraining &amp; systems · Page 15</div>
+  <h1>Memory, precision &amp; parallelism</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~80 min</span>
+    <span>Prereqs: <a href="04-transformer-block.html">04 Transformer block</a>, <a href="08-mixture-of-experts.html">08 Mixture of Experts</a>, <a href="14-optimization.html">14 Optimization</a></span>
+  </div>
+  <p class="lede">Research-engineer loops always include "how would you train model X on N GPUs?" This page teaches the whiteboard answer: count the bytes (model states and activations), choose number formats, price every collective, and place data, tensor, pipeline, expert and context parallelism on the network hierarchy so that model FLOPs utilization lands near 40%. Every number below is derived from a stated config or taken from a primary source.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Memory arithmetic on the spot:</strong> "How much memory does it take to train a 7B model with AdamW?" (16 bytes per parameter before activations) and "where does it go?"</li>
+    <li><strong>ZeRO and FSDP:</strong> what each stage shards, why stages 1 and 2 cost no extra communication and stage 3 costs 1.5×, and when you would not use stage 3.</li>
+    <li><strong>Why each parallelism lives where it does:</strong> tensor parallelism inside the node, pipeline across nodes, data parallelism outermost. Expect per-layer traffic numbers and the bubble fraction \((p-1)/(m+p-1)\).</li>
+    <li><strong>Numerics:</strong> why bf16 needs no loss scaling but still needs fp32 master weights, and how DeepSeek-V3 trains in FP8 with 1×128 and 128×128 scaling.</li>
+    <li><strong>Real layouts and MFU:</strong> Llama 3 405B (TP8, PP16, DP64, 43% MFU), DeepSeek-V3 (PP16, EP64, ZeRO-1, no tensor parallelism), and the difference between MFU and hardware FLOPs utilization.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Compute per-GPU training memory for weights, gradients, optimizer state and activations under DDP, ZeRO-1/2/3, tensor and pipeline parallelism.</li>
+    <li>Apply Korthikanti et al.'s per-layer activation formula \(sbh(34 + 5as/h)\), explain each term, and quantify full versus selective recomputation and sequence parallelism.</li>
+    <li>Compare fp32, fp16, bf16, FP8, MX and NVFP4 by range and precision, explain loss scaling, and describe DeepSeek-V3's FP8 recipe.</li>
+    <li>Derive ring all-reduce cost, ZeRO's \(2N\) versus \(3N\) volumes, Megatron's per-layer tensor-parallel traffic, and the pipeline bubble with interleaved, zero-bubble and DualPipe variants.</li>
+    <li>Justify a [TP, CP, PP, DP] layout (plus EP for MoE) for a given model and cluster with numbers, and criticize the layouts of Llama 3 and DeepSeek-V3.</li>
+    <li>Compute MFU and HFU from throughput, and audit a reported number.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="memory">Where the memory goes</h2>
+
+  <p>A training step holds four kinds of data in GPU memory <span class="zh">显存</span>: <strong>model states</strong> (weights, gradients, optimizer state), which scale with the parameter count \(N\); <strong>activations</strong>, which scale with tokens in flight times layers times width; <strong>temporary buffers</strong>; and <strong>fragmentation</strong>, memory that is free but unusable <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §3]</a>. Units: 1 GB = \(10^9\) bytes (page 04 quotes some numbers in GiB; 1 GiB = 1.074 GB).</p>
+
+  <h3 id="states">Model states: 16 bytes per parameter</h3>
+  <p><strong>Mixed-precision training</strong> <span class="zh">混合精度训练</span> runs the forward and backward passes in a 16-bit format but keeps an fp32 master copy for the update <a href="https://arxiv.org/abs/1710.03740">[Micikevicius et al. 2017, §3.1]</a>. With Adam, that means five tensors per parameter. ZeRO counts them as \(2N + 2N + KN\) with \(K = 12\) <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §3.1]</a>:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Tensor</th><th>dtype</th><th class="num">Bytes / param</th><th class="num">7B model</th><th class="num">Llama-3-8B (8.03B)</th></tr></thead>
+    <tbody>
+      <tr><td>Working weights (used in forward and backward)</td><td>bf16</td><td class="num">2</td><td class="num">14.0 GB</td><td class="num">16.06 GB</td></tr>
+      <tr><td>Gradients</td><td>bf16</td><td class="num">2</td><td class="num">14.0 GB</td><td class="num">16.06 GB</td></tr>
+      <tr><td>Master weights</td><td>fp32</td><td class="num">4</td><td class="num">28.0 GB</td><td class="num">32.12 GB</td></tr>
+      <tr><td>Adam first moment \(m\)</td><td>fp32</td><td class="num">4</td><td class="num">28.0 GB</td><td class="num">32.12 GB</td></tr>
+      <tr><td>Adam second moment \(v\)</td><td>fp32</td><td class="num">4</td><td class="num">28.0 GB</td><td class="num">32.12 GB</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td></td><td class="num"><strong>16</strong></td><td class="num"><strong>112 GB</strong></td><td class="num"><strong>128.5 GB</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">\(16 \times 7\text{B} = 112\) GB; \(16 \times 8{,}030{,}261{,}248 = 128.48\) GB.</p>
+
+  <p>Three-quarters of the bytes (\(12/16\)) are optimizer state, so sharding it (ZeRO-1, below) is the cheapest big win. An 8B model does not fit on an 80 GB H100 before a single activation is stored. The number 16 is specific to this recipe: Llama 3 accumulates and reduce-scatters gradients in fp32 <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>, which makes 18 bytes, while DeepSeek-V3 keeps fp32 master weights and gradients but bf16 Adam moments <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3.3]</a>, <span class="unverified" title="My arithmetic from the paper's description; the paper does not state a bytes-per-parameter total and I assume a separate bf16 weight copy is kept">about 14 by my count (2 + 4 + 4 + 2 + 2)</span>.</p>
+
+<pre><code class="language-python">def states_gb(N, stage, Nd, K=12, w=2, g=2):
+    """Per-GPU model-state GB with the ZeRO accounting: stage 0 = DDP, 1/2/3 = ZeRO-1/2/3."""
+    p  = w * N / (Nd if stage &gt;= 3 else 1)     # working weights
+    gr = g * N / (Nd if stage &gt;= 2 else 1)     # gradients
+    o  = K * N / (Nd if stage &gt;= 1 else 1)     # fp32 master + Adam m, v
+    return (p + gr + o) / 1e9
+
+print([round(states_gb(7.5e9, s, 64), 2) for s in range(4)])   # [120.0, 31.41, 16.64, 1.88]: ZeRO Table 1
+</code></pre>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>A jet-tagging transformer has millions of parameters, so its states are megabytes and plain DDP (every GPU holds everything, gradients are all-reduced) was all you needed. At LLM scale the states alone are terabytes (Llama 3 405B: \(16 \times 405\text{B} = 6.48\) TB), so the central question changes from "how do I split the batch?" to "how do I split the model?"</p>
+  </aside>
+
+  <h3 id="activations">Activations: Korthikanti's per-layer formula</h3>
+  <p>Backpropagation needs the tensors the forward pass produced. Korthikanti et al. count, for a GPT-style layer, every tensor that must be kept, in bytes, using 16-bit values (dropout masks take one byte per element) <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, §4.1]</a>. In their symbols, which we adopt in this section, \(s\) is the sequence length (our \(T\)), \(b\) the micro-batch size, \(h\) the hidden size (our \(d\)) and \(a\) the number of attention heads (our \(n_h\)). The derivation:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Block</th><th>Saved tensor</th><th class="num">Bytes</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="6">Self-attention</td><td>Input to the Q, K, V projections (shared)</td><td class="num">\(2sbh\)</td></tr>
+      <tr><td>\(Q\) and \(K\) (for \(QK^\top\))</td><td class="num">\(4sbh\)</td></tr>
+      <tr><td>Softmax output</td><td class="num">\(2as^2b\)</td></tr>
+      <tr><td>Softmax-dropout mask (1 byte per element)</td><td class="num">\(as^2b\)</td></tr>
+      <tr><td>Dropout output and \(V\) (for attention over \(V\))</td><td class="num">\(2as^2b + 2sbh\)</td></tr>
+      <tr><td>Input to the output projection, plus its dropout mask</td><td class="num">\(2sbh + sbh\)</td></tr>
+      <tr class="hl"><td colspan="2"><strong>Attention total</strong></td><td class="num"><strong>\(11sbh + 5as^2b\)</strong></td></tr>
+      <tr><td rowspan="2">MLP (\(h \to 4h \to h\))</td><td>Inputs of the two linears (\(2sbh\), \(8sbh\)), input of GeLU (\(8sbh\)), dropout mask (\(sbh\))</td><td class="num">\(19sbh\)</td></tr>
+      <tr class="hl"><td colspan="1"><strong>MLP total</strong></td><td class="num"><strong>\(19sbh\)</strong></td></tr>
+      <tr><td>Two layer norms</td><td>One input each, \(2sbh\)</td><td class="num">\(4sbh\)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="eq-box">
+  \[ \text{activation memory per layer} = sbh\Big(34 + 5\,\frac{a\,s}{h}\Big) \ \text{bytes} \]
+  <div class="eq-label">Korthikanti et al. 2022, Eq. 1 (no model parallelism, GPT-style block)</div>
+  </div>
+
+  <p>Read the two terms separately. The \(34\,sbh\) part is linear in sequence length. The \(5as^2b\) part comes from the \(s \times s\) score matrix of every head and is quadratic. Since \(5as/h = 5s/d_h\) with \(d_h = h/a\) the head dimension, it does not depend on model width: it exceeds 34 once \(s > 6.8\,d_h\), about 870 tokens for \(d_h = 128\). At 8K context the quadratic term is 90% of the total. The formula assumes GPT-2-style blocks (GeLU, \(4h\) MLP, dropout, full multi-head attention); Llama's SwiGLU, GQA and lack of dropout change the constant. <span class="unverified" title="My own tensor count, not from a paper; real frameworks save different sets of tensors">Counting bf16 tensors for a Llama-3-8B layer with a fused attention kernel, I get \(9\,sbh\) for attention (input 2, normed input 2, \(Q\) 2, \(K\) and \(V\) 0.5 each, output 2) plus \(25\,sbh\) for the SwiGLU MLP (residual 2, normed 2, gate, up and \(\text{silu}(\text{gate}) \odot \text{up}\) at \(2 \cdot 3.5 = 7\) each): 34 again, by coincidence</span>; other choices of what to store give 27 to 41. The scaling with \(s\), \(b\) and \(L\) is what matters.</p>
+
+  <p><strong>What parallelism does to it.</strong> Tensor parallelism of degree \(t\) divides the tensors inside the attention and MLP blocks, but the layer-norm inputs, dropout masks and block inputs are replicated, which leaves a \(10\,sbh\) term. <strong>Sequence parallelism</strong> <span class="zh">序列并行</span> shards those replicated regions along the sequence, and everything is divided by \(t\). Pipeline parallelism does <em>not</em> shrink activation memory: under 1F1B the first stage keeps \(p\) micro-batches of \(L/p\) layers, so it stores \(L\) layers' worth regardless of \(p\) <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, §4.2, Eq. 2, 4, 5]</a>. Table 2 of that paper, evaluated for Llama-3-8B shapes (\(s = 8192\), \(b = 1\), \(h = 4096\), \(a = 32\), \(t = 8\) where used):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Configuration (per layer, per GPU)</th><th class="num">Factor times \(sbh\)</th><th class="num">GB per layer</th><th class="num">GB, 32 layers</th></tr></thead>
+    <tbody>
+      <tr><td>Store everything</td><td class="num">\(34 + 5as/h = 354\)</td><td class="num">11.88</td><td class="num">380</td></tr>
+      <tr><td>Selective recomputation (or a fused kernel that never stores scores)</td><td class="num">34</td><td class="num">1.14</td><td class="num">36.5</td></tr>
+      <tr><td>Full recomputation (keep each layer's input only)</td><td class="num">2</td><td class="num">0.067</td><td class="num">2.15</td></tr>
+      <tr><td>Tensor parallel, \(t = 8\)</td><td class="num">\(10 + 24/t + 5as/(ht) = 53\)</td><td class="num">1.78</td><td class="num">56.9</td></tr>
+      <tr><td>Tensor + sequence parallel</td><td class="num">\((34 + 5as/h)/t = 44.25\)</td><td class="num">1.48</td><td class="num">47.5</td></tr>
+      <tr><td>Tensor parallel + selective recomputation</td><td class="num">\(10 + 24/t = 13\)</td><td class="num">0.44</td><td class="num">14.0</td></tr>
+      <tr class="hl"><td>Tensor + sequence parallel + selective</td><td class="num">\(34/t = 4.25\)</td><td class="num">0.14</td><td class="num">4.6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">\(sbh = 8192 \cdot 1 \cdot 4096 = 33.55\)M elements. For example \(354 \times 33.55\text{M} = 11.88\) GB per layer and \(\times 32 = 380\) GB, matching page 04 (354 GiB). The GPT-style constants are an approximation for Llama layers, as discussed above.</p>
+
+  <h3 id="checkpointing">Activation checkpointing</h3>
+  <p><strong>Activation recomputation</strong> <span class="zh">激活重计算</span> (gradient checkpointing) trades FLOPs for memory: keep some tensors and rerun part of the forward pass inside the backward pass. Splitting an \(n\)-layer network into \(\sqrt{n}\) segments costs \(O(\sqrt{n})\) memory for one extra forward pass <a href="https://arxiv.org/abs/1604.06174">[Chen et al. 2016, §4.3]</a>. For a transformer, <strong>full recomputation</strong> stores each layer's input (\(2sbh\)) and redoes the layer's forward. The step executes \(2N + 2N + 4N = 8N\) FLOPs per token instead of \(6N\): +33% (Korthikanti et al. observed 30 to 40% <a href="https://arxiv.org/abs/2205.05198">[§1]</a>).</p>
+
+  <p><strong>Selective recomputation</strong> is smarter: recompute only the tensors that are large but cheap to regenerate. The \(5as/h\) term consists of \(QK^\top\), softmax, dropout and attention-over-\(V\) tensors, which have huge sizes but few FLOPs per element. For GPT-3 (\(a = 96\), \(s = 2048\), \(h = 12288\), so \(5as/h = 80\)) recomputing only those saves 70% of activation memory for 2.7% extra FLOPs; for MT-NLG it saves 65% for 1.6% <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, §5]</a>. Fused attention kernels (FlashAttention, <a href="16-gpus-kernels.html">page 16</a>) build the same idea into the kernel: the score matrix is never written to HBM and is recomputed in the backward pass.</p>
+
+  <div class="decision">
+    <div class="decision-title">Selective activation recomputation</div>
+    <dl>
+      <dt>Problem</dt><dd>Full recomputation cuts activations to \(2sbh\) per layer but adds a forward pass (+33% FLOPs); storing everything is impossible at long context because of the \(s^2\) term.</dd>
+      <dt>Idea</dt><dd>Recompute only tensors with a high bytes-to-FLOPs ratio (attention scores, softmax, dropout, norms, activation functions); store the expensive matmul inputs.</dd>
+      <dt>Why it works</dt><dd>Recompute cost tracks FLOPs, memory saved tracks bytes, and the score-matrix tensors are memory-heavy and arithmetic-light.</dd>
+      <dt>Evidence</dt><dd>GPT-3: 70% less activation memory for 2.7% extra FLOPs; the 530B model reaches 54.2% MFU against 42.1% with full recomputation <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, abstract, §5]</a>.</dd>
+      <dt>Cost</dt><dd>Model-specific engineering. DeepSeek-V3 recomputes only RMSNorm and the MLA up-projections <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.2.3]</a>. DeepSeek-V4 generalizes to <strong>tensor-level checkpointing</strong>: annotate individual tensors, and the framework traces the graph with TorchFX, finds the minimal regenerating subgraph, and reuses the freed storage with no copy <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.4.4]</a>.</dd>
+      <dt>Used by</dt><dd>Megatron-LM, FlashAttention-based stacks, DeepSeek-V3/V4. Llama 3 trains 8K sequences with <em>no</em> activation checkpointing, thanks to careful pipeline memory management <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</dd>
+    </dl>
+  </div>
+
+  <h3 id="buffers">Temporary buffers and fragmentation</h3>
+  <p>Fused communication buffers are a classic hidden cost: an fp32 flattened gradient buffer for a 1.5B-parameter model is 6 GB, so ZeRO uses constant-size buffers. Fragmentation comes from mixing long-lived and short-lived tensors: ZeRO saw out-of-memory failures with over 30% of memory still free <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §3.2]</a>, and PyTorch FSDP found that for GPT-175B on 128 A100s with batch size 2, defragmentation made the backward pass 85.6% of iteration time instead of the usual 67% <a href="https://arxiv.org/abs/2304.11277">[FSDP, §5.4]</a>. Also budget the fp32 logits: \(8192 \times 128{,}256 \times 4\) bytes = 4.2 GB per sequence (page 04).</p>
+
+  <h3 id="memory-numbers">Worked numbers: Llama-3-8B, \(s = 8192\), \(b = 1\), on 64 H100s</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Item</th><th class="num">GB per GPU</th><th>Arithmetic</th></tr></thead>
+    <tbody>
+      <tr><td>Model states, no sharding</td><td class="num">128.5</td><td>\(16 \times 8.03\text{B}\): does not fit in 80 GB</td></tr>
+      <tr><td>ZeRO-1 over 64 GPUs</td><td class="num">33.6</td><td>\(4N + 12N/64 = 32.1 + 1.5\)</td></tr>
+      <tr><td>ZeRO-2 over 64 GPUs</td><td class="num">17.8</td><td>\(2N + 14N/64 = 16.1 + 1.8\)</td></tr>
+      <tr><td>ZeRO-3 over 64 GPUs</td><td class="num">2.0</td><td>\(16N/64\)</td></tr>
+      <tr><td>Activations, everything stored</td><td class="num">380</td><td>\(354 \times 33.55\text{M} \times 32\)</td></tr>
+      <tr><td>Activations, selective / fused kernel</td><td class="num">36.5</td><td>\(34 \times 33.55\text{M} \times 32\)</td></tr>
+      <tr><td>Activations, full recomputation</td><td class="num">2.1</td><td>\(2 \times 33.55\text{M} \times 32\)</td></tr>
+      <tr><td>fp32 logits for the loss</td><td class="num">4.2</td><td>\(8192 \times 128{,}256 \times 4\)</td></tr>
+    </tbody>
+  </table></div>
+  <p>ZeRO-1 plus selective activations is \(33.6 + 36.5 + 4.2 = 74.3\) GB: it "fits" on paper but leaves under 6 GB for buffers and fragmentation, so in practice you move to ZeRO-2 (58.5 GB) or add recomputation. Sharding states costs communication, recomputation costs FLOPs, and neither helps the other's term.</p>
+</section>
+
+<section>
+  <h2 id="numerics">Number formats and mixed precision</h2>
+  <p>A floating-point format trades <strong>range</strong> (exponent bits) against <strong>precision</strong> (mantissa bits). Training needs range for gradients that span many orders of magnitude and precision for accumulations and small updates, and the two needs are met by different formats at different places in the step.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Format</th><th class="num">Sign / exp / mantissa</th><th class="num">Max normal</th><th class="num">Min normal</th><th class="num">Min subnormal</th><th class="num">Relative step \(2^{-M}\)</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td class="num">1 / 8 / 23</td><td class="num">\(3.4\times10^{38}\)</td><td class="num">\(1.2\times10^{-38}\)</td><td class="num">\(1.4\times10^{-45}\)</td><td class="num">\(1.2\times10^{-7}\)</td></tr>
+      <tr><td>fp16</td><td class="num">1 / 5 / 10</td><td class="num">65,504</td><td class="num">\(2^{-14} = 6.1\times10^{-5}\)</td><td class="num">\(2^{-24} = 6.0\times10^{-8}\)</td><td class="num">\(9.8\times10^{-4}\)</td></tr>
+      <tr class="hl"><td>bf16</td><td class="num">1 / 8 / 7</td><td class="num">\(3.4\times10^{38}\)</td><td class="num">\(1.2\times10^{-38}\)</td><td class="num">\(9.2\times10^{-41}\)</td><td class="num">\(7.8\times10^{-3}\)</td></tr>
+      <tr><td>FP8 E4M3</td><td class="num">1 / 4 / 3</td><td class="num">448</td><td class="num">\(2^{-6}\)</td><td class="num">\(2^{-9}\)</td><td class="num">0.125</td></tr>
+      <tr><td>FP8 E5M2</td><td class="num">1 / 5 / 2</td><td class="num">57,344</td><td class="num">\(2^{-14}\)</td><td class="num">\(2^{-16}\)</td><td class="num">0.25</td></tr>
+      <tr><td>FP4 E2M1</td><td class="num">1 / 2 / 1</td><td class="num">6</td><td class="num">1</td><td class="num">0.5</td><td class="num">0.5</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">FP8 rows from <a href="https://arxiv.org/abs/2209.05433">[Micikevicius et al. 2022, Table 1]</a>; E2M1 represents \(\pm\{0, 0.5, 1, 1.5, 2, 3, 4, 6\}\) <a href="https://arxiv.org/abs/2509.25149">[NVFP4 report, §2]</a>; fp16 limits <a href="https://arxiv.org/abs/1710.03740">[Micikevicius et al. 2017, §3]</a>. Other entries are computed from the bit layouts (checked with <code>torch.finfo</code>). E4M3 has no infinities and one NaN pattern, which extends its maximum from 240 to 448; its range spans about 17.8 binades (\(\log_2(448/2^{-9})\)) versus 31.8 for E5M2.</p>
+
+  <h3 id="fp16-scaling">fp16 and loss scaling</h3>
+  <p>fp16 has 10 mantissa bits (good) but only 5 exponent bits: nothing below \(2^{-24} \approx 6\times10^{-8}\) survives, and gradient values are dominated by tiny magnitudes. In Micikevicius et al.'s histogram of activation gradients for a Multibox SSD detector (collected during fp32 training), much of fp16's representable range sat unused while many values fell below it, yet values in \([2^{-27}, 2^{-24})\) still mattered: the network diverged without scaling, and a scale of 8 (three binades) was enough. A bigLSTM language model needed a scale of 128 <a href="https://arxiv.org/abs/1710.03740">[§3.2, §4]</a>. <strong>Loss scaling</strong> <span class="zh">损失缩放</span> multiplies the loss by \(S\) before backpropagation, so by the chain rule every gradient is scaled by \(S\) and shifts into range. Then unscale the gradients in fp32 <em>before</em> clipping or the optimizer, and if any gradient is inf or NaN, skip the step and reduce \(S\); grow \(S\) again after a run of clean steps (dynamic loss scaling).</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>If you used <code>torch.cuda.amp</code> with <code>GradScaler</code>, that was exactly this fp16 loss-scaling loop. Large-model practice moved to bf16 largely to delete it.</p>
+  </aside>
+
+  <h3 id="bf16">bf16: why it needs no scaling, and what it still needs</h3>
+  <p>bf16 keeps fp32's 8 exponent bits, so it has fp32's range (max \(3.4\times10^{38}\), min normal \(1.2\times10^{-38}\)). Any gradient that fp32 can represent is essentially representable in bf16, so nothing flushes to zero and loss scaling disappears. The price is precision: 7 stored mantissa bits (8 significant), a relative step of \(2^{-7} = 0.78\%\). That has two consequences:</p>
+  <ul>
+    <li><strong>Small updates vanish.</strong> If an update is smaller than half the spacing of the weight, round-to-nearest returns the old weight. Micikevicius et al. give two fp16 failure modes: updates below \(2^{-24}\) become zero (about 5% of weight-gradient values in their Mandarin speech model), and updates more than about 2048 times smaller than the weight are shifted out; updating fp16 weights directly cost that model 80% relative accuracy <a href="https://arxiv.org/abs/1710.03740">[§3.1]</a>. For bf16 the second threshold is roughly 256 to 512 times. Hence an fp32 master copy stays even when loss scaling goes.</li>
+    <li><strong>Accumulations must be fp32:</strong> matmul accumulators, gradient accumulation across micro-batches, and gradient reduction (Llama 3 does both of the latter <a href="https://arxiv.org/abs/2407.21783">[§3.3.2]</a>).</li>
+  </ul>
+
+<pre><code class="language-python">import torch
+w = torch.tensor(0.02, dtype=torch.bfloat16)          # stored as 0.02001953125; spacing (ulp) here is 2**-13 = 1.22e-4
+u = torch.tensor(3e-5, dtype=torch.bfloat16)          # an Adam step of order lr = 3e-5, below half an ulp (6.1e-5)
+print(bool(w + u == w))                               # True: the update rounds away
+wb, wf = w.clone(), torch.tensor(0.02)                # bf16 weight vs fp32 master weight
+for _ in range(10_000):
+    wb = wb + u; wf = wf + 3e-5
+print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001...: bf16 never moved
+</code></pre>
+  <p>An Adam update is of order the learning rate per coordinate, so late in a cosine schedule (learning rates near \(3\times10^{-5}\)) updates to weights of size 0.02 fall below bf16's half-spacing: pure-bf16 training without stochastic rounding or a master copy stalls (my illustration; the arithmetic is exact).</p>
+
+  <h3 id="fp8">FP8 training</h3>
+  <p>FP8 halves the bytes and (on Hopper) doubles tensor-core FLOP/s relative to bf16, with a very narrow format. The standard recipe <a href="https://arxiv.org/abs/2209.05433">[Micikevicius et al. 2022, §3]</a> uses <strong>E4M3 for weights and activations and E5M2 for gradients</strong> (gradients need range, activations precision) and a <strong>per-tensor scaling factor</strong> that puts the tensor's maximum magnitude (amax) near the format's maximum (448 or 57,344), saturating overflows. In <strong>delayed scaling</strong> (the Transformer Engine style) the scale comes from a history of amax values from previous steps, avoiding a second pass over the tensor <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3.2]</a>.</p>
+
+  <p>The weakness is outliers: one large element sets the scale for the whole tensor and pushes everything else toward the bottom of a 3-bit-mantissa format. DeepSeek-V3's answer is <strong>fine-grained scaling</strong>, presented in the report as the first validation of FP8 training on an extremely large model <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3]</a>:</p>
+  <ul>
+    <li><strong>Granularity:</strong> one scale per <strong>1×128 tile</strong> of activations (one token, 128 channels) and per <strong>128×128 block</strong> of weights, computed <em>online</em> from the current tile's amax (no history).</li>
+    <li><strong>Format:</strong> E4M3 for <em>all</em> tensors, including gradients. Sharing an exponent per small group gives back the dynamic range that E5M2 would provide, so they spend the bits on mantissa.</li>
+    <li><strong>All three GEMMs</strong> of a linear layer (Fprop, Dgrad, Wgrad) run in FP8 with BF16 or FP32 outputs.</li>
+    <li><strong>Higher-precision accumulation:</strong> on H800 the tensor cores keep only about 14 bits when accumulating FP8 products, and a preliminary test at inner dimension \(K = 4096\) showed a maximum relative error near 2%. Every \(N_C = 128\) elements along \(K\), partial sums are promoted to FP32 registers on CUDA cores, where the per-tile scales are also applied.</li>
+    <li><strong>What stays high precision:</strong> embeddings, output head, MoE gating, normalizations and attention operators (BF16/FP32); master weights and gradients (FP32); Adam moments (BF16). Cached activations are FP8 (E5M6 for one exception); MoE dispatch is FP8, combine BF16.</li>
+    <li><strong>Result:</strong> relative loss error against a BF16 baseline stayed below 0.25% over about 1T tokens at two model scales.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">Fine-grained FP8 scaling (DeepSeek-V3)</div>
+    <dl>
+      <dt>Problem</dt><dd>FP8 has 2 to 3 mantissa bits and a narrow range: one outlier ruins a per-tensor scale, and FP8 tensor-core accumulation is too imprecise for long inner dimensions.</dd>
+      <dt>Idea</dt><dd>Scale each 1×128 activation tile and 128×128 weight block online, promote partial sums to FP32 every 128 elements of \(K\), keep sensitive operators in BF16/FP32.</dd>
+      <dt>Why it works</dt><dd>An outlier only degrades its own group; scales are applied during the FP32 promotion, so dequantization is nearly free; sharing an exponent per group lets E4M3 cover the range everywhere.</dd>
+      <dt>Evidence</dt><dd>Loss within 0.25% of BF16 on two model scales at about 1T tokens, then a full 14.8T-token run <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3, Tab. 1]</a>.</dd>
+      <dt>Cost</dt><dd>Custom GEMM kernels (DeepGEMM), scale tensors, a 1×128 to 128×1 re-quantization for one backward tensor, and dependence on Hopper's accumulator behavior. Blackwell's hardware microscaling supports finer groups <a href="https://arxiv.org/abs/2412.19437">[§3.3.2]</a>.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3; NVIDIA's NVFP4 study uses the same scaling for its FP8 baseline <a href="https://arxiv.org/abs/2509.25149">[NVFP4 report, App. A.1]</a>.</dd>
+    </dl>
+  </div>
+
+  <h3 id="microscaling">Microscaling and FP4</h3>
+  <p><strong>Microscaling</strong> <span class="zh">微缩放</span> (MX) formats make DeepSeek's idea a hardware standard: a block of \(k = 32\) elements shares one 8-bit power-of-two scale (E8M0), and the elements are FP8, FP6, FP4 (E2M1) or INT8, giving MXFP8, MXFP6, MXFP4 and MXINT8 <a href="https://arxiv.org/abs/2310.10537">[Rouhani et al. 2023, Tab. 1]</a>: \(4 + 8/32 = 4.25\) bits per element for MXFP4 (my arithmetic). DeepSeek-V3 notes that its tile and block scaling is "highly consistent" with microscaling.</p>
+  <p><strong>NVFP4</strong> uses 16-element blocks, an E4M3 block scale (not restricted to powers of two) and an FP32 per-tensor scale: 4.5 bits per element (my arithmetic). NVIDIA trained a 12B hybrid Mamba-Transformer on 10T tokens in NVFP4: validation loss stayed within about 1% of an FP8 run in the stable phase and widened to a little over 1.5% during learning-rate decay, with MMLU-Pro 62.58 versus 62.62 <a href="https://arxiv.org/abs/2509.25149">[NVFP4 report, §3]</a>. The recipe: random Hadamard transforms on weight-gradient inputs, 2D 16×16 weight scaling, stochastic rounding of gradients, and about 16% of the linear layers (the first 2 and last 8 blocks) kept in BF16. It beat MXFP4, which needed 36% more tokens to match <a href="https://arxiv.org/abs/2509.25149">[§5]</a>. Caveats: at most 12B parameters, no mixture of experts, and the report is about algorithms, not speed.</p>
+  <p><strong>DeepSeek-V4</strong> (April 2026) uses FP4 for the MoE expert weights and the CSA indexer's query-key path, as quantization-aware training in post-training <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §5.2.1]</a>. FP32 master weights are quantized to MXFP4 and <em>dequantized to FP8</em> for the matmul. That is lossless because E4M3 has two more exponent bits than E2M1 and the 1×32 FP4 scales inside a 128×128 FP8 block fit in FP8's range, so the FP8 stack is reused unchanged (straight-through estimator in the backward pass), and rollouts use native FP4 weights so sampling matches deployment. FP4×FP8 peak throughput currently equals FP8×FP8 <a href="https://arxiv.org/abs/2606.19348">[§1]</a>, so today the gain is memory capacity and traffic, not FLOP/s.</p>
+
+  <h3 id="determinism">Determinism and batch invariance</h3>
+  <p>DeepSeek-V4 also treats numerics as a reproducibility problem: its kernels are <em>batch-invariant</em> (a token's output is bitwise identical wherever it sits in the batch) and deterministic in the backward pass, so pretraining, post-training and inference agree bit for bit <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.3]</a>. That costs split-KV attention and split-\(k\) matmuls (replaced by fixed-order reductions) and <code>atomicAdd</code> accumulation (replaced by per-SM buffers). The payoff is that a loss spike can be replayed exactly and the trainer and sampler agree, which matters for reinforcement learning (<a href="25-rl-systems-agentic.html">page 25</a>).</p>
+</section>
+
+<section>
+  <h2 id="dp-zero">Collectives, data parallelism, ZeRO and FSDP</h2>
+
+  <h3 id="collectives">Collectives and what they cost</h3>
+  <p>A <strong>collective</strong> <span class="zh">集合通信</span> is an operation in which all ranks (one process per GPU) exchange data together. Four of them cover nearly everything on this page. With \(n\) ranks and a message of \(S\) bytes, a bandwidth-optimal ring implementation sends the following from each rank:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Collective</th><th>Each rank ends with</th><th class="num">Bytes sent per rank</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td>all-reduce</td><td>the elementwise sum of all ranks' tensors</td><td class="num">\(2\frac{n-1}{n}S\)</td><td>DDP gradients, tensor-parallel outputs</td></tr>
+      <tr><td>reduce-scatter</td><td>one \(1/n\) shard of the sum</td><td class="num">\(\frac{n-1}{n}S\)</td><td>ZeRO/FSDP gradients, sequence parallelism</td></tr>
+      <tr><td>all-gather</td><td>the concatenation of all shards (size \(S\))</td><td class="num">\(\frac{n-1}{n}S\)</td><td>ZeRO-3 parameters, context parallelism</td></tr>
+      <tr><td>all-to-all</td><td>chunk \(j\) of every rank's buffer, for rank \(j\)</td><td class="num">\(\frac{n-1}{n}S\)</td><td>MoE dispatch and combine</td></tr>
+      <tr><td>send / receive</td><td>one tensor from one peer</td><td class="num">\(S\)</td><td>pipeline activations</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The ring all-reduce derivation fits on a whiteboard. Cut the tensor into \(n\) chunks of \(S/n\) bytes. In \(n-1\) <strong>reduce-scatter</strong> steps every rank sends one chunk to its right neighbor, which adds it to its own copy; afterward rank \(r\) holds the fully summed chunk \((r+1) \bmod n\). In \(n-1\) <strong>all-gather</strong> steps the finished chunks circulate. Each step moves \(S/n\) per rank, so the total is \(2(n-1)S/n \to 2S\), independent of \(n\): adding ranks adds no bytes per rank and no rank is a bottleneck. ZeRO states it as: reduce-scatter and all-gather each move \(N\) elements, so standard data parallelism moves \(2N\) <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §7.1]</a>, and NCCL's benchmarks use these same factors to convert time to bus bandwidth <a href="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md">[nccl-tests]</a>. With per-hop latency \(\alpha\) and link bandwidth \(B\), time is about \(2(n-1)\alpha + 2\frac{n-1}{n}S/B\): latency-bound for small messages, so libraries fuse tensors into big buckets (FSDP saw total time for a fixed volume rise quickly once each all-gather fell below about 33M elements <a href="https://arxiv.org/abs/2304.11277">[FSDP, §3.2.1]</a>).</p>
+
+<pre><code class="language-python">def ring_allreduce(chunks):                       # chunks[r][c]: rank r's chunk c; n ranks, n chunks each
+    n = len(chunks)
+    buf = [[c.clone() for c in rank] for rank in chunks]
+    for s in range(n - 1):                        # reduce-scatter: rank r sends chunk (r - s) % n to rank r + 1
+        msgs = [buf[r][(r - s) % n].clone() for r in range(n)]      # every rank sends its start-of-step value
+        for r in range(n):
+            buf[(r + 1) % n][(r - s) % n] += msgs[r]                # the receiver adds
+    # rank r now holds the full sum of chunk (r + 1) % n
+    for s in range(n - 1):                        # all-gather: rank r sends chunk (r + 1 - s) % n
+        msgs = [buf[r][(r + 1 - s) % n].clone() for r in range(n)]
+        for r in range(n):
+            buf[(r + 1) % n][(r + 1 - s) % n] = msgs[r]             # the receiver overwrites
+    return buf                                    # each rank sent 2 (n - 1) chunks = 2 (n-1)/n of the tensor
+</code></pre>
+
+  <p>Which link a collective crosses decides its cost. The numbers to memorize:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Link</th><th class="num">Bandwidth per GPU</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>H100 HBM3 (memory)</td><td class="num">3.35 TB/s</td><td><a href="https://www.nvidia.com/en-us/data-center/h100/">NVIDIA H100</a></td></tr>
+      <tr><td>NVLink 4 inside an 8-GPU node</td><td class="num">900 GB/s in total, <span class="unverified" title="NVIDIA quotes 900 GB/s aggregate; the each-way half is my inference from that figure">about 450 GB/s each way</span></td><td><a href="https://www.nvidia.com/en-us/data-center/h100/">NVIDIA H100</a></td></tr>
+      <tr><td>InfiniBand or RoCE, 400 Gbps per GPU</td><td class="num">50 GB/s</td><td>Llama 3: "400 Gbps interconnects between GPUs" <a href="https://arxiv.org/abs/2407.21783">[§3.3.1]</a></td></tr>
+      <tr><td>DeepSeek's H800 cluster: NVLink vs IB</td><td class="num">160 GB/s vs 50 GB/s</td><td>"NVLink offers a bandwidth of 160 GB/s, roughly 3.2 times that of IB (50 GB/s)" <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.2.2]</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>NVLink is 9 to 18 times faster than the network (450 or 900 GB/s versus 50), and HBM is another 7 times faster than NVLink per direction. Every layout decision below follows from that hierarchy.</p>
+
+  <p><strong>Worked number.</strong> DDP gradient all-reduce for Llama-3-8B: the bf16 gradients are \(2 \times 8.03\text{B} = 16.06\) GB. Over 64 ranks each GPU sends \(2 \cdot \tfrac{63}{64} \cdot 16.06 = 31.6\) GB. At 50 GB/s that is 0.63 s. A step of 4M tokens on 64 GPUs is \(65{,}536\) tokens per GPU, \(6 \times 8.03\text{B} \times 65{,}536 = 3.16\times10^{15}\) FLOPs, which takes 8.0 s at 40% of 989.4 TFLOP/s. The all-reduce is 8% of the step, and most of it overlaps with the backward pass.</p>
+
+  <h3 id="dp">Data parallelism, and why it is not enough</h3>
+  <p><strong>Data parallelism</strong> <span class="zh">数据并行</span> replicates the model on every GPU, gives each replica a different slice of the batch, and all-reduces the gradients. It is compute-efficient (nothing is split, so matmuls stay big) and communicates once per step. Two limits force everything else on this page. Memory: every replica holds all \(16N\) bytes, so DDP runs out of memory beyond 1.4B parameters on 32 GB GPUs <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §1]</a>. Batch: replicas cannot outnumber the sequences in the global batch, and that batch cannot grow indefinitely without hurting optimization (<a href="14-optimization.html">page 14</a>) <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §1]</a>.</p>
+
+  <h3 id="zero">ZeRO-1, ZeRO-2 and ZeRO-3</h3>
+  <p>The Zero Redundancy Optimizer <span class="zh">零冗余优化器</span> starts from an observation: the \(N_d\) replicas store identical optimizer states, gradients and parameters, which is pure redundancy. It removes the redundancy in three cumulative stages by sharding across the \(N_d\) data-parallel ranks <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §5]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 428" role="img" aria-labelledby="fig-15-1-title">
+<title id="fig-15-1-title">Which model states each of four data-parallel GPUs stores under plain data parallelism and ZeRO stages 1, 2 and 3</title>
+<text x="281.0" y="20" text-anchor="middle" class="s-bold">GPU 0</text>
+<text x="405.0" y="20" text-anchor="middle" class="s-bold">GPU 1</text>
+<text x="529.0" y="20" text-anchor="middle" class="s-bold">GPU 2</text>
+<text x="653.0" y="20" text-anchor="middle" class="s-bold">GPU 3</text>
+<text x="8" y="58" class="s-bold">Data parallel</text>
+<text x="8" y="78" class="s-mono">16N per GPU</text>
+<text x="8" y="96" class="s-small s-muted">comm 2N (all-reduce)</text>
+<rect class="s-plain" x="220" y="32" width="122" height="76" rx="6"/>
+<rect class="s-a" x="226.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="253.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="281.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="308.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="226.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="253.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="281.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="308.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="226.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="253.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="281.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="308.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="344" y="32" width="122" height="76" rx="6"/>
+<rect class="s-a" x="350.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="377.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="405.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="432.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="350.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="377.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="405.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="432.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="350.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="377.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="405.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="432.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="468" y="32" width="122" height="76" rx="6"/>
+<rect class="s-a" x="474.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="501.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="529.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="556.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="474.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="501.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="529.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="556.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="474.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="501.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="529.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="556.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="592" y="32" width="122" height="76" rx="6"/>
+<rect class="s-a" x="598.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="625.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="653.0" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="680.5" y="40" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="598.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="625.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="653.0" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="680.5" y="62" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="598.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="625.5" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="653.0" y="84" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="680.5" y="84" width="26.0" height="16" rx="2"/>
+<text x="8" y="142" class="s-bold">ZeRO-1</text>
+<text x="8" y="162" class="s-mono">4N + 12N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="180" class="s-small s-muted">comm 2N</text>
+<rect class="s-plain" x="220" y="116" width="122" height="76" rx="6"/>
+<rect class="s-a" x="226.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="253.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="281.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="308.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="226.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="253.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="281.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="308.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="226.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="344" y="116" width="122" height="76" rx="6"/>
+<rect class="s-a" x="350.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="377.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="405.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="432.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="350.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="377.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="405.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="432.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="350.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="377.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="468" y="116" width="122" height="76" rx="6"/>
+<rect class="s-a" x="474.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="501.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="529.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="556.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="474.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="501.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="529.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="556.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="474.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="529.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="592" y="116" width="122" height="76" rx="6"/>
+<rect class="s-a" x="598.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="625.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="653.0" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="680.5" y="124" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="598.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="625.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="653.0" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="680.5" y="146" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="598.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="168" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="680.5" y="168" width="26.0" height="16" rx="2"/>
+<text x="8" y="226" class="s-bold">ZeRO-2</text>
+<text x="8" y="246" class="s-mono">2N + 14N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="264" class="s-small s-muted">comm 2N</text>
+<rect class="s-plain" x="220" y="200" width="122" height="76" rx="6"/>
+<rect class="s-a" x="226.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="253.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="281.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="308.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="226.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="226.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="344" y="200" width="122" height="76" rx="6"/>
+<rect class="s-a" x="350.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="377.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="405.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="432.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="350.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="377.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="350.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="377.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="468" y="200" width="122" height="76" rx="6"/>
+<rect class="s-a" x="474.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="501.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="529.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="556.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="474.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="529.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="474.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="529.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="592" y="200" width="122" height="76" rx="6"/>
+<rect class="s-a" x="598.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="625.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="653.0" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="680.5" y="208" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="598.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="680.5" y="230" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="598.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="252" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="680.5" y="252" width="26.0" height="16" rx="2"/>
+<text x="8" y="310" class="s-bold">ZeRO-3 / FSDP</text>
+<text x="8" y="330" class="s-mono">16N/N<tspan baseline-shift="sub" font-size="10">d</tspan></text>
+<text x="8" y="348" class="s-small s-muted">comm 3N (1.5×)</text>
+<rect class="s-plain" x="220" y="284" width="122" height="76" rx="6"/>
+<rect class="s-a" x="226.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="226.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="226.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="253.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="281.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="308.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="344" y="284" width="122" height="76" rx="6"/>
+<rect class="s-plain s-dash" x="350.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="377.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="350.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="377.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="350.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="377.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="405.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="432.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="468" y="284" width="122" height="76" rx="6"/>
+<rect class="s-plain s-dash" x="474.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="529.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="474.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="529.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="474.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="501.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="529.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="556.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain" x="592" y="284" width="122" height="76" rx="6"/>
+<rect class="s-plain s-dash" x="598.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="680.5" y="292" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="598.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-b" x="680.5" y="314" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="598.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="625.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-plain s-dash" x="653.0" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-d" x="680.5" y="336" width="26.0" height="16" rx="2"/>
+<rect class="s-a" x="222" y="376" width="16" height="12" rx="2"/><text x="244" y="387" class="s-small">parameters (bf16, 2N)</text>
+<rect class="s-b" x="392" y="376" width="16" height="12" rx="2"/><text x="414" y="387" class="s-small">gradients (bf16, 2N)</text>
+<rect class="s-d" x="552" y="376" width="16" height="12" rx="2"/><text x="574" y="387" class="s-small">optimizer (12N)</text>
+<rect class="s-plain s-dash" x="222" y="396" width="16" height="12" rx="2"/><text x="244" y="407" class="s-small">held by another GPU (parameters are gathered, gradients reduced, on demand)</text>
+</svg>
+    <figcaption><b>Figure 1.</b> What each of four data-parallel GPUs stores. Top bar: parameters, middle: gradients, bottom: optimizer state (schematic, \(N_d = 4\)). Each stage shards one more tensor kind, so per-GPU memory falls from \(16N\) to \(16N/N_d\), while communication stays at \(2N\) elements per step until parameters are sharded (\(3N\)).</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>ZeRO-1</strong> (\(P_{os}\), optimizer states). Each rank owns \(1/N_d\) of the optimizer state and updates only that \(1/N_d\) of the parameters. Gradients are reduce-scattered so each rank receives the sum for its shard, it updates its slice of the fp32 master weights, then all-gathers the new bf16 weights. That is a reduce-scatter plus an all-gather, exactly the two halves of the all-reduce it replaces: <strong>same \(2N\) volume</strong>. Memory: \(4N + 12N/N_d\).</li>
+    <li><strong>ZeRO-2</strong> (\(P_{os+g}\), plus gradients). As soon as a layer's gradients are computed in the backward pass they are reduce-scattered to their owner (in buckets) and the non-owned copies are freed. Still <strong>\(2N\)</strong>. Memory: \(2N + 14N/N_d\).</li>
+    <li><strong>ZeRO-3</strong> (\(P_{os+g+p}\), plus parameters; PyTorch calls it FSDP). Every rank stores only its parameter shard. Each layer's parameters are all-gathered just before use in the forward pass and freed afterward, gathered again in the backward pass, and gradients are reduce-scattered: \(N + N + N =\) <strong>\(3N\), 1.5 times DDP</strong> <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §7.2]</a>. Memory: \(16N/N_d\).</li>
+  </ul>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Stage</th><th>Sharded</th><th class="num">Per-GPU states</th><th class="num">Comm / step</th><th class="num">7.5B, \(N_d = 64\) (paper)</th><th class="num">Llama-3-8B, \(N_d = 64\)</th></tr></thead>
+    <tbody>
+      <tr><td>DDP</td><td>nothing</td><td class="num">\(16N\)</td><td class="num">\(2N\)</td><td class="num">120 GB</td><td class="num">128.5 GB</td></tr>
+      <tr><td>ZeRO-1</td><td>optimizer</td><td class="num">\(4N + 12N/N_d\)</td><td class="num">\(2N\)</td><td class="num">31.4 GB</td><td class="num">33.6 GB</td></tr>
+      <tr><td>ZeRO-2</td><td>+ gradients</td><td class="num">\(2N + 14N/N_d\)</td><td class="num">\(2N\)</td><td class="num">16.6 GB</td><td class="num">17.8 GB</td></tr>
+      <tr><td>ZeRO-3 / FSDP</td><td>+ parameters</td><td class="num">\(16N/N_d\)</td><td class="num">\(3N\)</td><td class="num">1.9 GB</td><td class="num">2.0 GB</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Left numeric column: ZeRO paper Table 1 (120, 31.4, 16.6, 1.88 GB). Right column: our arithmetic, e.g. ZeRO-1 is \(4 \times 8.03\text{B} + 12 \times 8.03\text{B}/64 = 32.1 + 1.5 = 33.6\) GB. Communication is per optimizer step with one micro-batch and is in elements; multiply by bytes per element and by \((N_d-1)/N_d\).</p>
+
+  <p><strong>The micro-batch caveat.</strong> These volumes are per optimizer step with one micro-batch. With \(m\) micro-batches, ZeRO-1 still communicates once per step (gradients accumulate locally in a full-size buffer, its price). ZeRO-2 must reduce-scatter after every micro-batch to keep that buffer small, and ZeRO-3 re-gathers parameters every micro-batch unless they stay resident after the forward pass. Llama 3 does exactly that: its FSDP shards optimizer states and gradients, but "for model shards we do not reshard after forward computation to avoid an extra all-gather communication during backward passes" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>. Check this whenever someone says "ZeRO-3 is only 1.5×".</p>
+
+  <h3 id="fsdp">FSDP</h3>
+  <p>PyTorch's <strong>fully sharded data parallel</strong> <span class="zh">完全分片数据并行</span> implements the ZeRO-3 idea with three engineering ideas <a href="https://arxiv.org/abs/2304.11277">[Zhao et al. 2023, §3-4]</a>:</p>
+  <ul>
+    <li><strong>FlatParameter units.</strong> The parameters of one wrapped module are flattened into one padded 1D tensor and cut into equal shards, so all-gather and reduce-scatter run on large, even buffers without copies. Peak parameter memory is \(O(\sum_i \psi_i/F + \max_i \psi_i)\): the shards plus the one unit currently gathered, so wrapping granularity trades memory for the number of collectives.</li>
+    <li><strong>Sharding factor \(F\).</strong> \(F = 1\) is DDP, \(F = W\) (world size) is full sharding, and in between is <strong>hybrid sharding</strong>: shard inside a group (say a node), replicate across groups; gradients are reduce-scattered inside the group, then all-reduced across replicas. For a bf16 8B model (\(M = 16.06\) GB) on \(W = 64\) GPUs in 8-GPU nodes, cross-node traffic per GPU is about \(2M(W-G)/(GW) = 3.5\) GB with \(F = G = 8\), against 31.6 GB for DDP and 47.4 GB for full sharding (\(3M(W-1)/W\)). The paper quotes \(2M(W-1)/(GW)\) for the hybrid case, a 3.9 GB upper bound.</li>
+    <li><strong>Overlap and memory control.</strong> All-gathers run on a separate CUDA stream with prefetching (backward prefetch sped up GPT-175B by about 18%). A <em>rate limiter</em> stops the CPU queueing all-gathers so eagerly that the allocator fragments: up to 5× faster on T5-11B, about 5% slower on DeepViT, so measure. Native mixed precision keeps the sharded fp32 master copy and gathers low-precision parameters.</li>
+  </ul>
+  <p>FSDP trained GPT-175B on up to 512 A100s at more than 173 and 186 TFLOP/s per GPU for batch sizes 1 and 2 (55% and 60% of 312), scaling linearly from 128 to 512 GPUs; activation checkpointing was on, so this is nearer hardware than model utilization (my reading) <a href="https://arxiv.org/abs/2304.11277">[FSDP, §5.4]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">ZeRO / FSDP sharding</div>
+    <dl>
+      <dt>Problem</dt><dd>DDP replicates \(16N\) bytes on every GPU, so model size is capped by one GPU's memory however large the cluster.</dd>
+      <dt>Idea</dt><dd>Shard optimizer state, then gradients, then parameters across the data-parallel group; fetch what is needed just in time.</dd>
+      <dt>Why it works</dt><dd>Replicas hold identical data, so sharding loses nothing. Stages 1 and 2 only reorder the all-reduce into reduce-scatter plus all-gather; stage 3 adds one parameter all-gather, hidden behind compute if layers are big.</dd>
+      <dt>Evidence</dt><dd>Table 1 of the ZeRO paper (7.5B: 120 GB to 1.9 GB at \(N_d = 64\)); FSDP at 175B on 512 GPUs. Yet Megatron's PTD-P beat ZeRO-3 by 70% at 175B and 530B "due to less cross-node communication" <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §1]</a>.</dd>
+      <dt>Cost</dt><dd>Stage 3 sends 1.5× more, per micro-batch unless parameters stay resident, over collectives spanning the whole DP group. Whole-matrix optimizers break the element-wise assumption: DeepSeek-V4's Muon uses a hybrid ZeRO that assigns whole matrices to ranks with a knapsack algorithm (padding under 10%) and repeats updates across extra DP groups <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.4.1]</a>.</dd>
+      <dt>Used by</dt><dd>ZeRO-1: DeepSeek-V2 and V3. FSDP: Llama 3's data-parallel dimension and most fine-tuning and mid-scale stacks.</dd>
+    </dl>
+  </div>
+
+  <p><strong>Rule of thumb.</strong> If ZeRO-1 or ZeRO-2 fits (states plus activations under about 70 GB), use it: communication equals DDP. If parameters alone do not fit, or per-GPU batches are too small to hide gathers, add tensor and pipeline parallelism and use FSDP or ZeRO-1 for what remains. Hybrid-sharded FSDP sits in between when the model fits in a node's aggregate memory.</p>
+</section>
+
+<section>
+  <h2 id="tp-sp">Tensor and sequence parallelism</h2>
+
+  <p><strong>Tensor parallelism</strong> <span class="zh">张量并行</span> splits each weight matrix of a layer across \(t\) GPUs, so every GPU does \(1/t\) of the layer's FLOPs and holds \(1/t\) of its parameters. It needs communication inside every layer, on the critical path, so it only pays off on the fastest links. Megatron-LM's design makes it cost one all-reduce per block <a href="https://arxiv.org/abs/1909.08053">[Shoeybi et al. 2019, §3]</a>.</p>
+
+  <h3 id="tp-mlp">The MLP: column-parallel, then row-parallel</h3>
+  <p>An MLP block computes \(Z = \text{act}(XA)\,B\) with \(A \in \R^{d \times \dff}\), \(B \in \R^{\dff \times d}\). Consider splitting \(A\) by <em>rows</em>: then \(XA = X_1 A_1 + X_2 A_2\), and because the activation is nonlinear, \(\text{act}(X_1A_1 + X_2A_2) \ne \text{act}(X_1A_1) + \text{act}(X_2A_2)\): the partial products must be summed (an all-reduce) before the activation. Now split \(A\) by <em>columns</em>, \(A = [A_1, A_2]\): each GPU computes its own slice \(\text{act}(XA_i)\) independently, with no communication, because the activation is elementwise. The second matrix is then split by <em>rows</em>, \(B = \begin{bmatrix} B_1 \\ B_2 \end{bmatrix}\), so each GPU can multiply its slice directly: \(Z = Y_1B_1 + Y_2B_2\), a sum of partial results. One all-reduce at the end, none in the middle. For SwiGLU, the gate and up projections are both column-parallel (their elementwise product is local) and the down projection is row-parallel: the same single all-reduce.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 376" role="img" aria-labelledby="fig-15-2-title">
+<title id="fig-15-2-title">Tensor-parallel MLP on two GPUs: first matrix split by columns, second by rows, one all-reduce at the end</title>
+<defs><marker id="arrow-15-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="146" y="30" class="s-bold">GPU 0</text>
+<text x="146" y="202" class="s-bold">GPU 1</text>
+<rect class="s-box" x="8" y="140" width="78" height="64" rx="6"/>
+<text x="47" y="164" text-anchor="middle" class="s-bold">X</text>
+<text x="47" y="180" text-anchor="middle" class="s-small">bT × d</text>
+<text x="47" y="194" text-anchor="middle" class="s-small s-muted">replicated</text>
+<circle class="s-e" cx="108" cy="172" r="13"/><text x="108" y="177" text-anchor="middle" class="s-bold">f</text>
+<path class="s-line" d="M86,172 L95,172" marker-end="url(#arrow-15-2)"/>
+<path class="s-line" d="M121,172 L127,172 L127,86.0 L136,86.0" marker-end="url(#arrow-15-2)"/>
+<path class="s-line" d="M121,172 L127,172 L127,258.0 L136,258.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-a" x="138" y="44" width="132" height="84" rx="6"/>
+<text x="204" y="68.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="10">0</tspan></text>
+<text x="204" y="89.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="10">0</tspan>: d × d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t</text>
+<text x="204" y="110.0" text-anchor="middle" class="s-small s-muted">column shard</text>
+<path class="s-line" d="M270,86.0 L290,86.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-plain" x="292" y="52" width="56" height="68" rx="6"/>
+<text x="320" y="91.0" text-anchor="middle" class="s-bold">act</text>
+<path class="s-line" d="M348,86.0 L368,86.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-b" x="370" y="44" width="132" height="84" rx="6"/>
+<text x="436" y="68.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="10">0</tspan> B<tspan baseline-shift="sub" font-size="10">0</tspan></text>
+<text x="436" y="89.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="10">0</tspan>: d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t × d</text>
+<text x="436" y="110.0" text-anchor="middle" class="s-small s-muted">row shard</text>
+<path class="s-line" d="M502,86.0 L522,86.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-d" x="524" y="44" width="78" height="84" rx="6"/>
+<text x="563" y="80.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="10">0</tspan></text>
+<text x="563" y="96.0" text-anchor="middle" class="s-small">partial sum</text>
+<path class="s-line" d="M602,86.0 L616,86.0 L616,158 L630,158" marker-end="url(#arrow-15-2)"/>
+<rect class="s-a" x="138" y="216" width="132" height="84" rx="6"/>
+<text x="204" y="240.0" text-anchor="middle" class="s-bold">X A<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="204" y="261.0" text-anchor="middle" class="s-small">A<tspan baseline-shift="sub" font-size="10">1</tspan>: d × d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t</text>
+<text x="204" y="282.0" text-anchor="middle" class="s-small s-muted">column shard</text>
+<path class="s-line" d="M270,258.0 L290,258.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-plain" x="292" y="224" width="56" height="68" rx="6"/>
+<text x="320" y="263.0" text-anchor="middle" class="s-bold">act</text>
+<path class="s-line" d="M348,258.0 L368,258.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-b" x="370" y="216" width="132" height="84" rx="6"/>
+<text x="436" y="240.0" text-anchor="middle" class="s-bold">Y<tspan baseline-shift="sub" font-size="10">1</tspan> B<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="436" y="261.0" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="10">1</tspan>: d<tspan baseline-shift="sub" font-size="10">ff</tspan>/t × d</text>
+<text x="436" y="282.0" text-anchor="middle" class="s-small s-muted">row shard</text>
+<path class="s-line" d="M502,258.0 L522,258.0" marker-end="url(#arrow-15-2)"/>
+<rect class="s-d" x="524" y="216" width="78" height="84" rx="6"/>
+<text x="563" y="252.0" text-anchor="middle" class="s-bold">Z<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<text x="563" y="268.0" text-anchor="middle" class="s-small">partial sum</text>
+<path class="s-line" d="M602,258.0 L616,258.0 L616,186 L630,186" marker-end="url(#arrow-15-2)"/>
+<circle class="s-e" cx="650" cy="172" r="20"/><text x="650" y="170" text-anchor="middle" class="s-bold">g</text><text x="650" y="183" text-anchor="middle" class="s-small">Σ</text>
+<text x="670" y="138" text-anchor="middle" class="s-small">Z = Z<tspan baseline-shift="sub" font-size="10">0</tspan> + Z<tspan baseline-shift="sub" font-size="10">1</tspan></text>
+<path class="s-line" d="M670,172 L700,172" marker-end="url(#arrow-15-2)"/>
+<line class="s-line s-dash" x1="134" y1="172" x2="606" y2="172"/>
+<text x="370" y="166" text-anchor="middle" class="s-small s-muted">no communication between the two GPUs in here</text>
+<text x="8" y="334" class="s-small">f: identity in the forward pass, all-reduce in the backward pass.   g: all-reduce in the forward pass, identity in the backward pass.</text>
+<text x="8" y="354" class="s-small">Shapes: b·T tokens, model width d, FFN width d<tspan baseline-shift="sub" font-size="10">ff</tspan>, t = 2 GPUs here. Llama-3-8B with t = 8: 14,336 / 8 = 1,792 columns per GPU.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> A tensor-parallel MLP on two GPUs. The first matrix is split by columns, so the nonlinearity runs on local data; the second is split by rows, so each GPU produces a partial sum of the output; a single all-reduce (\(g\)) combines them. In the backward pass the roles of \(f\) and \(g\) swap.</figcaption>
+  </figure>
+
+<pre><code class="language-python">def tp_mlp(x, W1, W2, tp, act=F.gelu):            # x: (..., d), W1: (d, d_ff), W2: (d_ff, d)
+    s = W1.shape[1] // tp                          # columns of W1 (= rows of W2) per rank
+    partials = [act(x @ W1[:, r*s:(r+1)*s]) @ W2[r*s:(r+1)*s] for r in range(tp)]   # local work only
+    return sum(partials)                           # the all-reduce (operator g)
+</code></pre>
+
+  <h3 id="tp-attn">Attention and the embedding</h3>
+  <p>Attention splits by <strong>heads</strong>: the \(Q\), \(K\), \(V\) projections are column-parallel so each GPU owns whole heads and computes their attention locally, and the output projection \(W^O\) is row-parallel, again ending in one all-reduce. So a transformer layer costs <strong>two all-reduces in the forward pass and two in the backward pass</strong> (operators \(g\) and \(f\)) <a href="https://arxiv.org/abs/1909.08053">[Shoeybi et al. 2019, §3]</a>. Constraints: \(t\) must divide the number of heads, and with GQA the KV heads must not be fewer than \(t\), or they get replicated, which is one reason GQA models use 8 KV heads to match 8-GPU nodes (<a href="07-kv-efficient-attention.html#tp">page 07</a>). The embedding table is sharded along the vocabulary, and the output logits are fused with the cross-entropy so that ranks exchange a scalar loss per token instead of all-gathering \(b \times s \times V\) logits.</p>
+
+  <h3 id="tp-cost">What tensor parallelism costs, and why it stays in the node</h3>
+  <p>Each all-reduce moves a \(b \times s \times h\) tensor. Four per layer (two forward, two backward), each costing \(2(t-1)/t\) times the tensor per rank, give \(8\,bsh\,(t-1)/t\) elements per device per layer per micro-batch <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §3.2]</a>. In bf16 that is \(16\,bsh\,(t-1)/t\) bytes. The layer's compute per device is \(72\,bsh^2/t\) FLOPs (\(3 \times 24bsh^2\) for a GPT-style layer, divided by \(t\); Korthikanti App. A). Dividing bytes by link bandwidth \(B_\ell\) and FLOPs by achieved throughput \(C\):</p>
+  <div class="eq-box">
+  \[ \frac{t_{\text{comm}}}{t_{\text{compute}}} \approx \frac{16\,bsh\,\frac{t-1}{t} \big/ B_\ell}{72\,bsh^2/(t\,C)} = \frac{2}{9}\,(t-1)\,\frac{C}{B_\ell\,h} \]
+  <div class="eq-label">Tensor-parallel traffic relative to compute (not overlapped): independent of \(b\) and \(s\), grows with \(t\) and with C/B, shrinks with width \(h\)</div>
+  </div>
+  <p><strong>Worked number (Llama-3-70B layer, \(t = 8\), \(s = 8192\), \(b = 1\), bf16).</strong> Traffic: \(8 \times 8192 \times 8192 \times \tfrac{7}{8} \times 2\) B \(= 939.5\) MB per layer per micro-batch. Compute: \(6 \times 855.65\text{M} \times 8192 / 8 = 5.26\) TFLOP per GPU, which takes 13.3 ms at 40% of 989.4 TFLOP/s. Over NVLink at 450 GB/s the traffic takes 2.1 ms, 16% of compute if not overlapped. Over 50 GB/s InfiniBand it takes 18.8 ms, <strong>1.41 times the compute</strong>. Tensor parallelism across nodes would leave the GPUs idle more than half the time. Empirically, ZeRO's authors ran a 40B Megatron model across two DGX-2 nodes and saw about 5 TFLOP/s per V100, under 5% of peak <a href="https://arxiv.org/abs/1910.02054">[ZeRO, §1]</a>, and Megatron's first takeaway is to use tensor parallelism up to the GPUs-per-node count and pipeline parallelism beyond <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §3.2]</a>. A second reason is arithmetic efficiency: splitting matrices by \(t\) also makes the GEMMs smaller and less efficient.</p>
+
+  <h3 id="sp">Sequence parallelism</h3>
+  <p>After tensor parallelism the layer norms, dropouts and residual additions are still replicated on all \(t\) GPUs: cheap in FLOPs but the source of the \(10\,sbh\) memory term. They are independent across the sequence dimension, so Korthikanti et al. shard them along \(s\). The boundary operators change: \(g\) becomes an all-gather in the forward pass and a reduce-scatter in the backward pass, and \(\bar g\) the reverse. An all-reduce is a reduce-scatter followed by an all-gather, so the same bytes move and "sequence parallelism does not introduce any communication overhead" <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022, §4.2.2]</a>. Per-layer activation memory drops to \(sbh(34 + 5as/h)/t\) (table in <a href="#activations">Activations</a>). The full input of the first linear layer is stored sharded and re-gathered in the backward pass, with the all-gather overlapped with the weight-gradient computation.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Three things called "sequence parallelism"</div>
+    <p><strong>Megatron sequence parallelism</strong> (above) shards only the non-tensor-parallel regions, inside the tensor-parallel group. <strong>Context parallelism</strong> (<a href="#ep-cp">below</a>) shards the whole model's activations along the sequence and needs a scheme for attention. <strong>DeepSpeed-Ulysses</strong> is another sequence-sharding scheme for attention, built on all-to-all. Ask which one an interviewer means.</p>
+  </aside>
+
+  <div class="decision">
+    <div class="decision-title">Tensor parallelism with sequence parallelism</div>
+    <dl>
+      <dt>Problem</dt><dd>One layer's weights, or its activations at long context, exceed one GPU, and data parallelism shrinks neither.</dd>
+      <dt>Idea</dt><dd>Column-parallel then row-parallel matmuls, whole heads per GPU, one all-reduce per block; shard the replicated norm and dropout regions along the sequence.</dd>
+      <dt>Why it works</dt><dd>Column then row splitting needs no synchronization between the two matmuls, and sequence parallelism swaps one all-reduce for the equivalent reduce-scatter plus all-gather, dividing activations by \(t\) at no extra bytes.</dd>
+      <dt>Evidence</dt><dd>8.3B on 512 V100s at 76% scaling efficiency <a href="https://arxiv.org/abs/1909.08053">[Megatron-LM, abstract]</a>; 530B at 54.2% MFU with sequence parallelism and selective recomputation <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al. 2022]</a>.</dd>
+      <dt>Cost</dt><dd>Critical-path traffic every layer (so \(t \le\) GPUs per node), smaller GEMMs, KV-head replication when \(t\) exceeds the KV heads.</dd>
+      <dt>Used by</dt><dd>Llama 3 (\(t = 8\) throughout) and Megatron-LM stacks; DeepSeek-V2 and V3 avoid it (<a href="#layouts">layouts</a>).</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="pp">Pipeline parallelism</h2>
+  <p><strong>Pipeline parallelism</strong> <span class="zh">流水线并行</span> cuts the layers into \(p\) contiguous <em>stages</em>, one per GPU group. Stage \(i\) sends its output activations to stage \(i+1\) and, in the backward pass, receives gradients back. The traffic is a single \(b \times s \times h\) tensor per stage boundary per micro-batch per direction, point-to-point, which is small enough to cross InfiniBand: 134 MB for \(s = h = 8192\) in bf16, 2.7 ms at 50 GB/s, against 266 ms of compute per stage (numbers from the 70B plan below). The catch is the dependency chain: with one batch, only one stage is busy at a time and utilization is \(1/p\). The fix is to split the batch into \(m\) <strong>micro-batches</strong> and stream them.</p>
+
+  <h3 id="bubble">Deriving the bubble</h3>
+  <p>Let each stage take \(t_f\) for one micro-batch's forward pass and \(t_b\) for its backward pass. In the GPipe schedule all forwards run first, then all backwards <a href="https://arxiv.org/abs/1811.06965">[Huang et al. 2018]</a>. The last stage cannot start until the first micro-batch has crossed \(p-1\) earlier stages, and in the same way the backward wave takes \(p-1\) extra steps to drain. The whole step takes</p>
+  \[ T = (m + p - 1)(t_f + t_b), \qquad T_{\text{ideal}} = m\,(t_f + t_b), \qquad T_{\text{bubble}} = (p-1)(t_f + t_b). \]
+  <p>Two ratios are in circulation and interviewers mix them up. Relative to the ideal compute time the bubble is \(\dfrac{p-1}{m}\) <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §2.2.1]</a>. As the fraction of wall-clock time each GPU sits idle it is \(\dfrac{p-1}{m+p-1}\), GPipe's \(O\big(\tfrac{K-1}{M+K-1}\big)\). State which you mean. The drill in <code>exercises/drills/parallel.py</code> simulates the schedule event by event and reproduces \((m+p-1)(t_f+t_b)\) exactly, for any ratio \(t_b/t_f\).</p>
+
+  <h3 id="1f1b">1F1B: same bubble, less memory</h3>
+  <p>GPipe must keep the activations of all \(m\) micro-batches until the backward passes start. The <strong>one-forward-one-backward</strong> (1F1B, "PipeDream-Flush") schedule starts backward passes as early as possible: stage \(i\) (0-indexed) runs \(p-1-i\) warm-up forwards, then alternates one forward and one backward, then drains the remaining backwards. The bubble is <em>identical</em>, but a stage never holds more than \(p-i\) micro-batches of activations (the first stage \(p\), the last stage 1), instead of \(m\) <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §2.2.1]</a>. 1F1B is a memory optimization, not a bubble optimization.</p>
+
+<pre><code class="language-python">def one_f_one_b(p, m, i):                            # operation order of stage i (0-indexed)
+    warm = min(p - 1 - i, m)
+    ops = [("F", j) for j in range(warm)]            # warm-up forwards
+    f, b = warm, 0
+    while f &lt; m:                                     # steady state: one forward, one backward
+        ops += [("F", f), ("B", b)]; f += 1; b += 1
+    return ops + [("B", j) for j in range(b, m)]     # cool-down: drain the remaining backwards
+</code></pre>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 318" role="img" aria-labelledby="fig-15-3-title">
+<title id="fig-15-3-title">One-forward-one-backward pipeline schedule with 4 stages and 8 microbatches, with idle bubbles marked</title>
+<text x="80" y="18" class="s-small s-muted">time →   (unit = one forward pass; a backward pass takes 2 units; 33 units in total)</text>
+<text x="8" y="56" class="s-bold">Stage 0</text>
+<rect class="s-a" x="80.0" y="34" width="17.9" height="30" rx="2"/>
+<text x="89.5" y="54" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="98.9" y="34" width="17.9" height="30" rx="2"/>
+<text x="108.3" y="54" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="117.8" y="34" width="17.9" height="30" rx="2"/>
+<text x="127.2" y="54" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="136.7" y="34" width="17.9" height="30" rx="2"/>
+<text x="146.1" y="54" text-anchor="middle" class="s-small">4</text>
+<rect class="s-plain s-dash" x="155.6" y="34" width="113.4" height="30" rx="2"/>
+<rect class="s-b" x="269.0" y="34" width="36.8" height="30" rx="2"/>
+<text x="287.9" y="54" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="306.8" y="34" width="17.9" height="30" rx="2"/>
+<text x="316.2" y="54" text-anchor="middle" class="s-small">5</text>
+<rect class="s-b" x="325.7" y="34" width="36.8" height="30" rx="2"/>
+<text x="344.6" y="54" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="363.5" y="34" width="17.9" height="30" rx="2"/>
+<text x="372.9" y="54" text-anchor="middle" class="s-small">6</text>
+<rect class="s-b" x="382.4" y="34" width="36.8" height="30" rx="2"/>
+<text x="401.3" y="54" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="420.2" y="34" width="17.9" height="30" rx="2"/>
+<text x="429.6" y="54" text-anchor="middle" class="s-small">7</text>
+<rect class="s-b" x="439.1" y="34" width="36.8" height="30" rx="2"/>
+<text x="458.0" y="54" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="476.9" y="34" width="17.9" height="30" rx="2"/>
+<text x="486.3" y="54" text-anchor="middle" class="s-small">8</text>
+<rect class="s-b" x="495.8" y="34" width="36.8" height="30" rx="2"/>
+<text x="514.7" y="54" text-anchor="middle" class="s-small">5</text>
+<rect class="s-plain s-dash" x="533.6" y="34" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="552.5" y="34" width="36.8" height="30" rx="2"/>
+<text x="571.4" y="54" text-anchor="middle" class="s-small">6</text>
+<rect class="s-plain s-dash" x="590.3" y="34" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="609.2" y="34" width="36.8" height="30" rx="2"/>
+<text x="628.1" y="54" text-anchor="middle" class="s-small">7</text>
+<rect class="s-plain s-dash" x="647.0" y="34" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="665.9" y="34" width="36.8" height="30" rx="2"/>
+<text x="684.8" y="54" text-anchor="middle" class="s-small">8</text>
+<text x="8" y="96" class="s-bold">Stage 1</text>
+<rect class="s-plain s-dash" x="80.0" y="74" width="18.9" height="30" rx="2"/>
+<rect class="s-a" x="98.9" y="74" width="17.9" height="30" rx="2"/>
+<text x="108.3" y="94" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="117.8" y="74" width="17.9" height="30" rx="2"/>
+<text x="127.2" y="94" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="136.7" y="74" width="17.9" height="30" rx="2"/>
+<text x="146.1" y="94" text-anchor="middle" class="s-small">3</text>
+<rect class="s-plain s-dash" x="155.6" y="74" width="75.6" height="30" rx="2"/>
+<rect class="s-b" x="231.2" y="74" width="36.8" height="30" rx="2"/>
+<text x="250.1" y="94" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="269.0" y="74" width="17.9" height="30" rx="2"/>
+<text x="278.4" y="94" text-anchor="middle" class="s-small">4</text>
+<rect class="s-b" x="287.9" y="74" width="36.8" height="30" rx="2"/>
+<text x="306.8" y="94" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="325.7" y="74" width="17.9" height="30" rx="2"/>
+<text x="335.1" y="94" text-anchor="middle" class="s-small">5</text>
+<rect class="s-b" x="344.6" y="74" width="36.8" height="30" rx="2"/>
+<text x="363.5" y="94" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="382.4" y="74" width="17.9" height="30" rx="2"/>
+<text x="391.8" y="94" text-anchor="middle" class="s-small">6</text>
+<rect class="s-b" x="401.3" y="74" width="36.8" height="30" rx="2"/>
+<text x="420.2" y="94" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="439.1" y="74" width="17.9" height="30" rx="2"/>
+<text x="448.5" y="94" text-anchor="middle" class="s-small">7</text>
+<rect class="s-b" x="458.0" y="74" width="36.8" height="30" rx="2"/>
+<text x="476.9" y="94" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="495.8" y="74" width="17.9" height="30" rx="2"/>
+<text x="505.2" y="94" text-anchor="middle" class="s-small">8</text>
+<rect class="s-b" x="514.7" y="74" width="36.8" height="30" rx="2"/>
+<text x="533.6" y="94" text-anchor="middle" class="s-small">6</text>
+<rect class="s-plain s-dash" x="552.5" y="74" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="571.4" y="74" width="36.8" height="30" rx="2"/>
+<text x="590.3" y="94" text-anchor="middle" class="s-small">7</text>
+<rect class="s-plain s-dash" x="609.2" y="74" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="628.1" y="74" width="36.8" height="30" rx="2"/>
+<text x="647.0" y="94" text-anchor="middle" class="s-small">8</text>
+<rect class="s-plain s-dash" x="665.9" y="74" width="37.8" height="30" rx="2"/>
+<text x="8" y="136" class="s-bold">Stage 2</text>
+<rect class="s-plain s-dash" x="80.0" y="114" width="37.8" height="30" rx="2"/>
+<rect class="s-a" x="117.8" y="114" width="17.9" height="30" rx="2"/>
+<text x="127.2" y="134" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="136.7" y="114" width="17.9" height="30" rx="2"/>
+<text x="146.1" y="134" text-anchor="middle" class="s-small">2</text>
+<rect class="s-plain s-dash" x="155.6" y="114" width="37.8" height="30" rx="2"/>
+<rect class="s-b" x="193.4" y="114" width="36.8" height="30" rx="2"/>
+<text x="212.3" y="134" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="231.2" y="114" width="17.9" height="30" rx="2"/>
+<text x="240.6" y="134" text-anchor="middle" class="s-small">3</text>
+<rect class="s-b" x="250.1" y="114" width="36.8" height="30" rx="2"/>
+<text x="269.0" y="134" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="287.9" y="114" width="17.9" height="30" rx="2"/>
+<text x="297.4" y="134" text-anchor="middle" class="s-small">4</text>
+<rect class="s-b" x="306.8" y="114" width="36.8" height="30" rx="2"/>
+<text x="325.7" y="134" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="344.6" y="114" width="17.9" height="30" rx="2"/>
+<text x="354.0" y="134" text-anchor="middle" class="s-small">5</text>
+<rect class="s-b" x="363.5" y="114" width="36.8" height="30" rx="2"/>
+<text x="382.4" y="134" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="401.3" y="114" width="17.9" height="30" rx="2"/>
+<text x="410.8" y="134" text-anchor="middle" class="s-small">6</text>
+<rect class="s-b" x="420.2" y="114" width="36.8" height="30" rx="2"/>
+<text x="439.1" y="134" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="458.0" y="114" width="17.9" height="30" rx="2"/>
+<text x="467.4" y="134" text-anchor="middle" class="s-small">7</text>
+<rect class="s-b" x="476.9" y="114" width="36.8" height="30" rx="2"/>
+<text x="495.8" y="134" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="514.7" y="114" width="17.9" height="30" rx="2"/>
+<text x="524.1" y="134" text-anchor="middle" class="s-small">8</text>
+<rect class="s-b" x="533.6" y="114" width="36.8" height="30" rx="2"/>
+<text x="552.5" y="134" text-anchor="middle" class="s-small">7</text>
+<rect class="s-plain s-dash" x="571.4" y="114" width="18.9" height="30" rx="2"/>
+<rect class="s-b" x="590.3" y="114" width="36.8" height="30" rx="2"/>
+<text x="609.2" y="134" text-anchor="middle" class="s-small">8</text>
+<rect class="s-plain s-dash" x="628.1" y="114" width="75.6" height="30" rx="2"/>
+<text x="8" y="176" class="s-bold">Stage 3</text>
+<rect class="s-plain s-dash" x="80.0" y="154" width="56.7" height="30" rx="2"/>
+<rect class="s-a" x="136.7" y="154" width="17.9" height="30" rx="2"/>
+<text x="146.1" y="174" text-anchor="middle" class="s-small">1</text>
+<rect class="s-b" x="155.6" y="154" width="36.8" height="30" rx="2"/>
+<text x="174.5" y="174" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="193.4" y="154" width="17.9" height="30" rx="2"/>
+<text x="202.8" y="174" text-anchor="middle" class="s-small">2</text>
+<rect class="s-b" x="212.3" y="154" width="36.8" height="30" rx="2"/>
+<text x="231.2" y="174" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="250.1" y="154" width="17.9" height="30" rx="2"/>
+<text x="259.5" y="174" text-anchor="middle" class="s-small">3</text>
+<rect class="s-b" x="269.0" y="154" width="36.8" height="30" rx="2"/>
+<text x="287.9" y="174" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="306.8" y="154" width="17.9" height="30" rx="2"/>
+<text x="316.2" y="174" text-anchor="middle" class="s-small">4</text>
+<rect class="s-b" x="325.7" y="154" width="36.8" height="30" rx="2"/>
+<text x="344.6" y="174" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="363.5" y="154" width="17.9" height="30" rx="2"/>
+<text x="372.9" y="174" text-anchor="middle" class="s-small">5</text>
+<rect class="s-b" x="382.4" y="154" width="36.8" height="30" rx="2"/>
+<text x="401.3" y="174" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="420.2" y="154" width="17.9" height="30" rx="2"/>
+<text x="429.6" y="174" text-anchor="middle" class="s-small">6</text>
+<rect class="s-b" x="439.1" y="154" width="36.8" height="30" rx="2"/>
+<text x="458.0" y="174" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="476.9" y="154" width="17.9" height="30" rx="2"/>
+<text x="486.3" y="174" text-anchor="middle" class="s-small">7</text>
+<rect class="s-b" x="495.8" y="154" width="36.8" height="30" rx="2"/>
+<text x="514.7" y="174" text-anchor="middle" class="s-small">7</text>
+<rect class="s-a" x="533.6" y="154" width="17.9" height="30" rx="2"/>
+<text x="543.0" y="174" text-anchor="middle" class="s-small">8</text>
+<rect class="s-b" x="552.5" y="154" width="36.8" height="30" rx="2"/>
+<text x="571.4" y="174" text-anchor="middle" class="s-small">8</text>
+<rect class="s-plain s-dash" x="590.3" y="154" width="113.4" height="30" rx="2"/>
+<line class="s-line" x1="703.7" y1="28" x2="703.7" y2="192"/>
+<text x="703.7" y="206" text-anchor="end" class="s-small">flush + optimizer step</text>
+<rect class="s-a" x="80" y="220" width="16" height="12" rx="2"/><text x="102" y="231" class="s-small">forward, micro-batch number</text>
+<rect class="s-b" x="280" y="220" width="16" height="12" rx="2"/><text x="302" y="231" class="s-small">backward</text>
+<rect class="s-plain s-dash" x="380" y="220" width="16" height="12" rx="2"/><text x="402" y="231" class="s-small">idle (bubble)</text>
+<text x="80" y="254" class="s-small">Every stage idles (p−1)(t<tspan baseline-shift="sub" font-size="10">f</tspan> + t<tspan baseline-shift="sub" font-size="10">b</tspan>) = 3 × 3 = 9 of 33 units: 27.3% = (p−1)/(m+p−1).</text>
+<text x="80" y="271" class="s-small">Stage 0 keeps up to 4 micro-batches in flight, stage 3 only 1.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> A 1F1B schedule for \(p = 4\) stages and \(m = 8\) micro-batches, drawn from the drill's simulator with \(t_b = 2t_f\). Dashed boxes are idle time. Each stage idles for \((p-1)(t_f+t_b) = 9\) of 33 units, and the total is \((m+p-1)\cdot 3 = 33\). Stage 0 has up to 4 micro-batches in flight (its first four forwards complete before its first backward), stage 3 only one.</figcaption>
+  </figure>
+
+  <h3 id="pp-variants">Reducing the bubble</h3>
+  <ul>
+    <li><strong>More micro-batches.</strong> Bubble \(\to 0\) as \(m \gg p\). GPipe reports the overhead as negligible for \(m \ge 4p\), helped by scheduling recomputation early <a href="https://arxiv.org/abs/1811.06965">[GPipe, §2.3]</a>; the formula still gives 19% at \(p = 16\), \(m = 64\), so treat \(4p\) as a minimum. But \(m = B_{\text{global}}/(N_d\,b)\): raising data parallelism shrinks \(m\) and grows the bubble.</li>
+    <li><strong>Interleaved 1F1B.</strong> Give each device \(v\) non-contiguous model chunks (device 1 holds layers 1, 2, 9, 10 instead of 1 to 4). Each chunk is \(1/v\) as long, the bubble becomes \(\frac{1}{v}\cdot\frac{p-1}{m}\), but every micro-batch now crosses \(v\) times more stage boundaries, so <strong>communication also grows by \(v\)</strong> <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, §2.2.2]</a>. Llama 3 uses it with a bubble ratio \(\frac{p-1}{v\cdot m}\) and makes the number of consecutive micro-batches tunable so the batch size need not be divisible by \(p\) <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</li>
+    <li><strong>Zero-bubble schedules.</strong> Split each backward pass into \(B\) (gradient with respect to the input, needed by the previous stage) and \(W\) (gradient with respect to the weights, needed only by the optimizer). \(W\) has no downstream dependency, so it can fill what would be idle time. For a transformer layer \(T_W \lt T_F \lt T_B\) and \(T_B + T_W = 2T_F\) <a href="https://arxiv.org/abs/2401.10241">[Qi et al. 2023, Tab. 1]</a>. <strong>ZB-H1</strong> has bubble \((p-1)(T_F + T_B - T_W)\), one third of 1F1B's when all three are equal, at 1F1B's memory; <strong>ZB-H2</strong> is near zero but holds \(2p-1\) micro-batches of activations. Reported gains over 1F1B: up to 23% throughput at similar memory, up to 31% with more. The optimizer step is an obstacle, since global gradient-norm clipping and NaN checks synchronize all stages; they use an optimistic step with post-validation and rollback, because clipping and NaNs rarely trigger <a href="https://arxiv.org/abs/2401.10241">[Zero Bubble PP, abstract, §2, §4]</a>.</li>
+    <li><strong>DualPipe</strong> (DeepSeek-V3). Feed micro-batches from <em>both ends</em> at once and overlap each forward chunk with a backward chunk so the expert all-to-all hides behind compute (<a href="#ep-cp">below</a>; cost accounting in <a href="27-deepseek-2-v3.html">page 27</a>).</li>
+  </ul>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Schedule</th><th>Bubble</th><th class="num">Parameter copies</th><th class="num">Peak activations</th></tr></thead>
+    <tbody>
+      <tr><td>1F1B</td><td>\((PP-1)(F+B)\)</td><td class="num">1×</td><td class="num">\(PP\)</td></tr>
+      <tr><td>ZB1P (= ZB-H1)</td><td>\((PP-1)(F+B-2W)\)</td><td class="num">1×</td><td class="num">\(PP\)</td></tr>
+      <tr class="hl"><td>DualPipe</td><td>\((\tfrac{PP}{2}-1)(F\&amp;B + B - 3W)\)</td><td class="num">2×</td><td class="num">\(PP+1\)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">DeepSeek-V3 Table 2 <a href="https://arxiv.org/abs/2412.19437">[§3.2.1]</a>. \(F\) is a forward chunk, \(B\) a <em>full</em> backward chunk (input plus weight gradients), \(W\) the weight-gradient part, \(F\&amp;B\) two mutually overlapped forward and backward chunks. Note the naming: the Zero Bubble paper's \(B\) is input-gradient only, so ZB-H1 reads \((p-1)(T_F + T_B - T_W)\) there. DualPipe needs stages and micro-batches divisible by 2, and its 2× parameter copies are cheap "since we use a large EP size".</p>
+
+  <p><strong>Balance and memory.</strong> The first stage holds the embedding and the most in-flight activations; the last holds the LM head and loss (fp32 logits) and becomes the latency bottleneck. Llama 3 removes one transformer layer from each of the first and last stages and frees dead tensors eagerly, which lets it train 8K sequences without recomputation <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>. DeepSeek-V3 puts the shallowest and deepest layers on one pipeline rank so the multi-token-prediction module can share embedding and head parameters <a href="https://arxiv.org/abs/2412.19437">[§3.2.3]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Pipeline schedule</div>
+    <dl>
+      <dt>Problem</dt><dd>Sequential layers make stages idle while the pipeline fills and drains, and holding \(m\) micro-batches of activations can exhaust memory.</dd>
+      <dt>Idea</dt><dd>1F1B bounds in-flight micro-batches at \(p\); interleaving shortens the bubble by \(v\); splitting \(B\) from \(W\) fills the rest; DualPipe adds bidirectional feeding and communication overlap.</dd>
+      <dt>Why it works</dt><dd>The bubble is a start-up and drain cost of \((p-1)\) micro-batch-times, so shrink the unit of work (interleaving) or find work with fewer dependencies (\(W\)).</dd>
+      <dt>Evidence</dt><dd>Interleaving: over 10% higher throughput at comparable memory <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021, abstract]</a>. ZB-2p: bubble under 1% in most settings <a href="https://arxiv.org/abs/2401.10241">[Qi et al. 2023, Tab. 5]</a>.</dd>
+      <dt>Cost</dt><dd>Interleaving multiplies communication by \(v\) and constrains \(m\) (relaxed by Llama 3); ZB-H2 doubles activation memory; DualPipe doubles parameter copies and needs even stage and micro-batch counts.</dd>
+      <dt>Used by</dt><dd>Llama 3 (PP16, interleaved), DeepSeek-V2 (zero-bubble), DeepSeek-V3 (DualPipe), Megatron-LM.</dd>
+    </dl>
+  </div>
+
+  <h3 id="bubble-numbers">Worked numbers: \(p = 16\), \(m = 64\)</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Schedule</th><th class="num">Bubble / ideal</th><th class="num">Idle fraction of the step</th><th>Arithmetic</th></tr></thead>
+    <tbody>
+      <tr><td>GPipe or 1F1B</td><td class="num">23.4%</td><td class="num">19.0%</td><td>\(15/64\); \(15/79\)</td></tr>
+      <tr><td>Interleaved, \(v = 2\)</td><td class="num">11.7%</td><td class="num">10.5%</td><td>\(15/128\); \(15/143\)</td></tr>
+      <tr><td>Interleaved, \(v = 4\)</td><td class="num">5.9%</td><td class="num">5.5%</td><td>\(15/256\); \(15/271\)</td></tr>
+      <tr><td>ZB-H1 (equal \(T_F = T_B = T_W\))</td><td class="num">7.8%</td><td class="num">n/a</td><td>\(15 \cdot 1/(64 \cdot 3)\): one third of 23.4%</td></tr>
+    </tbody>
+  </table></div>
+  <p>A 1F1B stage 0 keeps 16 micro-batches of activations in flight; GPipe would keep 64.</p>
+</section>
+
+<section>
+  <h2 id="ep-cp">Expert and context parallelism</h2>
+
+  <h3 id="ep">Expert parallelism</h3>
+  <p>In a mixture-of-experts layer (<a href="08-mixture-of-experts.html">page 08</a>) each token is routed to a few of many expert MLPs. <strong>Expert parallelism</strong> <span class="zh">专家并行</span> places different experts on different GPUs (GShard introduced it at scale <a href="https://arxiv.org/abs/2006.16668">[Lepikhin et al. 2021]</a>). A token's hidden state travels to its expert's GPU (an <strong>all-to-all dispatch</strong>), is processed, and returns (an <strong>all-to-all combine</strong>): two all-to-alls per MoE layer forward and two backward. Attention and dense parts stay data-parallel (or tensor-parallel), so EP is "sharding for the experts, data parallelism for everything else"; expert gradients reduce only among ranks holding the same expert.</p>
+  <p>EP is unavoidable for large MoEs because experts are almost all the parameters: 654B of 671B (97%) in DeepSeek-V3 (my count from the published config, which reproduces the 671B total). The cost is bandwidth. Per token and selected expert, DeepSeek-V4 sends the hidden state in FP8 on dispatch and BF16 on combine, \(d + 2d = 3d\) bytes, against \(6\,d\,d_e\) FLOPs for the three expert matrices (\(d_e\) is the expert hidden width) <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.1]</a>. Communication can be fully hidden when \(C/B \le V_{\text{comp}}/V_{\text{comm}} = 2d_e\), 6,144 FLOP per byte for V4-Pro (\(d_e = 3072\)). By my arithmetic a GPU with 1,979 TFLOP/s of dense FP8 then needs about \(1979/6144 = 322\) GB/s of dispatch and combine bandwidth, far above one 50 GB/s network port, so tokens must cross the network as few times as possible.</p>
+
+  <p>DeepSeek's engineering shows how far this can be pushed:</p>
+  <ul>
+    <li><strong>Node-limited routing.</strong> V3 limits each token to at most 4 nodes (V2: at most 3 devices), so a token crosses the slow network at most 4 times. It is sent once over InfiniBand to the GPU with the same in-node index on each target node, then forwarded over NVLink (160 GB/s versus 50 GB/s) to the GPUs hosting its experts; on average 3.2 experts per node are served without extra NVLink overhead. Only 20 of an H800's 132 SMs are enough to saturate both links <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.2.2]</a>.</li>
+    <li><strong>Overlap.</strong> Cross-node EP gave a computation-to-communication ratio of about 1:1, so DualPipe overlaps one micro-batch's all-to-all with another's compute <a href="https://arxiv.org/abs/2412.19437">[§3.2.1]</a>.</li>
+    <li><strong>One fused kernel</strong> (DeepSeek-V4). Experts are split into <em>waves</em>: a wave's GEMMs start as soon as its tokens arrive, while the next wave's tokens are in flight and the previous wave's results are sent back. Theoretical speedup over compute-then-communicate is 1.92× for the V4-Flash shape (1.42× for a coarser overlap scheme); measured, 1.50 to 1.73× for general inference and up to 1.96× for latency-sensitive uses such as RL rollouts. It is open-sourced as MegaMoE in DeepGEMM <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.1]</a>.</li>
+  </ul>
+  <p>Routing and load balancing are page 08's subject; note that an unbalanced router makes some GPUs' compute and all-to-all volume larger, and every step waits for the slowest.</p>
+
+  <h3 id="cp">Context parallelism</h3>
+  <p>At long context the activations dominate: at \(s = 131{,}072\) even the linear \(34\,sbh\) term is \(34 \times 131{,}072 \times 4096 = 18.3\) GB per layer for a Llama-3-8B-shaped model. <strong>Context parallelism</strong> <span class="zh">上下文并行</span> shards the sequence over \(c\) ranks: every rank holds \(s/c\) tokens, norms and MLPs are token-wise so they need no communication, and only attention has to see the other ranks' keys and values. Four ways to do that:</p>
+  <ul>
+    <li><strong>Ring attention</strong> <a href="https://arxiv.org/abs/2310.01889">[Liu et al. 2023]</a>. Each rank keeps its query block while key/value blocks rotate around a ring and each rank computes blockwise attention (online-softmax rescaling, <a href="16-gpus-kernels.html">page 16</a>). Communication hides if computing a block takes at least as long as sending it. For block length \(\beta\) and hidden size \(d\), one block pair costs \(4d\beta^2\) FLOPs and the key and value blocks are \(4\beta d\) bytes in bf16, so \(\beta \ge F/B\) (peak FLOP/s over link bandwidth) <a href="https://arxiv.org/abs/2310.01889">[§3]</a>. For an A100 that is 1.0K tokens on NVLink but 24.5K over InfiniBand <a href="https://arxiv.org/abs/2310.01889">[Tab. 2]</a>; my H100 numbers are \(989.4\text{T}/450\text{G} = 2.2\)K on NVLink and \(989.4\text{T}/50\text{G} = 19.8\)K over a 50 GB/s port. GQA shrinks the transferred bytes by \(d/d_{kv}\) (4× for Llama-3-8B, 8× for 70B); a causal mask halves the FLOPs and doubles the requirement.</li>
+    <li><strong>All-gather context parallelism</strong> (Llama 3). All-gather \(K\) and \(V\), then attend with the local queries. The latency is exposed, but small: GQA makes \(K\) and \(V\) far smaller than \(Q\), and attention compute is \(O(S^2)\) against \(O(S)\) communication. Any mask works (Llama 3 uses a document mask). The sequence is cut into \(2c\) chunks and rank \(i\) takes chunks \(i\) and \(2c-1-i\), balancing causal work <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</li>
+    <li><strong>DeepSpeed-Ulysses</strong> <a href="https://arxiv.org/abs/2309.14509">[Jacobs et al. 2023]</a>. Inputs are sharded along the sequence; an all-to-all before attention swaps to "full sequence, subset of heads", each GPU attends for its heads, and a second all-to-all swaps back. Communication per link is \(4Nh/P\) for sequence length \(N\) on \(P\) GPUs, constant when both grow together (Megatron's sequence parallelism stays at \(4Nh\)). Head-parallel attention in the middle caps the degree at the number of heads (my inference).</li>
+    <li><strong>Two-stage CP for compressed attention</strong> (DeepSeek-V4). CSA and HCA compress every \(m\) consecutive KV entries into one, and a group can straddle two ranks. Stage 1: each rank sends its last \(m\) uncompressed KV entries to the next rank, which compresses them with its own \(s\) entries into a fixed \(s/m + 1\) entries (padded). Stage 2: an all-gather plus a fused select-and-pad kernel yields \(c \cdot s/m\) entries <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.4.3]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">All-gather context parallelism (Llama 3) versus ring attention</div>
+    <dl>
+      <dt>Problem</dt><dd>At 128K tokens one sequence's activations do not fit on a GPU, and attention needs every earlier token's keys and values.</dd>
+      <dt>Idea</dt><dd>Shard the sequence, all-gather the (small, thanks to GQA) keys and values, then compute attention for the local queries.</dd>
+      <dt>Why it works</dt><dd>Attention FLOPs grow as \(S^2\) but gathered bytes only as \(S\), so the exposed all-gather is small, and one gathered tensor makes any mask trivial.</dd>
+      <dt>Evidence</dt><dd>Llama 3 405B at 128K: TP8, CP16, PP16, DP8 on 16,384 H100s, 380 TFLOP/s per GPU, 38% MFU <a href="https://arxiv.org/abs/2407.21783">[Llama 3, Tab. 4]</a>.</dd>
+      <dt>Cost</dt><dd>Peak memory holds the gathered \(K\) and \(V\) for the whole sequence (fine with 8 KV heads). Ring attention avoids that and hides latency, but needs blocks of at least \(F/B\) tokens and custom masking.</dd>
+      <dt>Used by</dt><dd>Llama 3 (CP = 1 at 8K, 16 at 128K); DeepSeek-V4 needed a bespoke two-stage scheme for compressed attention.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="layouts">Putting it together: layouts and worked plans</h2>
+
+  <p>A real job uses several dimensions at once: 3D parallelism (data, tensor, pipeline), 4D with context parallelism (Llama 3), or 5D with experts. The dimensions multiply: \(\text{GPUs} = t \cdot c \cdot p \cdot N_d\) (with EP folded inside the data-parallel dimension for the experts). The order matters because the mapping onto the network is what makes it fast. Llama 3 places them <strong>[TP, CP, PP, DP] from innermost to outermost</strong>: the innermost dimension "requires the highest network bandwidth and lowest latency" and is confined to a server, while data parallelism, outermost, "can tolerate longer network latency by asynchronously prefetching sharded model weights and reducing gradients" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.2]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 404" role="img" aria-labelledby="fig-15-4-title">
+<title id="fig-15-4-title">Where each parallelism dimension lives: tensor parallelism inside a node, pipeline stages across nodes, data parallelism outermost</title>
+<defs><marker id="arrow-15-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="8" y="70" class="s-bold">DP replica 0</text>
+<text x="8" y="86" class="s-small s-muted">(same layers,</text>
+<text x="8" y="100" class="s-small s-muted">other data)</text>
+<rect class="s-box" x="126" y="20" width="148" height="118" rx="8"/>
+<text x="200.0" y="38" text-anchor="middle" class="s-bold">node, PP stage 0</text>
+<rect class="s-a" x="134" y="50" width="28" height="28" rx="4"/><text x="148" y="68" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="168" y="50" width="28" height="28" rx="4"/><text x="182" y="68" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="202" y="50" width="28" height="28" rx="4"/><text x="216" y="68" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="236" y="50" width="28" height="28" rx="4"/><text x="250" y="68" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="134" y="84" width="28" height="28" rx="4"/><text x="148" y="102" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="168" y="84" width="28" height="28" rx="4"/><text x="182" y="102" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="202" y="84" width="28" height="28" rx="4"/><text x="216" y="102" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="236" y="84" width="28" height="28" rx="4"/><text x="250" y="102" text-anchor="middle" class="s-small">7</text>
+<text x="200.0" y="130" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<path class="s-line-b" d="M274,74 L292,74" marker-end="url(#arrow-15-4)"/>
+<rect class="s-box" x="292" y="20" width="148" height="118" rx="8"/>
+<text x="366.0" y="38" text-anchor="middle" class="s-bold">node, PP stage 1</text>
+<rect class="s-a" x="300" y="50" width="28" height="28" rx="4"/><text x="314" y="68" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="334" y="50" width="28" height="28" rx="4"/><text x="348" y="68" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="368" y="50" width="28" height="28" rx="4"/><text x="382" y="68" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="402" y="50" width="28" height="28" rx="4"/><text x="416" y="68" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="300" y="84" width="28" height="28" rx="4"/><text x="314" y="102" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="334" y="84" width="28" height="28" rx="4"/><text x="348" y="102" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="368" y="84" width="28" height="28" rx="4"/><text x="382" y="102" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="402" y="84" width="28" height="28" rx="4"/><text x="416" y="102" text-anchor="middle" class="s-small">7</text>
+<text x="366.0" y="130" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<path class="s-line-b" d="M440,74 L458,74" marker-end="url(#arrow-15-4)"/>
+<rect class="s-box" x="458" y="20" width="148" height="118" rx="8"/>
+<text x="532.0" y="38" text-anchor="middle" class="s-bold">node, PP stage 2</text>
+<rect class="s-a" x="466" y="50" width="28" height="28" rx="4"/><text x="480" y="68" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="500" y="50" width="28" height="28" rx="4"/><text x="514" y="68" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="534" y="50" width="28" height="28" rx="4"/><text x="548" y="68" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="568" y="50" width="28" height="28" rx="4"/><text x="582" y="68" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="466" y="84" width="28" height="28" rx="4"/><text x="480" y="102" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="500" y="84" width="28" height="28" rx="4"/><text x="514" y="102" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="534" y="84" width="28" height="28" rx="4"/><text x="548" y="102" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="568" y="84" width="28" height="28" rx="4"/><text x="582" y="102" text-anchor="middle" class="s-small">7</text>
+<text x="532.0" y="130" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<text x="614" y="70" class="s-small">… p stages</text>
+<text x="8" y="218" class="s-bold">DP replica 1</text>
+<text x="8" y="234" class="s-small s-muted">(same layers,</text>
+<text x="8" y="248" class="s-small s-muted">other data)</text>
+<rect class="s-box" x="126" y="168" width="148" height="118" rx="8"/>
+<text x="200.0" y="186" text-anchor="middle" class="s-bold">node, PP stage 0</text>
+<rect class="s-a" x="134" y="198" width="28" height="28" rx="4"/><text x="148" y="216" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="168" y="198" width="28" height="28" rx="4"/><text x="182" y="216" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="202" y="198" width="28" height="28" rx="4"/><text x="216" y="216" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="236" y="198" width="28" height="28" rx="4"/><text x="250" y="216" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="134" y="232" width="28" height="28" rx="4"/><text x="148" y="250" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="168" y="232" width="28" height="28" rx="4"/><text x="182" y="250" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="202" y="232" width="28" height="28" rx="4"/><text x="216" y="250" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="236" y="232" width="28" height="28" rx="4"/><text x="250" y="250" text-anchor="middle" class="s-small">7</text>
+<text x="200.0" y="278" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<path class="s-line-b" d="M274,222 L292,222" marker-end="url(#arrow-15-4)"/>
+<rect class="s-box" x="292" y="168" width="148" height="118" rx="8"/>
+<text x="366.0" y="186" text-anchor="middle" class="s-bold">node, PP stage 1</text>
+<rect class="s-a" x="300" y="198" width="28" height="28" rx="4"/><text x="314" y="216" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="334" y="198" width="28" height="28" rx="4"/><text x="348" y="216" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="368" y="198" width="28" height="28" rx="4"/><text x="382" y="216" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="402" y="198" width="28" height="28" rx="4"/><text x="416" y="216" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="300" y="232" width="28" height="28" rx="4"/><text x="314" y="250" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="334" y="232" width="28" height="28" rx="4"/><text x="348" y="250" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="368" y="232" width="28" height="28" rx="4"/><text x="382" y="250" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="402" y="232" width="28" height="28" rx="4"/><text x="416" y="250" text-anchor="middle" class="s-small">7</text>
+<text x="366.0" y="278" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<path class="s-line-b" d="M440,222 L458,222" marker-end="url(#arrow-15-4)"/>
+<rect class="s-box" x="458" y="168" width="148" height="118" rx="8"/>
+<text x="532.0" y="186" text-anchor="middle" class="s-bold">node, PP stage 2</text>
+<rect class="s-a" x="466" y="198" width="28" height="28" rx="4"/><text x="480" y="216" text-anchor="middle" class="s-small">0</text>
+<rect class="s-a" x="500" y="198" width="28" height="28" rx="4"/><text x="514" y="216" text-anchor="middle" class="s-small">1</text>
+<rect class="s-a" x="534" y="198" width="28" height="28" rx="4"/><text x="548" y="216" text-anchor="middle" class="s-small">2</text>
+<rect class="s-a" x="568" y="198" width="28" height="28" rx="4"/><text x="582" y="216" text-anchor="middle" class="s-small">3</text>
+<rect class="s-a" x="466" y="232" width="28" height="28" rx="4"/><text x="480" y="250" text-anchor="middle" class="s-small">4</text>
+<rect class="s-a" x="500" y="232" width="28" height="28" rx="4"/><text x="514" y="250" text-anchor="middle" class="s-small">5</text>
+<rect class="s-a" x="534" y="232" width="28" height="28" rx="4"/><text x="548" y="250" text-anchor="middle" class="s-small">6</text>
+<rect class="s-a" x="568" y="232" width="28" height="28" rx="4"/><text x="582" y="250" text-anchor="middle" class="s-small">7</text>
+<text x="532.0" y="278" text-anchor="middle" class="s-small s-muted">TP group = 8 GPUs</text>
+<text x="614" y="218" class="s-small">… p stages</text>
+<path class="s-line-d s-dash" d="M200.0,138 L200.0,168" marker-end="url(#arrow-15-4)"/>
+<path class="s-line-d s-dash" d="M366.0,138 L366.0,168" marker-end="url(#arrow-15-4)"/>
+<path class="s-line-d s-dash" d="M532.0,138 L532.0,168" marker-end="url(#arrow-15-4)"/>
+<text x="8" y="146" class="s-small s-td">DP (dashed arrows):</text>
+<text x="8" y="160" class="s-small s-td">reduce-scatter and</text>
+<text x="8" y="174" class="s-small s-td">all-gather of the</text>
+<text x="8" y="188" class="s-small s-td">stage's shard</text>
+<text x="8" y="336" class="s-bold">Traffic and link</text>
+<rect class="s-a" x="126" y="322" width="16" height="12" rx="2"/><text x="148" y="332" class="s-small">TP (and CP): all-reduce or all-gather every layer, on the critical path: NVLink, ~450 GB/s per direction</text>
+<rect class="s-b" x="126" y="342" width="16" height="12" rx="2"/><text x="148" y="352" class="s-small">PP: point-to-point activations, b·s·h per boundary: InfiniBand or RoCE, ~50 GB/s per GPU</text>
+<rect class="s-d" x="126" y="362" width="16" height="12" rx="2"/><text x="148" y="372" class="s-small">DP / FSDP: bulk collectives once per step, prefetched and overlapped: the outermost, slowest links</text>
+</svg>
+    <figcaption><b>Figure 4.</b> Mapping the parallelism dimensions onto the hardware. Tensor (and context) parallel groups fill a node so their per-layer collectives use NVLink. Pipeline stages span nodes and send only activations. Data-parallel replicas are the outermost dimension, and their bulk, once-per-step collectives are the traffic that tolerates the slowest links.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th>Hardware</th><th>Layout</th><th class="num">MFU</th></tr></thead>
+    <tbody>
+      <tr><td>Megatron 530B <a href="https://arxiv.org/abs/2205.05198">[Korthikanti et al., Tab. 3]</a></td><td>2,240 A100</td><td>TP8 × PP35 = 280 GPUs per replica, so DP 8 (my arithmetic); sequence parallel, selective recompute, interleaving \(v = 3\)</td><td class="num">54.2%</td></tr>
+      <tr><td>PaLM 540B <a href="https://arxiv.org/abs/2204.02311">[Chowdhery et al., §4]</a></td><td>6,144 TPU v4 (2 pods)</td><td>12-way model parallel × 256-way FSDP inside each pod, 2-way DP across pods, no pipeline</td><td class="num">46.2%</td></tr>
+      <tr><td>Llama 3 405B, 8K, phase 1 <a href="https://arxiv.org/abs/2407.21783">[Tab. 4]</a></td><td>8,192 H100</td><td>TP8 × CP1 × PP16 × DP64; 16M tokens per batch</td><td class="num">43%</td></tr>
+      <tr><td>Llama 3 405B, 8K</td><td>16,384 H100</td><td>TP8 × CP1 × PP16 × DP128</td><td class="num">41%</td></tr>
+      <tr><td>Llama 3 405B, 128K</td><td>16,384 H100</td><td>TP8 × CP16 × PP16 × DP8</td><td class="num">38%</td></tr>
+      <tr><td>DeepSeek-V3 <a href="https://arxiv.org/abs/2412.19437">[§3.2]</a></td><td>2,048 H800</td><td>PP16 × EP64 (8 nodes) × ZeRO-1 DP, <strong>no TP</strong>; DualPipe</td><td class="num">not reported</td></tr>
+      <tr><td>DeepSeek-V2 <a href="https://arxiv.org/abs/2405.04434">[§3.1.3]</a></td><td>H800 cluster</td><td>16-way zero-bubble PP × 8-way EP × ZeRO-1, no TP</td><td class="num">not reported</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Llama 3 rows: 430, 400 and 380 TFLOP/s per GPU. They check out: \(8 \cdot 1 \cdot 16 \cdot 64 = 8192\), \(8 \cdot 1 \cdot 16 \cdot 128 = 16{,}384\), \(8 \cdot 16 \cdot 16 \cdot 8 = 16{,}384\), and \(64 \times 32 \times 8192 = 16.8\)M tokens per batch. The MFU drop from 43% to 41% "is due to the lower batch size per DP group needed to keep the global tokens per batch constant".</p>
+
+  <h3 id="procedure">The whiteboard procedure</h3>
+  <ol>
+    <li><strong>Count the states:</strong> \(16N\) bytes (or 14 to 18 for your recipe). If ZeRO-1 or ZeRO-2 over the whole cluster fits with activations, stop: no model parallelism is the fastest layout.</li>
+    <li><strong>Count the activations</strong> at your sequence length and micro-batch (\(34\,sbhL/t\) with sequence parallelism and selective recomputation, then adjust for your architecture).</li>
+    <li><strong>Add tensor parallelism</strong> up to the node size (8) only if layers are wide enough to keep GEMMs efficient and you need the memory; respect \(t \le n_{kv}\).</li>
+    <li><strong>Add pipeline parallelism</strong> across nodes until states plus activations fit and DP traffic stops dominating. Pick \(m\) and \(v\) so the bubble is a few percent, with \(m = B_{\text{global}}/(N_d b) \ge 4p\).</li>
+    <li><strong>Fill the cluster with data parallelism:</strong> \(N_d = \text{GPUs}/(t\,p\,c)\); ZeRO-1 first, FSDP if parameters still do not fit.</li>
+    <li><strong>MoE: expert parallelism</strong> across nodes with node-limited routing. <strong>Long context: context parallelism</strong> only for the training phases that need it.</li>
+    <li><strong>Price the communication</strong> of each dimension against step time, estimate MFU, and iterate.</li>
+  </ol>
+
+  <h3 id="plan-a">(a) Llama-3-8B on 64 H100s</h3>
+  <p>Assume 4M tokens per step (512 sequences of 8K), so each GPU processes 8 sequences: 8 micro-batches of \(b = 1\). Step time: \(6 \times 8.03\text{B} \times 65{,}536 = 3.16\times10^{15}\) FLOPs per GPU, 8.0 s at 40% MFU. Options, with selective-recomputation activations (36.5 GB) and fp32 logits (4.2 GB) added to the states:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Strategy</th><th class="num">States GB</th><th class="num">Total GB</th><th>Traffic per GPU per step (bf16, 50 GB/s network)</th></tr></thead>
+    <tbody>
+      <tr><td>ZeRO-1, \(N_d = 64\)</td><td class="num">33.6</td><td class="num">74.3</td><td>reduce-scatter + all-gather once: 31.6 GB, 0.63 s</td></tr>
+      <tr class="hl"><td>ZeRO-2, \(N_d = 64\)</td><td class="num">17.8</td><td class="num">58.5</td><td>8 reduce-scatters of 15.8 GB + 1 all-gather = 142 GB, 2.8 s, overlapped with backward (each backward is about 0.7 s, each reduce-scatter 0.32 s)</td></tr>
+      <tr><td>FSDP, full sharding</td><td class="num">2.0</td><td class="num">42.7</td><td>2 all-gathers + 1 reduce-scatter per micro-batch = 47.4 GB, times 8 = 379 GB, 7.6 s: as long as the whole step, unless parameters stay resident</td></tr>
+      <tr><td>FSDP, hybrid \(F = 8\)</td><td class="num">16.1</td><td class="num">56.8</td><td>gathers and reduce-scatters stay on NVLink; cross-node about 3.5 GB per step</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Answer:</strong> no tensor or pipeline parallelism. Data parallelism with ZeRO-2 (or ZeRO-1 plus a little recomputation) and selective activations, 58 GB per GPU, exposed communication a few percent. "The best parallelism is the least parallelism": every extra dimension adds bubbles, small GEMMs or slow-link traffic, and an 8B model does not need them. Watch the ZeRO-1 row: 74 GB "fits" but leaves no slack for buffers and fragmentation.</p>
+
+  <h3 id="plan-b">(b) A 70B dense model on 1,024 H100s, 8K context</h3>
+  <p>Config (Llama-3-70B): \(L = 80\), \(d = 8192\), \(\dff = 28{,}672\), \(n_h = 64\), \(n_{kv} = 8\), \(V = 128{,}256\), giving \(N = 70.55\)B parameters (855.65M per layer, my count from the config). Assume the batch of Llama 3's later phases, \(2^{24} = 16.8\)M tokens, which is 2,048 sequences. Cluster: 128 nodes of 8 GPUs.</p>
+  <ol>
+    <li><strong>States:</strong> \(16N = 1.13\) TB. Impossible to replicate, and about 14 H100s' worth of memory even before activations.</li>
+    <li><strong>TP = 8</strong> inside the node (\(n_{kv} = 8\) divides evenly). Traffic per layer per micro-batch is 939.5 MB: 2.1 ms on NVLink against 13.3 ms of compute (16%), but 18.8 ms over InfiniBand.</li>
+    <li><strong>PP = 4</strong> (20 layers per stage). Then \(N_d = 1024/32 = 32\) and \(m = 2048/32 = 64\) micro-batches of one sequence. Bubble \((p-1)/m = 3/64 = 4.7\%\) of ideal (idle 4.5%); with interleaving \(v = 2\), 2.3%.</li>
+    <li><strong>ZeRO-1</strong> over the 32 replicas.</li>
+  </ol>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Per-GPU memory, TP8 × PP4 × DP32</th><th class="num">GB</th><th>Arithmetic</th></tr></thead>
+    <tbody>
+      <tr><td>Parameters (bf16)</td><td class="num">4.4</td><td>\(70.55\text{B}/32 = 2.20\)B parameters, times 2 bytes</td></tr>
+      <tr><td>Gradients (bf16)</td><td class="num">4.4</td><td>same (8.8 GB if accumulated in fp32)</td></tr>
+      <tr><td>Optimizer state, ZeRO-1</td><td class="num">0.8</td><td>\(12 \times 2.20\text{B}/32\)</td></tr>
+      <tr><td>Activations, first stage</td><td class="num">22.8</td><td>\(34\,sbhL/t = 34 \times 8192 \times 8192 \times 80/8\) (sequence parallel + selective; first stage holds \(L\) layers' worth)</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td class="num"><strong>32.5</strong></td><td>fits in 80 GB with room for logits, buffers and fragmentation</td></tr>
+    </tbody>
+  </table></div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Dimension</th><th>Traffic</th><th class="num">Time</th><th>Compared with</th></tr></thead>
+    <tbody>
+      <tr><td>TP (NVLink)</td><td>939.5 MB per layer per micro-batch</td><td class="num">2.1 ms</td><td>13.3 ms compute per layer: 16%, if not overlapped</td></tr>
+      <tr><td>PP (InfiniBand)</td><td>134 MB per boundary per direction</td><td class="num">2.7 ms</td><td>266 ms of compute per stage per micro-batch: 1%</td></tr>
+      <tr><td>DP (ZeRO-1)</td><td>4.4 GB reduce-scatter + 4.4 GB all-gather</td><td class="num">0.17 s</td><td>17.5 s step: 1%, and overlappable</td></tr>
+    </tbody>
+  </table></div>
+  <p>The step takes \(6 \times 70.55\text{B} \times 2^{24} = 7.1\times10^{18}\) FLOPs, which is 17.5 s at 40% MFU on 1,024 GPUs. Training on 15T tokens would need \(6ND/(1024 \times 0.4 \times 989.4\text{T}) = 1.57\times10^{7}\) s, about 181 days: 1,024 GPUs is a small cluster for a 15T-token 70B run.</p>
+  <p><strong>Why not fewer stages, or FSDP with no pipeline?</strong> \(\text{PP} = 2\) needs 41 GB and \(\text{PP} = 1\) needs 59 GB: both fit and remove the bubble, but each GPU's data-parallel shard grows to 4.4B or 8.8B parameters (2 to 4 times larger DP collectives). FSDP with TP8 × DP128 shards states to 1.1 GB, but each GPU must gather its tensor-parallel slice (8.8B parameters, 17.6 GB in bf16) for every one of its 16 micro-batches: two gathers take 0.70 s of network time against 1.10 s of compute per micro-batch. That works only with near-perfect overlap or resident parameters, the trade behind PTD-P's 70% lead over ZeRO-3 <a href="https://arxiv.org/abs/2104.04473">[Narayanan et al. 2021]</a>. The plan above is one good answer, not the only one: state the trade-offs, check the arithmetic, and measure.</p>
+
+  <h3 id="plan-c">(c) DeepSeek-V3's actual layout, and Llama 3 405B</h3>
+  <p><strong>DeepSeek-V3.</strong> The report: 2,048 H800s, 16-way pipeline parallelism, 64-way expert parallelism "spanning 8 nodes", ZeRO-1 data parallelism, with the memory footprint optimized so as to train "without using costly Tensor Parallelism (TP)" <a href="https://arxiv.org/abs/2412.19437">[§3.2]</a>. The arithmetic behind it (my count from the published config: 3 dense and 58 MoE layers, 256 routed experts of 44.04M parameters, 1 shared expert):</p>
+  <ul>
+    <li>\(2048/16 = 128\) GPUs per pipeline stage, with routed experts sharded 64 ways inside a stage: \(256/64 = 4\) experts per MoE layer per GPU. (The report states only PP16, EP64 and ZeRO-1; the leftover factor of 2 is my inference.)</li>
+    <li>Routed experts: \(58 \times 256 \times 44.04\text{M} = 654\)B parameters, 40.9B per stage, 0.64B per GPU. Everything else (attention, shared experts, dense FFN, embedding, head): 17.1B, 1.07B per stage. Each GPU holds about <strong>1.7B parameters</strong>: 31 GB even at 18 bytes per parameter with no sharding.</li>
+    <li>With so little to save, tensor parallelism would only add per-layer all-reduces on a 160 GB/s NVLink for already small GEMMs (\(d_e = 2048\)). DeepSeek-V2 gave the same reasoning: few activated parameters plus recomputation make it unnecessary <a href="https://arxiv.org/abs/2405.04434">[V2, §3.1.3]</a>. V4 keeps this infrastructure as its base <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §3.4]</a>.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">No tensor parallelism (DeepSeek-V2 and V3)</div>
+    <dl>
+      <dt>Problem</dt><dd>Tensor-parallel all-reduces sit on every layer's critical path and need the fastest links; H800 NVLink is capped (160 GB/s effective) and expert GEMMs are small.</dd>
+      <dt>Idea</dt><dd>Get the memory reduction elsewhere: 16 pipeline stages, 64-way expert parallelism for the 97% of parameters that are experts, ZeRO-1, cheap-op recomputation, and DualPipe overlap of the all-to-all.</dd>
+      <dt>Why it works</dt><dd>A sparse MoE leaves about 1.7B parameters per GPU, and the remaining traffic (all-to-all, point-to-point) is overlappable, unlike per-layer all-reduces.</dd>
+      <dt>Evidence</dt><dd>180K H800 GPU-hours per trillion tokens (3.7 days on 2,048 GPUs) and 2.788M GPU-hours in total <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §1, Tab. 1]</a>.</dd>
+      <dt>Cost</dt><dd>Heavy systems engineering (custom all-to-all kernels on 20 SMs, DualPipe, FP8 kernels), dependence on balanced routing, and a dense part replicated across 128 GPUs.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V2, V3, and V4's training framework.</dd>
+    </dl>
+  </div>
+
+  <p><strong>Llama 3 405B</strong> takes the opposite route: dense, 126 layers, \(d = 16{,}384\), \(\dff = 53{,}248\), 128 heads, 8 KV heads. \(16N = 6.48\) TB; TP8 × PP16 already divides it by 128 to 50.6 GB per GPU, and FSDP over DP shards optimizer state and gradients further. Wide layers make TP cheap (traffic over compute \(\propto 1/h\)), and interleaved pipeline parallelism handles the cross-node part. Training 8K sequences <em>without</em> activation checkpointing is the payoff of all the memory work above.</p>
+</section>
+
+<section>
+  <h2 id="mfu">Measuring efficiency: MFU and HFU</h2>
+  <p><strong>Model FLOPs utilization</strong> <span class="zh">模型浮点运算利用率</span> (MFU) is the ratio of observed throughput to the theoretical maximum throughput of a system running at peak FLOP/s, where the FLOPs counted are only those the <em>model</em> needs, "and not rematerialization" <a href="https://arxiv.org/abs/2204.02311">[PaLM, §4.1]</a>. For a dense decoder with \(N\) matmul parameters, \(L\) layers, width \(d\) (more precisely heads times head dimension) and sequence length \(T\), per token:</p>
+  <div class="eq-box">
+  \[ \text{MFU} = \frac{\text{tokens/s per GPU} \times \big(6N + 12\,L\,d\,T\big)}{\text{peak FLOP/s per GPU}} \]
+  <div class="eq-label">PaLM Appendix B; the attention term \(12LdT\) counts the full \(T\times T\) scores, causal counting halves it. For MoE use activated parameters</div>
+  </div>
+  <p><strong>Hardware FLOPs utilization</strong> (HFU) counts what the chip executes, including recomputation. With full recomputation the step runs \(8N\) instead of \(6N\) FLOPs per token, so \(\text{HFU} \approx \tfrac{4}{3}\,\text{MFU}\). PaLM recomputes about 75% of its non-attention forward FLOPs plus all attention forward FLOPs (App. B): 46.2% MFU, 57.8% HFU. With Korthikanti's selective recomputation the ratio is about \(1 + s/(6h)\) <a href="https://arxiv.org/abs/2205.05198">[§6]</a>: for the 175B model \(2048/(6 \cdot 12288) = 0.028\), and 51.4% MFU is indeed 52.8% HFU. PaLM introduced MFU because HFU rewards wasteful recomputation and depends on how operations are counted.</p>
+
+<pre><code class="language-python">def mfu(tokens_per_s_per_gpu, n_params, peak, n_layers=0, d=0, T=0, causal=True):
+    flops_per_token = 6 * n_params + (6 if causal else 12) * n_layers * d * T   # 6N + attention (12 L d T, halved if causal)
+    return tokens_per_s_per_gpu * flops_per_token / peak
+</code></pre>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Run</th><th>Hardware</th><th class="num">MFU</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 175B</td><td>V100</td><td class="num">21.3%</td><td rowspan="4"><a href="https://arxiv.org/abs/2204.02311">PaLM, Tab. 3</a></td></tr>
+      <tr><td>Gopher 280B</td><td>4,096 TPU v3</td><td class="num">32.5%</td></tr>
+      <tr><td>Megatron-Turing NLG 530B</td><td>2,240 A100</td><td class="num">30.2%</td></tr>
+      <tr><td>PaLM 540B</td><td>6,144 TPU v4</td><td class="num">46.2% (HFU 57.8%)</td></tr>
+      <tr><td>Megatron 530B, sequence parallel + selective</td><td>2,240 A100</td><td class="num">54.2%</td><td><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al., abstract</a></td></tr>
+      <tr><td>Megatron 1T, no data parallelism</td><td>512 A100</td><td class="num">56.3% (HFU 57.0%)</td><td><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al., Tab. 5</a></td></tr>
+      <tr class="hl"><td>Llama 3 405B</td><td>8,192 to 16,384 H100</td><td class="num">38% to 43%</td><td><a href="https://arxiv.org/abs/2407.21783">Llama 3, §3.3.2</a></td></tr>
+    </tbody>
+  </table></div>
+  <p>Read these in context. Megatron and PaLM ran on A100 and TPU v4, whose peaks (312 and 275 TFLOP/s) are three to four times below an H100's 989.4, so the same software reaches a lower fraction on H100 when memory and network do not scale with compute. Llama 3's 38% to 43% on H100 BF16 is a good result (page 04 shows how to audit a claim above 50%), and MFU falls with scale at a fixed global batch: 43% to 41% for Llama 3.</p>
+
+  <h3 id="mfu-numbers">Worked numbers</h3>
+  <ol>
+    <li><strong>Llama-3-8B, 64 H100s, 500,000 tokens/s in total, \(s = 8192\).</strong> Per GPU: \(500{,}000/64 = 7{,}812.5\) tokens/s. FLOPs per token with causal attention: \(51.47\) GFLOPs (matmuls \(6 \times 7.505\text{B} = 45.03\) plus \(6 \cdot 32 \cdot 8192 \cdot 4096 = 6.44\) GFLOPs of attention; page 04). Achieved: \(7{,}812.5 \times 51.47\text{G} = 402.1\) TFLOP/s, so <strong>MFU = 402.1/989.4 = 40.6%</strong>. With the naive \(6N = 48.18\) GFLOPs it is 376.4 TFLOP/s, 38.0%: the convention alone moves the number by 2.6 points. Peak matters more: quoting against 1,979 TFLOP/s (the sparsity figure) would halve it.</li>
+    <li><strong>Llama 3 405B.</strong> 430 TFLOP/s per GPU over 989.4 is 43.5%, matching the paper's 43%. With \(6N\) only, that is \(430\text{T}/(6 \cdot 405\text{B}) = 177\) tokens/s per GPU, or 1.45M tokens/s on 8,192 GPUs, so a 16.8M-token batch takes about 11.6 s (my arithmetic; the paper does not give step times).</li>
+    <li><strong>DeepSeek-V3, implied.</strong> The paper gives 180K H800 GPU-hours per trillion tokens, not an MFU. With 37B activated parameters (\(6N_{\text{act}} = 222\) GFLOPs per token): \(10^{12}/(180{,}000 \times 3600) = 1{,}543\) tokens/s per GPU, so at least 343 TFLOP/s of model FLOPs (attention and the MTP module are not counted, so this is a lower bound). That is 34.6% of the 989.4 TFLOP/s BF16 peak but only <span class="unverified" title="Assumes the H800's FP8 tensor-core peak equals the H100 SXM's 1,979 TFLOP/s dense; I did not verify the H800 datasheet">17.3% of the 1,979 TFLOP/s FP8 peak</span> that the run actually computes in. Quoting an MoE's MFU against BF16 peak flatters it.</li>
+  </ol>
+
+  <h3 id="mfu-limits">What holds MFU down</h3>
+  <ul>
+    <li><strong>Exposed communication:</strong> tensor-parallel all-reduces, unhidden DP or FSDP collectives, expert all-to-all.</li>
+    <li><strong>Pipeline bubbles</strong> and stage imbalance (the LM-head stage).</li>
+    <li><strong>Small kernels:</strong> narrow layers, small micro-batches, grouped expert GEMMs with few tokens, memory-bound norms and elementwise ops (<a href="16-gpus-kernels.html">page 16</a>).</li>
+    <li><strong>Stragglers and failures:</strong> Llama 3 saw 466 job interruptions in 54 days on 16K GPUs (419 unexpected, about 78% hardware) yet kept more than 90% effective training time <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.3.4]</a>. MFU measures steady-state math, not this.</li>
+    <li><strong>Recomputation</strong> is not counted as useful work, so it lowers MFU while raising HFU.</li>
+  </ul>
+  <p>For planning, invert the definition: training time \(= 6ND / (G \cdot \text{peak} \cdot \text{MFU})\), as in the 181-day estimate above. Page 34 collects the whiteboard formulas.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"ZeRO-3 sends 3× the data."</strong> It sends \(3N\) against DDP's \(2N\): 1.5×. ZeRO-1 and ZeRO-2 send exactly \(2N\), so they are free memory savings (per step with one micro-batch; with many, ZeRO-2 and ZeRO-3 communicate more often).</li>
+    <li><strong>"bf16 is more precise than fp16."</strong> It has less precision (8 versus 11 significant bits) and far more range. That is why it needs no loss scaling, and why fp32 master weights and accumulation remain: near learning rates of \(10^{-5}\), updates to weights of size 0.02 round away in bf16.</li>
+    <li><strong>"1F1B reduces the pipeline bubble."</strong> Its bubble equals GPipe's; it reduces activation memory (\(p\) micro-batches in flight instead of \(m\)). The bubble shrinks with more micro-batches, interleaving (÷\(v\), \(v\times\) the communication) or a \(B\)/\(W\) split.</li>
+    <li><strong>"The bubble is \((p-1)/(m+p-1)\)."</strong> That is the idle fraction of wall-clock time; \((p-1)/m\) is relative to ideal compute. At \(p = 16\), \(m = 64\): 19.0% and 23.4%. Say which you mean.</li>
+    <li><strong>"Tensor parallelism across nodes is fine with InfiniBand."</strong> For a 70B layer at \(t = 8\), its traffic takes 1.4 times the compute time over a 50 GB/s port, against 16% over NVLink. Keep \(t \le\) GPUs per node.</li>
+    <li><strong>"Activation checkpointing is free memory."</strong> Full recomputation adds a forward pass (+33% FLOPs), lowering MFU and raising HFU. Selective recomputation costs 1.6 to 2.7%.</li>
+    <li><strong>"Sequence parallelism and context parallelism are the same."</strong> Megatron's shards only the norm and dropout regions inside a tensor-parallel group. Context parallelism shards the whole model's activations along the sequence and needs a scheme (ring, all-gather, all-to-all) for attention.</li>
+    <li><strong>"FP8 training means everything is FP8."</strong> DeepSeek-V3 runs the three matmuls per linear layer in FP8, but embeddings, head, MoE gating, norms and attention stay BF16/FP32, master weights and gradients are FP32, and Adam moments BF16.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> How much memory does it take to train a 7B model with AdamW in mixed precision? Where does it go?</summary>
+    <div class="answer">
+      <p>Sixteen bytes per parameter before activations: bf16 weights (2), bf16 gradients (2), an fp32 master copy (4), and Adam's two fp32 moments (4 + 4). For 7B parameters that is 14 GB + 14 GB + 28 GB + 28 GB + 28 GB = <strong>112 GB</strong> (104 GiB), of which 75% is optimizer state. It does not fit on an 80 GB GPU, so the states must be sharded: ZeRO-1 over 8 GPUs gives \(4N + 12N/8 = 28 + 10.5 = 38.5\) GB per GPU, ZeRO-3 gives 14 GB.</p>
+      <p>Activations come on top and scale with tokens in flight: for a 32-layer, 4096-wide model they are tens of GB per 8K-token sequence unless you recompute (see the activation question). Recipes shift the constant: fp32 gradient accumulation (Llama 3) makes it 18 bytes, bf16 Adam moments (DeepSeek-V3) about 14.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why can bf16 skip loss scaling when fp16 cannot? What does bf16 still need?</summary>
+    <div class="answer">
+      <p>The issue with fp16 is <em>range</em>: 5 exponent bits, so values below \(2^{-24} \approx 6\times10^{-8}\) flush to zero, and gradients are dominated by tiny values. Loss scaling multiplies the loss by \(S\) so backpropagation produces gradients \(S\) times larger, shifting them into range; you unscale in fp32 before clipping and skip the step on inf or NaN (Micikevicius et al.: some networks diverge without it, scales of 8 to 128 sufficed). bf16 keeps fp32's 8 exponent bits, so its range is fp32's (\(3.4\times10^{38}\) max, \(1.2\times10^{-38}\) min normal) and nothing needs shifting.</p>
+      <p>bf16 pays with precision: 7 stored mantissa bits, relative step \(2^{-7}\). So it still needs (1) an fp32 master copy, because updates smaller than about 1/256 to 1/512 of a weight round to zero (bf16(0.02) has spacing \(1.2\times10^{-4}\), so an update of \(3\times10^{-5}\) vanishes, and 10,000 of them leave it unchanged while an fp32 copy reaches 0.32), and (2) fp32 accumulation for matmuls, gradient accumulation across micro-batches and gradient reduction.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is MFU and how do you compute it? A Llama-3-8B run on 64 H100s reports 500,000 tokens/s at sequence length 8192. What is its MFU?</summary>
+    <div class="answer">
+      <p>MFU is achieved model FLOP/s divided by the hardware's peak FLOP/s, counting only the FLOPs the model needs (\(6N\) per token plus attention) and not recomputation. Per GPU: \(500{,}000/64 = 7{,}812.5\) tokens/s. FLOPs per token: \(6 \times 7.505\text{B}\) matmul parameters \(+ 6 \cdot 32 \cdot 8192 \cdot 4096\) causal attention \(= 45.03 + 6.44 = 51.47\) GFLOPs. Achieved \(= 402.1\) TFLOP/s. Against the H100 dense bf16 peak of 989.4 TFLOP/s: <strong>40.6%</strong>. With plain \(6N = 48.18\) GFLOPs it is 376.4 TFLOP/s, 38.0%.</p>
+      <p>State your conventions: dense peak (989.4, not the 1,979 sparsity number), which \(N\), whether attention is counted and whether causally. HFU additionally counts recomputed FLOPs (\(\approx \tfrac{4}{3}\) MFU with full recomputation). For a mixture of experts, use activated parameters.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Name the main collectives and say which parallelism uses each. What does a ring all-reduce cost per GPU?</summary>
+    <div class="answer">
+      <p><strong>All-reduce</strong> (everyone gets the sum): DDP gradients, tensor-parallel outputs. <strong>Reduce-scatter</strong> (everyone gets one shard of the sum) and <strong>all-gather</strong> (everyone gets all shards): ZeRO/FSDP, sequence parallelism, all-gather context parallelism. <strong>All-to-all</strong>: MoE dispatch and combine, Ulysses. <strong>Send/receive</strong>: pipeline activations.</p>
+      <p>Ring all-reduce over \(n\) ranks of \(S\) bytes: cut into \(n\) chunks; \(n-1\) reduce-scatter steps and \(n-1\) all-gather steps each move \(S/n\), so each GPU sends \(2\frac{n-1}{n}S\), tending to \(2S\) whatever \(n\) is. Reduce-scatter and all-gather cost \(\frac{n-1}{n}S\) each. Example: 16 GB of bf16 gradients over 64 ranks: \(2 \cdot \tfrac{63}{64} \cdot 16.06 = 31.6\) GB per GPU, 0.63 s at 50 GB/s.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain ZeRO-1, ZeRO-2 and ZeRO-3 and their communication costs.</summary>
+    <div class="answer">
+      <p>All three shard, across the \(N_d\) data-parallel ranks, what plain DP replicates. <strong>ZeRO-1</strong> shards optimizer state: memory \(4N + 12N/N_d\). Reduce-scatter gradients so each rank gets the sum for its shard, update that shard's fp32 master weights, all-gather the new weights: \(N + N = 2N\) elements, the same as the all-reduce it replaces. <strong>ZeRO-2</strong> also shards gradients (reduce-scatter as they are produced, free the rest): \(2N + 14N/N_d\), still \(2N\). <strong>ZeRO-3</strong> also shards parameters: each layer is all-gathered before forward, freed, gathered again for backward, and gradients reduce-scattered: \(3N\), 1.5× DDP, memory \(16N/N_d\).</p>
+      <p>Numbers (7.5B, \(N_d = 64\), ZeRO Table 1): 120, 31.4, 16.6, 1.9 GB. Caveats an interviewer likes: these volumes assume one micro-batch per step; with \(m\) micro-batches ZeRO-2 reduce-scatters and ZeRO-3 re-gathers every micro-batch unless parameters stay resident (Llama 3 keeps them), and ZeRO-3's collectives span the whole DP group, so across nodes it needs prefetch and overlap. Megatron's PTD-P beat ZeRO-3 by 70% at 175B and 530B for that reason.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does tensor parallelism split an MLP and attention? Why keep it within a node?</summary>
+    <div class="answer">
+      <p><strong>MLP:</strong> split \(A\) (\(d \times \dff\)) by columns and \(B\) by rows. Each GPU computes \(\text{act}(XA_i)\) locally (the activation is elementwise, so no synchronization is needed; splitting \(A\) by rows would need a sum before the nonlinearity) and then \(Y_iB_i\), a partial sum of the output. One all-reduce combines them. SwiGLU: gate and up column-parallel, down row-parallel. <strong>Attention:</strong> whole heads per GPU (Q, K, V column-parallel, output projection row-parallel), one all-reduce. So two all-reduces per layer forward and two backward. Embedding is vocabulary-sharded and the loss is fused with the logits to avoid all-gathering \(b \times s \times V\) values.</p>
+      <p><strong>Cost:</strong> \(8\,bsh\,(t-1)/t\) elements per device per layer per micro-batch, on the critical path. Relative to compute it is \(\tfrac{2}{9}(t-1)C/(B_\ell h)\). For a Llama-70B layer at \(t = 8\), \(s = 8192\): 940 MB per layer, 2.1 ms over NVLink against 13.3 ms of compute (16%), 18.8 ms over a 50 GB/s port (141%). Hence \(t \le\) GPUs per node; ZeRO's authors measured about 5 TFLOP/s per V100 for 40B across two nodes. Also \(t\) must divide the heads, and with GQA \(t\) should not exceed the KV-head count.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the pipeline bubble fraction. How do you reduce it?</summary>
+    <div class="answer">
+      <p>With \(p\) stages, \(m\) micro-batches, forward time \(t_f\) and backward time \(t_b\) per stage per micro-batch, GPipe (all forwards, then all backwards) needs \(p-1\) extra steps to fill and \(p-1\) to drain: \(T = (m+p-1)(t_f+t_b)\). Ideal is \(m(t_f+t_b)\), so the bubble is \((p-1)(t_f+t_b)\): \(\tfrac{p-1}{m}\) of ideal time, or \(\tfrac{p-1}{m+p-1}\) of wall-clock time. For \(p = 16\), \(m = 64\): 23.4% and 19.0%.</p>
+      <p>Reduce it by (1) more micro-batches (\(m \ge 4p\)), limited by \(m = B_{\text{global}}/(N_d b)\); (2) interleaving \(v\) chunks per device: bubble \(\div v\), communication \(\times v\) (\(v = 4\): 5.9%); (3) zero-bubble schedules that split backward into \(B\) and \(W\) and use \(W\) to fill gaps (ZB-H1: one third of the bubble at 1F1B memory; ZB-H2: near zero at about twice the activation memory); (4) DualPipe's bidirectional feeding. 1F1B does <em>not</em> reduce the bubble; it caps in-flight micro-batches at \(p\) instead of \(m\), a memory saving.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does DeepSeek-V3 train in FP8, and what does it keep in higher precision?</summary>
+    <div class="answer">
+      <p>All three matmuls of each linear layer (Fprop, Dgrad, Wgrad) run in FP8 E4M3, with BF16 or FP32 outputs. Instead of one scale per tensor, it uses <strong>1×128 tiles</strong> for activations and <strong>128×128 blocks</strong> for weights, each with its own online-computed scale, so an outlier only damages its own group and E4M3 (3 mantissa bits) can be used for gradients too, in place of the usual E5M2. Hopper tensor cores accumulate FP8 products with only about 14 bits (about 2% error at \(K = 4096\) in their test), so every 128 elements along \(K\) the partial sums are promoted to FP32 on CUDA cores, where the scales are also applied.</p>
+      <p>Kept in BF16/FP32: embeddings, output head, MoE gating, normalizations, attention operators. Master weights and gradients FP32, Adam moments BF16. Cached activations FP8 (E5M6 for one), MoE dispatch FP8 and combine BF16. Result: relative loss error under 0.25% versus BF16 at about 1T tokens. For comparison, the hybrid recipe (E4M3 forward, E5M2 gradients, per-tensor delayed scaling) needs no custom accumulation but is more outlier-sensitive.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> A 32-layer, 4096-wide model with 32 heads trains at sequence length 8192 and micro-batch 1. Estimate activation memory and say how you would reduce it.</summary>
+    <div class="answer">
+      <p>Use Korthikanti's per-layer \(sbh(34 + 5as/h)\) bytes with \(sbh = 8192 \cdot 1 \cdot 4096 = 33.55\)M: the factor is \(34 + 5 \cdot 32 \cdot 8192/4096 = 354\), so 11.9 GB per layer and <strong>380 GB</strong> for 32 layers, 90% of it from the \(s^2\) attention-score terms. Options:</p>
+      <ul>
+        <li><strong>Selective recomputation</strong> or a fused attention kernel that never stores scores: factor 34, 1.14 GB per layer, <strong>36.5 GB</strong>, for a few percent of FLOPs.</li>
+        <li><strong>Full recomputation:</strong> keep each layer's input, \(2sbh\): <strong>2.1 GB</strong>, but +33% FLOPs.</li>
+        <li><strong>Tensor parallelism \(t = 8\) with sequence parallelism and selective recomputation:</strong> \(34/8 = 4.25\), <strong>4.6 GB</strong> per GPU. Tensor parallelism alone leaves \(10 + 24/8 = 13\) because norms and dropouts are replicated; sequence parallelism shards those too at no extra bytes.</li>
+      </ul>
+      <p>Pipeline parallelism does not help: the first stage holds \(p\) micro-batches of \(L/p\) layers, \(L\) layers' worth. Caveat: these constants are for GPT-style blocks (GeLU, 4h MLP, dropout); SwiGLU/GQA shift the constant but not the scaling.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> FSDP (ZeRO-3) sends 1.5× the data of DDP. When does that hurt, and how do you mitigate it?</summary>
+    <div class="answer">
+      <p>It hurts when gathers cannot hide behind compute: (1) <strong>many micro-batches:</strong> with reshard-after-forward, each micro-batch does two all-gathers and a reduce-scatter; Llama-3-8B on 64 GPUs with 8 micro-batches would move about 379 GB per GPU per step (7.6 s at 50 GB/s) against an 8 s step; (2) <strong>slow links:</strong> collectives span all \(N_d\) ranks, across nodes; (3) <strong>small micro-batches or models:</strong> too little compute per gathered byte.</p>
+      <p>Mitigations: keep gathered parameters after forward (Llama 3's variant); <strong>hybrid sharding</strong>, sharding inside a node over NVLink and replicating across nodes (cross-node traffic falls from 47 GB to about 3.5 GB in the 8B example); prefetching and a rate limiter; bigger micro-batches; ZeRO-1 or ZeRO-2 if states fit; or pipeline parallelism, which shrinks each rank's shard so DP collectives are smaller and once per step.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Llama 3 405B uses TP8 × CP × PP16 × DP with FSDP. Why that order, and what changes for 128K context?</summary>
+    <div class="answer">
+      <p>[TP, CP, PP, DP] runs from most to least communication-intensive, mapped from fastest to slowest links. TP (per-layer all-reduces) and CP (per-layer all-gathers) need NVLink inside a node. PP sends only activations between stages, tolerable over the network. DP/FSDP does bulk collectives once per step, which prefetching and overlap can hide on the slowest links. Phase 1 is TP8 × PP16 × DP64 = 8,192 GPUs at 43% MFU (430 TFLOP/s per GPU); DP128 on 16,384 GPUs gives 41% because the batch per DP group shrinks.</p>
+      <p>At 128K one sequence's activations no longer fit, so CP goes from 1 to 16 and DP drops to 8 (TP8 × CP16 × PP16 × DP8 = 16,384), at 38% MFU. Llama 3 uses all-gather CP: \(K\) and \(V\) are small thanks to GQA, attention compute is \(O(S^2)\) against \(O(S)\) communication, and document masks are easy. It cuts the sequence into \(2\,\text{CP}\) chunks and gives rank \(i\) chunks \(i\) and \(2\,\text{CP}-1-i\) to balance causal work.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain expert parallelism, and why DeepSeek-V3 caps each token at 4 nodes.</summary>
+    <div class="answer">
+      <p>Experts live on different GPUs. Each MoE layer does an all-to-all dispatch (tokens travel to their experts' GPUs), expert compute, and an all-to-all combine, twice in forward and twice in backward. Attention and dense parts stay data-parallel; expert gradients reduce only among replicas of the same expert. It is needed because experts are almost all the parameters (654B of 671B in V3) and the cost is bandwidth: per token and selected expert, \(d\) bytes in FP8 out and \(2d\) in BF16 back.</p>
+      <p>V3's cluster has NVLink at 160 GB/s and InfiniBand at 50 GB/s (3.2×). Limiting each token to at most 4 nodes bounds IB traffic: a token goes once over IB to the GPU with the same in-node index on each target node, then fans out over NVLink (3.2 experts per node on average at no extra NVLink overhead), and 20 SMs suffice to saturate both links. Even so the all-to-all is about as long as the compute, so DualPipe overlaps them. V4 goes further with a fused kernel that splits experts into waves so compute, dispatch and combine pipeline across waves (1.50 to 1.73× measured for inference workloads).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Plan the parallelism for training a 70B dense model on 1,024 H100s with 8K context.</summary>
+    <div class="answer">
+      <p>Config (Llama-3-70B): \(L = 80\), \(d = 8192\), 64 heads, 8 KV heads, \(N = 70.55\)B. Batch \(2^{24}\) tokens = 2,048 sequences.</p>
+      <ol>
+        <li><strong>States:</strong> \(16N = 1.13\) TB, impossible to replicate.</li>
+        <li><strong>TP = 8</strong> in the node: 940 MB per layer per micro-batch, 2.1 ms on NVLink versus 13.3 ms compute (16%); 141% over IB, so never wider than a node.</li>
+        <li><strong>PP = 4</strong> (20 layers per stage): DP \(= 32\), \(m = 2048/32 = 64\), bubble \(3/64 = 4.7\%\) (2.3% with \(v = 2\)); activations cross stage boundaries as 134 MB per micro-batch, 1% of stage compute on IB.</li>
+        <li><strong>ZeRO-1</strong> over DP = 32: RS + AG of 4.4 GB each per step, 0.17 s of a 17.5 s step.</li>
+      </ol>
+      <p>Memory per GPU: 4.4 (weights) + 4.4 (grads) + 0.8 (ZeRO-1 optimizer) + 22.8 (first-stage activations, \(34\,sbhL/t\) with sequence parallel and selective recompute) = 32.5 GB, plenty of slack. PP = 2 (41 GB) or 1 (59 GB) also fit and remove the bubble, but the DP shard grows 2 to 4× and FSDP-only variants gather 17.6 GB per micro-batch. Estimated time: 17.5 s per step at 40% MFU; 15T tokens would take about 181 days. What I would check on hardware: bubble and stage imbalance (LM-head stage), exposed TP traffic, straggler and restart behavior, and whether MFU is near 40% or the bubble or all-reduce is bigger than modeled.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> DeepSeek-V3 trains without tensor parallelism. Reconstruct why that works, and what would break for a dense model of the same total size.</summary>
+    <div class="answer">
+      <p>Layout: 2,048 GPUs = 16 pipeline stages × 128 GPUs, experts sharded 64 ways (4 per MoE layer per GPU), ZeRO-1. Parameters per GPU: routed experts \(654\text{B}/16/64 = 0.64\)B plus everything else \(17.1\text{B}/16 = 1.07\)B, about 1.7B in total, 31 GB even at 18 B per parameter unsharded. So memory needs no tensor parallelism. Communication is all-to-all (overlapped by DualPipe) and small point-to-point pipeline traffic, not per-layer all-reduces on the critical path, and the expert GEMMs (\(d_e = 2048\)) are already small enough that splitting them would hurt efficiency. Recomputing RMSNorm and MLA up-projections trims activations.</p>
+      <p>A dense 671B model has none of this. With no expert dimension to absorb 97% of the parameters, each layer's dense weights are 18 times larger, so PP and ZeRO alone leave huge shards: you would need TP (cheap for wide layers, traffic \(\propto 1/h\)) and/or FSDP gathers of enormous tensors. Sparsity turns a memory problem into an all-to-all bandwidth problem, which DeepSeek solved with node-limited routing, DualPipe and custom kernels.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How do zero-bubble pipeline schedules work? What do they cost?</summary>
+    <div class="answer">
+      <p>Split each stage's backward pass into \(B\) (gradient with respect to the input, which the previous stage waits for) and \(W\) (gradient with respect to the weights, needed only by the optimizer). \(F\) and \(B\) keep their cross-stage dependency chain, but \(W\) can run any time after its \(B\) on the same stage, so a scheduler drops \(W\) into would-be bubbles. For a transformer layer \(T_B + T_W = 2T_F\). ZB-H1 starts \(B\) earlier and fills the tail with \(W\): bubble \((p-1)(T_F + T_B - T_W)\), one third of 1F1B's for equal times, at 1F1B's peak memory. ZB-H2 adds warm-up forwards to get near zero bubble but peaks at \(2p-1\) micro-batches of activations. Reported: up to 23% more throughput than 1F1B at similar memory, 31% with more, and bubble rates under 1% in most settings once a search fits the schedule to profiled \(T_F, T_B, T_W\).</p>
+      <p>Costs: memory (ZB-H2), and the optimizer step. Global gradient-norm clipping and NaN checks synchronize all stages and would rebuild the bubble, so the paper takes an optimistic step, validates afterward and rolls back if needed. DualPipe builds on the \(B\)/\(W\) split (bubble \((PP/2-1)(F\&B + B - 3W)\)) and adds bidirectional feeding with forward/backward overlap to hide expert all-to-alls, at the price of two parameter copies.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> The same model and data give different loss curves on an 8-GPU tensor-parallel run and a 512-GPU FSDP plus pipeline run. How do you debug it?</summary>
+    <div class="answer">
+      <p>Separate bugs from numerics. <strong>Semantics first:</strong> same global batch, learning-rate schedule and data order; loss normalized by the global token count (not per-micro-batch or per-rank means, which reweight sequences); dropout RNG seeded correctly per tensor-parallel rank; identical document and padding masks; clipping on the true global norm; sharded optimizer state not dropping padded or unassigned parameters.</p>
+      <p><strong>Numerics:</strong> floating-point addition is not associative, so reduction order matters, and low-precision reductions amplify it. Llama 3 compared loss across parallelism setups and fixed numerical issues by accumulating gradients in FP32 across micro-batches and reduce-scattering in FP32 across data-parallel ranks. DeepSeek-V4 goes to batch-invariant, deterministic kernels so runs can be compared bit for bit. Procedure: from identical weights, run one step in fp32 or fp64 and compare loss, per-layer activations and gradient norms between layouts (the first divergent layer localizes the bug); then repeat in bf16, and if only that diverges, inspect accumulation and reduction precision before touching hyperparameters.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Distributed training by simulation.</strong> No GPUs or process groups: ranks are list entries. Implement <code>ring_allreduce</code> (reduce-scatter plus all-gather over a ring, returning each rank's result and the bytes each rank sent, which the test checks against \(2(n-1)/n\) of the tensor and against the exact schedule for uneven chunks), <code>column_row_parallel_mlp</code> and <code>head_parallel_attention</code> (per-rank partial outputs that sum to the dense result, with a test that each rank reads only its own shards). Then the formula functions: <code>training_memory_bytes</code> for ZeRO stages 0 to 3 (checked against Table 1 of the ZeRO paper), <code>zero_comm_bytes_per_step</code>, <code>pipeline_bubble</code> and <code>mfu</code> (checked against Llama 3 405B and PaLM), and, as a bonus, <code>simulate_1f1b</code>, an event simulator that reproduces the closed-form bubble and the \(p-i\) in-flight micro-batches of 1F1B against GPipe's \(m\). An interviewer would expect <code>ring_allreduce</code> and the tensor-parallel MLP in about 30 minutes, and each formula function in 5. <span class="ex-path">exercises/drills/parallel.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_parallel.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/1910.02054">Rajbhandari et al. (2020). ZeRO: Memory Optimizations Toward Training Trillion Parameter Models.</a> <span class="why">Why read it: the \(2N + 2N + KN\) accounting, stages 1 to 3, Table 1, and the communication analysis (§7) behind "1.5×".</span></li>
+    <li><a href="https://arxiv.org/abs/2304.11277">Zhao et al. (2023). PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel.</a> <span class="why">Why read it: FlatParameters, hybrid sharding, prefetching and the rate limiter, with real scaling numbers.</span></li>
+    <li><a href="https://arxiv.org/abs/1909.08053">Shoeybi et al. (2019). Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.</a> <span class="why">Why read it: column/row parallelism in three pages; the \(f\) and \(g\) operators.</span></li>
+    <li><a href="https://arxiv.org/abs/2104.04473">Narayanan et al. (2021). Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM.</a> <span class="why">Why read it: the bubble derivation, the interleaved schedule, tensor-versus-pipeline traffic, and the three takeaways for combining parallelism.</span></li>
+    <li><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al. (2022). Reducing Activation Recomputation in Large Transformer Models.</a> <span class="why">Why read it: the \(sbh(34 + 5as/h)\) derivation, sequence parallelism, selective recomputation, and the first MFU/HFU tables.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.10241">Qi et al. (2023). Zero Bubble Pipeline Parallelism</a> (with <a href="https://arxiv.org/abs/1811.06965">Huang et al. 2018, GPipe</a>). <span class="why">Why read it: the \(B\)/\(W\) split, ZB-H1/H2 and the post-validation trick; GPipe for the original micro-batch pipeline.</span></li>
+    <li><a href="https://arxiv.org/abs/2209.05433">Micikevicius et al. (2022). FP8 Formats for Deep Learning</a> (with <a href="https://arxiv.org/abs/1710.03740">Micikevicius et al. 2017, Mixed Precision Training</a>). <span class="why">Why read it: E4M3 and E5M2 bit layouts and scaling; the 2017 paper for master weights and loss scaling.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report</a> and <a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4.</a> <span class="why">Why read them: V3 §3.2 to 3.3 (layout, DualPipe Table 2, all-to-all, fine-grained FP8); V4 §3 (fused MoE kernel, deterministic kernels, Muon-aware ZeRO, two-stage CP, tensor-level checkpointing) and §5.2.1 (FP4 QAT).</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">Why read it: §3.3, the only public 4D-parallel layout at 16K GPUs with a per-configuration MFU table.</span></li>
+    <li><a href="https://arxiv.org/abs/2204.02311">Chowdhery et al. (2022). PaLM: Scaling Language Modeling with Pathways.</a> <span class="why">Why read it: the definition of MFU versus HFU (§4.1, App. B) and a pipeline-free TPU layout.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>States:</strong> \(16N\) bytes = 2 (bf16 weights) + 2 (grads) + 12 (fp32 master, Adam \(m\), \(v\)). 7B: 112 GB; Llama-3-8B: 128.5 GB. 18 with fp32 grads (Llama 3), about 14 with bf16 moments (V3).</li>
+      <li><strong>ZeRO (\(N_d\) ranks):</strong> DDP \(16N\), comm \(2N\). Z1 \(4N + 12N/N_d\), \(2N\). Z2 \(2N + 14N/N_d\), \(2N\). Z3/FSDP \(16N/N_d\), \(3N\) (1.5×), per micro-batch for Z2/Z3 unless parameters stay resident. 7.5B at \(N_d = 64\): 120 / 31.4 / 16.6 / 1.9 GB.</li>
+      <li><strong>Activations per layer:</strong> \(sbh(34 + 5as/h)\) bytes, with \(5as/h = 5s/d_h\). TP: \(10 + 24/t + 5as/(ht)\); TP+SP: \(/t\); selective: 34; full: 2. Llama-3-8B, \(s = 8192\): 354 (380 GB) → 34 (36.5 GB) → 2 (2.1 GB). Pipeline does not reduce it.</li>
+      <li><strong>Recompute:</strong> full = +33% FLOPs (\(8N\) vs \(6N\)); selective = 1.6 to 2.7%. HFU ≈ 4/3 MFU (full), MFU × (1 + \(s/6h\)) (selective).</li>
+      <li><strong>Formats:</strong> bf16 = fp32 range, 8 significant bits; fp16 min \(2^{-24}\), needs loss scaling; E4M3 max 448, E5M2 max 57,344, E2M1 max 6. bf16 drops updates below about \(|w|/256\): keep fp32 masters and accumulation.</li>
+      <li><strong>DeepSeek-V3 FP8:</strong> E4M3 everywhere, 1×128 activation tiles and 128×128 weight blocks (online scales), FP32 promotion every 128 elements of \(K\), BF16/FP32 for embeddings, head, gating, norms, attention; loss error under 0.25%. V4: FP4 QAT for experts and indexer QK, dequantized to FP8 losslessly.</li>
+      <li><strong>Collectives (ring):</strong> all-reduce \(2\frac{n-1}{n}S\); reduce-scatter, all-gather, all-to-all \(\frac{n-1}{n}S\). Links: HBM 3.35 TB/s, NVLink 900 GB/s aggregate, IB 400 Gbps = 50 GB/s per GPU (V3's H800: NVLink 160 vs 50).</li>
+      <li><strong>TP:</strong> column then row split, heads split; 2 all-reduces forward + 2 backward per layer; \(8bsh(t-1)/t\) elements; comm/compute \(\approx \tfrac{2}{9}(t-1)C/(B_\ell h)\). 70B layer at \(t = 8\): 16% on NVLink, 141% on IB. SP: same bytes, activations \(/t\).</li>
+      <li><strong>Pipeline:</strong> \(T = (m+p-1)(t_f+t_b)\); bubble/ideal \((p-1)/m\), idle \((p-1)/(m+p-1)\): 23.4% / 19.0% at \(p = 16\), \(m = 64\). 1F1B: same bubble, \(p\) in flight. Interleaving: bubble ÷\(v\), comm ×\(v\). ZB-H1: ⅓ bubble. DualPipe: \((PP/2-1)(F\&B+B-3W)\), 2× params.</li>
+      <li><strong>EP / CP:</strong> EP = 2 all-to-alls per MoE layer per direction; V3: at most 4 nodes per token, IB then NVLink. CP: ring needs blocks \(\ge F/B\) tokens; Llama 3 all-gathers K, V (GQA), \(2c\) chunks.</li>
+      <li><strong>Layouts:</strong> [TP, CP, PP, DP] inner to outer. Llama 3 405B: TP8×PP16×DP64 (8,192 GPUs) 43%; DP128 41%; 128K: TP8×CP16×PP16×DP8 38%. DeepSeek-V3: PP16×EP64×ZeRO-1, no TP, about 1.7B params per GPU. PaLM: 12-way MP × 256-way FSDP, 46.2%.</li>
+      <li><strong>MFU:</strong> tokens/s/GPU × (\(6N\) + attention) / peak; H100 989.4 TFLOP/s dense bf16 (1,979 with sparsity). 500K tok/s on 64 H100s, Llama-3-8B: 40.6%. Time \(= 6ND/(G \cdot \text{peak} \cdot \text{MFU})\).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

@@ -132,11 +132,18 @@ def test_accuracy_ci_wald_degenerates_at_the_edges_but_wilson_does_not(impl):
     _, lo, hi = impl.accuracy_ci(0, 30, method="wald")
     assert (lo, hi) == (0.0, 0.0)                                   # zero-width interval: the Wald failure
     _, lo, hi = impl.accuracy_ci(0, 30, method="wilson")
-    assert lo == 0.0 and 0.05 < hi < 0.2
+    assert lo == pytest.approx(0.0, abs=1e-12) and 0.05 < hi < 0.2
     _, lo, hi = impl.accuracy_ci(30, 30, method="wilson")
-    assert hi == 1.0 and 0.8 < lo < 0.95
+    assert hi == pytest.approx(1.0, abs=1e-12) and 0.8 < lo < 0.95
     p, lo, hi = impl.accuracy_ci(3, 30, method="wilson")
     assert 0.0 <= lo < p < hi <= 1.0
+
+
+def test_accuracy_ci_is_clipped_to_the_unit_interval(impl):
+    p, lo, hi = impl.accuracy_ci(3, 30, method="wald")      # raw Wald interval is [-0.007, 0.207]
+    assert p == pytest.approx(0.1) and lo == 0.0 and hi == pytest.approx(0.1 + 1.96 * math.sqrt(0.09 / 30))
+    p, lo, hi = impl.accuracy_ci(27, 30, method="wald")     # raw Wald interval reaches 1.007
+    assert hi == 1.0 and lo == pytest.approx(0.9 - 1.96 * math.sqrt(0.09 / 30))
 
 
 def test_accuracy_ci_wilson_formula(impl):
@@ -192,9 +199,10 @@ def test_paired_bootstrap_reproducible_and_seed_sensitive(impl):
 
 
 def test_paired_bootstrap_matches_analytic_paired_interval(impl):
-    # 500 questions; A is right / B wrong on 40, B right / A wrong on 25 (the page example)
-    a = np.array([1] * 40 + [0] * 25 + [1] * 300 + [0] * 135)
-    b = np.array([0] * 40 + [1] * 25 + [1] * 300 + [0] * 135)
+    # 500 questions; A is right / B wrong on 40, B right / A wrong on 25 (the page example: 72% against 69%)
+    a = np.array([1] * 40 + [0] * 25 + [1] * 320 + [0] * 115)
+    b = np.array([0] * 40 + [1] * 25 + [1] * 320 + [0] * 115)
+    assert a.mean() == pytest.approx(0.72) and b.mean() == pytest.approx(0.69)
     d, lo, hi = impl.paired_bootstrap(a, b, n_boot=4000, seed=0)
     n = len(a)
     diff = a - b
@@ -203,6 +211,27 @@ def test_paired_bootstrap_matches_analytic_paired_interval(impl):
     assert se == pytest.approx(0.0161, abs=1e-3)
     assert (hi - lo) / 2 == pytest.approx(1.96 * se, rel=0.12)
     assert lo < 0.0 < hi                            # not significant at 5%, as computed on the page
+
+
+def test_paired_bootstrap_alpha_controls_the_width(impl):
+    rng = np.random.default_rng(11)
+    a = rng.integers(0, 2, 400)
+    b = rng.integers(0, 2, 400)
+    _, lo95, hi95 = impl.paired_bootstrap(a, b, n_boot=3000, seed=0, alpha=0.05)
+    _, lo50, hi50 = impl.paired_bootstrap(a, b, n_boot=3000, seed=0, alpha=0.50)
+    assert (hi50 - lo50) < 0.5 * (hi95 - lo95)      # a 50% interval is about a third as wide as a 95% one
+    assert lo95 <= lo50 <= hi50 <= hi95             # nested: same resamples, different quantiles
+
+
+def test_paired_bootstrap_is_a_percentile_interval(impl):
+    # 3 of 100 questions favor A, none favor B. Every resampled mean lies in [0, 1] and P(mean = 0) = 0.97**100
+    # = 4.8% > 2.5%, so the percentile interval starts at exactly 0. A mean +/- 1.96 SD interval would not.
+    a = np.array([1] * 3 + [0] * 97)
+    b = np.zeros(100, dtype=int)
+    d, lo, hi = impl.paired_bootstrap(a, b, n_boot=4000, seed=0)
+    assert d == pytest.approx(0.03)
+    assert lo == 0.0
+    assert 0.03 < hi <= 0.08
 
 
 def test_paired_bootstrap_uses_pairing(impl):

@@ -99,6 +99,25 @@ def test_merge_equals_unmerged_and_unmerge_restores(impl):
     torch.testing.assert_close(m(x), y_unmerged, atol=1e-5, rtol=1e-5)
 
 
+def test_adapter_dtype_follows_base(impl):
+    base = _layer().double()
+    m = impl.LoRALinear(base, r=3, alpha=6)
+    assert m.lora_A.dtype == torch.float64 and m.lora_B.dtype == torch.float64
+    x = torch.randn(4, 24, dtype=torch.float64)
+    assert m(x).dtype == torch.float64
+
+
+def test_unmerge_without_merge_is_noop(impl):
+    base = _layer()
+    m = impl.LoRALinear(base, r=4, alpha=8)
+    with torch.no_grad():
+        m.lora_B.normal_()
+    w0 = base.weight.detach().clone()
+    m.unmerge()
+    assert not m.merged
+    assert torch.equal(base.weight.detach(), w0)
+
+
 def test_no_bias_layer(impl):
     base = _layer(bias=False)
     m = impl.LoRALinear(base, r=2, alpha=2)

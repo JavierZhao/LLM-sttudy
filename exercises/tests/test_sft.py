@@ -223,6 +223,26 @@ def test_packed_lm_loss_never_predicts_across_document_boundary(impl):
     assert math.isclose(got_seq.item(), expect, rel_tol=1e-5)
 
 
+def test_token_reduction_equals_cross_entropy_with_ignore_index(impl):
+    # The page's sft_loss masks labels with -100 and calls F.cross_entropy(..., ignore_index=-100).
+    # With one document per row and no padding, the "token" reduction must be the same number.
+    torch.manual_seed(3)
+    B, T, V = 3, 10, 13
+    logits = torch.randn(B, T, V)
+    ids = torch.randint(0, V, (B, T))
+    mask = torch.rand(B, T) > 0.5
+    mask[:, -1] = True                                        # at least one counted target
+    doc = torch.zeros(B, T, dtype=torch.long)
+    labels = ids.masked_fill(~mask, -100)
+    ref = F.cross_entropy(logits[:, :-1].flatten(0, 1), labels[:, 1:].flatten(), ignore_index=-100)
+    got = impl.packed_lm_loss(logits, ids, mask, doc, "token")
+    torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-5)
+    # the first token of a row is only ever an input (nothing predicts it), so changing it cannot change the loss
+    ids2 = ids.clone()
+    ids2[:, 0] = (ids2[:, 0] + 1) % V
+    assert torch.allclose(impl.packed_lm_loss(logits, ids2, mask, doc, "token"), got)
+
+
 def test_packed_lm_loss_empty_and_gradient(impl):
     logits = torch.randn(1, 5, 7, requires_grad=True)
     ids = torch.randint(0, 7, (1, 5))

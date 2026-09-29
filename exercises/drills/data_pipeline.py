@@ -4,8 +4,9 @@ Implement the functions below. Run:
     pytest exercises/tests/test_data_pipeline.py
 
 Conventions (the tests rely on all of them):
-- Documents are plain strings. "Words" for shingling are lowercase runs of [A-Za-z0-9_]
-  (re.findall(r"\\w+", text.lower())). The Gopher filter uses its own, simpler word definition
+- Documents are plain strings. "Words" for shingling are lowercase runs of Unicode word
+  characters (letters, digits and underscore in any script;
+  re.findall(r"\\w+", text.lower())). The Gopher filter uses its own, simpler word definition
   (whitespace split), documented on that function.
 - Use only the standard library and numpy. Do not use Python's built-in hash() for strings:
   it is salted per process, so signatures would not be reproducible.

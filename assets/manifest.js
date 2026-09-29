@@ -41,7 +41,7 @@ window.LLM_MANIFEST = {
     {
       id: "III", title: "Pretraining & systems",
       pages: [
-        { n: "12", drills: ["data_pipeline"], slug: "12-pretraining-data", title: "Pretraining data", tier: "P0", minutes: 60, status: "planned",
+        { n: "12", drills: ["data_pipeline"], slug: "12-pretraining-data", title: "Pretraining data", tier: "P0", minutes: 60, status: "written",
           desc: "Common Crawl pipelines, heuristic and model-based filtering, dedup, mixtures, annealing, synthetic data, contamination." },
         { n: "13", drills: ["scaling"], slug: "13-scaling-laws", title: "Scaling laws", tier: "P0", minutes: 60, status: "written",
           desc: "Kaplan vs Chinchilla, IsoFLOP analysis, C≈6ND, overtraining for inference, data-constrained and MoE scaling." },

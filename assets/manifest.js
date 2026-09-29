@@ -64,7 +64,7 @@ window.LLM_MANIFEST = {
           desc: "Chat formatting, loss masking, packing, data quality, rejection sampling, logit/sequence/on-policy distillation." },
         { n: "20", drills: ["lora"], slug: "20-peft-lora", title: "Parameter-efficient finetuning (LoRA, QLoRA)", tier: "P1", minutes: 40, status: "planned",
           desc: "LoRA math and initialization, α/r, QLoRA and NF4, DoRA, what low-rank updates cannot do." },
-        { n: "21", drills: ["dpo"], slug: "21-preference-optimization", title: "Reward models & preference optimization (DPO family)", tier: "P0", minutes: 65, status: "planned",
+        { n: "21", drills: ["dpo"], slug: "21-preference-optimization", title: "Reward models & preference optimization (DPO family)", tier: "P0", minutes: 65, status: "written",
           desc: "Bradley-Terry reward models, over-optimization, the full DPO derivation, IPO/KTO/ORPO/SimPO, online DPO." }
       ]
     },

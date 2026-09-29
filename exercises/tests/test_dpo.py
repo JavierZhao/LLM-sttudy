@@ -203,6 +203,21 @@ def test_dpo_label_smoothing_is_cdpo(impl):
     assert a.item() > math.log(2) and b.item() > math.log(2)
 
 
+def test_cdpo_gradient_weight_is_dpo_weight_minus_eps(impl):
+    # Chowdhury et al. 2024, Lemma 3.2: the cDPO gradient weight is sigma(-m) - eps.
+    beta, eps = 0.1, 0.1
+    pw, pl, rw_, rl_ = (x.clone() for x in args(A))
+    pw.requires_grad_(), pl.requires_grad_()
+    impl.dpo_loss(pw, pl, rw_, rl_, beta, label_smoothing=eps)[0].sum().backward()
+    w = 1.0 / (1.0 + math.exp(0.8)) - eps                          # sigma(-0.8) - 0.1 = 0.2100
+    assert abs(pw.grad.item() + beta * w) < 1e-9
+    assert abs(pl.grad.item() - beta * w) < 1e-9
+    # eps = 0.5 makes the loss even in the margin, so the gradient vanishes at margin 0
+    z = [t(-3.0).requires_grad_() for _ in range(2)]
+    impl.dpo_loss(z[0], z[1], t(-3.0), t(-3.0), beta, label_smoothing=0.5)[0].sum().backward()
+    assert abs(z[0].grad.item()) < 1e-12 and abs(z[1].grad.item()) < 1e-12
+
+
 # ----------------------------------------------------------------------------- IPO
 def test_ipo_values_and_two_sided_penalty(impl):
     # h = 8 for pair A; tau = 0.1 -> target 5 -> loss 9

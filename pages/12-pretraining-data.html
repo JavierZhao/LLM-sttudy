@@ -1,0 +1,843 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Pretraining data · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="12" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part III · Pretraining &amp; systems · Page 12</div>
+  <h1>Pretraining data</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~60 min</span>
+    <span>Prereqs: <a href="01-big-picture.html">01 Big picture</a>, <a href="02-tokenization.html">02 Tokenization</a></span>
+  </div>
+  <p class="lede">A language model is a compressed copy of its training distribution, so the pipeline that turns a web crawl into tokens matters as much as the architecture. This page follows that pipeline stage by stage (text extraction, filtering, deduplication, model-based quality scores), then covers how mixture weights are chosen, why the last few percent of training use different data, what to do when unique tokens run out, how contamination is handled, and how labs decide any of this with experiments they can afford.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Pipeline design:</strong> "How would you build a 15T-token corpus from Common Crawl?" Expect an ordered list of stages, the reason for the order, and what you would measure at each step.</li>
+    <li><strong>MinHash LSH from first principles:</strong> why the collision probability of one minhash equals the Jaccard similarity, the \(1-(1-s^r)^b\) S-curve, and how to pick bands and rows for a threshold.</li>
+    <li><strong>Quality versus quantity:</strong> what model-based filters (FineWeb-Edu, DCLM) buy, what they cost in diversity and unique tokens, and why global deduplication can hurt.</li>
+    <li><strong>Mixtures and schedules:</strong> how domain weights are chosen (small-model sweeps, DoReMi, RegMix), and what annealing or mid-training does.</li>
+    <li><strong>Data-constrained training:</strong> "You have 2T good tokens and a budget for 8T": repetition, code, rephrasing, and their limits.</li>
+    <li><strong>Evidence hygiene:</strong> contamination detection, proxy-model experiments, and why perplexity alone misleads.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Lay out a Common Crawl to corpus pipeline in order, giving for each stage a documented threshold or number (Gopher, C4 and FineWeb rules; FineWeb and DCLM token counts).</li>
+    <li>Derive the MinHash collision probability and the LSH S-curve, compute candidate probabilities for a given bands by rows configuration, and choose one for a similarity threshold.</li>
+    <li>Explain the FineWeb finding that global MinHash deduplication is worse than per-snapshot deduplication, and the competing evidence.</li>
+    <li>Compare GPT-3, FineWeb-Edu, DCLM and Nemotron-CC quality filters, and name the risks (topic sculpting, unique-token starvation).</li>
+    <li>Describe three ways to set mixture weights (small-model sweeps, DoReMi, RegMix) with their costs, and compute epochs per domain from weights.</li>
+    <li>Explain annealing and mid-training with the Llama 3 and OLMo 2 evidence, and use the effective-data formula of Muennighoff et al. to size a repetition plan.</li>
+    <li>Describe n-gram decontamination and its limits, and design a proxy-model experiment for a data decision.</li>
+  </ul>
+</section>
+
+
+<section>
+  <h2 id="web-pipeline">From crawl to corpus: sources and the web pipeline</h2>
+
+  <p><strong>Pretraining data</strong> <span class="zh">预训练数据</span> is a mixture of domains. The bulk is web text, usually from Common Crawl (a public archive of web snapshots) or a lab's own crawler. Around it sit code (The Stack and similar), mathematics, books, academic papers (increasingly from OCR of PDFs), Wikipedia (tiny, but repeated many times) and non-English text. Every domain is put through the same three questions: is it text, is it good, is it new.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model or corpus</th><th class="num">Training tokens</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 (2020)</td><td class="num">300B</td><td>Filtered Common Crawl: 570GB, about 400B tokens <a href="https://arxiv.org/abs/2005.14165">[GPT-3, §2.2]</a></td></tr>
+      <tr><td>Llama 3</td><td class="num">about 15T</td><td>405B model: 15.6T <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §1]</a></td></tr>
+      <tr><td>DeepSeek-V3</td><td class="num">14.8T</td><td>More math and code than V2 <a href="https://arxiv.org/abs/2412.19437">[V3, §4.1]</a></td></tr>
+      <tr><td>Qwen3</td><td class="num">36T</td><td>119 languages <a href="https://arxiv.org/abs/2505.09388">[Qwen3, §3.1]</a></td></tr>
+      <tr><td>DeepSeek-V4-Flash / Pro</td><td class="num">32T / 33T</td><td>April 2026 preview <a href="https://arxiv.org/abs/2606.19348">[V4, §1]</a></td></tr>
+      <tr><td>OLMo 2 7B</td><td class="num">4.05T</td><td>3.90T in the first stage <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.3]</a></td></tr>
+      <tr><td>FineWeb, FineWeb-Edu</td><td class="num">15T, 1.3T</td><td>96 snapshots, GPT-2 tokenizer <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §3.7, §4]</a></td></tr>
+      <tr><td>DCLM-Pool, DCLM-Baseline</td><td class="num">240T, 3.8T</td><td>GPT-NeoX tokens <a href="https://arxiv.org/abs/2406.11794">[DCLM, §3.1, §2]</a></td></tr>
+      <tr><td>Nemotron-CC</td><td class="num">6.3T</td><td>4.4T real plus 1.9T synthetic <a href="https://arxiv.org/abs/2412.02595">[Nemotron-CC, §2.4]</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Three readings. Llama-3-8B saw \(15\text{T}/8.03\text{B} \approx 1{,}868\) tokens per parameter, about \(93\times\) the 20 of a compute-optimal run (<a href="13-scaling-laws.html">page 13</a>), because inference cost dominates. Token counts depend on the tokenizer (C4 is quoted as 160B, 172B and 177.3B tokens by DCLM, FineWeb and Lee et al.; <a href="02-tokenization.html">page 02</a>), so never compare counts across papers unchecked. And the constraint is not raw web (DCLM-Pool is 240T tokens) but <em>good, unique</em> web: after global fuzzy deduplication DCLM-Baseline holds about 1.0T unique tokens and FineWeb-Edu-2 about 1.1T <a href="https://arxiv.org/abs/2412.02595">[Nemotron-CC, Tab. 4]</a>.</p>
+
+  <h3 id="warc-wet">WARC versus WET</h3>
+  <p>Common Crawl ships a <strong>WARC</strong> file (raw HTTP responses, full HTML) and a <strong>WET</strong> file (plain text from a generic extractor). WET is cheap, but it keeps menus, cookie banners and footers, and flattens code blocks and math. FineWeb found trafilatura on WARC clearly better than WET <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §3.2, Fig. 1]</a>, and DCLM measured it at the 1B-1x scale:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Extraction (then RefinedWeb heuristics)</th><th class="num">CORE</th><th class="num">EXTENDED</th></tr></thead>
+    <tbody>
+      <tr><td>resiliparse on HTML</td><td class="num">24.1</td><td class="num">13.4</td></tr>
+      <tr><td>trafilatura on HTML</td><td class="num">24.5</td><td class="num">12.5</td></tr>
+      <tr><td>Common Crawl WET</td><td class="num">20.7</td><td class="num">12.2</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: <a href="https://arxiv.org/abs/2406.11794">DCLM, Tab. 3</a>. CORE is a centered accuracy over 22 low-variance tasks; resiliparse is also 8× faster than trafilatura.</p>
+  <p>So most labs re-extract from HTML (FineWeb: trafilatura; DCLM: resiliparse; Nemotron-CC: Justext; Llama 3: a custom parser that keeps image alt text, where math often hides, and drops markdown markers, which hurt a web-trained model <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1.1]</a>). The extractor is also a yield knob: on 13 snapshots Justext with the same filters gave 28.6% more high-quality tokens than trafilatura at comparable accuracy <a href="https://arxiv.org/abs/2412.02595">[Nemotron-CC, Tab. 1, 7]</a>. The cost is CPU time over petabytes of HTML.</p>
+
+  <h3 id="pipeline-order">The pipeline and why it is ordered this way</h3>
+  <p>A web pipeline orders its filters by cost: cheap, per-document, high-recall steps first, then steps that need global state (deduplication), then steps that need a model. Every threshold is justified by an ablation (see <a href="#decisions">How labs make data decisions</a>). This stage is what people mean by data cleaning <span class="zh">数据清洗</span>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 476" role="img" aria-labelledby="fig-12-1-title">
+<title id="fig-12-1-title">The web-data pipeline as a funnel of eight stages, with what each removes and documented token counts</title>
+<rect class="s-a" x="15" y="10" width="270" height="38" rx="6"/>
+<text x="150" y="34" text-anchor="middle" class="s-bold">1  Crawl (WARC)</text>
+<text x="300" y="26" class="s-small">Petabytes of raw HTML in about 100 snapshots</text>
+<text x="300" y="41" class="s-small s-muted">FineWeb starts from 96 snapshots, 2013 to 2024</text>
+
+<rect class="s-a" x="25" y="57" width="250" height="38" rx="6"/>
+<text x="150" y="81" text-anchor="middle" class="s-bold">2  URL filter</text>
+<text x="300" y="73" class="s-small">Adult content, PII-heavy and unsafe domains</text>
+<text x="300" y="88" class="s-small s-muted">Blocklists; runs on the URL alone, before parsing</text>
+
+<rect class="s-a" x="35" y="104" width="230" height="38" rx="6"/>
+<text x="150" y="128" text-anchor="middle" class="s-bold">3  Extract text</text>
+<text x="300" y="120" class="s-small">Menus, footers, cookie banners; keeps code and math</text>
+<text x="300" y="135" class="s-small s-muted">WET text is 2.5+ CORE points worse (DCLM, Tab. 3)</text>
+
+<rect class="s-a" x="45" y="151" width="210" height="38" rx="6"/>
+<text x="150" y="175" text-anchor="middle" class="s-bold">4  Language ID</text>
+<text x="300" y="167" class="s-small">Wrong-language pages (fastText, English score ≥ 0.65)</text>
+<text x="300" y="182" class="s-small s-muted">About 40% of documents pass (FineWeb2, §4.1)</text>
+
+<rect class="s-a" x="55" y="198" width="190" height="38" rx="6"/>
+<text x="150" y="222" text-anchor="middle" class="s-bold">5  Heuristic filters</text>
+<text x="300" y="214" class="s-small">Length, symbols, punctuation, repeated lines and n-grams</text>
+<text x="300" y="229" class="s-small s-muted">C4's punctuation rule alone drops ~30% of tokens</text>
+
+<rect class="s-d" x="65" y="245" width="170" height="38" rx="6"/>
+<text x="150" y="269" text-anchor="middle" class="s-bold">6  Deduplicate</text>
+<text x="300" y="261" class="s-small">Repeated documents, lines and substrings (global state)</text>
+<text x="300" y="276" class="s-small s-muted">FineWeb: per-snapshot MinHash, 36T to 20T tokens</text>
+
+<rect class="s-e" x="75" y="292" width="150" height="38" rx="6"/>
+<text x="150" y="316" text-anchor="middle" class="s-bold">7  PII and safety</text>
+<text x="300" y="308" class="s-small">Emails, IP addresses, personal and unsafe content</text>
+<text x="300" y="323" class="s-small s-muted">Regex, domain lists, or a model-based filter</text>
+
+<rect class="s-c" x="85" y="339" width="130" height="38" rx="6"/>
+<text x="150" y="363" text-anchor="middle" class="s-bold">8  Quality model</text>
+<text x="300" y="355" class="s-small">Low-value pages (score cutoff or score-based upsampling)</text>
+<text x="300" y="370" class="s-small s-muted">FineWeb-Edu keeps 1.3T of 15T; DCLM keeps the top 10%</text>
+
+<line class="s-line s-dash" x1="15" y1="392" x2="705" y2="392"/>
+<text x="15" y="410" class="s-small s-bold">Documented token counts</text>
+<text x="15" y="427" class="s-small">FineWeb (GPT-2 tokens): 36T after base filters, 20T after per-snapshot MinHash, 15T after C4 and custom rules, 1.3T in FineWeb-Edu.</text>
+<text x="15" y="443" class="s-small">FineWeb alternative: 4T if MinHash is applied globally across all 96 snapshots. DCLM (GPT-NeoX tokens): 240T pool, 3.8T Baseline (1.6%).</text>
+<text x="15" y="462" class="s-small s-muted">Blue: per-document and streaming. Purple: needs global state. Yellow: safety. Green: needs a trained model. Widths are schematic.</text>
+</svg>
+    <figcaption><b>Figure 1.</b> The web pipeline as a funnel. Stages 1 to 5 look at one document at a time and parallelize trivially. Deduplication (6) needs state across documents, so it runs after the cheap filters have shrunk the input. The model-based filter (8) is the most expensive per document (FineWeb-Edu's classifier needed 6,000 H100 hours for 15T tokens), so it runs last. In FineWeb the actual order is base filters, then MinHash, then C4 and custom rules.</figcaption>
+  </figure>
+
+  <h3 id="url-lang">URL filtering and language identification</h3>
+  <p>A URL blocklist drops adult content before parsing <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §3.3]</a>; Llama 3 also removes whole domains that are PII-heavy or unsafe <a href="https://arxiv.org/abs/2407.21783">[§3.1.1]</a>. Language identification <span class="zh">语言识别</span> is a fastText classifier over character n-grams. FineWeb keeps English at score at least 0.65, which passes about 40% of documents (the other 60% seeded FineWeb2) <a href="https://arxiv.org/abs/2506.20920">[FineWeb2, §4.1]</a>; C4 used <code>langdetect</code> at 0.99, which also drops noisy English <a href="https://arxiv.org/abs/1910.10683">[T5, §2.2]</a>. One threshold does not fit all languages: FineWeb2 found Arabic and Russian prefer cutoffs above 0.8 while Swahili is best near 0.3, and sets a per-language cutoff \(\max\{0.3, \min\{0.9, \text{median} - \text{std}\}\}\) <a href="https://arxiv.org/abs/2506.20920">[§4.2]</a>.</p>
+
+  <h3 id="heuristics">Heuristic quality filters</h3>
+  <p>Heuristics are cheap statistics with a threshold, transparent and biased only in obvious ways. DeepMind used them <em>instead of</em> a learned classifier on purpose: a classifier trained on Wikipedia-like pages "could inadvertently bias towards a certain demographic or erase certain dialects or sociolects" <a href="https://arxiv.org/abs/2112.11446">[Gopher, App. A]</a>. The rule sets everyone copies:</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Source</th><th>Rule (document is removed if...)</th><th>What it catches</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="7">Gopher quality <a href="https://arxiv.org/abs/2112.11446">[App. A.1]</a></td><td>fewer than 50 or more than 100,000 words</td><td>stubs, giant dumps</td></tr>
+      <tr><td>mean word length outside 3 to 10 characters</td><td>symbol soup, URLs</td></tr>
+      <tr><td>symbol-to-word ratio above 0.1 for "#" or for ellipses</td><td>hashtag spam, snippets</td></tr>
+      <tr><td>more than 90% of lines start with a bullet</td><td>menus, link lists</td></tr>
+      <tr><td>more than 30% of lines end with an ellipsis</td><td>search-result pages</td></tr>
+      <tr><td>fewer than 80% of words contain a letter</td><td>numeric tables</td></tr>
+      <tr><td>fewer than 2 of {the, be, to, of, and, that, have, with}</td><td>"English" with no English</td></tr>
+      <tr><td>Gopher repetition <a href="https://arxiv.org/abs/2112.11446">[Tab. A1]</a></td><td>duplicate lines or paragraphs above 30% (their characters above 20%); most frequent 2-gram above 20% of characters; duplicated 5- to 10-grams above 15% down to 10%</td><td>templated pages, keyword stuffing</td></tr>
+      <tr><td rowspan="3">C4 <a href="https://arxiv.org/abs/1910.10683">[T5, §2.2]</a></td><td>lines not ending in terminal punctuation are dropped (removes about 30% of tokens)</td><td>menus, headings</td></tr>
+      <tr><td>pages under 3 sentences; lines under 5 words; any "{" or "lorem ipsum"; bad-words list</td><td>fragments, code, placeholders</td></tr>
+      <tr><td>three-sentence spans seen more than once are kept once</td><td>repeats across pages</td></tr>
+      <tr><td rowspan="3">FineWeb custom <a href="https://arxiv.org/abs/2406.17557">[§3.6]</a></td><td>fraction of lines ending in punctuation at most 0.12</td><td>list-like pages (10.1% of tokens)</td></tr>
+      <tr><td>fraction of characters in duplicated lines at least 0.1 (Gopher: 0.2)</td><td>internal repetition (12.5%)</td></tr>
+      <tr><td>fraction of lines under 30 characters at least 0.67</td><td>fragmented text (3 to 4%)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>FineWeb derived its thresholds systematically. It computed over 50 document statistics on two versions of one snapshot (deduplicated within the snapshot as "higher quality", deduplicated globally as "lower quality", see <a href="#global-dedup">below</a>) and picked thresholds where the low-quality histogram was denser, giving 16 candidate rules. Each was tested in a 28B-token ablation of a 1.71B model; three helped most, together removing about 22% of tokens for about 1 point of aggregate accuracy <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §3.5, §3.6]</a>. C4's terminal-punctuation rule gave the largest single gain but costs 30% of tokens, so FineWeb applied all C4 rules except that one.</p>
+
+  <p><strong>Worked example.</strong> The drill's 98-word news paragraph has mean word length 4.64, every token contains a letter, and six of the eight stop words occur, so it passes. A 149-token page of navigation links (<code>Home | About us | ...</code>) has a plausible length and mean word length (3.35) but only 54% of its tokens contain a letter and no stop word appears, so rules 6 and 7 reject it. A length filter alone would have kept it, which is why the rules work in combination.</p>
+
+  <p>Heuristics tune toward benchmark scores, not toward text that reads well. Meta's line-level dedup (drop lines seen more than 6 times per bucket of 30M documents) also removes some "frequent high-quality text" and stayed because evaluations improved <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1.1]</a>. A rule survives if the ablation says so.</p>
+
+  <h3 id="pii-safety">PII and safety</h3>
+  <p>Practice varies. FineWeb's release anonymizes email addresses and public IPs by regex <a href="https://arxiv.org/abs/2406.17557">[§3.7]</a>. Llama 3 drops PII-heavy domains. Olmo 3 uses small LLM classifiers for PDFs because whether a name is PII depends on document type, and removed 4.9% of that pool <a href="https://arxiv.org/abs/2512.13961">[§3.4.2]</a>. For toxicity, Gopher used SafeSearch but no word lists, since such lists disproportionately remove inoffensive text about minority groups and a model that never sees toxic text cannot recognize it; the training text had mean Perspective toxicity 0.10, with 0.8% of spans above 0.5 versus 4.3% reported for GPT-2's data <a href="https://arxiv.org/abs/2112.11446">[Gopher, App. A]</a>.</p>
+
+  <h3 id="funnel-numbers">The token funnel</h3>
+  <p>Documented token counts for two pipelines:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Pipeline</th><th>Stage</th><th class="num">Tokens</th><th class="num">Kept from previous row</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="5">FineWeb <a href="https://arxiv.org/abs/2406.17557">[§3.3 to §4]</a></td><td>After URL filter, language ID, Gopher rules (96 snapshots)</td><td class="num">≈36T</td><td class="num"></td></tr>
+      <tr><td>After per-snapshot MinHash</td><td class="num">20T</td><td class="num">56%</td></tr>
+      <tr><td>(alternative: after global MinHash)</td><td class="num">4T</td><td class="num">11% of 36T</td></tr>
+      <tr><td>After C4 rules (minus punctuation) and custom rules: FineWeb</td><td class="num">15T</td><td class="num">75%</td></tr>
+      <tr><td>FineWeb-Edu (classifier score at least 3)</td><td class="num">1.3T</td><td class="num">8.7%</td></tr>
+      <tr><td rowspan="2">DCLM <a href="https://arxiv.org/abs/2406.11794">[§3.1, §2]</a></td><td>DCLM-Pool: all Common Crawl 2013 to 2022, resiliparse</td><td class="num">240T</td><td class="num"></td></tr>
+      <tr><td>DCLM-Baseline (RefinedWeb heuristics, Bloom-filter dedup, top 10% by fastText)</td><td class="num">3.8T</td><td class="num">1.6% of pool</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Tokenizers and starting points differ (FineWeb's 36T is already language- and heuristic-filtered), so compare stage ratios within a pipeline, not across. FineWeb2 deduplicated before filtering only so that filtering experiments measured the final data <a href="https://arxiv.org/abs/2506.20920">[§4.3]</a>: an experimenter's order, not a production one.</p>
+</section>
+
+<section>
+  <h2 id="dedup">Deduplication</h2>
+
+  <p>Deduplication <span class="zh">去重</span> matters for three reasons, all measured by Lee et al. <a href="https://arxiv.org/abs/2107.06499">[Lee et al. 2021]</a>. <strong>Memorization:</strong> a model trained on C4 emitted memorized 50-token sequences in 1.9% of unprompted generated tokens, and 0.19% after near-duplicate removal, about 10× less (Tab. 4). <strong>Efficiency:</strong> datasets became up to 19% smaller (RealNews) at the same or better accuracy. <strong>Clean evaluation:</strong> 4.6% of C4's validation examples had a near-duplicate in the training split, and one 61-word sentence occurred 61,036 times. Most duplicates are templated pages that differ by a city name or a price, so exact matching misses them. Not everyone sees a downstream benefit: Muennighoff et al. found none from deduplicating C4 in a data-constrained setting <a href="https://arxiv.org/abs/2305.16264">[§7]</a>.</p>
+
+  <h3 id="exact-dedup">Exact deduplication</h3>
+  <ul>
+    <li><strong>Document:</strong> hash the normalized text, keep one copy per hash. Catches mirrors and scraped copies.</li>
+    <li><strong>Line or paragraph:</strong> Llama 3 removes any line seen more than 6 times within a bucket of 30M documents, which kills menus and cookie notices <a href="https://arxiv.org/abs/2407.21783">[§3.1.1]</a>. A Bloom filter (fixed-size probabilistic set, no false negatives) scales this to 10TB and beyond.</li>
+    <li><strong>Substring:</strong> build a <em>suffix array</em> (all suffix start positions of the concatenated corpus, sorted). Any sequence occurring twice creates two adjacent suffixes with a long common prefix: for <code>banana</code> the sorted suffixes are <code>a, ana, anana, banana, na, nana</code>, and <code>ana</code> and <code>anana</code> share a 3-character prefix. One scan finds every repeat of at least \(k\) tokens. Lee et al. use \(k=50\) at 8 bytes per token, so 1T tokens need 8TB, and on C4 it marks 7.18% of tokens as repeated <a href="https://arxiv.org/abs/2107.06499">[§4.1]</a>.</li>
+  </ul>
+  <p>DCLM compared the options at 1B-1x: Bloom filter +2.1 CORE over no dedup, suffix array +1.9, exact +1.3, MinHash +0.9, with gains that do not add and sit near run-to-run noise; at 7B-2x a Bloom filter matched MinHash plus suffix array within 0.2 CORE <a href="https://arxiv.org/abs/2406.11794">[DCLM, App. L, Tab. 17]</a>.</p>
+
+  <h3 id="minhash">Near-duplicates: MinHash and LSH</h3>
+  <p>Treat each document as a set of <strong>shingles</strong> (overlapping word \(n\)-grams: \(n=5\) in FineWeb and Lee et al., 13 in Gopher). Similarity is the <strong>Jaccard index</strong> \(J(A,B) = |A \cap B| / |A \cup B|\). We compress each set to a short signature whose agreement rate estimates \(J\).</p>
+
+  <p><strong>MinHash <span class="zh">最小哈希</span>.</strong> For a random permutation \(\pi\) of all shingles let \(h_\pi(A) = \min_{x \in A} \pi(x)\). The element of \(A \cup B\) that \(\pi\) ranks first is uniform over the union, and \(h_\pi(A) = h_\pi(B)\) exactly when it lies in \(A \cap B\). Hence</p>
+  <div class="eq-box">
+    \[ \Pr\big[h_\pi(A) = h_\pi(B)\big] = \frac{|A \cap B|}{|A \cup B|} = J(A,B) \]
+    <div class="eq-label">One minhash agrees with probability J</div>
+  </div>
+  <p>Use \(k\) independent hashes (in practice \(h_i(x) = (a_i x + b_i) \bmod p\)). The fraction of agreeing positions is an unbiased estimate of \(J\) with standard error \(\sqrt{J(1-J)/k}\): at \(J=0.8\), 0.038 for \(k=112\) and 0.004 for \(k=9{,}000\).</p>
+
+  <p><strong>Locality-sensitive hashing (LSH) <span class="zh">局部敏感哈希</span>.</strong> Comparing all pairs is \(O(N^2)\), hopeless for \(10^{10}\) documents. Split the \(k\) signature rows into \(b\) <em>bands</em> of \(r\) rows (\(k = b\,r\)), hash each band to a bucket, and call two documents a <strong>candidate pair</strong> if they share a bucket in <em>any</em> band. One row agrees with probability \(J\); a whole band with \(J^r\); at least one of \(b\) bands with</p>
+  <div class="eq-box">
+    \[ P_{\text{candidate}}(J) = 1 - \left(1 - J^{r}\right)^{b} \]
+    <div class="eq-label">The LSH S-curve. Steepest near J* ≈ (1/b)^(1/r)</div>
+  </div>
+  <p>At \(J^* = (1/b)^{1/r}\) we have \(J^{*r} = 1/b\), so \(P = 1-(1-1/b)^b \approx 1 - 1/e = 0.63\): the middle of the transition, and how you read a threshold off \((b, r)\).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 290" role="img" aria-labelledby="fig-12-2-title">
+<title id="fig-12-2-title">Two MinHash signatures split into four bands of three rows; band 1 matches on all rows so the documents become a candidate pair</title>
+<text x="100" y="20" class="s-small s-bold">MinHash signatures with k = 12 rows, cut into b = 4 bands of r = 3 rows</text>
+<text x="160" y="46" text-anchor="middle" class="s-small s-bold">band 1</text>
+<line class="s-line" x1="100" y1="52" x2="220" y2="52"/>
+<text x="292" y="46" text-anchor="middle" class="s-small s-bold">band 2</text>
+<line class="s-line" x1="232" y1="52" x2="352" y2="52"/>
+<text x="424" y="46" text-anchor="middle" class="s-small s-bold">band 3</text>
+<line class="s-line" x1="364" y1="52" x2="484" y2="52"/>
+<text x="556" y="46" text-anchor="middle" class="s-small s-bold">band 4</text>
+<line class="s-line" x1="496" y1="52" x2="616" y2="52"/>
+<rect class="s-c" x="100" y="62" width="40" height="30" rx="3"/>
+<text x="120" y="82" text-anchor="middle" class="s-mono">17</text>
+<rect class="s-c" x="100" y="100" width="40" height="30" rx="3"/>
+<text x="120" y="120" text-anchor="middle" class="s-mono">17</text>
+<rect class="s-c" x="140" y="62" width="40" height="30" rx="3"/>
+<text x="160" y="82" text-anchor="middle" class="s-mono">42</text>
+<rect class="s-c" x="140" y="100" width="40" height="30" rx="3"/>
+<text x="160" y="120" text-anchor="middle" class="s-mono">42</text>
+<rect class="s-c" x="180" y="62" width="40" height="30" rx="3"/>
+<text x="200" y="82" text-anchor="middle" class="s-mono">8</text>
+<rect class="s-c" x="180" y="100" width="40" height="30" rx="3"/>
+<text x="200" y="120" text-anchor="middle" class="s-mono">8</text>
+<rect class="s-b" x="232" y="62" width="40" height="30" rx="3"/>
+<text x="252" y="82" text-anchor="middle" class="s-mono">5</text>
+<rect class="s-b" x="232" y="100" width="40" height="30" rx="3"/>
+<text x="252" y="120" text-anchor="middle" class="s-mono">6</text>
+<rect class="s-c" x="272" y="62" width="40" height="30" rx="3"/>
+<text x="292" y="82" text-anchor="middle" class="s-mono">91</text>
+<rect class="s-c" x="272" y="100" width="40" height="30" rx="3"/>
+<text x="292" y="120" text-anchor="middle" class="s-mono">91</text>
+<rect class="s-b" x="312" y="62" width="40" height="30" rx="3"/>
+<text x="332" y="82" text-anchor="middle" class="s-mono">23</text>
+<rect class="s-b" x="312" y="100" width="40" height="30" rx="3"/>
+<text x="332" y="120" text-anchor="middle" class="s-mono">20</text>
+<rect class="s-c" x="364" y="62" width="40" height="30" rx="3"/>
+<text x="384" y="82" text-anchor="middle" class="s-mono">64</text>
+<rect class="s-c" x="364" y="100" width="40" height="30" rx="3"/>
+<text x="384" y="120" text-anchor="middle" class="s-mono">64</text>
+<rect class="s-b" x="404" y="62" width="40" height="30" rx="3"/>
+<text x="424" y="82" text-anchor="middle" class="s-mono">12</text>
+<rect class="s-b" x="404" y="100" width="40" height="30" rx="3"/>
+<text x="424" y="120" text-anchor="middle" class="s-mono">9</text>
+<rect class="s-c" x="444" y="62" width="40" height="30" rx="3"/>
+<text x="464" y="82" text-anchor="middle" class="s-mono">30</text>
+<rect class="s-c" x="444" y="100" width="40" height="30" rx="3"/>
+<text x="464" y="120" text-anchor="middle" class="s-mono">30</text>
+<rect class="s-b" x="496" y="62" width="40" height="30" rx="3"/>
+<text x="516" y="82" text-anchor="middle" class="s-mono">77</text>
+<rect class="s-b" x="496" y="100" width="40" height="30" rx="3"/>
+<text x="516" y="120" text-anchor="middle" class="s-mono">71</text>
+<rect class="s-c" x="536" y="62" width="40" height="30" rx="3"/>
+<text x="556" y="82" text-anchor="middle" class="s-mono">3</text>
+<rect class="s-c" x="536" y="100" width="40" height="30" rx="3"/>
+<text x="556" y="120" text-anchor="middle" class="s-mono">3</text>
+<rect class="s-c" x="576" y="62" width="40" height="30" rx="3"/>
+<text x="596" y="82" text-anchor="middle" class="s-mono">58</text>
+<rect class="s-c" x="576" y="100" width="40" height="30" rx="3"/>
+<text x="596" y="120" text-anchor="middle" class="s-mono">58</text>
+<text x="92" y="82" text-anchor="end" class="s-bold">Doc A</text>
+<text x="92" y="120" text-anchor="end" class="s-bold">Doc B</text>
+<text x="160" y="152" text-anchor="middle" class="s-small">3 of 3 rows agree</text>
+<text x="160" y="168" text-anchor="middle" class="s-small s-bold s-tc">same bucket: candidate</text>
+<text x="292" y="152" text-anchor="middle" class="s-small">1 of 3 rows agree</text>
+<text x="292" y="168" text-anchor="middle" class="s-small s-muted">no collision</text>
+<text x="424" y="152" text-anchor="middle" class="s-small">2 of 3 rows agree</text>
+<text x="424" y="168" text-anchor="middle" class="s-small s-muted">no collision</text>
+<text x="556" y="152" text-anchor="middle" class="s-small">2 of 3 rows agree</text>
+<text x="556" y="168" text-anchor="middle" class="s-small s-muted">no collision</text>
+<rect class="s-box" x="100" y="184" width="516" height="70" rx="6"/>
+<text x="116" y="204" class="s-mono">P[one row agrees] = J</text>
+<text x="116" y="222" class="s-mono">P[a band of r rows agrees] = J<tspan baseline-shift="super" font-size="9">r</tspan></text>
+<text x="116" y="240" class="s-mono">P[some band agrees] = 1 − (1 − J<tspan baseline-shift="super" font-size="9">r</tspan>)<tspan baseline-shift="super" font-size="9">b</tspan></text>
+<text x="100" y="276" class="s-small">Here 8 of 12 rows agree, so the estimate is 0.667. For b = 4, r = 3: P = 1 − (1 − 0.667³)⁴ = 0.755.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Two signatures with \(k=12\) rows, cut into \(b=4\) bands of \(r=3\). Green cells agree, orange differ. Eight of 12 rows agree, so \(\hat J = 0.667\). Band 1 agrees on all three rows, so the pair shares a bucket and becomes a candidate. One matching band is enough, which is why the S-curve rises much faster than \(J\) itself.</figcaption>
+  </figure>
+
+  <p><strong>Worked numbers.</strong> \(P_{\text{candidate}}\) for three real settings: the classic 20 × 5 (100 hashes), FineWeb's 14 × 8 (112 hashes, "targeting documents that are at least 75% similar" <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §3.4]</a>), and Lee et al.'s and RefinedWeb's 450 × 20 (9,000 hashes) <a href="https://arxiv.org/abs/2107.06499">[Lee et al., §4.2]</a>.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Bands × rows</th><th class="num">Hashes</th><th class="num">J*</th><th class="num">J=0.5</th><th class="num">J=0.7</th><th class="num">J=0.75</th><th class="num">J=0.8</th><th class="num">J=0.9</th></tr></thead>
+    <tbody>
+      <tr><td>20 × 5</td><td class="num">100</td><td class="num">0.55</td><td class="num">0.470</td><td class="num">0.975</td><td class="num">0.996</td><td class="num">0.9996</td><td class="num">1.000</td></tr>
+      <tr class="hl"><td>14 × 8 (FineWeb)</td><td class="num">112</td><td class="num">0.72</td><td class="num">0.053</td><td class="num">0.565</td><td class="num">0.772</td><td class="num">0.924</td><td class="num">0.9996</td></tr>
+      <tr><td>450 × 20 (Lee et al.)</td><td class="num">9,000</td><td class="num">0.74</td><td class="num">0.0004</td><td class="num">0.302</td><td class="num">0.761</td><td class="num">0.995</td><td class="num">1.000</td></tr>
+    </tbody>
+  </table></div>
+  <p>FineWeb row: at \(J=0.5\), \(0.5^8 = 0.0039\) and \((1-0.0039)^{14} = 0.947\), so \(P = 0.053\). At \(J=0.7\), \(0.7^8 = 0.0576\), \((1-0.0576)^{14} = 0.435\), \(P = 0.565\). At \(J=0.9\), \(0.9^8 = 0.430\), \((1-0.430)^{14} = 0.0004\), \(P \approx 0.9996\). The 20 × 5 setting is lenient: a pair at \(J=0.5\) collides 47% of the time, so it needs a verification step. FineWeb's setting accepts 77% of pairs at \(J=0.75\) and only 5% at \(J=0.5\). The 450 × 20 setting is far steeper but costs 80 times more hashes; FineWeb judged that "the compute and storage savings make up for the higher uncertainty on documents near the threshold" <a href="https://arxiv.org/abs/2406.17557">[App. E.1]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 344" role="img" aria-labelledby="fig-12-3-title">
+<title id="fig-12-3-title">LSH S-curves: probability that two documents become a candidate pair as a function of their Jaccard similarity, for three bands by rows settings</title>
+<line class="s-line s-dash" x1="70" y1="160.0" x2="690" y2="160.0"/>
+<line class="s-line s-dash" x1="566.0" y1="30.0" x2="566.0" y2="290.0"/>
+<line class="s-line" x1="70" y1="290" x2="690" y2="290"/>
+<line class="s-line" x1="70" y1="290" x2="70" y2="30"/>
+<path class="s-line-a" d="M70.0,290.0 L73.1,290.0 L76.2,290.0 L79.3,290.0 L82.4,290.0 L85.5,290.0 L88.6,290.0 L91.7,290.0 L94.8,290.0 L97.9,290.0 L101.0,290.0 L104.1,290.0 L107.2,290.0 L110.3,290.0 L113.4,290.0 L116.5,290.0 L119.6,290.0 L122.7,290.0 L125.8,290.0 L128.9,290.0 L132.0,289.9 L135.1,289.9 L138.2,289.9 L141.3,289.9 L144.4,289.9 L147.5,289.8 L150.6,289.8 L153.7,289.8 L156.8,289.7 L159.9,289.7 L163.0,289.6 L166.1,289.5 L169.2,289.5 L172.3,289.4 L175.4,289.3 L178.5,289.1 L181.6,289.0 L184.7,288.9 L187.8,288.7 L190.9,288.5 L194.0,288.3 L197.1,288.1 L200.2,287.9 L203.3,287.6 L206.4,287.3 L209.5,287.0 L212.6,286.7 L215.7,286.3 L218.8,285.9 L221.9,285.4 L225.0,285.0 L228.1,284.5 L231.2,283.9 L234.3,283.3 L237.4,282.6 L240.5,281.9 L243.6,281.2 L246.7,280.4 L249.8,279.5 L252.9,278.6 L256.0,277.7 L259.1,276.6 L262.2,275.5 L265.3,274.3 L268.4,273.1 L271.5,271.8 L274.6,270.4 L277.7,268.9 L280.8,267.4 L283.9,265.7 L287.0,264.0 L290.1,262.2 L293.2,260.3 L296.3,258.3 L299.4,256.2 L302.5,254.0 L305.6,251.8 L308.7,249.4 L311.8,246.9 L314.9,244.3 L318.0,241.6 L321.1,238.8 L324.2,235.9 L327.3,233.0 L330.4,229.9 L333.5,226.6 L336.6,223.3 L339.7,219.9 L342.8,216.4 L345.9,212.8 L349.0,209.1 L352.1,205.4 L355.2,201.5 L358.3,197.5 L361.4,193.5 L364.5,189.4 L367.6,185.2 L370.7,180.9 L373.8,176.6 L376.9,172.2 L380.0,167.8 L383.1,163.3 L386.2,158.8 L389.3,154.3 L392.4,149.8 L395.5,145.2 L398.6,140.6 L401.7,136.1 L404.8,131.6 L407.9,127.0 L411.0,122.6 L414.1,118.1 L417.2,113.7 L420.3,109.4 L423.4,105.2 L426.5,101.0 L429.6,96.9 L432.7,92.9 L435.8,89.0 L438.9,85.2 L442.0,81.5 L445.1,77.9 L448.2,74.5 L451.3,71.2 L454.4,68.1 L457.5,65.0 L460.6,62.1 L463.7,59.4 L466.8,56.8 L469.9,54.4 L473.0,52.1 L476.1,49.9 L479.2,47.9 L482.3,46.0 L485.4,44.3 L488.5,42.7 L491.6,41.2 L494.7,39.9 L497.8,38.7 L500.9,37.6 L504.0,36.6 L507.1,35.7 L510.2,34.9 L513.3,34.2 L516.4,33.5 L519.5,33.0 L522.6,32.5 L525.7,32.1 L528.8,31.7 L531.9,31.4 L535.0,31.2 L538.1,30.9 L541.2,30.7 L544.3,30.6 L547.4,30.5 L550.5,30.4 L553.6,30.3 L556.7,30.2 L559.8,30.2 L562.9,30.1 L566.0,30.1 L569.1,30.1 L572.2,30.0 L575.3,30.0 L578.4,30.0 L581.5,30.0 L584.6,30.0 L587.7,30.0 L590.8,30.0 L593.9,30.0 L597.0,30.0 L600.1,30.0 L603.2,30.0 L606.3,30.0 L609.4,30.0 L612.5,30.0 L615.6,30.0 L618.7,30.0 L621.8,30.0 L624.9,30.0 L628.0,30.0 L631.1,30.0 L634.2,30.0 L637.3,30.0 L640.4,30.0 L643.5,30.0 L646.6,30.0 L649.7,30.0 L652.8,30.0 L655.9,30.0 L659.0,30.0 L662.1,30.0 L665.2,30.0 L668.3,30.0 L671.4,30.0 L674.5,30.0 L677.6,30.0 L680.7,30.0 L683.8,30.0 L686.9,30.0 L690.0,30.0"/>
+<path class="s-line-b" d="M70.0,290.0 L73.1,290.0 L76.2,290.0 L79.3,290.0 L82.4,290.0 L85.5,290.0 L88.6,290.0 L91.7,290.0 L94.8,290.0 L97.9,290.0 L101.0,290.0 L104.1,290.0 L107.2,290.0 L110.3,290.0 L113.4,290.0 L116.5,290.0 L119.6,290.0 L122.7,290.0 L125.8,290.0 L128.9,290.0 L132.0,290.0 L135.1,290.0 L138.2,290.0 L141.3,290.0 L144.4,290.0 L147.5,290.0 L150.6,290.0 L153.7,290.0 L156.8,290.0 L159.9,290.0 L163.0,290.0 L166.1,290.0 L169.2,290.0 L172.3,290.0 L175.4,290.0 L178.5,290.0 L181.6,290.0 L184.7,290.0 L187.8,290.0 L190.9,290.0 L194.0,290.0 L197.1,290.0 L200.2,290.0 L203.3,290.0 L206.4,290.0 L209.5,290.0 L212.6,290.0 L215.7,290.0 L218.8,290.0 L221.9,290.0 L225.0,289.9 L228.1,289.9 L231.2,289.9 L234.3,289.9 L237.4,289.9 L240.5,289.9 L243.6,289.9 L246.7,289.8 L249.8,289.8 L252.9,289.8 L256.0,289.8 L259.1,289.7 L262.2,289.7 L265.3,289.6 L268.4,289.6 L271.5,289.5 L274.6,289.5 L277.7,289.4 L280.8,289.4 L283.9,289.3 L287.0,289.2 L290.1,289.1 L293.2,289.0 L296.3,288.9 L299.4,288.7 L302.5,288.6 L305.6,288.4 L308.7,288.2 L311.8,288.1 L314.9,287.9 L318.0,287.6 L321.1,287.4 L324.2,287.1 L327.3,286.8 L330.4,286.5 L333.5,286.2 L336.6,285.8 L339.7,285.4 L342.8,284.9 L345.9,284.5 L349.0,283.9 L352.1,283.4 L355.2,282.8 L358.3,282.2 L361.4,281.5 L364.5,280.7 L367.6,279.9 L370.7,279.1 L373.8,278.2 L376.9,277.2 L380.0,276.1 L383.1,275.0 L386.2,273.8 L389.3,272.6 L392.4,271.2 L395.5,269.8 L398.6,268.2 L401.7,266.6 L404.8,264.9 L407.9,263.1 L411.0,261.1 L414.1,259.1 L417.2,256.9 L420.3,254.6 L423.4,252.3 L426.5,249.7 L429.6,247.1 L432.7,244.3 L435.8,241.4 L438.9,238.3 L442.0,235.1 L445.1,231.8 L448.2,228.3 L451.3,224.7 L454.4,220.9 L457.5,217.0 L460.6,212.9 L463.7,208.7 L466.8,204.3 L469.9,199.8 L473.0,195.2 L476.1,190.5 L479.2,185.6 L482.3,180.6 L485.4,175.5 L488.5,170.3 L491.6,165.0 L494.7,159.7 L497.8,154.2 L500.9,148.8 L504.0,143.2 L507.1,137.7 L510.2,132.1 L513.3,126.6 L516.4,121.0 L519.5,115.5 L522.6,110.1 L525.7,104.8 L528.8,99.5 L531.9,94.4 L535.0,89.4 L538.1,84.5 L541.2,79.8 L544.3,75.3 L547.4,71.0 L550.5,66.9 L553.6,63.0 L556.7,59.4 L559.8,56.0 L562.9,52.8 L566.0,49.9 L569.1,47.2 L572.2,44.8 L575.3,42.6 L578.4,40.6 L581.5,38.8 L584.6,37.3 L587.7,36.0 L590.8,34.8 L593.9,33.8 L597.0,33.0 L600.1,32.3 L603.2,31.8 L606.3,31.3 L609.4,31.0 L612.5,30.7 L615.6,30.5 L618.7,30.4 L621.8,30.2 L624.9,30.2 L628.0,30.1 L631.1,30.1 L634.2,30.0 L637.3,30.0 L640.4,30.0 L643.5,30.0 L646.6,30.0 L649.7,30.0 L652.8,30.0 L655.9,30.0 L659.0,30.0 L662.1,30.0 L665.2,30.0 L668.3,30.0 L671.4,30.0 L674.5,30.0 L677.6,30.0 L680.7,30.0 L683.8,30.0 L686.9,30.0 L690.0,30.0"/>
+<path class="s-line-c" d="M70.0,290.0 L73.1,290.0 L76.2,290.0 L79.3,290.0 L82.4,290.0 L85.5,290.0 L88.6,290.0 L91.7,290.0 L94.8,290.0 L97.9,290.0 L101.0,290.0 L104.1,290.0 L107.2,290.0 L110.3,290.0 L113.4,290.0 L116.5,290.0 L119.6,290.0 L122.7,290.0 L125.8,290.0 L128.9,290.0 L132.0,290.0 L135.1,290.0 L138.2,290.0 L141.3,290.0 L144.4,290.0 L147.5,290.0 L150.6,290.0 L153.7,290.0 L156.8,290.0 L159.9,290.0 L163.0,290.0 L166.1,290.0 L169.2,290.0 L172.3,290.0 L175.4,290.0 L178.5,290.0 L181.6,290.0 L184.7,290.0 L187.8,290.0 L190.9,290.0 L194.0,290.0 L197.1,290.0 L200.2,290.0 L203.3,290.0 L206.4,290.0 L209.5,290.0 L212.6,290.0 L215.7,290.0 L218.8,290.0 L221.9,290.0 L225.0,290.0 L228.1,290.0 L231.2,290.0 L234.3,290.0 L237.4,290.0 L240.5,290.0 L243.6,290.0 L246.7,290.0 L249.8,290.0 L252.9,290.0 L256.0,290.0 L259.1,290.0 L262.2,290.0 L265.3,290.0 L268.4,290.0 L271.5,290.0 L274.6,290.0 L277.7,290.0 L280.8,290.0 L283.9,290.0 L287.0,290.0 L290.1,290.0 L293.2,290.0 L296.3,290.0 L299.4,290.0 L302.5,290.0 L305.6,290.0 L308.7,290.0 L311.8,290.0 L314.9,290.0 L318.0,290.0 L321.1,290.0 L324.2,290.0 L327.3,290.0 L330.4,290.0 L333.5,290.0 L336.6,290.0 L339.7,290.0 L342.8,290.0 L345.9,290.0 L349.0,290.0 L352.1,290.0 L355.2,290.0 L358.3,290.0 L361.4,290.0 L364.5,290.0 L367.6,290.0 L370.7,289.9 L373.8,289.9 L376.9,289.9 L380.0,289.9 L383.1,289.9 L386.2,289.8 L389.3,289.8 L392.4,289.8 L395.5,289.7 L398.6,289.6 L401.7,289.6 L404.8,289.5 L407.9,289.4 L411.0,289.3 L414.1,289.1 L417.2,288.9 L420.3,288.7 L423.4,288.5 L426.5,288.2 L429.6,287.8 L432.7,287.4 L435.8,287.0 L438.9,286.4 L442.0,285.8 L445.1,285.0 L448.2,284.1 L451.3,283.1 L454.4,281.9 L457.5,280.5 L460.6,278.9 L463.7,277.0 L466.8,274.9 L469.9,272.4 L473.0,269.6 L476.1,266.4 L479.2,262.8 L482.3,258.6 L485.4,253.9 L488.5,248.6 L491.6,242.6 L494.7,236.0 L497.8,228.6 L500.9,220.5 L504.0,211.5 L507.1,201.8 L510.2,191.4 L513.3,180.2 L516.4,168.3 L519.5,155.9 L522.6,143.2 L525.7,130.2 L528.8,117.2 L531.9,104.5 L535.0,92.3 L538.1,80.8 L541.2,70.3 L544.3,61.0 L547.4,53.1 L550.5,46.5 L553.6,41.3 L556.7,37.3 L559.8,34.5 L562.9,32.6 L566.0,31.4 L569.1,30.7 L572.2,30.3 L575.3,30.1 L578.4,30.0 L581.5,30.0 L584.6,30.0 L587.7,30.0 L590.8,30.0 L593.9,30.0 L597.0,30.0 L600.1,30.0 L603.2,30.0 L606.3,30.0 L609.4,30.0 L612.5,30.0 L615.6,30.0 L618.7,30.0 L621.8,30.0 L624.9,30.0 L628.0,30.0 L631.1,30.0 L634.2,30.0 L637.3,30.0 L640.4,30.0 L643.5,30.0 L646.6,30.0 L649.7,30.0 L652.8,30.0 L655.9,30.0 L659.0,30.0 L662.1,30.0 L665.2,30.0 L668.3,30.0 L671.4,30.0 L674.5,30.0 L677.6,30.0 L680.7,30.0 L683.8,30.0 L686.9,30.0 L690.0,30.0"/>
+<circle class="s-fill-b" cx="535.0" cy="89.4" r="4.5"/>
+<text x="526.0" y="93.4" text-anchor="end" class="s-small s-tb">FineWeb targets J ≥ 0.75: P = 0.77</text>
+<text x="571.0" y="277.0" class="s-small s-muted">J = 0.8: Gopher's duplicate threshold</text>
+<line class="s-line" x1="70.0" y1="290.0" x2="70.0" y2="295.0"/><text x="70.0" y="309.0" text-anchor="middle" class="s-small">0</text>
+<line class="s-line" x1="225.0" y1="290.0" x2="225.0" y2="295.0"/><text x="225.0" y="309.0" text-anchor="middle" class="s-small">0.25</text>
+<line class="s-line" x1="380.0" y1="290.0" x2="380.0" y2="295.0"/><text x="380.0" y="309.0" text-anchor="middle" class="s-small">0.5</text>
+<line class="s-line" x1="535.0" y1="290.0" x2="535.0" y2="295.0"/><text x="535.0" y="309.0" text-anchor="middle" class="s-small">0.75</text>
+<line class="s-line" x1="690.0" y1="290.0" x2="690.0" y2="295.0"/><text x="690.0" y="309.0" text-anchor="middle" class="s-small">1</text>
+<line class="s-line" x1="65" y1="290.0" x2="70" y2="290.0"/><text x="61" y="294.0" text-anchor="end" class="s-small">0</text>
+<line class="s-line" x1="65" y1="160.0" x2="70" y2="160.0"/><text x="61" y="164.0" text-anchor="end" class="s-small">0.5</text>
+<line class="s-line" x1="65" y1="30.0" x2="70" y2="30.0"/><text x="61" y="34.0" text-anchor="end" class="s-small">1</text>
+<text x="380.0" y="338" text-anchor="middle" class="s-small">Jaccard similarity J of the two documents' shingle sets</text>
+<text x="20" y="160" text-anchor="middle" class="s-small" transform="rotate(-90 20 160)">P(candidate pair)</text>
+<line class="s-line-a" x1="86" y1="44" x2="116" y2="44"/><text x="122" y="48" class="s-small">20 bands × 5 rows (100 hashes), steepest at J ≈ 0.55</text>
+<line class="s-line-b" x1="86" y1="62" x2="116" y2="62"/><text x="122" y="66" class="s-small">14 × 8 (112 hashes, FineWeb), steepest at J ≈ 0.72</text>
+<line class="s-line-c" x1="86" y1="80" x2="116" y2="80"/><text x="122" y="84" class="s-small">450 × 20 (9,000 hashes, Lee et al. and RefinedWeb), J ≈ 0.74</text>
+</svg>
+    <figcaption><b>Figure 3.</b> The three S-curves. More rows per band shifts the curve right (stricter); more bands shifts it left (more permissive); more total hashes makes it steeper. The dashed line marks Gopher's duplicate rule, Jaccard above 0.8 <a href="https://arxiv.org/abs/2112.11446">[Gopher, App. A.1]</a>. Lee et al. write the curve as \(1-(1-s^{b})^{r}\) with \(b=20, r=450\), so their letters are swapped relative to the usual convention.</figcaption>
+  </figure>
+
+  <p><strong>Choosing bands and rows.</strong> Fix the hash budget \(k\) first (compute and memory are linear in it). Then minimize a weighted sum of the false-positive area \(\int_0^{t} P(s)\,ds\) and the false-negative area \(\int_t^{1} (1-P(s))\,ds\) around the target threshold \(t\). For \(k=128\) and equal weights this gives 25 × 5 for \(t=0.5\) and 9 × 13 for \(t=0.8\) (computed with the drill's reference solution). The weights say what an error costs: a missed duplicate leaves one redundant document, a false positive deletes a distinct one, so most pipelines lean toward precision. Afterward, candidate pairs are graph edges: take connected components with union-find and keep one document per component. This is transitive, so A~B and B~C collapse all three. FineWeb keeps a random member per cluster; Lee et al. also require edit similarity above 0.8. Storage is the practical limit: \(10^{10}\) documents × 112 values × 8 bytes is 8.96TB.</p>
+
+<pre><code class="language-python">import hashlib, random
+import numpy as np
+
+P = (1 &lt;&lt; 61) - 1  # Mersenne prime: universal hash h_i(x) = (a_i x + b_i) mod P
+
+def minhash(shingle_set, k=112, seed=0):
+    rng = random.Random(seed)                      # same seed for every document
+    a = [rng.randrange(1, P) for _ in range(k)]
+    b = [rng.randrange(P) for _ in range(k)]
+    xs = [int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "big") % P
+          for s in shingle_set]                    # stable 61-bit id per shingle (not hash())
+    return np.array([min((ai * x + bi) % P for x in xs) for ai, bi in zip(a, b)],
+                    dtype=np.uint64)               # (k,): signature[i] = min_x h_i(x)
+
+def lsh_pairs(sigs, bands=14, rows=8):             # sigs: (N, bands * rows)
+    pairs = set()
+    for j in range(bands):
+        buckets = {}
+        for i, row in enumerate(sigs[:, j * rows:(j + 1) * rows]):
+            buckets.setdefault(row.tobytes(), []).append(i)   # equal band content = same bucket
+        for ids in buckets.values():
+            pairs.update((x, y) for x in ids for y in ids if x &lt; y)
+    return pairs                                   # then union-find, keep one per component
+</code></pre>
+
+  <h3 id="global-dedup">Global versus per-snapshot deduplication</h3>
+  <p>The obvious plan is to deduplicate across the whole corpus. FineWeb tried it <a href="https://arxiv.org/abs/2406.17557">[§3.4, Fig. 3 to 5]</a>. MinHash over all 96 snapshots (newest first) removed up to 90% of the oldest ones and left 4T tokens; a model on a 350B-token sample improved only slightly over no dedup and stayed far below RefinedWeb. On the 2013-48 snapshot the globally kept data (about 31B tokens, 10%) was <em>worse</em> than the removed data (460B tokens; 171B after per-snapshot dedup): more ads, keyword lists and bad formatting. Deduplicating each snapshot independently kept 20T tokens and matched RefinedWeb.</p>
+  <p>FineWeb's hypothesis is that dedup pays off by removing huge duplicate clusters, while collapsing clusters of fewer than about 100 copies backfires: what survives is disproportionately content that appeared exactly once, unique because nobody else wanted it. Duplicate count is a weak <em>quality signal</em>, not only a nuisance.</p>
+
+  <div class="decision">
+    <div class="decision-title">Global or per-snapshot deduplication</div>
+    <dl>
+      <dt>Problem</dt><dd>Pages recur across crawls. Removing every repeat saves tokens but may remove signal.</dd>
+      <dt>Idea</dt><dd>Deduplicate within each snapshot only (FineWeb), or globally and then partly restore duplicated documents by upsampling (FineWeb2's "rehydration").</dd>
+      <dt>Why it works</dt><dd>Moderately repeated documents tend to be popular and informative; singletons and the largest clusters skew toward junk. FineWeb2 measured a U-shaped filtering rate against cluster size and upsamples by weights from 1 to 10 using it as a quality proxy <a href="https://arxiv.org/abs/2506.20920">[§4.5]</a>.</dd>
+      <dt>Evidence</dt><dd>For: FineWeb, above. Against: Nemotron-CC estimates DCLM and FineWeb-Edu are about 80% near-duplicates and deduplicates globally <a href="https://arxiv.org/abs/2412.02595">[§2.4]</a>; Llama 3 and Olmo 3 (75% of web documents cut) do too <a href="https://arxiv.org/abs/2512.13961">[§3.4.1]</a>; DCLM-Baseline would lose 85% of its documents to global MinHash, because its Bloom-filter dedup ran in 100 independent shards <a href="https://arxiv.org/abs/2406.11794">[Tab. 23]</a>.</dd>
+      <dt>Cost</dt><dd>The answer depends on token horizon and downstream filters. At 1T to 2T tokens per-snapshot is fine; at 15T, unique tokens are scarce, so discarding 80% hurts and upsampling by cluster size or quality becomes attractive.</dd>
+      <dt>Used by</dt><dd>Per-snapshot: FineWeb. Global, with or without rehydration: FineWeb2, Nemotron-CC, Llama 3, Olmo 3.</dd>
+    </dl>
+  </div>
+  <p>This is unsettled: FineWeb's evidence is one controlled ablation at 350B tokens, and the global-dedup pipelines report results on different downstream filters. Everyone agrees that huge duplicate clusters must go and that duplicate counts are worth keeping as metadata.</p>
+</section>
+
+<section>
+  <h2 id="model-filter">Model-based quality filtering</h2>
+
+  <p>Heuristics reject obvious junk but cannot tell a mediocre forum post from a good tutorial. Quality filtering <span class="zh">质量过滤</span> trains a classifier to score every document, then keeps the top fraction or upsamples by score. The design questions are what the positives are, which model scores, and how a score becomes a decision.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Approach</th><th>Labels or positives</th><th>Scoring model</th><th>Selection</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-3 (2020) <a href="https://arxiv.org/abs/2005.14165">[App. A]</a></td><td>WebText, Wikipedia, web books versus raw Common Crawl</td><td>Logistic regression on hashed bag-of-words</td><td>Stochastic: keep if <code>np.random.pareto(9)</code> exceeds \(1 - \text{score}\)</td></tr>
+      <tr><td>FineWeb-Edu (2024) <a href="https://arxiv.org/abs/2406.17557">[§4]</a></td><td>Llama-3-70B-Instruct rates 460k pages 0 to 5 for educational value</td><td>Linear head on frozen Snowflake-arctic-embed-m</td><td>Score at least 3</td></tr>
+      <tr><td>DCLM (2024) <a href="https://arxiv.org/abs/2406.11794">[§4.4]</a></td><td>OpenHermes 2.5 instruction data plus top r/ELI5 posts versus random web</td><td>fastText, about 400k training documents</td><td>Top 10% by score</td></tr>
+      <tr><td>Nemotron-CC (2024) <a href="https://arxiv.org/abs/2412.02595">[§2.2]</a></td><td>Two LLM annotators (Nemotron-340B, Mixtral 8x22B) plus DCLM's classifier</td><td>Three classifiers, max of quantile buckets</td><td>Five tiers calibrated by annealing runs</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Llama 3 also uses fastText and DistilRoBERTa quality classifiers (with Llama 2 judgments as labels) but does not disclose selection <a href="https://arxiv.org/abs/2407.21783">[§3.1.1]</a>. Olmo 3 scores per topic and upsamples by quality, below.</p>
+
+  <p><strong>GPT-3's soft threshold.</strong> NumPy's <code>pareto(a)</code> draws \(X\) with \(\Pr[X &gt; x] = (1+x)^{-a}\), so a document with score \(s\) is kept with probability \(\Pr[X &gt; 1-s] = (2-s)^{-9}\): 1.0 at \(s=1\), 0.42 at 0.9, 0.19 at 0.8, 0.026 at 0.5. Steep but non-zero, so "some documents that were out of distribution" still get in <a href="https://arxiv.org/abs/2005.14165">[GPT-3, App. A]</a>.</p>
+
+  <p><strong>FineWeb-Edu.</strong> An LLM is too slow to score 15T tokens, so it labels a sample and a small regressor imitates it on frozen embeddings (410k pages to train, 50k to validate, F1 82% at the "score at least 3" decision; 6,000 H100 hours over FineWeb). Distilling an LLM's judgment into a cheap scorer is now the standard pattern. On 350B-token runs of a 1.71B model, FineWeb-Edu lifted MMLU from 33% to 37% and ARC from 46% to 57%, and reached 33.6% MMLU with 38B tokens where the next-best dataset needed about 300B; threshold 3 beat 2 and 4 <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §4]</a>.</p>
+
+  <p><strong>DCLM</strong> ran the most controlled comparison. At 1B-1x a fastText classifier scored CORE 30.2 against 27.5 for heuristics alone, ahead of perplexity filtering (29.0), top-k logits (29.2), AskLLM (28.6), a BGE-embedding classifier (27.2), SemDedup (27.1) and PageRank (26.1). The positives mattered: at 7B-1x instruction data plus ELI5 reached CORE 41.0 against 37.5 for GPT-3-style positives (Wikipedia, OpenWebText2, books) and 35.7 for Wikipedia alone, and the top 10% beat the top 15% (39.8) and top 20% (38.7). The 7B model trained on 2.6T tokens reached 64% MMLU, near Llama 3 8B (66%) with 6.6× less compute <a href="https://arxiv.org/abs/2406.11794">[Tab. 4, 5]</a>.</p>
+
+  <h3 id="filter-risks">What the filters cost</h3>
+  <ul>
+    <li><strong>Topic sculpting.</strong> A classifier changes the topic mix, not just the quality. FineWeb-Edu favors education, history and politics pages and downsamples business, entertainment and travel; its perplexity is worse on broad web (C4, Twitter, Reddit) and better on Wikipedia, academic text and code <a href="https://arxiv.org/abs/2406.17557">[FineWeb, §4]</a>.</li>
+    <li><strong>Unique-token starvation.</strong> Keeping the top 10% suits a 1T to 2.6T horizon, but a 15T run then repeats it many times. Nemotron-CC counts about 1.0T unique tokens in DCLM and 1.1T in FineWeb-Edu-2, and responds by (i) ensembling three classifiers, whose high-quality sets overlap by only 10.1%, (ii) skipping the heuristic filters on documents the classifier trusts (they removed 18.1% of high-quality tokens), and (iii) rephrasing (below) <a href="https://arxiv.org/abs/2412.02595">[§2, Tab. 8]</a>. Olmo 3 drops the flat cutoff: discard the bottom of the score distribution and repeat the top up to 7× <a href="https://arxiv.org/abs/2512.13961">[§3.4.4]</a>.</li>
+    <li><strong>Benchmark alignment.</strong> DCLM's positives are instruction-formatted, so the corpus resembles benchmark prompts. Nemotron-CC therefore sets its tiers by short annealing runs rather than trusting raw scores.</li>
+    <li><strong>Interaction with mixing.</strong> Adding curated sources helped weakly filtered Common Crawl subsets by +1.4 to +2.2 CORE but <em>hurt</em> DCLM-Baseline by 1.2 (1B-1x, Tab. 6). Strong filtering already captures what they offered.</li>
+  </ul>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>If a tagger's score is correlated with jet mass, cutting on it sculpts the mass spectrum, which is why decorrelation methods exist. A quality classifier trained on textbook-style positives sculpts topic and style the same way. The analog of checking the mass distribution before and after a cut is to compare topic histograms before and after filtering, and to evaluate on the domains the filter disfavors.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="mixtures">Mixtures: choosing domain weights</h2>
+
+  <p>A corpus is a set of domains \(i\) (web, code, math, books, ...) with \(n_i\) available tokens each. The <strong>mixture</strong> <span class="zh">数据配比</span> is the vector of sampling weights \(w_i\), summing to 1. A weight is not a share of the corpus: with \(D\) training tokens, domain \(i\) is seen \(w_i D / n_i\) times. Small high-quality domains get repeated; huge mediocre ones are barely touched. Gopher's weights (<a href="https://arxiv.org/abs/2112.11446">[Gopher, Tab. 2]</a>, \(D = 300\)B):</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>MassiveText subset</th><th class="num">Tokens available</th><th class="num">Weight</th><th class="num">Tokens seen</th><th class="num">Epochs</th></tr></thead>
+    <tbody>
+      <tr><td>MassiveWeb</td><td class="num">506B</td><td class="num">48%</td><td class="num">144B</td><td class="num">0.28</td></tr>
+      <tr><td>Books</td><td class="num">560B</td><td class="num">27%</td><td class="num">81B</td><td class="num">0.14</td></tr>
+      <tr><td>C4</td><td class="num">182B</td><td class="num">10%</td><td class="num">30B</td><td class="num">0.16</td></tr>
+      <tr><td>News</td><td class="num">676B</td><td class="num">10%</td><td class="num">30B</td><td class="num">0.04</td></tr>
+      <tr><td>GitHub</td><td class="num">422B</td><td class="num">3%</td><td class="num">9B</td><td class="num">0.02</td></tr>
+      <tr class="hl"><td>Wikipedia</td><td class="num">4B</td><td class="num">2%</td><td class="num">6B</td><td class="num">1.5</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Epochs = weight × 300B / tokens available. GPT-3 likewise gave Common Crawl weight 60%, so \(0.60 \times 300/410 = 0.44\) epochs, while Wikipedia was seen 3.4 times <a href="https://arxiv.org/abs/2005.14165">[GPT-3, Tab. 2.2]</a>.</p>
+
+  <p>Gopher chose these numbers by sweeping seven combinations of the four large subsets with small models and reading downstream loss <a href="https://arxiv.org/abs/2112.11446">[App. A.3.1]</a>. The weakness is visible: the answer depends on which evaluations you read, and the search does not scale beyond a handful of domains.</p>
+
+  <h3 id="mix-methods">Ways to set the weights</h3>
+
+  <p><strong>Scaling-law ablations (Llama 3).</strong> Meta classified web documents by knowledge category and downsampled over-represented ones such as arts and entertainment, trained small models on candidate mixes to predict large-model performance, picked one and verified it at larger scale. The final mix is about 50% general knowledge, 25% math and reasoning, 17% code and 8% multilingual <a href="https://arxiv.org/abs/2407.21783">[§3.1.2]</a>: 7.5T, 3.75T, 2.55T and 1.2T of 15T tokens. It also changed during training (more non-English, upsampled math, newer web data; §3.4.1).</p>
+
+  <p><strong>DoReMi: a proxy with group DRO.</strong> DoReMi <a href="https://arxiv.org/abs/2305.10429">[Xie et al. 2023]</a> seeks weights that make a small model good on <em>every</em> domain without looking at downstream tasks. Train a reference model on baseline weights, then a same-size proxy whose domain weights \(\alpha\) are updated online to maximize the proxy's <strong>excess loss</strong> over the reference:</p>
+  \[ \min_\theta \max_{\alpha \in \Delta^k} \; \sum_{i=1}^{k} \alpha_i \Bigg[ \frac{1}{\sum_{x \in D_i}|x|} \sum_{x \in D_i} \big( \ell_\theta(x) - \ell_{\text{ref}}(x) \big) \Bigg] \]
+  <p>Per-token excess loss is clipped at zero, and \(\alpha \leftarrow \alpha \odot \exp(\eta \lambda)\) is renormalized and smoothed; the average of \(\alpha\) over training is returned (Alg. 1). The reference loss marks how <em>learnable</em> a domain is, so a domain where the proxy lags the reference has headroom, while hopelessly high-entropy or trivially easy domains get less. On the Pile (22 domains) a 280M proxy set weights for an 8B model: +6.5 points of one-shot accuracy, the baseline's accuracy in 75k steps instead of 200k (2.6× faster), lower perplexity on all 22 domains, at 8% extra FLOPs. Pile-CC went from 0.112 to 0.606 and ArXiv from 0.105 to 0.004. Caveats from the paper: a 1B proxy gave different weights, and results depend on the reference model and the domain definitions <a href="https://arxiv.org/abs/2305.10429">[§3, §4, §6]</a>.</p>
+
+  <p><strong>RegMix: regression on many tiny runs.</strong> RegMix <a href="https://arxiv.org/abs/2407.01492">[Liu et al. 2024]</a> samples 512 mixtures from a Dirichlet around the natural distribution, trains a 1M-parameter model on 1B tokens for each, fits gradient-boosted trees from weights to target loss (validation loss on the Pile's web subset), and searches the fitted model for the best mix. The bet is <em>rank invariance</em>: mixtures rank the same at small and large scale. It held: Spearman correlation between predicted and actual rank of unseen mixtures was 97.1 for 1B models on 25B tokens. The 512 runs cost about 2% of one 1B run, and reaching the mixture took about 10% of DoReMi's FLOPs (3.5e18 versus 3.7e19). Average score: 47.3 for RegMix, 46.8 for DoReMi, 45.1 for the Pile's hand-picked weights. Two findings deserve attention: web-text validation loss correlated with downstream accuracy far better than Wikipedia loss did, and domain interactions were often counterintuitive, which is the argument for fitting a model instead of reasoning by hand <a href="https://arxiv.org/abs/2407.01492">[§4, §5]</a>.</p>
+
+  <p><strong>Constrained swarms and instance-level mixing.</strong> Olmo 3 runs the RegMix recipe with 30M-parameter models on 3B tokens (5× Chinchilla), a swarm about 5× the domain count, one regression per task, and a search that caps repetition at about 4 to 7× at the 6T budget. "Conditional mixing" freezes the previous optimum as one virtual domain, so a late-arriving source does not force a new swarm <a href="https://arxiv.org/abs/2512.13961">[§3.4.4]</a>. Qwen3 labels over 30T tokens (educational value, field, domain, safety) and optimizes the mix at the <em>instance</em> level with small proxy ablations <a href="https://arxiv.org/abs/2505.09388">[§3.1]</a>. Data mixing laws fit explicit functional forms instead of trees <a href="https://arxiv.org/abs/2403.16952">[Ye et al. 2024]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Choosing mixture weights with small models</div>
+    <dl>
+      <dt>Problem</dt><dd>The search space is continuous and high-dimensional, evaluations are expensive, and intuition about domain interactions is unreliable.</dd>
+      <dt>Idea</dt><dd>Measure mixtures on cheap proxies (DoReMi: one proxy with group DRO; RegMix, Olmo 3: many tiny runs plus a regressor) and transfer the best to the big run.</dd>
+      <dt>Why it works</dt><dd>Mixture rankings transfer across scale, and a regression over hundreds of points captures interactions no one guesses.</dd>
+      <dt>Evidence</dt><dd>DoReMi: +6.5 points, 2.6× fewer steps at 8B from a 280M proxy. RegMix: Spearman 97.1 at 1B/25B, about 10% of DoReMi's compute.</dd>
+      <dt>Cost</dt><dd>Results depend on the evaluation (RegMix optimized Pile-CC loss), the domain partition, the reference model (DoReMi 280M and 1B disagree) and the compute budget. Weights are in tokens, so they change with the tokenizer (<a href="02-tokenization.html">page 02</a>).</dd>
+      <dt>Used by</dt><dd>Llama 3 (scaling-law mixing), Olmo 3 (swarm), Qwen3 (instance-level proxy ablations).</dd>
+    </dl>
+  </div>
+
+  <h3 id="what-to-upweight">Code, math and language shares</h3>
+  <p>Every recent report upweights the domains that carry reasoning. Llama 3 gives math 25% and code 17%, with DistilRoBERTa classifiers that find math and code pages inside the crawl <a href="https://arxiv.org/abs/2407.21783">[§3.1.1]</a>; DeepSeek-V3 raised the math and code ratio over V2 <a href="https://arxiv.org/abs/2412.19437">[§4.1]</a>. Code is nearly free for language performance: Muennighoff et al. swapped up to 50% of natural-language tokens for Python with no drop on natural-language tasks <a href="https://arxiv.org/abs/2305.16264">[§7]</a>. Llama 3 set its 8% multilingual share "experimentally, balancing model performance on English and multilingual benchmarks". At the long tail there is simply little web: of FineWeb2's 1,868 language-script pairs, 70% have more than half of their documents from Bible- or Wikipedia-related domains <a href="https://arxiv.org/abs/2506.20920">[FineWeb2, §5]</a>.</p>
+</section>
+
+<section>
+  <h2 id="annealing">Annealing and mid-training</h2>
+
+  <p>Most learning-rate schedules end with a decay to a small value or to zero (<a href="14-optimization.html">page 14</a>). Recent reports use that decay as a second lever: in the last few percent of training they switch to a smaller, cleaner, more task-like data mix. Meta calls this <strong>annealing</strong> <span class="zh">退火</span>; OLMo and GLM call the stage <strong>mid-training</strong> <span class="zh">中期训练</span>, Qwen3 a "reasoning stage". It is now standard, and interviewers ask why it works.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 352" role="img" aria-labelledby="fig-12-4-title">
+<title id="fig-12-4-title">Annealing schematic: learning rate follows a truncated cosine schedule then decays linearly to zero while the data mix shifts from 95 percent web to a mix with math and instruction data</title>
+<text x="60" y="16" class="s-small s-bold">Learning rate (schematic, OLMo 2 7B)</text>
+<line class="s-line" x1="60" y1="130" x2="690" y2="130"/><line class="s-line" x1="60" y1="30" x2="60" y2="130"/>
+<path class="s-line-a" d="M60.0,130.0 L72.0,30.0 L72.0,30.0 L78.1,30.0 L84.2,30.1 L90.3,30.2 L96.4,30.4 L102.5,30.6 L108.6,30.8 L114.7,31.1 L120.8,31.4 L126.9,31.8 L133.0,32.2 L139.1,32.7 L145.2,33.2 L151.3,33.7 L157.4,34.3 L163.5,34.9 L169.6,35.6 L175.7,36.3 L181.8,37.0 L187.9,37.8 L194.0,38.6 L200.1,39.4 L206.2,40.3 L212.3,41.2 L218.4,42.2 L224.5,43.2 L230.6,44.2 L236.7,45.2 L242.8,46.3 L248.9,47.4 L255.0,48.5 L261.1,49.7 L267.2,50.9 L273.3,52.1 L279.4,53.3 L285.5,54.6 L291.6,55.8 L297.7,57.1 L303.8,58.4 L309.9,59.8 L316.0,61.1 L322.1,62.4 L328.2,63.8 L334.3,65.2 L340.4,66.6 L346.5,68.0 L352.6,69.4 L358.7,70.8 L364.8,72.2 L370.9,73.6 L377.0,75.0 L383.1,76.4 L389.2,77.8 L395.3,79.2 L401.4,80.6 L407.5,82.0 L413.6,83.4 L419.7,84.8 L425.8,86.2 L431.9,87.6 L438.0,88.9 L444.1,90.2 L450.2,91.6 L456.3,92.9 L462.4,94.2 L468.5,95.4 L474.6,96.7 L480.7,97.9 L486.8,99.1 L492.9,100.3 L499.0,101.5 L505.1,102.6 L511.2,103.7 L517.3,104.8 L523.4,105.8 L529.5,106.8 L535.6,107.8 L541.7,108.8 L547.8,109.7 L553.9,110.6 L560.0,111.4 L640.0,130.0"/>
+<line class="s-line s-dash" x1="560" y1="24" x2="560" y2="130"/>
+<circle class="s-fill-a" cx="560" cy="111.4" r="3.5"/>
+<text x="76" y="42" class="s-small">peak 3e-4</text>
+<text x="552" y="103.4" text-anchor="end" class="s-small">cut at about 19% of peak</text>
+<text x="310" y="150" text-anchor="middle" class="s-small">Stage 1: about 4T tokens, at least 90% of FLOPs, cosine schedule</text>
+<text x="626" y="150" text-anchor="middle" class="s-small">Stage 2: 50B tokens</text>
+<text x="626" y="98" text-anchor="middle" class="s-small s-muted">LR to 0</text>
+<text x="626" y="84" text-anchor="middle" class="s-small s-muted">(width exaggerated)</text>
+<text x="60" y="182" class="s-small s-bold">Stage 1 mix (OLMo 2 Mix 1124): web plus 4.8% code, papers, math, Wikipedia</text>
+<rect class="s-a" x="60.0" y="190" width="599.8" height="32" rx="2"/>
+<text x="359.9" y="211" text-anchor="middle" class="s-small">web (DCLM) 95.2%</text>
+<rect class="s-plain" x="659.8" y="190" width="30.2" height="32" rx="2"/>
+<text x="60" y="248" class="s-small s-bold">Stage 2 mix (Dolmino, 50B tokens): higher-quality web, instruction and synthetic math data</text>
+<rect class="s-a" x="60.0" y="256" width="297.4" height="32" rx="2"/>
+<text x="208.7" y="277" text-anchor="middle" class="s-small">filtered web 47.2%</text>
+<rect class="s-d" x="357.4" y="256" width="104.6" height="32" rx="2"/>
+<text x="409.7" y="277" text-anchor="middle" class="s-small">FLAN 16.6%</text>
+<rect class="s-e" x="461.9" y="256" width="131.0" height="32" rx="2"/>
+<text x="527.5" y="277" text-anchor="middle" class="s-small">math 20.8%</text>
+<rect class="s-b" x="593.0" y="256" width="36.9" height="32" rx="2"/>
+<text x="611.4" y="277" text-anchor="middle" class="s-small">5.9</text>
+<rect class="s-c" x="629.8" y="256" width="44.8" height="32" rx="2"/>
+<text x="652.2" y="277" text-anchor="middle" class="s-small">7.1</text>
+<rect class="s-plain" x="674.6" y="256" width="15.4" height="32" rx="2"/>
+<text x="60" y="318" class="s-small s-muted">Small segments in stage 2, left to right:</text>
+<rect class="s-b" x="290" y="308" width="12" height="12" rx="2"/><text x="307" y="318" class="s-small">peS2o papers 5.9%</text>
+<rect class="s-c" x="431" y="308" width="12" height="12" rx="2"/><text x="448" y="318" class="s-small">Wikipedia 7.1%</text>
+<rect class="s-plain" x="554" y="308" width="12" height="12" rx="2"/><text x="571" y="318" class="s-small">StackExchange Q&amp;A 2.5%</text>
+<text x="60" y="340" class="s-small s-muted">Stage 2 web is DCLM fastText top 7% intersected with FineWeb-Edu classifier score of 2 or more.</text>
+</svg>
+    <figcaption><b>Figure 4.</b> The OLMo 2 7B recipe. Stage 1 uses a cosine schedule calibrated to end at 10% of peak at 5T tokens but stops at 4T, where it sits at \(0.1 + 0.9 \cdot 0.5\,(1+\cos 0.8\pi) \approx 19\%\) of peak. Stage 2 restarts there, decays the learning rate linearly to zero over only 50B tokens, and changes the data: web filtered harder, plus instruction data and synthetic math <a href="https://arxiv.org/abs/2501.00656">[OLMo 2, §2.3, §4.1, Tab. 10, 13]</a>. Three such anneals with different data orders are averaged into one model.</figcaption>
+  </figure>
+
+  <h3 id="anneal-evidence">The evidence</h3>
+  <p><strong>Llama 3</strong> linearly annealed the 405B model's learning rate to zero over its final 40M tokens at 128K context on upsampled very high-quality data, and averaged checkpoints <a href="https://arxiv.org/abs/2407.21783">[§3.4.3]</a>. Annealing the 8B model on small amounts of code and math data improved GSM8K by 24.0% and MATH by 6.4% (validation sets, with the GSM8K and MATH <em>training</em> sets in the annealing data), but the effect at 405B was negligible (§3.1.3).</p>
+
+  <p><strong>OLMo 2</strong> spends 5% to 10% of FLOPs on stage 2. For 7B, three 50B-token anneals with different data orders are averaged ("souping") <a href="https://arxiv.org/abs/2501.00656">[§2.3]</a>. The effect (Tab. 9): MMLU 59.8 to 63.7, ARC-C 72.6 to 79.8, DROP 40.7 to 60.8, GSM8K 24.1 to 67.5. Its ablation (50B-token anneals from a 4T checkpoint, Tab. 11) separates decay from data:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Stage-2 run (50B tokens)</th><th class="num">OLMES</th><th class="num">MMLU</th><th class="num">GSM* (200 items)</th></tr></thead>
+    <tbody>
+      <tr><td>checkpoint before annealing</td><td class="num">69.6</td><td class="num">59.8</td><td class="num">28.5</td></tr>
+      <tr><td>anneal on the stage-1 mix (decay only)</td><td class="num">74.0</td><td class="num">61.8</td><td class="num">27.0</td></tr>
+      <tr class="hl"><td>anneal on curated web + math + instruction data</td><td class="num">75.7</td><td class="num">63.1</td><td class="num">46.5</td></tr>
+    </tbody>
+  </table></div>
+  <p>Decay alone gives +4.4 OLMES and +2.0 MMLU but no math gain (GSM* falls 1.5). The data change adds +1.7 OLMES, +1.3 MMLU and +19.5 on the math dev set. Decay makes the model a little better everywhere; the specialized data teaches skills the web mix underserves. OLMo 2's "microanneals" (about 200M tokens of candidate math mixed into web data) add that the <em>presence</em> of domain data matters more than its share (35% math reached 63.5 GSM*, 10% reached 61), a few repeats help (2 copies 66, 4 copies 65), and TinyGSM's code-style answers <em>hurt</em> while a natural-language rewrite helped: format matters as much as content <a href="https://arxiv.org/abs/2501.00656">[§4.4.2]</a>.</p>
+
+  <p>Others follow the same pattern. Qwen3's reasoning stage is about 5T tokens after 30T+, with more STEM, code, reasoning and synthetic data and accelerated decay <a href="https://arxiv.org/abs/2505.09388">[§3.2]</a>. Kimi K2 anneals 400B tokens at 4K context, then 60B at 32K <a href="https://arxiv.org/abs/2507.20534">[§2.5]</a>. MiMo-V2-Flash upsamples code and adds about 5% synthetic reasoning data over tokens 22T to 26T of 27T <a href="https://arxiv.org/abs/2601.02780">[§3.1]</a>. Olmo 3 builds a 100B-token mid-training mix from a 2T pool (math, code, QA, instruction data, reasoning traces) and checks a candidate mix's <em>post-trainability</em> with SFT, "to lay groundwork for post-training" <a href="https://arxiv.org/abs/2512.13961">[§2, §3.5]</a>. GLM-5 and DeepSeek-V4 add agentic and long-context data <a href="https://arxiv.org/abs/2602.15763">[GLM-5, §2.3]</a>. The boundary with post-training (<a href="19-sft-distillation.html">page 19</a>) is blurring on the data side.</p>
+
+  <div class="decision">
+    <div class="decision-title">Anneal on higher-quality data</div>
+    <dl>
+      <dt>Problem</dt><dd>Specialized capabilities (math, code, instruction following) are a small share of a web-heavy mix.</dd>
+      <dt>Idea</dt><dd>Train on a broad mix, then in the final stretch (from well under 1% of tokens for Llama 3's 40M-token anneal to about 15% for Qwen3 and MiMo) decay the learning rate while shifting to a smaller, capability-targeted, higher-quality mix, often with some repetition.</dd>
+      <dt>Why it works</dt><dd>Not fully settled. Two non-exclusive explanations: at low learning rate the model can fit the fine structure of the final distribution instead of bouncing around it, and late data is not diluted by trillions of web tokens. OLMo 2's table separates them empirically.</dd>
+      <dt>Evidence</dt><dd>OLMo 2 7B: GSM8K 24.1 to 67.5 (Tab. 9). Llama 3 8B: +24.0% on GSM8K, negligible at 405B.</dd>
+      <dt>Cost</dt><dd>Gains can be format learning rather than knowledge (Llama's annealing data included GSM8K and MATH training splits); benchmark-shaped data invites contamination; the effect shrinks for very large models.</dd>
+      <dt>Used by</dt><dd>Llama 3, OLMo 2, Olmo 3, Qwen3, Kimi K2, MiMo-V2-Flash, GLM-5, DeepSeek-V4.</dd>
+    </dl>
+  </div>
+
+  <h3 id="anneal-eval">Annealing as an experiment</h3>
+  <p>Annealing is also a cheap way to <em>evaluate small datasets</em>: 5B new tokens cannot move the loss at pretraining proportions. Meta's recipe: take an 8B checkpoint that is 50% trained, decay the learning rate linearly to zero over 40B tokens with 30% candidate data and 70% default mix, and compare benchmarks <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §3.1.3]</a>. Nemotron-CC scored each of its 20 quality buckets this way (70%-trained 8B, 50B more tokens, 34% bucket), found the top bucket far better than the rest and buckets 12 to 18 about equal, and used that to define its five tiers <a href="https://arxiv.org/abs/2412.02595">[§2.2, App. C]</a>. The limit is that the measurement is conditional on the late-stage regime, and benchmark-like data looks better than it is.</p>
+</section>
+
+<section>
+  <h2 id="repetition">Repetition, synthetic data and running out of tokens</h2>
+
+  <p>Aggressive filtering, deduplication and long runs push toward the same wall: the supply of unique high-quality tokens. You can repeat what you have or manufacture more. Both have measured limits.</p>
+
+  <h3 id="epochs">How many epochs are nearly free</h3>
+  <p>Muennighoff et al. trained more than 400 models (up to 9B parameters and 900B tokens, up to 1,500 epochs) on C4 and other corpora <a href="https://arxiv.org/abs/2305.16264">[Muennighoff et al. 2023]</a>. With total tokens \(D\) drawn from \(U\) unique tokens, let \(R_D = D/U - 1\) be the number of <em>repeats</em>. Each repeat is worth a geometrically shrinking fraction of a fresh token, giving an <strong>effective data</strong> size (§3.1):</p>
+  <div class="eq-box">
+    \[ D' = U + U\,R_D^{*}\left(1 - e^{-R_D / R_D^{*}}\right) \]
+    <div class="eq-label">Repeated tokens decay in value; R*_D ≈ 15 is fitted</div>
+  </div>
+  <p>For small \(R_D\), \(D' \approx D\): repetition is free. As \(R_D \to \infty\), \(D' \to U(1 + R_D^*)\), so no number of epochs is worth more than about 16 fresh passes. \(R^*_D \approx 15\) is the "half-life". The headline result: an 8.7B model trained for 4 epochs on 44B unique tokens had only 0.5% higher validation loss than one trained on 178B unique tokens at the same compute, and downstream accuracy did not differ significantly up to about 4 epochs. Excess parameters lose value faster than repeated data, so when data-constrained, scale epochs faster than parameters: at \(9.3 \times 10^{21}\) FLOPs with 25B unique tokens, the optimal model with 27% fewer parameters beat the Chinchilla-allocated one <a href="https://arxiv.org/abs/2305.16264">[§5, §6]</a>. Earlier, T5 repeated a \(2^{29}\)-token subset of C4 64 times with almost no GLUE loss (83.28 to 82.87), while 4,096 repeats of a \(2^{23}\)-token subset cost 7 points <a href="https://arxiv.org/abs/1910.10683">[T5, Tab. 9]</a>.</p>
+
+  <p><strong>Worked numbers.</strong> With \(U = 2\)T and \(R^*_D = 15\):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Epochs</th><th class="num">Tokens seen</th><th class="num">\(D'\) (effective)</th><th class="num">Fraction of a fresh-data run</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td class="num">2T</td><td class="num">2.00T</td><td class="num">100%</td></tr>
+      <tr><td class="num">2</td><td class="num">4T</td><td class="num">3.94T</td><td class="num">98%</td></tr>
+      <tr class="hl"><td class="num">4</td><td class="num">8T</td><td class="num">7.44T</td><td class="num">93%</td></tr>
+      <tr><td class="num">8</td><td class="num">16T</td><td class="num">13.19T</td><td class="num">82%</td></tr>
+      <tr><td class="num">16</td><td class="num">32T</td><td class="num">20.96T</td><td class="num">66%</td></tr>
+    </tbody>
+  </table></div>
+  <p>For 4 epochs: \(R_D = 3\), \(e^{-3/15} = 0.8187\), so \(D' = 2 + 2 \cdot 15 \cdot (1 - 0.8187) = 2 + 5.44 = 7.44\)T. The asymptote is \(2 \cdot 16 = 32\)T however long you train. Caveats: constants fitted on dense GPT-2-style models up to 9B on C4 and OSCAR, one seed per configuration. Practical limits move with data quality: OLMo 2's mid-training math helped with 2 copies and was flat at 4, and Olmo 3's mixing search caps repetition at about 4 to 7 per domain <a href="https://arxiv.org/abs/2512.13961">[§3.4.4]</a>. Two more moves from the same paper: <strong>fill with code</strong> (up to 50% of natural-language tokens replaced by Python with no deterioration, §7) and <strong>filter selectively</strong> (perplexity filtering helped, deduplication did not).</p>
+
+  <h3 id="synthetic">Synthetic data: rephrasing and textbooks</h3>
+  <p>Synthetic data <span class="zh">合成数据</span> in pretraining comes in three kinds: <strong>rephrasing</strong> real documents, <strong>generating</strong> textbook-style text from scratch, and <strong>task-shaped data</strong> (QA, reasoning traces) used mostly in mid-training.</p>
+
+  <p><strong>WRAP.</strong> Maini et al. have a frozen Mistral-7B-Instruct rephrase C4 documents in several styles (easy, Wikipedia-like, terse, question-answer), at most 300 tokens at a time because longer inputs lost information, and train on a 1:1 real:rephrased mix <a href="https://arxiv.org/abs/2401.16380">[WRAP, §3]</a>. For 1.3B models, real C4 plus rephrases (85B real tokens) averaged 49.4 on eight zero-shot tasks versus 47.4 for the same real tokens alone, with about 3× faster learning. Their caveats: synthetic data cannot impart new knowledge, it only speeds up learning of what the source contained; synthetic-only training hurt on some Pile domains, so real data stays; a small rephraser (Qwen-1.8B, Mistral-7B) sufficed while fine-tuned T5-base was much worse; no single style won everywhere.</p>
+
+  <p><strong>Nemotron-CC and Kimi K2 at scale.</strong> Nemotron-CC rephrased low-quality documents into Wikipedia style to remove noise, and high-quality ones four more ways (question-answer pairs, distilled passages, extracted knowledge, knowledge lists) to make fresh unique tokens, using Mistral NeMo 12B: 1.9T synthetic of 6.3T total <a href="https://arxiv.org/abs/2412.02595">[§2.3]</a>. Kimi K2 rephrases knowledge text in varied styles chunk by chunk, each conditioned on the previous output, with a fidelity check against the source. On SimpleQA with an early checkpoint, raw text for 10 epochs scored 23.76, one rephrasing for 10 epochs 27.39, and ten rephrasings seen once 28.94; in production each corpus is rephrased at most twice <a href="https://arxiv.org/abs/2507.20534">[§2.2, Tab. 1]</a>.</p>
+
+  <p><strong>Cost check.</strong> Generating 1.9T tokens with a 12B model costs at least \(2 \cdot 12 \times 10^9 \cdot 1.9 \times 10^{12} \approx 4.6 \times 10^{22}\) FLOPs (generated tokens only). Training an 8B model on 15T tokens is \(6 \cdot 8.03 \times 10^9 \cdot 15 \times 10^{12} \approx 7.2 \times 10^{23}\). So rephrasing at this scale is at least about 6% of the run it feeds.</p>
+
+  <p><strong>Textbooks from scratch: phi-1.</strong> Gunasekar et al. trained a 1.3B code model on about 6B tokens of web code chosen by a classifier (GPT-4 rated about 100k files for "educational value"; a random forest on CodeGen embeddings scored the rest), under 1B tokens of GPT-3.5 "textbooks" and a 180M-token exercise set for finetuning <a href="https://arxiv.org/abs/2306.11644">[phi-1, §2]</a>. Filtering alone helped a 350M model from 12.19% to 17.68% HumanEval, and textbooks made it 20.12%; phi-1 reached 50.6% HumanEval and 55.5% MBPP after about 8 passes over 7B tokens. GPT-3.5 data has a high error rate.</p>
+
+  <div class="decision">
+    <div class="decision-title">Rephrase real documents</div>
+    <dl>
+      <dt>Problem</dt><dd>High-quality unique tokens run out, while low-quality tokens are plentiful but noisy.</dd>
+      <dt>Idea</dt><dd>Use an LLM to restyle real text so each source document yields several distinct training documents.</dd>
+      <dt>Why it works</dt><dd>Repeating identical tokens has diminishing returns, but the same facts in different wording behave more like fresh data, and rephrasing turns noisy pages into cleaner text.</dd>
+      <dt>Evidence</dt><dd>WRAP: about 3× faster learning. K2: 23.76 to 28.94 on SimpleQA. Nemotron-CC: 1.9T synthetic tokens in 6.3T.</dd>
+      <dt>Cost</dt><dd>Inference compute, introduced errors, stylistic homogenization, possible teacher contamination, and no new knowledge.</dd>
+      <dt>Used by</dt><dd>Kimi K2, Nemotron-CC, Olmo mid-training math rewrites, Qwen3 (synthetic data from Qwen2.5 models).</dd>
+    </dl>
+  </div>
+
+  <h3 id="collapse">Model collapse</h3>
+  <p>Model collapse <span class="zh">模型崩溃</span> is the degradation from training recursively on a model's own samples: the distribution's tails vanish first <a href="https://arxiv.org/abs/2305.17493">[Shumailov et al. 2023]</a>. Gerstgrasser et al. separate two regimes. If each generation <em>replaces</em> the data with synthetic samples, test error grows (in linear regression, \(\sigma^2 d\, n/(T-d-1)\)). If synthetic data <em>accumulates</em> next to the original real data, error stays bounded, at most \(\sigma^2 d/(T-d-1) \cdot \pi^2/6\), and language-model experiments up to 125M parameters agree <a href="https://arxiv.org/abs/2404.01413">[§2.1, Thm. 2]</a>. The practical rule is never to replace real data with synthetic. Labs also guard against synthetic text arriving through the crawl: DeepSeek-V4 filters "batched auto-generated and templated content" <a href="https://arxiv.org/abs/2606.19348">[§4.1]</a>, and DCLM drops all Common Crawl from 2023 on <a href="https://arxiv.org/abs/2406.11794">[App. E]</a>. They exclude accidental synthetic text and add deliberate, controlled synthetic text at once.</p>
+</section>
+
+<section>
+  <h2 id="contamination">Contamination</h2>
+
+  <p>Data contamination <span class="zh">数据污染</span> means benchmark test items, or close variants, are in the training data, so a score measures memorization. The web holds benchmark files, answer keys, exam sites and discussions of both, and synthetic data from a model that saw a benchmark can carry it along. Evaluation-side treatment (dated benchmarks, held-out suites) is on <a href="18-evaluation.html">page 18</a>; this is the data side.</p>
+
+  <h3 id="detect">Detecting overlap</h3>
+  <p>The standard tool is n-gram overlap between training documents and evaluation examples. Implementations differ in \(n\), in what a match triggers, and in what counts as a "contaminated example":</p>
+  <ul>
+    <li><strong>GPT-3.</strong> Find 13-gram matches, remove the colliding 13-gram plus a 200-character window, discard leftovers under 200 characters, drop documents split into more than 10 pieces, and ignore 13-grams found in more than 10 documents (boilerplate). A bug made the filter miss many overlaps and retraining was unaffordable, so OpenAI compared scores on the whole benchmark with a "clean" subset afterwards <a href="https://arxiv.org/abs/2005.14165">[GPT-3, §4, App. C]</a>.</li>
+    <li><strong>Llama 3.</strong> An example is contaminated if at least a fraction \(T_D\) of its tokens lie in 8-grams found in the pretraining corpus, with \(T_D\) chosen per benchmark to maximize the estimated gain (clean-subset versus whole-set score). HellaSwag: 85% flagged, gain about 14 to 15 points at all three sizes; PIQA 55%, about 8 points; Natural Questions 52%, about 1 point; GSM8K 41%, roughly 0 to 1. For MMLU, MMLU-Pro, HumanEval and MBPP the overlap is so high that no gain can be estimated <a href="https://arxiv.org/abs/2407.21783">[§5.1.4, Tab. 15]</a>.</li>
+    <li><strong>DCLM.</strong> Flag a page if it contains an MMLU or HellaSwag question and at least one answer option. Only 0.007% of DCLM-Baseline was flagged (Dolma 1.7: 0.001%, FineWeb-Edu: 0.009%), and training without the overlaps did not lower scores (MMLU 51.8 to 52.7 at 7B-2x) <a href="https://arxiv.org/abs/2406.11794">[§4.6, App. O]</a>.</li>
+    <li><strong>Olmo 3.</strong> The <code>decon</code> tool samples n-grams at a stride and expands hits to neighbors before dropping a document. It is applied to mid-training and long-context data because memorization is strongest near the end of training <a href="https://arxiv.org/abs/2512.13961">[§3.5.3]</a>.</li>
+    <li><strong>Beyond n-grams (phi-1).</strong> A 13-gram search found only 4 overlaps between HumanEval and phi-1's synthetic exercises, all false positives. Embedding plus AST similarity found many close problems; after pruning over 40% of the exercise set, phi-1 still scored 45.1% on HumanEval against StarCoder-Prompted's 41.5% <a href="https://arxiv.org/abs/2306.11644">[§5]</a>.</li>
+  </ul>
+
+  <h3 id="contam-limits">Limits, and what labs do</h3>
+  <p><strong>Paraphrase and translation escape n-gram matching</strong> (phi-1's experiment), and short items (MMLU, HumanEval) produce false positives, so thresholds are tuned by hand on inspected examples. <strong>Effect size varies</strong>: catastrophic for HellaSwag, minor for a Natural Questions question without its answer, and large models absorb less (Llama 3's annealing gains vanish at 405B). <strong>The clean-subset comparison is biased too</strong>, since the clean subset may be systematically easier or harder; GPT-3 says so. <strong>Removal is not free</strong>: it changes the distribution and can delete legitimate text sharing a phrase. And <strong>the field disagrees</strong>: DCLM and Nemotron-CC release without decontaminating, while Olmo 3 and Gemma 4 decontaminate deliberately <a href="https://arxiv.org/abs/2607.02770">[Gemma 4, §2.4]</a>.</p>
+  <p>A defensible practice: (1) n-gram decontaminate against every benchmark in your suite before training, at 8 to 13 tokens plus whole-question matching; (2) treat late-stage and synthetic data as the highest risk; (3) keep a private held-out set that never touches the web; (4) report a clean-subset comparison beside headline numbers; (5) prefer dated or regenerated benchmarks for claims that matter.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Train-test leakage in a tagger is the same event: a jet or Monte Carlo file appearing in both splits under different reconstructions. The fix is to split on the event identifier before any featurization. Web text has no event identifier, and near-duplicate detection (n-gram overlap, MinHash) is how you rebuild one, which is why the same machinery serves both deduplication and decontamination.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="decisions">How labs make data decisions</h2>
+
+  <p>Nobody trains a 15T-token model per candidate dataset, so every decision above comes from a smaller experiment. The craft is knowing what it can and cannot tell you.</p>
+
+  <h3 id="proxies">Proxy models and how far they transfer</h3>
+  <p>DCLM compared rankings of ten curation methods at smaller scales with the 7B-1x ranking: correlations 0.838 for 400M-1x, 0.956 for 1B-1x and 0.982 for 3B-1x <a href="https://arxiv.org/abs/2406.11794">[§3.2]</a>. DataDecide made the question systematic with 1,050 models (25 corpora × 14 sizes from 4M to 1B × 3 seeds, 100 tokens per parameter) <a href="https://arxiv.org/abs/2504.11393">[DataDecide, §2, §3]</a>:</p>
+  <ul>
+    <li>Ranking corpora at a single small size (150M) picks the right winner in about 80% of pairwise comparisons at 1B, and eight scaling-law extrapolation baselines did not do better.</li>
+    <li>Run-to-run noise is real: standard deviation across seeds at 1B can reach 2 accuracy points on some tasks, so use multiple seeds.</li>
+    <li>A continuous metric (probability of the correct answer) beats accuracy at small scale: with it MMLU, ARC, HellaSwag, MBPP and HumanEval were more than 80% predictable at 1B from 0.01% of the target compute. Tasks differ: HellaSwag needs more compute and SocialIQA is hard at every scale.</li>
+  </ul>
+
+  <h3 id="signal">Early-signal benchmarks and compute-matched ablations</h3>
+  <p>A benchmark helps only if it clears noise at your model size. FineWeb chose tasks by three rules: low variance across random samples of the same data, near-monotonic improvement during training, and above-chance scores at the ablation scale <a href="https://arxiv.org/abs/2406.17557">[§3.1]</a>; DCLM's CORE (22 tasks, centered at chance) followed the same logic. MMLU is the cautionary case: across fastText variants at 7B-1x it sits between about 24 and 29 (chance is 25) <a href="https://arxiv.org/abs/2406.11794">[DCLM, Tab. 5]</a>. Ablations must be compute-matched (same architecture, hyperparameters and steps; only data differs), with two seeds per variant as in FineWeb. Two traps remain. Some effects appear only at scale: FineWeb notes deduplication is not always visible in a 28B-token slice, so it ran those studies at 350B tokens <a href="https://arxiv.org/abs/2406.17557">[App. E.2]</a>, and Gopher says its ablations underestimate dedup's benefit <a href="https://arxiv.org/abs/2112.11446">[App. A.3.2]</a>. And equal <em>tokens</em> is the wrong constraint for a long-horizon run: an aggressive filter wins at equal tokens but may lose when it leaves too few unique tokens for 15T.</p>
+
+  <h3 id="perplexity">Why perplexity alone misleads</h3>
+  <ol>
+    <li><strong>It depends on the reference distribution.</strong> In RegMix, validation loss on web text tracked downstream accuracy well and loss on Wikipedia did not <a href="https://arxiv.org/abs/2407.01492">[§5]</a>.</li>
+    <li><strong>It is not comparable across training distributions.</strong> Muennighoff et al. stopped using loss to compare data strategies for that reason.</li>
+    <li><strong>Better data can have worse perplexity.</strong> FineWeb-Edu is worse than FineWeb on broad web sources yet better on MMLU (<a href="#model-filter">above</a>).</li>
+    <li><strong>Low perplexity is not quality.</strong> Repetitive text is easy to predict, and DCLM's perplexity filter (CORE 29.0) trailed its fastText filter (30.2).</li>
+  </ol>
+  <p>The remedy is a small panel: in-distribution loss on the domain you care about, an early-signal task suite, and checks on the domains the change may hurt. A protocol that follows: train compute-matched proxies of each variant at a size where benchmarks clear the noise floor, with at least two seeds; confirm the finalists at a second scale; test late-stage data by annealing; and remember that effects needing scale (deduplication, repetition, unique-token supply) can be invisible or misleading in small runs, that data recipes can cross over with scale, and that contamination can make a change look better than it is.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Filter harder and quality always goes up."</strong> Filtering only removes tokens. Aggressive filters win at 1T to 2.6T tokens, but leave about 1T unique tokens, which starves a 15T run (Nemotron-CC). The right cutoff depends on the training horizon.</li>
+    <li><strong>"Deduplicate as globally as possible."</strong> FineWeb's global MinHash left 4T tokens that trained worse than per-snapshot dedup's 20T. Duplicate counts carry information (FineWeb2 upsamples by them). Remove huge clusters and think twice about small ones.</li>
+    <li><strong>"A quality classifier measures quality."</strong> It measures similarity to its positives and moves the topic mix (FineWeb-Edu favors education and history). Compare topic histograms before and after, and evaluate on the domains it disfavors.</li>
+    <li><strong>"The mixture is a property of the corpus."</strong> Weights are in tokens, so they depend on the tokenizer; they change with compute budget and domain definitions; and they are not corpus shares, since domain \(i\) is seen \(w_i D/n_i\) times.</li>
+    <li><strong>"Annealing is just a lower learning rate."</strong> In OLMo 2, decay alone gave +4.4 OLMES and no math gain; the curated data added +19.5 on the math dev set. It is two interventions, and the data half can teach a benchmark's format.</li>
+    <li><strong>"Repeating data is harmful" or "worthless."</strong> Neither. About 4 epochs behaves almost like fresh data (0.5% loss difference at 8.7B), the half-life is about 15 epochs, and returns then decay toward a ceiling of \(U(1+R^*_D)\).</li>
+    <li><strong>"Synthetic data means collapse" or "is free knowledge."</strong> Collapse is a replace-real-data failure; accumulating synthetic beside real data keeps error bounded. Rephrasing speeds up learning of what the source contains (WRAP, K2) but adds no facts and can add errors.</li>
+    <li><strong>"N-gram decontamination solves contamination."</strong> It misses paraphrases and translations and struggles on short items; for MMLU and HumanEval, Llama 3's 8-gram overlap was too high to estimate any effect. It lowers risk; it does not certify a benchmark.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is the difference between WARC and WET files, and why do most modern pipelines re-extract text from HTML?</summary>
+    <div class="answer">
+      <p>WARC stores the raw crawl (HTTP responses with full HTML). WET stores plain text from Common Crawl's generic extractor, which keeps menus, footers and cookie banners and flattens code and math. Labs re-extract from WARC with trafilatura, resiliparse, Justext or a custom parser.</p>
+      <p>Evidence: at DCLM's 1B-1x scale, CORE was 24.1 (resiliparse) and 24.5 (trafilatura) versus 20.7 for WET, and resiliparse is 8× faster. Meta wrote its own parser to keep math alt text and drop markdown markers. The cost is CPU over petabytes of HTML, and the extractor also sets yield: Justext gave 28.6% more high-quality tokens than trafilatura in Nemotron-CC.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Name five Gopher quality rules with thresholds. What does each catch?</summary>
+    <div class="answer">
+      <p>(1) 50 to 100,000 words: stubs and dumps. (2) Mean word length 3 to 10: URL and symbol soup. (3) "#" or ellipsis-to-word ratio above 0.1: hashtag spam and snippets. (4) More than 90% of lines bulleted, or more than 30% ending in an ellipsis: menus and search-result pages. (5) At least 80% of words containing a letter: numeric tables. (6) At least 2 of {the, be, to, of, and, that, have, with}: "English" pages with no English. Separate repetition rules (duplicate lines above 30%, top 2-gram above 20% of characters) catch templated pages.</p>
+      <p>DeepMind chose transparent statistics over a learned classifier to avoid biasing against dialects. The rules work in combination: a navigation page passes the length rule and fails the letter and stop-word rules.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why deduplicate pretraining data? Give numbers.</summary>
+    <div class="answer">
+      <p>Lee et al. on C4: memorized 50-token sequences appeared in 1.9% of unprompted generated tokens, versus 0.19% after near-duplicate removal (about 10× less); datasets became up to 19% smaller at the same or better accuracy; and 4.6% of C4's validation examples had a near-duplicate in training, with one 61-word sentence repeated 61,036 times. Duplicates are mostly templated pages that differ in a few fields, so exact hashing is not enough.</p>
+      <p>Caveats: Muennighoff et al. saw no downstream gain from dedup in a data-constrained setting, and over-deduplicating globally hurt in FineWeb (see the deep-dive).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Design a pipeline to turn Common Crawl into a high-quality pretraining corpus.</summary>
+    <div class="answer">
+      <p>Order stages by cost. (1) WARC download. (2) URL and domain filters. (3) HTML to text with a main-content extractor. (4) fastText language ID with per-language thresholds. (5) Heuristics (Gopher and repetition rules, C4 rules minus its punctuation rule, which alone drops 30% of tokens), with thresholds tuned by comparing statistic histograms of good and bad subsets. (6) Dedup: exact line or URL, then MinHash (FineWeb: 14 × 8 on 5-grams); decide global versus per-snapshot and keep cluster sizes. (7) PII and safety. (8) A quality model (fastText on instruction-like positives, or a distilled LLM rubric) used as a cutoff or for upsampling. (9) Separate code, math and per-language pipelines. (10) Decontaminate. (11) Mix, tokenize, shard.</p>
+      <p>Measure each step with compute-matched proxies (for example 1.7B models on 28B tokens for filters, 350B for dedup, two seeds) and track token yield: FineWeb 36T, 20T after per-snapshot dedup, 15T final; DCLM 240T to 3.8T. For long horizons track unique tokens too, and budget the expensive steps (FineWeb-Edu's classifier: 6,000 H100 hours).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain MinHash LSH and how you would choose bands and rows.</summary>
+    <div class="answer">
+      <p>Represent documents as sets of word \(n\)-gram shingles. For a random permutation, the minimum over \(A\) equals the minimum over \(B\) exactly when the first element of \(A \cup B\) lies in \(A \cap B\), which has probability \(J\). A signature of \(k\) such minhashes estimates \(J\) with standard error \(\sqrt{J(1-J)/k}\).</p>
+      <p>Split the \(k = b\,r\) rows into \(b\) bands of \(r\); a band matches with probability \(J^r\), so a pair becomes a candidate with probability \(1-(1-J^r)^b\), an S-curve steepest near \((1/b)^{1/r}\). Fix \(k\) from the cost budget, then choose the factorization minimizing weighted false-positive area \(\int_0^t P\) and false-negative area \(\int_t^1 (1-P)\), weighting precision more since a false positive deletes a distinct document. Example: FineWeb's 14 × 8 gives \(P = 0.053, 0.565, 0.772, 0.924\) at \(J = 0.5, 0.7, 0.75, 0.8\). Then take connected components and keep one document each.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: with 128 minhashes, compare 16 bands × 8 rows and 32 bands × 4 rows at \(J = 0.5\) and \(J = 0.8\). Which do you use for a 0.8 duplicate threshold?</summary>
+    <div class="answer">
+      <p>16 × 8: at \(J=0.5\), \(0.5^8 = 0.0039\), \(P = 1-(0.9961)^{16} = 0.061\). At \(J=0.8\), \(0.8^8 = 0.168\), \(P = 1-(0.832)^{16} = 0.947\). Threshold \((1/16)^{1/8} = 0.71\).</p>
+      <p>32 × 4: at \(J=0.5\), \(0.5^4 = 0.0625\), \(P = 1-(0.9375)^{32} = 0.873\). At \(J=0.8\), \(0.8^4 = 0.41\), \(P \approx 1.000\). Threshold \((1/32)^{1/4} = 0.42\).</p>
+      <p>Use 16 × 8: it catches 95% of \(J=0.8\) pairs and passes only 6% of \(J=0.5\) pairs. The 32 × 4 setting passes 87% of \(J=0.5\) pairs and would need exact verification or delete many distinct documents. To catch even more true duplicates, use fewer rows: 21 × 6 (126 hashes) gives 0.998 at \(J=0.8\) but 0.28 at \(J=0.5\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you decide the mixture proportions of web, code, math and books?</summary>
+    <div class="answer">
+      <p>Weights set epochs: domain \(i\) is seen \(w_i D/n_i\) times, so small high-quality sources get repeated (Wikipedia: 1.5 epochs in Gopher, 3.4 in GPT-3) while web is seen less than once. Cap repetition using data-constrained results (about 4 epochs is nearly free).</p>
+      <p>Then measure on proxies. Options: a hand sweep (Gopher, seven combinations); scaling-law prediction from small runs (Llama 3: 50% general, 25% math and reasoning, 17% code, 8% multilingual); DoReMi (group-DRO proxy, 280M for an 8B model: +6.5 points, 2.6× faster, 8% extra compute); RegMix (regression on 512 tiny runs, Spearman 97.1 at 1B, about 10% of DoReMi's compute). Verify the winner at larger scale.</p>
+      <p>Caveats: the answer depends on the metric you optimize (RegMix used web-text loss), the domain partition, the tokenizer and the budget; mixing other sources into strongly filtered DCLM-Baseline cost 1.2 CORE at 1B-1x; and mixes change during training (Llama 3 upsampled math and non-English later).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is annealing (mid-training), and why does it help?</summary>
+    <div class="answer">
+      <p>In the last stretch the learning rate decays to zero and the mix shifts to a smaller, higher-quality, more task-like set. Llama 3 annealed its final 40M tokens at 128K context; OLMo 2 spends 5% to 10% of FLOPs on a 50B-token stage (three runs averaged); Qwen3's stage is about 5T tokens of STEM, code, reasoning and synthetic data.</p>
+      <p>The evidence separates two effects. OLMo 2: decay alone gives +4.4 OLMES and no math gain; curated data adds +1.7 OLMES and +19.5 on a math dev set; end to end 7B goes from 59.8 to 63.7 MMLU and 24.1 to 67.5 GSM8K. Why is not fully settled: at low learning rate the model can fit fine structure, and late data is not diluted by trillions of web tokens. Caveats: gains can be format learning (Llama's annealing data included GSM8K and MATH training splits; the effect vanished at 405B), and benchmark-shaped data invites contamination. Annealing also evaluates datasets: decay a half-trained model on 30% to 34% candidate data plus default mix (Llama 3, Nemotron-CC).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compare FineWeb-Edu and DCLM quality filtering. What are the risks?</summary>
+    <div class="answer">
+      <p>FineWeb-Edu: Llama-3-70B-Instruct scores 460k pages 0 to 5 for educational value, a linear head on frozen embeddings imitates it, and score at least 3 is kept (1.3T of 15T tokens); at 1.71B and 350B tokens MMLU rose from 33 to 37 and ARC from 46 to 57. DCLM: a fastText classifier with OpenHermes-2.5 and ELI5 positives, keeping the top 10% of scores; it was the best of seven scorers at 1B (CORE 30.2 versus 29.0 for perplexity filtering), and its positives beat GPT-3-style ones at 7B (41.0 versus 37.5).</p>
+      <p>Risks: topic sculpting (FineWeb-Edu shifts toward education and history and has worse broad-web perplexity); benchmark alignment (instruction-style positives; Nemotron-CC sets tiers by annealing instead of raw scores); and unique-token starvation for long runs (about 1T unique tokens in DCLM), which Nemotron-CC counters with a three-classifier ensemble, relaxed heuristics on trusted documents and rephrasing. Olmo 3 replaces the cutoff with quality-aware upsampling.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you detect and prevent benchmark contamination?</summary>
+    <div class="answer">
+      <p>Detection is n-gram overlap between training data and every evaluation set: GPT-3 used 13-grams (removing the match plus a 200-character window); Llama 3 flags an example when a set fraction of its tokens lie in 8-grams found in the corpus, choosing the fraction per benchmark to maximize the clean-versus-full score gap (HellaSwag 85% flagged, about 14 to 15 points; MMLU and HumanEval overlap too high to estimate). Olmo 3's <code>decon</code> samples n-grams at a stride and expands hits. phi-1's authors found a 13-gram search flagged only 4 false positives, yet embedding and AST similarity pruned over 40% of their exercises.</p>
+      <p>Prevention: decontaminate before training, prioritizing mid-training and synthetic data (memorization is strongest late); keep a private held-out set; report clean-subset comparisons; use dated or regenerated benchmarks. Limits: paraphrase and translation evade n-grams, short items give false positives, removal shifts the distribution, and labs disagree on its value (DCLM found removing MMLU overlaps did not lower its score, 51.8 to 52.7).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> You have 2T unique high-quality tokens but budget for 8T. What do you do?</summary>
+    <div class="answer">
+      <p>Quantify first. 8T is 4 epochs. With the Muennighoff et al. fit (\(R^*_D \approx 15\)), \(R_D = 3\) and \(D' = 2 + 2 \cdot 15 \cdot (1 - e^{-0.2}) = 7.44\)T, 93% of fresh data (measured gap at 8.7B: 0.5% loss). Plain repetition is a strong baseline; 8 epochs (82%) is where it starts to hurt.</p>
+      <p>Then improve it without more real data. (1) Repeat selectively: upsample the best fraction several times and the rest once (Olmo 3, capped at 7×). (2) Add unique tokens: relax filters on trusted documents, more medium-quality web, code (up to 50% of tokens without hurting text tasks), math, other languages. (3) Rephrase good data into two or three styles (K2: at most twice per corpus; Nemotron-CC's rephrasing cost at least about 6% of the run's FLOPs). (4) Put the best tokens late, in annealing. (5) Reconsider model size: data-constrained scaling favors fewer parameters and more epochs than Chinchilla allocation. Validate at equal <em>unique-token</em> supply with held-out real data. An illustrative plan (mine, not from a paper): 2T top-tier at 2 epochs, 2T rephrased at 1 epoch, 2T medium-quality web at 1 epoch.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> FineWeb found global MinHash deduplication worse than per-snapshot deduplication. Why, and what would you do?</summary>
+    <div class="answer">
+      <p>Facts: global MinHash over 96 snapshots left 4T tokens (up to 90% removed from the oldest) and barely beat no dedup, far below RefinedWeb. On the 2013-48 snapshot the 31B tokens that survived were worse than the 460B removed (171B after per-snapshot dedup): more ads and keyword lists. Per-snapshot dedup left 20T and matched RefinedWeb.</p>
+      <p>Hypothesis (FineWeb's): the gain comes from removing enormous clusters, while collapsing clusters under about 100 copies removes popular content and leaves singletons that are unique because they are low-value. Counter-evidence: DCLM-Baseline would lose 85% of documents to global MinHash, and Nemotron-CC, Llama 3 and Olmo 3 deduplicate globally, so the result depends on downstream filters and horizon.</p>
+      <p>What I would do: remove the giant clusters, keep cluster sizes as metadata, upsample by a quality proxy as FineWeb2's rehydration does (weights 1 to 10), and test at the target horizon, where unique-token supply may change the answer.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design the experiment program for a data decision. What scale, which benchmarks, and why is perplexity not enough?</summary>
+    <div class="answer">
+      <p>Scale: the smallest size at which your benchmarks clear noise. FineWeb used 1.71B models on 28B tokens for filters and 350B for dedup. DataDecide: ranking at 150M picks the 1B winner in about 80% of pairs, scaling-law extrapolation did no better, and seed std at 1B can reach 2 points, so use at least two seeds. DCLM's ranking correlation with 7B-1x was 0.84, 0.96 and 0.98 for 400M, 1B and 3B.</p>
+      <p>Benchmarks: low variance across data subsets, monotonic learning curves, above chance at your scale (FineWeb's criteria; DCLM's CORE); MMLU sits at 24 to 29 (chance 25) at 7B-1x. Continuous proxies (probability of the correct answer) made MMLU, ARC, HellaSwag, MBPP and HumanEval over 80% predictable at 1B from 0.01% of target compute.</p>
+      <p>Perplexity fails because it depends on the reference distribution (RegMix: web loss tracked downstream accuracy, Wikipedia loss did not), is not comparable across training distributions, and can mislead in both directions (FineWeb-Edu has worse broad-web perplexity yet better MMLU; low perplexity favors repetitive text). Use a panel: in-distribution loss, early-signal tasks, checks on domains the change may hurt; anneal to test late data; confirm finalists at a second scale.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> A teammate proposes rephrasing the whole web with a 70B model to fix the token shortage. What do you check?</summary>
+    <div class="answer">
+      <p>Cost: generation is about \(2N\) FLOPs per output token, so 1T tokens from a 70B model is \(2 \cdot 70 \times 10^9 \cdot 10^{12} = 1.4 \times 10^{23}\) FLOPs, 19% of the \(7.2 \times 10^{23}\) for an 8B model on 15T tokens, before input tokens. A big rephraser is not needed: WRAP found Qwen-1.8B and Mistral-7B sufficient (fine-tuned T5-base was clearly worse) and Nemotron-CC used a 12B model.</p>
+      <p>Benefit: rephrasing speeds up learning of what the source contains (WRAP about 3×; K2 SimpleQA 23.76 to 28.94) but adds no facts and can add errors, so add a fidelity check (K2). Keep real data in the mix (1:1 in WRAP; synthetic-only hurt some domains) and accumulate rather than replace. Use several styles and cap rephrasings per source (K2: two). Decontaminate the synthetic data, since the teacher may have seen benchmarks (my inference). Test at equal unique <em>real</em>-token supply and confirm the gain survives annealing.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>The data-pipeline drill.</strong> Implement a near-duplicate detector and one heuristic filter: <code>shingles</code>, <code>jaccard</code>, <code>minhash_signature</code> (universal hashing over a stable 64-bit shingle hash, exact integer arithmetic), <code>lsh_candidates</code> (banding, no all-pairs comparison), <code>lsh_collision_probability</code>, <code>choose_bands_rows</code> (numerical optimization of the false-positive and false-negative areas) and <code>gopher_quality_filter</code> (all seven rules). The tests check that signatures estimate Jaccard similarity, that the candidate rate of synthetic signature pairs follows \(1-(1-s^r)^b\), that near-duplicates become candidates while unrelated documents do not, and that the filter accepts prose and rejects navigation pages. An interviewer would expect <code>shingles</code> through <code>lsh_candidates</code> in about 25 minutes and the Gopher filter in another 10 to 15; <code>choose_bands_rows</code> is a stretch. <span class="ex-path">exercises/drills/data_pipeline.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_data_pipeline.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2406.17557">Penedo et al. (2024). The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale.</a> <span class="why">Every pipeline decision is ablated, including WARC versus WET, the C4 rules, the global-dedup failure and FineWeb-Edu.</span></li>
+    <li><a href="https://arxiv.org/abs/2406.11794">Li et al. (2024). DataComp-LM: In Search of the Next Generation of Training Sets for Language Models.</a> <span class="why">A controlled testbed comparing extractors, dedup methods and seven quality scorers, with the fastText recipe and a contamination analysis.</span></li>
+    <li><a href="https://arxiv.org/abs/2112.11446">Rae et al. (2021). Scaling Language Models: Methods, Analysis &amp; Insights from Training Gopher.</a> <span class="why">Appendix A is the reference for the quality and repetition rules and the argument against classifier filtering.</span></li>
+    <li><a href="https://arxiv.org/abs/2107.06499">Lee et al. (2021). Deduplicating Training Data Makes Language Models Better.</a> <span class="why">Suffix-array and MinHash deduplication, with the memorization and leakage numbers.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.21783">Llama Team (2024). The Llama 3 Herd of Models.</a> <span class="why">§3.1 is the fullest frontier-lab account of web curation, mixture selection, annealing and contamination.</span></li>
+    <li><a href="https://arxiv.org/abs/2305.10429">Xie et al. (2023). DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining.</a> <span class="why">Group-DRO domain weights from a small proxy, with the reasoning for excess loss as the objective.</span></li>
+    <li><a href="https://arxiv.org/abs/2407.01492">Liu et al. (2024). RegMix: Data Mixture as Regression for Language Model Pre-Training.</a> <span class="why">The regression alternative at a tenth of the compute, and the finding that web loss predicts downstream accuracy.</span></li>
+    <li><a href="https://arxiv.org/abs/2305.16264">Muennighoff et al. (2023). Scaling Data-Constrained Language Models.</a> <span class="why">The effective-data formula, the 4-epoch and 16-epoch rules of thumb, and code as filler.</span></li>
+    <li><a href="https://arxiv.org/abs/2501.00656">OLMo Team (2025). 2 OLMo 2 Furious.</a> <span class="why">§4 has the cleanest open ablations of mid-training: learning-rate decay versus data, microanneals, souping.</span></li>
+    <li><a href="https://arxiv.org/abs/2504.11393">Magnusson et al. (2025). DataDecide: How to Predict Best Pretraining Data with Small Experiments.</a> <span class="why">An empirical answer to when small proxy runs can be trusted, from 1,050 trained models.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li>Pipeline order: URL filter, HTML extraction (not WET), language ID, heuristics, dedup, PII and safety, quality model, mixture. Cheap first, expensive last.</li>
+      <li>Gopher: 50 to 100k words; mean word length 3 to 10; # or ellipsis ratio at most 0.1; bullet lines at most 90%; ellipsis lines at most 30%; 80% of words with a letter; 2 of 8 stop words. C4: terminal punctuation (drops about 30% of tokens), at least 3 sentences, no "{" or "lorem ipsum".</li>
+      <li>Token funnel: FineWeb 36T, then 20T (per-snapshot MinHash), then 15T, then 1.3T (Edu). Global MinHash: 4T and worse. DCLM: 240T to 3.8T. Counts depend on the tokenizer.</li>
+      <li>MinHash: \(\Pr[h(A)=h(B)] = J\); signature error \(\sqrt{J(1-J)/k}\). LSH: \(P = 1-(1-J^r)^b\), steepest at \((1/b)^{1/r}\). FineWeb 14 × 8 on 5-grams: 0.053, 0.565, 0.772, 0.924 at \(J\) = 0.5, 0.7, 0.75, 0.8. Lee et al.: 450 × 20.</li>
+      <li>Dedup evidence: memorization about 10× lower (1.9% to 0.19%); C4 has 3.04% near-duplicate documents and 7.18% of tokens in repeated 50-token substrings; suffix array costs 8 bytes per token.</li>
+      <li>Quality filters: GPT-3 keep probability \((2-s)^{-9}\); FineWeb-Edu score at least 3 (MMLU 33 to 37, ARC 46 to 57); DCLM fastText top 10% (7B on 2.6T tokens: 64% MMLU); Nemotron-CC 6.3T tokens.</li>
+      <li>Epochs seen = \(w_i D/n_i\). Llama 3 mix: 50% general, 25% math, 17% code, 8% multilingual. DoReMi: 280M proxy, +6.5 points, 2.6× faster, 8% compute. RegMix: 512 × 1M models, Spearman 97.1.</li>
+      <li>Annealing: LR to 0 on a higher-quality mix. OLMo 2 7B: MMLU 59.8 to 63.7, GSM8K 24.1 to 67.5; decay alone +4.4 OLMES. Llama 3 evaluates datasets by annealing on 30% candidate data.</li>
+      <li>Repetition: \(D' = U + U R^* (1 - e^{-R/R^*})\), \(R^* \approx 15\); 4 epochs about 93% of fresh (2T unique, 8T seen gives 7.44T); ceiling \(U(1+R^*)\). Code up to 50% is free for text tasks.</li>
+      <li>Synthetic: WRAP about 3× faster, no new knowledge; K2 SimpleQA 23.76 to 28.94; Nemotron-CC 1.9T synthetic. Accumulate real plus synthetic, never replace (error at most \(\sigma^2 d/(T-d-1)\,\pi^2/6\)).</li>
+      <li>Contamination: 13-gram (GPT-3), 8-gram (Llama 3: HellaSwag 85% flagged), question plus option (DCLM), embedding and AST (phi-1). Decontaminate mid-training first; keep a private held-out set.</li>
+      <li>Data decisions: proxies transfer (DCLM r = 0.84 to 0.98; DataDecide about 80% of pairs), use two seeds, benchmarks above noise (MMLU near chance at 7B-1x), perplexity alone misleads.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

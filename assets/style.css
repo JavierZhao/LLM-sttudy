@@ -245,6 +245,9 @@ pre:hover .copy-btn { opacity: 1; }
 .hljs { background: transparent !important; color: var(--code-fg); }
 
 /* ---------- math ---------- */
+/* KaTeX's hidden MathML is position:absolute; anchor it so it cannot escape scroll containers */
+.katex { position: relative; }
+.table-wrap, .katex-display, pre { position: relative; }
 .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
 .eq-box {
   border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-soft);

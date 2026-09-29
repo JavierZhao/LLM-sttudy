@@ -82,7 +82,8 @@
     });
     side.innerHTML = html;
     var cur = side.querySelector("a.current");
-    if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "center" });
+    // scroll only the sidebar (scrollIntoView would also scroll the window)
+    if (cur) side.scrollTop = Math.max(0, cur.offsetTop - side.clientHeight / 2);
     document.getElementById("theme-btn").addEventListener("click", function () {
       theme = themeOrder[(themeOrder.indexOf(theme) + 1) % themeOrder.length];
       save("llm-theme", theme);

@@ -24,7 +24,7 @@ window.LLM_MANIFEST = {
     {
       id: "II", title: "Modern architecture",
       pages: [
-        { n: "07", slug: "07-kv-efficient-attention", title: "KV-efficient attention: MQA, GQA, MLA", tier: "P0", minutes: 70, status: "planned",
+        { n: "07", slug: "07-kv-efficient-attention", title: "KV-efficient attention: MQA, GQA, MLA", tier: "P0", minutes: 70, status: "written",
           desc: "MQA, GQA and DeepSeek’s Multi-head Latent Attention: low-rank KV compression, weight absorption, decoupled RoPE." },
         { n: "08", slug: "08-mixture-of-experts", title: "Mixture of Experts", tier: "P0", minutes: 75, status: "planned",
           desc: "Routing, load balancing (aux loss and aux-loss-free), fine-grained and shared experts, capacity, expert parallelism." },

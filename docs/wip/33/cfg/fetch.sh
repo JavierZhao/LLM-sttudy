@@ -1,0 +1,31 @@
+#!/bin/bash
+# name repo
+get() { code=$(curl -sS -m 40 -L -o "$1.json" -w "%{http_code}" "https://huggingface.co/$2/raw/main/config.json"); echo "$1 $2 $code"; }
+get llama2_70b NousResearch/Llama-2-70b-hf
+get llama3_8b NousResearch/Meta-Llama-3-8B
+get llama31_8b unsloth/Llama-3.1-8B
+get llama3_70b NousResearch/Meta-Llama-3-70B
+get llama31_70b unsloth/Llama-3.1-70B
+get llama31_405b unsloth/Llama-3.1-405B
+get llama4_mav unsloth/Llama-4-Maverick-17B-128E-Instruct
+get mistral7b mistralai/Mistral-7B-v0.1
+get mixtral8x22 mistralai/Mixtral-8x22B-v0.1
+get gemma2_27b unsloth/gemma-2-27b
+get gemma3_27b unsloth/gemma-3-27b-pt
+get qwen25_72b Qwen/Qwen2.5-72B
+get qwen3_32b Qwen/Qwen3-32B
+get qwen3_235b Qwen/Qwen3-235B-A22B
+get qwen3_next Qwen/Qwen3-Next-80B-A3B-Instruct
+get dsv2 deepseek-ai/DeepSeek-V2
+get dsv3 deepseek-ai/DeepSeek-V3
+get dsv32 deepseek-ai/DeepSeek-V3.2
+get dsv4pro deepseek-ai/DeepSeek-V4-Pro
+get dsv4flash deepseek-ai/DeepSeek-V4-Flash
+get kimik2 moonshotai/Kimi-K2-Base
+get glm45 zai-org/GLM-4.5
+get minimax_m1 MiniMaxAI/MiniMax-M1-80k
+get minimax_m2 MiniMaxAI/MiniMax-M2
+get gptoss120 openai/gpt-oss-120b
+get olmo2_32b allenai/OLMo-2-0325-32B
+get qwen35 Qwen/Qwen3.5-397B-A17B
+get kimik3 moonshotai/Kimi-K3

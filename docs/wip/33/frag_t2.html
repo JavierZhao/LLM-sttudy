@@ -1,0 +1,34 @@
+<div class="table-wrap"><table class="data" style="min-width:1100px">
+<thead><tr><th>Model</th><th>Attention</th><th class="num">Heads: query / KV × head dim</th><th>Positions</th><th>Norm and stability</th></tr></thead>
+<tbody>
+<tr><td><strong>GPT-3 175B</strong></td><td>MHA, alternating dense and locally banded</td><td class="num">96 / 96 × 128</td><td>learned absolute (as GPT-2)</td><td>pre-LayerNorm</td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>4</sup>§</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td>GQA, sliding window 4,096 in every layer</td><td class="num">32 / 8 × 128</td><td>RoPE, θ = 10<sup>4</sup></td><td>pre-RMSNorm</td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td>GQA</td><td class="num">32 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td>GQA</td><td class="num">128 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup>, llama3 rescale ×8</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td>GQA, full (window off)</td><td class="num">48 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td>GQA, local (4,096) : global = 1 : 1</td><td class="num">32 / 16 × 128</td><td>RoPE, θ = 10<sup>4</sup></td><td>pre + post RMSNorm; soft-cap 50 (attention), 30 (logits)</td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QKV bias</td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td>GQA</td><td class="num">40 / 8 × 128</td><td>RoPE, θ = 5×10<sup>5</sup></td><td>output-side RMSNorm per sublayer; QK-norm (full width)</td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td>GQA, local (1,024) : global = 5 : 1</td><td class="num">32 / 16 × 128</td><td>RoPE, θ = 10<sup>4</sup> local, 10<sup>6</sup> global (×8)</td><td>pre + post RMSNorm; QK-norm</td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td>GQA</td><td class="num">64 / 8 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm, no QKV bias</td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td>GQA, local (1,024) : global = 5 : 1; global K = V</td><td class="num">local 32 / 16 × 256; global 32 / 4 × 512</td><td>RoPE θ = 10<sup>4</sup> local; p-RoPE (25% of dims), θ = 10<sup>6</sup> global</td><td>pre + post RMSNorm; QK-norm; logit cap 30</td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td>MLA</td><td class="num">128 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 10<sup>4</sup>; YaRN ×40</td><td>RMSNorm; latent norms</td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td>MLA (V3.2: + sparse top-2,048, DSA)</td><td class="num">128 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 10<sup>4</sup>; YaRN ×40</td><td>RMSNorm; latent norms</td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td>GQA, chunked (8,192) RoPE layers : global NoPE layers = 3 : 1</td><td class="num">40 / 8 × 128</td><td>RoPE θ = 5×10<sup>5</sup> on 3 of 4 layers; none on the 4th</td><td>pre-RMSNorm</td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td>GQA</td><td class="num">64 / 4 × 128</td><td>RoPE, θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm</td></tr>
+<tr><td><strong>Kimi K2</strong></td><td>MLA</td><td class="num">64 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>decoupled RoPE key, θ = 5×10<sup>4</sup>; YaRN ×32</td><td>RMSNorm; QK-Clip (MuonClip)</td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td>GQA</td><td class="num">96 / 8 × 128</td><td>partial RoPE (50% of dims), θ = 10<sup>6</sup></td><td>pre-RMSNorm; QK-norm; QKV bias</td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td>GQA, banded (128) : dense = 1 : 1</td><td class="num">64 / 8 × 64</td><td>RoPE, θ = 1.5×10<sup>5</sup>; YaRN ×32</td><td>pre-RMSNorm; learned sink logit per head; attention biases</td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td>hybrid: 7 lightning (linear) : 1 softmax GQA</td><td class="num">softmax layers 64 / 8 × 128</td><td>RoPE on half of each head, θ = 10<sup>7</sup></td><td>post-norm with DeepNorm scaling</td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td>GQA, full in all 62 layers</td><td class="num">48 / 8 × 128</td><td>RoPE on 64 of 128 dims, θ = 5×10<sup>6</sup></td><td>pre-RMSNorm; QK-norm (full width)</td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td>hybrid: 3 Gated DeltaNet : 1 gated softmax GQA</td><td class="num">softmax layers 16 / 2 × 256</td><td>RoPE on 25% of dims, θ = 10<sup>7</sup></td><td>zero-centered RMSNorm; QK-norm; sigmoid output gate</td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td>hybrid: 3 Gated DeltaNet : 1 gated softmax GQA</td><td class="num">softmax layers 32 / 2 × 256</td><td>RoPE on 25% of dims (interleaved M-RoPE), θ = 10<sup>7</sup></td><td>sigmoid output gate</td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td>GQA, local (1,024) : global = 5 : 1; global K = V</td><td class="num">local 16 / 8 × 256; global 16 / 2 × 512</td><td>as 31B: θ = 10<sup>4</sup> local; p-RoPE 25%, 10<sup>6</sup> global</td><td>pre + post RMSNorm; QK-norm; logit cap 30</td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td>hybrid: 3 Gated DeltaNet : 1 sparse softmax (QSA)</td><td class="num">softmax layers 24 / 2 × 256</td><td>RoPE on 25% of dims, θ = 10<sup>7</sup></td><td>gated residual (4 streams); sigmoid output gate</td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td>compressed shared-KV MQA: CSA (÷4, top-512) and HCA (÷128) layers; 2 window-only layers first</td><td class="num">64 / 1 × 512</td><td>RoPE on last 64 of 512 dims, θ = 10<sup>4</sup> (160,000 on compressed); YaRN ×16</td><td>mHC residual (4 streams); RMSNorm on q and KV; sink logits</td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td>compressed shared-KV MQA: CSA (÷4, top-1,024) and HCA (÷128) layers; 2 HCA first</td><td class="num">128 / 1 × 512</td><td>as V4-Flash</td><td>mHC residual (4 streams); RMSNorm on q and KV; sink logits</td></tr>
+<tr><td><strong>Kimi K3</strong></td><td>hybrid: 3 Kimi Delta Attention : 1 gated MLA (69 + 24)</td><td class="num">MLA layers: 96 heads; d<sub>c</sub> = 512, d<sub>R</sub> = 64</td><td>NoPE in the MLA layers (gates carry position)</td><td>attention residuals (AttnRes); MLA output gate</td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td>CSA2: compressed sparse, KV shared across layers (4 Full owners); causal encoder-decoder</td><td class="num">64 / 1 × 512</td><td>as V4-Flash</td><td>mHC residual (single-pass); sliding-window KV in FP8</td></tr>
+</tbody></table></div>

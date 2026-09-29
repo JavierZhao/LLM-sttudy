@@ -1,0 +1,34 @@
+<div class="table-wrap"><table class="data" style="min-width:1060px">
+<thead><tr><th>Model</th><th>FFN (hidden width, ratio to d)</th><th>Experts: routed / active / shared × width</th><th class="num">Sparsity</th><th>Routing and balancing</th></tr></thead>
+<tbody>
+<tr><td><strong>GPT-3 175B</strong></td><td>GELU MLP, 49,152 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 2 70B</strong></td><td>SwiGLU, 28,672 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Mistral 7B</strong></td><td>SwiGLU, 14,336 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr class="hl"><td><strong>Llama 3.1 8B</strong></td><td>SwiGLU, 14,336 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 3.1 70B</strong></td><td>SwiGLU, 28,672 (3.5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Llama 3.1 405B</strong></td><td>SwiGLU, 53,248 (3.25d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Mixtral 8x22B</strong></td><td>SwiGLU experts</td><td>8 / 2 / 0 × 16,384; all 56 layers</td><td class="num">4</td><td>softmax over the top-2 logits</td></tr>
+<tr><td><strong>Gemma 2 27B</strong></td><td>GeGLU, 36,864 (8d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Qwen2.5-72B</strong></td><td>SwiGLU, 29,568 (3.6d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>OLMo 2 32B</strong></td><td>SwiGLU, 27,648 (5.4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Gemma 3 27B</strong></td><td>GeGLU, 21,504 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Qwen3-32B</strong></td><td>SwiGLU, 25,600 (5d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>Gemma 4 31B</strong></td><td>GeGLU, 21,504 (4d)</td><td>dense</td><td class="num">–</td><td>–</td></tr>
+<tr><td><strong>DeepSeek-V2</strong></td><td>SwiGLU; layer 1 dense 12,288</td><td>160 / 6 / 2 × 1,536; 59 MoE layers</td><td class="num">26.7</td><td>softmax; device-limited (3 of 8 groups); three aux losses</td></tr>
+<tr class="hl"><td><strong>DeepSeek-V3 / V3.2</strong></td><td>SwiGLU; layers 1–3 dense 18,432</td><td>256 / 8 / 1 × 2,048; 58 MoE layers</td><td class="num">32</td><td>sigmoid, normalized, ×2.5; bias balancing, no aux loss; ≤ 4 nodes</td></tr>
+<tr><td><strong>Llama 4 Maverick</strong></td><td>SwiGLU; 24 dense layers 16,384, alternating</td><td>128 / 1 / 1 × 8,192; 24 MoE layers</td><td class="num">128</td><td>top-1 plus always-on shared expert</td></tr>
+<tr><td><strong>Qwen3-235B-A22B</strong></td><td>SwiGLU experts</td><td>128 / 8 / 0 × 1,536; all 94 layers</td><td class="num">16</td><td>softmax top-8 renormalized; global-batch aux loss</td></tr>
+<tr><td><strong>Kimi K2</strong></td><td>SwiGLU; layer 1 dense 18,432</td><td>384 / 8 / 1 × 2,048; 60 MoE layers</td><td class="num">48</td><td>sigmoid, bias balancing; no expert groups</td></tr>
+<tr><td><strong>GLM-4.5</strong></td><td>SwiGLU; layers 1–3 dense 12,288</td><td>160 / 8 / 1 × 1,536; 89 MoE layers</td><td class="num">20</td><td>sigmoid, loss-free balancing</td></tr>
+<tr><td><strong>gpt-oss-120b</strong></td><td>clamped SwiGLU experts (limit 7)</td><td>128 / 4 / 0 × 2,880; all 36 layers</td><td class="num">32</td><td>top-4 softmax</td></tr>
+<tr><td><strong>MiniMax-M1</strong></td><td>SwiGLU experts</td><td>32 / 2 / 0 × 9,216; all 80 layers</td><td class="num">16</td><td>top-2</td></tr>
+<tr><td><strong>MiniMax-M2</strong></td><td>SwiGLU experts</td><td>256 / 8 / 0 × 1,536; all 62 layers</td><td class="num">32</td><td>sigmoid with learned routing bias</td></tr>
+<tr><td><strong>Qwen3-Next-80B-A3B</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 512; all 48 layers</td><td class="num">51.2</td><td>softmax top-10 renormalized; gated shared expert</td></tr>
+<tr><td><strong>Qwen3.5-397B-A17B</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 1,024; all 60 layers</td><td class="num">51.2</td><td>top-10 plus shared expert</td></tr>
+<tr><td><strong>Gemma 4 26B-A4B</strong></td><td>GeGLU experts + parallel dense MLP 2,112</td><td>128 / 8 / 1 (dense MLP) × 704; all 30 layers</td><td class="num">16</td><td>top-8</td></tr>
+<tr><td><strong>Qwen3.8-Flash-Next</strong></td><td>SwiGLU experts</td><td>512 / 10 / 1 × 640; all 48 layers</td><td class="num">51.2</td><td>top-10 plus shared expert</td></tr>
+<tr><td><strong>DeepSeek-V4-Flash</strong></td><td>SwiGLU (clamped ±10); all 43 layers MoE</td><td>256 / 6 / 1 × 2,048; first 3 hash-routed</td><td class="num">42.7</td><td>Sqrt(Softplus) affinities; bias balancing; FP4 experts</td></tr>
+<tr><td><strong>DeepSeek-V4-Pro</strong></td><td>SwiGLU (clamped ±10); all 61 layers MoE</td><td>384 / 6 / 1 × 3,072; first 3 hash-routed</td><td class="num">64</td><td>as V4-Flash</td></tr>
+<tr><td><strong>Kimi K3</strong></td><td>SiTU-GLU; layer 1 dense 33,792</td><td>896 / 16 / 2 × 3,072; 92 MoE layers, LatentMoE (3,584)</td><td class="num">56</td><td>sigmoid, bias balancing</td></tr>
+<tr><td><strong>DeepSeek-V4.1-Flash</strong></td><td>SwiGLU (clamped ±10); all 40 layers MoE</td><td>384 / 6 / 1 × 2,304</td><td class="num">64</td><td>as V4-Flash</td></tr>
+</tbody></table></div>

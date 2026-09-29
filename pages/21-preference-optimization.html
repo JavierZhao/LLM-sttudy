@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Reward models &amp; preference optimization (DPO family) · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="21" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part IV · Post-training: SFT &amp; preferences · Page 21</div>
+  <h1>Reward models &amp; preference optimization (DPO family)</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~65 min</span>
+    <span>Prereqs: <a href="19-sft-distillation.html">19 SFT</a>. Helpful: <a href="22-rl-foundations.html">22 RL foundations</a> (not required)</span>
+  </div>
+  <p class="lede">After supervised fine-tuning, a model imitates good answers but has never been told which of two answers is better. This page covers how that signal is collected, how a Bradley-Terry reward model learns from it, why optimizing against a learned reward goes wrong, and how Direct Preference Optimization removes the reward model and the RL loop with one change of variables. The DPO derivation is the most frequently asked derivation in post-training interviews, so we do it line by line, then look at where it breaks and at the family of variants (IPO, KTO, ORPO, SimPO) built to repair it.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The DPO derivation, from a blank page:</strong> the KL-regularized objective, the closed-form optimum with its partition function \(Z(x)\), solving for the reward, why \(Z\) cancels in the Bradley-Terry difference, the loss, and its gradient with the \(\sigma(\hat r_l - \hat r_w)\) weight.</li>
+    <li><strong>Assumptions, stated out loud:</strong> the optimum is over <em>all</em> policies, not the parametric family; the reference must put mass wherever the optimum does; preferences follow Bradley-Terry; pairs come from (or near) the reference.</li>
+    <li><strong>Reward models:</strong> the pairwise loss, LM backbone plus scalar head on the last token, why one epoch, what accuracy is achievable given annotator disagreement, and reward over-optimization (Gao et al.).</li>
+    <li><strong>Failure modes:</strong> likelihood displacement (the chosen response's probability can <em>fall</em>), length exploitation, off-policy data, \(\beta\) sensitivity, overfitting to deterministic preferences.</li>
+    <li><strong>The zoo:</strong> what problem IPO, KTO, ORPO, SimPO, cDPO/rDPO and online DPO each address, with the exact objectives, and when online RL beats all of them.</li>
+    <li><strong>Calculation:</strong> "given these four log-probabilities and \(\beta = 0.1\), what is the loss and the gradient weight?" and "what implicit-reward margin gives loss 0.1?"</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Derive the DPO loss from the KL-regularized reward-maximization objective without notes, naming every assumption, and explain why \(\log Z(x)\) cancels.</li>
+    <li>Compute the DPO loss, implicit rewards and gradient weight from four sequence log-probabilities and \(\beta\), and the log-ratio gap needed to reach a target loss.</li>
+    <li>Write the Bradley-Terry reward-model loss, sketch the architecture (LM backbone, scalar head on the final token), and say how a reward model is trained and evaluated.</li>
+    <li>Describe reward over-optimization with the functional forms of Gao et al., and explain why a KL penalty behaves like early stopping.</li>
+    <li>Explain likelihood displacement, length exploitation and the off-policy problem with the mechanism and the evidence for each, and name the mitigations.</li>
+    <li>State the exact objectives of IPO, KTO, ORPO, SimPO, cDPO and rDPO, and which failure each was designed for.</li>
+    <li>Choose between DPO, online DPO and online RL for a given situation, citing the evidence (Xu et al., Tulu 3, Llama 3, OLMo 3).</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="preference-data">Preference data: what is collected, and how noisy it is</h2>
+
+  <p>Supervised fine-tuning (<a href="19-sft-distillation.html">page 19</a>) shows the model <em>one</em> good response per prompt. It cannot say that response A is better than response B, and it cannot penalize a fluent but wrong answer. <strong>Preference optimization</strong> <span class="zh">偏好优化</span> supplies that missing signal. The basic datum is a triple \((x, y_w, y_l)\): a prompt, a <strong>chosen</strong> (winning) response and a <strong>rejected</strong> (losing) response, meaning a labeler judged \(y_w \succ y_l\) given \(x\). Comparisons are used instead of absolute scores because people are inconsistent at scoring and much more consistent at ranking two things side by side <a href="https://arxiv.org/abs/1706.03741">[Christiano et al. 2017, §1]</a>.</p>
+
+  <h3 id="collection">How pairs are collected</h3>
+  <ul>
+    <li><strong>Human labelers, ranking.</strong> InstructGPT hired about 40 contractors. Each saw \(K\) between 4 and 9 responses to one prompt and ranked them, giving \(\binom{K}{2}\) comparisons per prompt (6 to 36). The reward-model set had 33k training prompts <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.2, §3.4, §3.5]</a>.</li>
+    <li><strong>Human labelers, binary with a strength.</strong> Llama 2 chose a binary comparison protocol "to maximize the diversity of collected prompts", and asked for the degree of preference on four levels (significantly better, better, slightly better, negligibly better or unsure). It collected over 1 million comparisons (1,418,091 in the Meta helpfulness and safety sets) <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023, §3.2.1, Tab. 6]</a>. Llama 3 kept the four levels, added an editing step (edited \(\succ\) chosen \(\succ\) rejected), and trained only on pairs rated "significantly better" or "better" <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.2.1]</a>.</li>
+    <li><strong>AI feedback</strong> (RLAIF). A feedback model reads two responses plus a written principle and picks the better one. Constitutional AI used the normalized log-probability of "(A)" versus "(B)" as a soft label, sampled one of 16 principles per comparison, and mixed 135,296 human helpfulness comparisons with 182,831 AI harmlessness comparisons <a href="https://arxiv.org/abs/2212.08073">[Bai et al. 2022, §4.1-4.2]</a>. UltraFeedback sampled 4 completions per instruction from a pool of 17 models over 63,967 instructions (255,864 completions) and had GPT-4 rate each from 1 to 5 on four aspects <a href="https://arxiv.org/abs/2310.01377">[Cui et al. 2023, §2.2-2.4]</a>. Tulu 3 does the same with 4 responses from a 22-model pool, GPT-4o as judge, chosen = highest mean rating and rejected = a random response below it, ending with 354,192 preference pairs <a href="https://arxiv.org/abs/2411.15124">[Lambert et al. 2024, §2.3, §5.2]</a>.</li>
+  </ul>
+
+  <p>The alternatives to human ranking are not free of error. On MT-bench, GPT-4 agreed with human experts 85% of the time on non-tied votes, against 81% agreement between two humans, but LLM judges show position bias (GPT-4 gave the same verdict after swapping the order of two near-identical answers only 65% of the time with the default prompt), verbosity bias and some self-preference <a href="https://arxiv.org/abs/2306.05685">[Zheng et al. 2023, §3.3, §4.2, Tab. 2 and 5]</a>.</p>
+
+  <h3 id="noise">Noise: what accuracy is even possible?</h3>
+  <p>Human preferences are noisy. InstructGPT's training labelers agreed with each other on \(72.6 \pm 1.5\%\) of comparisons, and held-out labelers on \(77.3 \pm 1.3\%\) <a href="https://arxiv.org/abs/2203.02155">[Ouyang et al. 2022, §3.4]</a>. RewardBench notes that the Anthropic HH and OpenAI summarization test sets have accuracy ceilings of 60 to 70% because of annotator disagreement <a href="https://arxiv.org/abs/2403.13787">[Lambert et al. 2024, §1]</a>. Llama 2's own reward models show the same pattern by pair difficulty: 80.7% on "significantly better" pairs but 54.7% on "negligibly better or unsure" ones (Helpfulness RM on the Meta Helpfulness test set) <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023, Tab. 8]</a>.</p>
+  <p>Bradley-Terry makes this quantitative. If a pair's true reward gap is \(\Delta\), annotators pick the better response with probability \(\sigma(\Delta)\). Inverting, a pair on which annotators agree \(p\) of the time has gap \(\operatorname{logit}(p)\): \(p = 0.726\) gives \(0.97\), \(p = 0.75\) gives \(1.10\). Typical real gaps are about one nat, not ten, so a reward model cannot be much more than 70 to 80% accurate on such data, and a reward model that is 95% accurate on it is probably fitting an artifact.</p>
+
+  <p>Two systematic biases matter later. <strong>Length:</strong> always choosing the longer response agrees with the labels 55.7% of the time on WebGPT, 59.6% on Stack and 63.1% on RLCD <a href="https://arxiv.org/abs/2310.03716">[Singhal et al. 2023, Tab. 5]</a>. <strong>Who wrote the pair:</strong> pairs may come from the model being trained (on-policy), from earlier or other models (off-policy), or from a pool of models. What matters most is often the <em>delta</em> between the two responses rather than the quality of either: OLMo 3 builds pairs from Qwen3-32B (chosen) versus Qwen3-0.6B (rejected), and preference-tuning on them improves the model although supervised fine-tuning on the same chosen responses hurts it <a href="https://arxiv.org/abs/2512.13961">[Olmo 3, §4.3, Tab. 21]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Pairwise comparisons instead of scalar ratings</div>
+    <dl>
+      <dt>Problem</dt><dd>We need a training signal for "better", but absolute quality scores from different annotators are uncalibrated and unstable.</dd>
+      <dt>Idea</dt><dd>Show two responses to the same prompt and ask which is better. Model the latent scores with Bradley-Terry.</dd>
+      <dt>Why it works</dt><dd>A comparison cancels each annotator's private offset and scale, and it is easier and faster to give than a demonstration or a calibrated rating.</dd>
+      <dt>Evidence</dt><dd>Christiano et al. found comparisons easier to provide and equally useful <a href="https://arxiv.org/abs/1706.03741">[§1]</a>. InstructGPT, Llama 2/3 and Tulu 3 all train on them.</dd>
+      <dt>Cost</dt><dd>Each label is about one bit, 25 to 30% of labels disagree with a second labeler, there is no magnitude (hence Llama 2's rating-based margin) and preferences need not be transitive.</dd>
+      <dt>Used by</dt><dd>Every RLHF and DPO pipeline in this page. Scalar AI ratings (UltraFeedback, Tulu 3) are converted to pairs by binarizing.</dd>
+    </dl>
+  </div>
+
+  <p>Figure 1 shows where these pairs go in the three training recipes this page compares.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-21-1-title">
+<title id="fig-21-1-title">Data flow of RLHF with PPO, offline DPO and online iterative DPO: which models are needed and where samples come from</title>
+<defs><marker id="arrow-21-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="15" y="18" class="s-bold">A. RLHF with PPO: online, needs a reward model and a critic</text>
+<rect class="s-a" x="15" y="28" width="150" height="52" rx="6"/>
+<text x="90.0" y="50" text-anchor="middle" class="s-bold">prompt x</text>
+<text x="90.0" y="68" text-anchor="middle" class="s-small s-muted">from a prompt set</text>
+<rect class="s-b" x="195" y="28" width="150" height="52" rx="6"/>
+<text x="270.0" y="50" text-anchor="middle" class="s-bold">policy samples y</text>
+<text x="270.0" y="68" text-anchor="middle" class="s-small s-muted">generated every step</text>
+<rect class="s-d" x="375" y="28" width="150" height="52" rx="6"/>
+<text x="450.0" y="50" text-anchor="middle" class="s-bold">reward model</text>
+<text x="450.0" y="68" text-anchor="middle" class="s-small s-muted">score r(x,y) minus β·KL</text>
+<rect class="s-c" x="555" y="28" width="150" height="52" rx="6"/>
+<text x="630.0" y="50" text-anchor="middle" class="s-bold">PPO update</text>
+<text x="630.0" y="68" text-anchor="middle" class="s-small s-muted">also needs value net, π_ref</text>
+<path class="s-line" d="M165,54 L195,54" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M345,54 L375,54" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M525,54 L555,54" marker-end="url(#arrow-21-1)"/>
+<path class="s-line s-dash" d="M630.0,80 L630.0,98 L270.0,98 L270.0,80" marker-end="url(#arrow-21-1)"/>
+<text x="450.0" y="114" text-anchor="middle" class="s-small s-muted">repeat: samples always come from the current policy</text>
+<text x="15" y="136" class="s-bold">B. DPO: offline, no sampling, no reward model, no critic</text>
+<rect class="s-a" x="15" y="146" width="150" height="52" rx="6"/>
+<text x="90.0" y="168" text-anchor="middle" class="s-bold">fixed pairs</text>
+<text x="90.0" y="186" text-anchor="middle" class="s-small s-muted">(x, y_w, y_l) from a dataset</text>
+<rect class="s-b" x="195" y="146" width="150" height="52" rx="6"/>
+<text x="270.0" y="168" text-anchor="middle" class="s-bold">πθ and frozen π_ref</text>
+<text x="270.0" y="186" text-anchor="middle" class="s-small s-muted">4 sequence log-probs</text>
+<rect class="s-d" x="375" y="146" width="150" height="52" rx="6"/>
+<text x="450.0" y="168" text-anchor="middle" class="s-bold">implicit reward</text>
+<text x="450.0" y="186" text-anchor="middle" class="s-small s-muted">β·log(πθ / π_ref) per response</text>
+<rect class="s-c" x="555" y="146" width="150" height="52" rx="6"/>
+<text x="630.0" y="168" text-anchor="middle" class="s-bold">logistic loss</text>
+<text x="630.0" y="186" text-anchor="middle" class="s-small s-muted">−log σ(r_w − r_l), one step</text>
+<path class="s-line" d="M165,172 L195,172" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M345,172 L375,172" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M525,172 L555,172" marker-end="url(#arrow-21-1)"/>
+<text x="360.0" y="218" text-anchor="middle" class="s-small s-muted">the pairs were written by some other policy, so training is off-policy</text>
+<text x="15" y="254" class="s-bold">C. Online / iterative DPO: fresh pairs from the current policy each round</text>
+<rect class="s-a" x="15" y="264" width="150" height="52" rx="6"/>
+<text x="90.0" y="286" text-anchor="middle" class="s-bold">sample pairs</text>
+<text x="90.0" y="304" text-anchor="middle" class="s-small s-muted">≥ 2 responses from πθ</text>
+<rect class="s-d" x="195" y="264" width="150" height="52" rx="6"/>
+<text x="270.0" y="286" text-anchor="middle" class="s-bold">label the pair</text>
+<text x="270.0" y="304" text-anchor="middle" class="s-small s-muted">reward model or LLM judge</text>
+<rect class="s-c" x="375" y="264" width="150" height="52" rx="6"/>
+<text x="450.0" y="286" text-anchor="middle" class="s-bold">DPO update</text>
+<text x="450.0" y="304" text-anchor="middle" class="s-small s-muted">loss of B, against π_ref</text>
+<rect class="s-b" x="555" y="264" width="150" height="52" rx="6"/>
+<text x="630.0" y="286" text-anchor="middle" class="s-bold">new policy πθ</text>
+<text x="630.0" y="304" text-anchor="middle" class="s-small s-muted">samples the next round</text>
+<path class="s-line" d="M165,290 L195,290" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M345,290 L375,290" marker-end="url(#arrow-21-1)"/>
+<path class="s-line" d="M525,290 L555,290" marker-end="url(#arrow-21-1)"/>
+<path class="s-line s-dash" d="M630.0,316 L630.0,334 L90.0,334 L90.0,316" marker-end="url(#arrow-21-1)"/>
+<text x="360.0" y="352" text-anchor="middle" class="s-small s-muted">a few rounds, not a continuous loop: rewards come from a frozen labeler between rounds</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Three ways to use preference pairs. A: RLHF trains a reward model from the pairs, then runs an online RL loop that generates fresh samples every step (four models in memory, <a href="23-rlhf.html">page 23</a>). B: DPO trains directly on the fixed pairs with only the policy and a frozen reference. C: online or iterative DPO keeps DPO's simple loss but regenerates the pairs from the current policy each round and labels them with a reward model or judge. Notice which boxes involve sampling from the policy: those are what make A and C on-policy and B off-policy.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2 id="reward-models">Bradley-Terry reward models</h2>
+
+  <p>A <strong>reward model</strong> <span class="zh">奖励模型</span> \(r_\phi(x, y) \in \R\) maps a prompt and a response to a scalar that should be higher for responses people prefer. The <strong>Bradley-Terry model</strong> <span class="zh">布拉德利-特里模型</span> (Bradley and Terry, Biometrika 39(3/4):324-345, 1952) says each response has a latent strength and the probability that \(y_1\) beats \(y_2\) depends only on the strength gap:</p>
+
+  \[ P(y_1 \succ y_2 \mid x) = \frac{e^{r(x,y_1)}}{e^{r(x,y_1)} + e^{r(x,y_2)}} = \sigma\big(r(x,y_1) - r(x,y_2)\big) \]
+
+  <p>This is the Elo rating model: a rating difference of \(\Delta\) means the better player wins with probability \(\sigma(\Delta)\) <a href="https://arxiv.org/abs/1706.03741">[Christiano et al. 2017, §2.2.3]</a>. Fitting \(r_\phi\) by maximum likelihood on a dataset of pairs gives the <strong>pairwise logistic loss</strong>:</p>
+
+  <div class="eq-box">
+  \[ \mathcal L_{\text{RM}}(\phi) = -\,\E_{(x,y_w,y_l)}\Big[\log \sigma\big(r_\phi(x,y_w) - r_\phi(x,y_l)\big)\Big] = \E\Big[\log\big(1 + e^{-(r_w - r_l)}\big)\Big] \]
+  <div class="eq-label">Bradley-Terry reward-model loss (InstructGPT Eq. 1 averages this over the \(\binom K2\) pairs of a prompt)</div>
+  </div>
+
+  <p>This is logistic regression on the <em>difference</em> of two scalar features. Its gradient with respect to the gap \(\Delta = r_w - r_l\) is \(-\sigma(-\Delta)\): large when the model ranks the pair wrongly, small once it is confident and right. With equal rewards the loss is \(\log 2 = 0.693\) (chance). With \(r_w = 1.2\) and \(r_l = 0.4\), \(\Delta = 0.8\), the model assigns probability \(\sigma(0.8) = 0.690\) to the correct order and the loss is \(\log(1 + e^{-0.8}) = 0.371\).</p>
+
+  <p>Two consequences of "differences only" recur throughout the page. First, <strong>rewards are defined only up to a prompt-dependent shift</strong>: replacing \(r(x,y)\) by \(r(x,y) + f(x)\) leaves every probability unchanged. InstructGPT therefore adds a bias so that labeler demonstrations score 0 on average before RL <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>. Second, rewards from different prompts are not comparable unless something anchors them, which is why the DPO implicit reward (below) is only meaningful within a prompt.</p>
+
+  <h3 id="rm-architecture">Architecture: LM backbone plus a scalar head</h3>
+  <p>A reward model is usually a copy of a pretrained or SFT decoder with the unembedding \(d \to V\) removed and a linear head \(d \to 1\) added. InstructGPT describes starting from the SFT model with the unembedding layer removed <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>, and Llama 2 from the pretrained chat checkpoint, so that the reward model "knows what the chat model knows" and does not reward hallucinations the policy cannot detect <a href="https://arxiv.org/abs/2307.09288">[Touvron et al. 2023, §3.2.2]</a>. The reward is read at the <strong>last token</strong> of the concatenated prompt and response. Under causal attention that position is the only one whose hidden state has attended to everything.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class RewardModel(nn.Module):
+    def __init__(self, backbone, d):              # backbone: decoder body returning hidden states (B, T, d)
+        super().__init__()
+        self.backbone = backbone
+        self.head = nn.Linear(d, 1)               # replaces the (d -> V) unembedding
+
+    def forward(self, input_ids, attention_mask):
+        h = self.backbone(input_ids, attention_mask)             # (B, T, d), causal attention
+        last = attention_mask.sum(-1) - 1                        # index of last real token (right padding)
+        h_last = h[torch.arange(h.size(0)), last]                # (B, d): sees prompt and full response
+        return self.head(h_last).squeeze(-1)                     # (B,) one scalar per (x, y)
+
+def bt_loss(r_w, r_l, margin=0.0):
+    return -F.logsigmoid(r_w - r_l - margin).mean()              # = softplus(-(r_w - r_l - margin))
+</code></pre>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>Your tagger read a whole jet through a bidirectional encoder and pooled it into one classification logit, permutation-invariantly. A reward model is a classifier on a <em>sequence</em>, but built on a causal decoder, so the "pooling" is simply the final position: it is the one place where information from all earlier tokens has been aggregated, and its value depends on token order. The loss is also different in kind: not cross-entropy against a class label but a logistic loss on the <em>difference</em> of two forward passes.</p>
+  </aside>
+
+  <h3 id="rm-training">Training recipes and tricks that matter</h3>
+  <ul>
+    <li><strong>One epoch.</strong> Reward models overfit fast. Llama 2 trained one epoch (learning rate \(5\times10^{-6}\) for 70B, \(10^{-5}\) otherwise, cosine to 10%, 512 pairs per batch) after finding that longer training overfits <a href="https://arxiv.org/abs/2307.09288">[§3.2.2]</a>. InstructGPT saw the same and used one epoch at \(9\times10^{-6}\) <a href="https://arxiv.org/abs/2203.02155">[App. C.2]</a>.</li>
+    <li><strong>All pairs of a prompt in one batch element.</strong> Comparisons within one ranking task are strongly correlated. Shuffling all \(\binom K2\) pairs into one dataset uses each completion in \(K-1\) gradient steps and overfits within a single pass. InstructGPT instead puts all pairs of a prompt in one batch element, which also needs only \(K\) forward passes instead of \(\binom K2\) <a href="https://arxiv.org/abs/2203.02155">[§3.5]</a>. A batch of 64 prompts with \(K=9\) holds \(64 \times 36 = 2{,}304\) comparisons.</li>
+    <li><strong>Reward margin.</strong> If labelers give a strength, subtract a margin: \(-\log\sigma(r_w - r_l - m(\text{rating}))\). Llama 2 used margins 1, 2/3, 1/3, 0 (small) or 3, 2, 1, 0 (large) for the four ratings. Average accuracy on Meta Helpfulness went from 62.5 (no margin) to 63.0 (small) and 62.9 (large): better on separable pairs, worse on similar ones for the large margin, and the reward distribution becomes bimodal <a href="https://arxiv.org/abs/2307.09288">[App. A.3.3, Tab. 27-28]</a>. Llama 3 dropped the margin "as we observe diminishing improvements after data scaling" <a href="https://arxiv.org/abs/2407.21783">[§4.1.2]</a>.</li>
+    <li><strong>Separate models for separate objectives.</strong> Llama 2 trained a helpfulness RM and a safety RM because the two objectives trade off, and combined them with a safety threshold of 0.15 on the safety score <a href="https://arxiv.org/abs/2307.09288">[§3.2.2, §3.2.3]</a>.</li>
+    <li><strong>Ensembles and label-noise robustness.</strong> Christiano et al. averaged an ensemble of predictors, each normalized, and assumed a 10% chance the human answers uniformly at random, "conceptually needed because human raters have a constant probability of making an error" <a href="https://arxiv.org/abs/1706.03741">[§2.2.3]</a>. Conservative ensemble objectives are covered in the next section, and label-smoothing losses in <a href="#variants">the variants section</a>.</li>
+  </ul>
+
+  <h3 id="rm-eval">Evaluating a reward model</h3>
+  <p>The basic metric is <strong>pairwise accuracy</strong> on held-out pairs: the fraction with \(r(x,y_w) > r(x,y_l)\). Because of annotator noise, in-distribution accuracy saturates at 70 to 80% (see above), so it says little beyond a point. <strong>RewardBench</strong> instead builds about 3,000 prompt-chosen-rejected trios with subtle, verifiable reasons (bugs, incorrect facts, refusals) in four groups: Chat, Chat Hard, Safety and Reasoning, plus prior preference test sets weighted at 0.5 <a href="https://arxiv.org/abs/2403.13787">[Lambert et al. 2024, §4, Tab. 1]</a>. (The paper's text says 2,958 prompts, while its Table 1 subset counts sum to 2,985.) In the paper's Table 2 the top open reward model, ArmoRM-Llama3-8B-v0.1, scores 89.0, and DPO-trained chat models can be scored as reward models through their implicit reward, but only with the correct reference model: a "similar but different" reference dropped performance to about the random baseline <a href="https://arxiv.org/abs/2403.13787">[Tab. 2, App. B]</a>. RewardBench 2 (2025) has 1,865 cases in six subsets, models score about 20 points lower on average, and it reports higher correlation with downstream best-of-n and PPO results <a href="https://arxiv.org/abs/2506.01937">[Malik et al. 2025]</a>. Even so, treat benchmark accuracy with care: Tulu 3 reports that strong scores on reward-model benchmarks do not necessarily translate into better PPO results <a href="https://arxiv.org/abs/2411.15124">[§5.4.1]</a>.</p>
+
+  <div class="decision">
+    <div class="decision-title">Scalar head on the last token, trained with the pairwise Bradley-Terry loss</div>
+    <dl>
+      <dt>Problem</dt><dd>RL and best-of-n need a cheap, automatic score for arbitrary (prompt, response) pairs, but humans only supplied relative judgments on a finite set.</dd>
+      <dt>Idea</dt><dd>Fit a scalar function whose <em>differences</em> predict human choices, initialized from a strong language model.</dd>
+      <dt>Why it works</dt><dd>A pretrained LM already represents fluency, facts and instruction-following, so a linear head plus one epoch of pairwise training extracts a preference direction from it.</dd>
+      <dt>Evidence</dt><dd>InstructGPT: a 6B reward model was enough to drive PPO for all sizes, and 175B RMs were unstable <a href="https://arxiv.org/abs/2203.02155">[§3.5, App. C.2]</a>. Llama 2 and 3 use the same recipe at scale.</dd>
+      <dt>Cost</dt><dd>It is a proxy trained on noisy, finite data, and any policy that optimizes it hard will find its blind spots (next section). A separate large model must be trained, stored and served during RL.</dd>
+      <dt>Used by</dt><dd>InstructGPT, Llama 2 (two RMs), Llama 3 (rejection sampling), Tulu 3 (PPO ablation), and the "reward model" side of every RLHF system.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="over-optimization">Reward over-optimization</h2>
+
+  <p>A reward model is a proxy: it was fit on a finite, noisy set of comparisons and is only trustworthy near the distribution it saw. Optimize a policy hard against it and the policy finds responses the proxy scores highly and people do not. This is <strong>Goodhart's law</strong> <span class="zh">古德哈特定律</span> ("when a measure becomes a target, it ceases to be a good measure"), and in RLHF it is called <strong>reward over-optimization</strong> <span class="zh">奖励过优化</span>. The classic symptom is a policy whose proxy score keeps rising while its real quality peaks and then declines, often with responses getting longer and more repetitive.</p>
+
+  <h3 id="gao">The measurement: Gao et al. (2022)</h3>
+  <p>Measuring this with real humans is expensive, so Gao et al. use a synthetic setup. A fixed 6B "gold" reward model (the InstructGPT RM) plays the role of human labelers. It labels 100,000 synthetic comparisons (10% held out), deterministically preferring the response with the higher gold score, and these train <em>proxy</em> reward models of 3M to 3B parameters. A policy (1.2B, or 6B in one ablation) is then optimized against a proxy by best-of-\(n\) sampling or PPO, and the gold score is tracked as a function of how far the policy moved <a href="https://arxiv.org/abs/2210.10760">[Gao et al. 2022, §2, §2.1]</a>. Distance is measured by \(d = \sqrt{\KL(\pi \,\|\, \pi_{\text{init}})}\). For best-of-\(n\) it is known in closed form, \(\KL_{\text{bon}} = \log n - \tfrac{n-1}{n}\), so \(n = 1000\) is \(6.908 - 0.999 = 5.91\) nats and \(n = 60{,}000\) is \(11.002 - 1.000 = 10.00\) nats. The fitted functional forms are:</p>
+
+  <div class="eq-box">
+  \[ R_{\text{bon}}(d) = d\,(\alpha_{\text{bon}} - \beta_{\text{bon}}\, d), \qquad R_{\text{RL}}(d) = d\,(\alpha_{\text{RL}} - \beta_{\text{RL}} \log d) \]
+  <div class="eq-label">Gold reward against \(d = \sqrt{\mathrm{KL}}\) (Gao et al. §1). The RL form has infinite slope at \(d = 0\), so it is not meant to hold near the origin.</div>
+  </div>
+
+  <p>Both curves rise, peak and fall. Setting the derivative to zero gives the peak location and height, which are handy for reasoning about how much optimization is safe:</p>
+  \[ R_{\text{bon}}' = \alpha - 2\beta d = 0 \Rightarrow d^\star = \frac{\alpha}{2\beta},\ R^\star = \frac{\alpha^2}{4\beta}; \qquad R_{\text{RL}}' = \alpha - \beta\log d - \beta = 0 \Rightarrow d^\star = e^{\alpha/\beta - 1},\ R^\star = \beta\, d^\star \]
+  <p>Gao et al. use the same idea to predict peak gold scores (their Fig. 12); the closed forms above are our algebra on their fitted forms. A smaller \(\beta\) (a more robust reward model) pushes the peak out, and in KL terms the peak sits at \((d^\star)^2\).</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 388" role="img" aria-labelledby="fig-21-2-title">
+<title id="fig-21-2-title">Schematic over-optimization curve: proxy reward model score keeps rising with the square root of KL while gold reward peaks and then falls</title>
+<defs><marker id="arrow-21-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="74.0" y1="30" x2="74.0" y2="318"/>
+<text x="74.0" y="334" text-anchor="middle" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="204.9" y1="30" x2="204.9" y2="318"/>
+<text x="204.9" y="334" text-anchor="middle" class="s-small s-muted">4</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="335.9" y1="30" x2="335.9" y2="318"/>
+<text x="335.9" y="334" text-anchor="middle" class="s-small s-muted">16</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="466.8" y1="30" x2="466.8" y2="318"/>
+<text x="466.8" y="334" text-anchor="middle" class="s-small s-muted">36</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="597.8" y1="30" x2="597.8" y2="318"/>
+<text x="597.8" y="334" text-anchor="middle" class="s-small s-muted">64</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="74" y1="270.0" x2="696" y2="270.0"/>
+<text x="66" y="274.0" text-anchor="end" class="s-small s-muted">0</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="74" y1="193.2" x2="696" y2="193.2"/>
+<text x="66" y="197.2" text-anchor="end" class="s-small s-muted">4</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="74" y1="116.4" x2="696" y2="116.4"/>
+<text x="66" y="120.4" text-anchor="end" class="s-small s-muted">8</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="74" y1="39.6" x2="696" y2="39.6"/>
+<text x="66" y="43.6" text-anchor="end" class="s-small s-muted">12</text>
+<line class="s-line" x1="74" y1="318" x2="696" y2="318"/>
+<line class="s-line" x1="74" y1="30" x2="74" y2="318"/>
+<line class="s-line" style="stroke-width:1" x1="74" y1="270.0" x2="696" y2="270.0"/>
+<text x="385.0" y="356" text-anchor="middle" class="s-small">KL(π ‖ π_init) in nats (horizontal axis is √KL, as in Gao et al.)</text>
+<text x="16" y="174.0" text-anchor="middle" class="s-small" transform="rotate(-90 16 174.0)">reward (arbitrary units)</text>
+<polyline class="s-line-b s-dash" points="74.0,270.0 90.4,264.0 106.7,258.0 123.1,252.0 139.5,246.0 155.8,240.0 172.2,234.0 188.6,228.0 204.9,222.0 221.3,216.0 237.7,210.0 254.1,204.0 270.4,198.0 286.8,192.0 303.2,186.0 319.5,180.0 335.9,174.0 352.3,168.0 368.6,162.0 385.0,156.0 401.4,150.0 417.7,144.0 434.1,138.0 450.5,132.0 466.8,126.0 483.2,120.0 499.6,114.0 515.9,108.0 532.3,102.0 548.7,96.0 565.1,90.0 581.4,84.0 597.8,78.0 614.2,72.0 630.5,66.0 646.9,60.0 663.3,54.0 679.6,48.0 696.0,42.0"/>
+<polyline class="s-line-a" points="74.0,270.0 90.4,265.3 106.7,261.0 123.1,256.9 139.5,253.1 155.8,249.6 172.2,246.4 188.6,243.5 204.9,240.8 221.3,238.5 237.7,236.4 254.1,234.6 270.4,233.1 286.8,231.9 303.2,231.0 319.5,230.4 335.9,230.1 352.3,230.0 368.6,230.3 385.0,230.8 401.4,231.6 417.7,232.7 434.1,234.1 450.5,235.8 466.8,237.7 483.2,240.0 499.6,242.5 515.9,245.4 532.3,248.5 548.7,251.9 565.1,255.6 581.4,259.6 597.8,263.9 614.2,268.4 630.5,273.3 646.9,278.4 663.3,283.8 679.6,289.5 696.0,295.5"/>
+<line class="s-line s-dash" style="stroke-width:1" x1="346.8" y1="230.0" x2="346.8" y2="318"/>
+<circle class="s-fill-e" cx="346.8" cy="230.0" r="5" style="stroke:none"/>
+<text x="356.8" y="222.0" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">best point: stop here</text>
+<path class="s-line" d="M597.8,82.0 L597.8,259.9" marker-end="url(#arrow-21-2)" marker-start="url(#arrow-21-2)"/>
+<text x="589.8" y="170.9" text-anchor="end" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">gap = how much the proxy is exploited</text>
+<rect class="s-plain" x="90" y="40" width="300" height="76" rx="6"/>
+<line class="s-line-b s-dash" x1="100" y1="58" x2="130" y2="58"/><text x="138" y="62" class="s-small">proxy RM score, about linear in √KL</text>
+<line class="s-line-a" x1="100" y1="78" x2="130" y2="78"/><text x="138" y="82" class="s-small">gold reward, R(d) = d(α − βd), d = √KL</text>
+<text x="100" y="102" class="s-small s-muted">SCHEMATIC, not data. Illustrative α = 1, β = 0.12, slope 1.25.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Schematic of over-optimization (illustrative parameters, not data). The proxy score keeps rising roughly linearly in the square root of KL, while the gold reward, here the quadratic best-of-\(n\) form, peaks near \(\mathrm{KL} = (\alpha/2\beta)^2 \approx 17\) nats and then falls below where it started. Notice that the gap between the two lines is what has been exploited, and that it is invisible if you only monitor the proxy.</figcaption>
+  </figure>
+
+  <h3 id="gao-findings">What they found</h3>
+  <ul>
+    <li><strong>Coefficients scale smoothly with reward-model size.</strong> \(\alpha_{\text{bon}}\), \(\beta_{\text{bon}}\) and \(\beta_{\text{RL}}\) follow roughly logarithmic trends in RM parameters, and \(\alpha_{\text{RL}}\) is nearly constant across sizes <a href="https://arxiv.org/abs/2210.10760">[§1, §3.2]</a>. Bigger reward models over-optimize later.</li>
+    <li><strong>Data matters, with a threshold.</strong> With fewer than about 2,000 comparisons the reward models were near chance, and after that more data helped all sizes <a href="https://arxiv.org/abs/2210.10760">[§3.3]</a>. Unique comparisons count, not gradient steps: 4 epochs of 2,000 examples did no better than 1 epoch.</li>
+    <li><strong>Policy size hardly matters.</strong> A 6B policy gains less from optimization than a 1.2B one, but its gold reward peaks at almost the same KL, and the proxy-gold gap is about the same <a href="https://arxiv.org/abs/2210.10760">[§3.4]</a>.</li>
+    <li><strong>RL spends KL less efficiently than best-of-\(n\).</strong> Best-of-\(n\) KL grows like \(\log n\). Without a KL penalty, RL's KL grows roughly quadratically with training steps, so both progress and over-optimization need much more KL. Hence KL is a poor common yardstick across methods <a href="https://arxiv.org/abs/2210.10760">[§3.5, §4.1]</a>.</li>
+    <li><strong>The KL penalty acts like early stopping.</strong> Varying the penalty in RL changed how soon the run converged but did not move the gold-reward-versus-KL frontier, so its effect on the gold score is "akin to early stopping" (the authors note this could depend on hyperparameters) <a href="https://arxiv.org/abs/2210.10760">[§3.6]</a>.</li>
+  </ul>
+
+  <p>Gao et al. also map the curves onto Goodhart's taxonomy. The proxy is roughly linear in \(\sqrt{\mathrm{KL}}\), and the slope gap between proxy and the linear part of gold (the \(\alpha\) term) is <em>regressional</em> Goodhart: some of the optimization power selects noise in the proxy. The downward bend (the \(\beta\) term) is mostly <em>extremal</em> Goodhart: the policy leaves the region where the reward model is accurate, for example by finding that length always scored well. <em>Adversarial</em> Goodhart, a policy deliberately manipulating the proxy, is not captured because their models are too weak <a href="https://arxiv.org/abs/2210.10760">[§4.2]</a>. Length is the standard real-world example: PPO with a reward that was <em>only</em> a length target reproduced most of the simulated-preference win rate of PPO with a learned reward (for example 56% versus 58% on WebGPT) <a href="https://arxiv.org/abs/2310.03716">[Singhal et al. 2023, §1, Tab. 2]</a>.</p>
+
+  <h3 id="mitigations">Mitigations</h3>
+  <ul>
+    <li><strong>Bigger reward model, more and cleaner data</strong>, and keeping the policy near the RM's training distribution. Llama 2 collected fresh preference data each round because "reward model accuracy can quickly degrade if not exposed to this new sample distribution" <a href="https://arxiv.org/abs/2307.09288">[§3.2.1]</a>. Gao et al. show that with \(k\) rounds of fresh labels the gold reward rises by \(\beta_{\text{RL}}\, d \log k\) <a href="https://arxiv.org/abs/2210.10760">[§4.3]</a>.</li>
+    <li><strong>Ensembles with a conservative objective.</strong> Train several reward models with different seeds and score with the minimum (worst-case) or with mean minus \(\lambda\) times variance. With five 44M proxy reward models against a 7B gold model and 25% label noise, this raised best-of-\(n\) final gold reward by about 75% over the average single reward model, and with PPO it eliminated over-optimization when paired with a KL penalty of 0.01. A single reward model needed a penalty of 0.2, twenty times larger, at a real cost in performance <a href="https://arxiv.org/abs/2310.02743">[Coste et al. 2023, §5.1, §5.2]</a>.</li>
+    <li><strong>Early stopping on a held-out gold signal</strong>, length controls, and a KL penalty (below).</li>
+    <li><strong>Direct methods over-optimize too.</strong> DPO, IPO and SLiC trained at seven values of \(\beta\) show the same hump: win rate against the reference rises then falls as KL grows, wide-KL runs peak after only about a quarter of an epoch, and the 1B model over-optimizes almost immediately. IPO was the least prone <a href="https://arxiv.org/abs/2406.02900">[Rafailov et al. 2024, §3.1-3.2]</a>. Skipping the reward model removes the proxy, but not the problem.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">A KL penalty toward the reference policy</div>
+    <dl>
+      <dt>Problem</dt><dd>Maximizing a learned reward exploits it, and also erodes fluency and diversity, since the reward model has no opinion about text far from its training data.</dd>
+      <dt>Idea</dt><dd>Maximize \(\E[r] - \beta\,\KL(\pi\|\pi_{\text{ref}})\), where \(\pi_{\text{ref}}\) is the SFT model.</dd>
+      <dt>Why it works</dt><dd>It keeps the policy where the reward is informative, keeps entropy, and, crucially for the next two sections, has a closed-form optimum.</dd>
+      <dt>Evidence</dt><dd>Used in InstructGPT (\(\beta = 0.02\), <a href="https://arxiv.org/abs/2203.02155">[App. C.4]</a>) and Llama 2 (\(\beta = 0.01\) for 7B and 13B, \(0.005\) for 34B and 70B, <a href="https://arxiv.org/abs/2307.09288">[§3.2.3]</a>). But Gao et al. find it behaves like early stopping rather than a better frontier, and Coste et al. find it must be 20 times larger than with an ensemble.</dd>
+      <dt>Cost</dt><dd>One more hyperparameter, a reference model in memory (or cached log-probabilities), and the KL is measured over whole sequences in nats.</dd>
+      <dt>Used by</dt><dd>PPO-based RLHF and, implicitly through \(\beta\), DPO and its variants.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="kl-objective">The KL-regularized objective and its closed-form optimum</h2>
+
+  <p>Treat generation as a one-step decision at the sequence level: for prompt \(x\), the policy \(\pi(\cdot\mid x)\) is a distribution over complete responses \(y\), and \(\pi(y|x) = \prod_t \pi(y_t \mid x, y_{&lt;t})\). The standard RLHF objective is</p>
+
+  <div class="eq-box">
+  \[ J(\pi) = \E_{x}\Big[\ \E_{y \sim \pi(\cdot|x)}\, r(x,y) \;-\; \beta\, \KL\big(\pi(\cdot|x)\,\big\|\,\pi_{\text{ref}}(\cdot|x)\big)\Big], \qquad \beta > 0 \]
+  <div class="eq-label">KL-regularized reward maximization (DPO paper Eq. 3). \(\pi_{\text{ref}}\) is usually the SFT model, and \(\pi\) is initialized from it.</div>
+  </div>
+
+  <p>We now derive its optimum <strong>exactly</strong>, with no calculus of variations. Every step below is one an interviewer will want to see.</p>
+
+  <ol>
+    <li><strong>Decouple prompts.</strong> \(J\) is an average over \(x\) of terms that each depend only on \(\pi(\cdot|x)\). If the policy is unrestricted, maximize each prompt's term separately. Fix \(x\) and drop it from the notation.</li>
+    <li><strong>Write the KL as an expectation under \(\pi\).</strong> \(\KL(\pi\|\pi_{\text{ref}}) = \E_{y\sim\pi}[\log \pi(y)/\pi_{\text{ref}}(y)]\), so
+      \[ \E_\pi[r] - \beta\,\KL(\pi\|\pi_{\text{ref}}) = -\beta\,\E_{y\sim\pi}\Big[\log\frac{\pi(y)}{\pi_{\text{ref}}(y)} - \frac{r(y)}{\beta}\Big]. \]
+      Maximizing \(J\) is the same as minimizing \(F(\pi) = \E_\pi\big[\log \frac{\pi}{\pi_{\text{ref}}} - \frac r\beta\big]\).</li>
+    <li><strong>Define a normalized distribution that absorbs the reward.</strong> Let
+      \[ Z(x) = \sum_y \pi_{\text{ref}}(y|x)\, e^{r(x,y)/\beta}, \qquad \pi^\star(y|x) = \frac{1}{Z(x)}\,\pi_{\text{ref}}(y|x)\,e^{r(x,y)/\beta}. \]
+      \(\pi^\star\) is nonnegative and sums to 1 by construction, so it is a valid distribution. \(Z(x)\) is the <strong>partition function</strong> <span class="zh">配分函数</span>. Taking logs, \(\log\pi^\star = \log\pi_{\text{ref}} + r/\beta - \log Z\), hence \(\log\frac{\pi}{\pi_{\text{ref}}} - \frac r\beta = \log\frac{\pi}{\pi^\star} - \log Z\).</li>
+    <li><strong>Substitute.</strong> \(F(\pi) = \E_\pi[\log \pi/\pi^\star] - \log Z = \KL(\pi\|\pi^\star) - \log Z\). Multiplying by \(-\beta\) gives an exact identity for <em>every</em> policy:
+      \[ J(\pi) \;=\; \beta \log Z(x) \;-\; \beta\,\KL\big(\pi\,\|\,\pi^\star\big). \]</li>
+    <li><strong>Read off the optimum.</strong> \(\log Z\) does not depend on \(\pi\), and \(\KL \ge 0\) with equality if and only if \(\pi = \pi^\star\) (Gibbs' inequality). So the unique maximizer is \(\pi^\star\), the maximum value is \(\beta\log Z(x)\), and any other policy loses exactly \(\beta\,\KL(\pi\|\pi^\star)\) relative to it.</li>
+  </ol>
+
+  <div class="eq-box">
+  \[ \pi^\star(y|x) = \frac{1}{Z(x)}\,\pi_{\text{ref}}(y|x)\exp\!\Big(\frac{1}{\beta}\,r(x,y)\Big), \qquad Z(x) = \sum_y \pi_{\text{ref}}(y|x)\exp\!\Big(\frac{1}{\beta}\,r(x,y)\Big) \]
+  <div class="eq-label">Closed-form optimum (DPO paper Eq. 4, App. A.1): the reference policy, exponentially tilted by the reward</div>
+  </div>
+
+  <p>The Lagrangian route gives the same answer: maximize \(\sum_y \pi(y)[r(y) - \beta\log\frac{\pi(y)}{\pi_{\text{ref}}(y)}] + \lambda(\sum_y \pi(y) - 1)\), set the derivative with respect to each \(\pi(y)\) to zero, get \(\pi(y) \propto \pi_{\text{ref}}(y)e^{r(y)/\beta}\), and let the normalization constraint define \(Z\). The completing-the-KL argument above is faster to write and shows more, since it proves optimality and prices every suboptimal policy. \(\beta\) is also the Lagrange multiplier of the constrained problem "maximize \(\E[r]\) subject to \(\KL \le \epsilon\)", so the two formulations trace the same family of optima.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Assumptions hidden in these five lines</div>
+    <p><strong>(1) The maximization is over all distributions</strong>, not over what a transformer can represent. Any trained \(\pi_\theta\) only approximates \(\pi^\star\). <strong>(2) Support:</strong> \(\pi^\star(y|x) = 0\) wherever \(\pi_{\text{ref}}(y|x) = 0\), and policies with mass outside the reference's support have infinite KL and are infeasible. The inversion in the next section, \(r = \beta\log(\pi^\star/\pi_{\text{ref}}) + \beta\log Z\), is only defined on the reference's support: rewards of responses the reference cannot produce are simply not identified. A softmax LM gives every sequence positive probability in principle, but the loss only ever touches the ratio at responses in the dataset, so what matters in practice is <em>coverage</em>. <strong>(3)</strong> \(Z(x)\) is finite (true for bounded \(r\)). <strong>(4)</strong> The KL is over whole sequences. By the chain rule it equals the expected <em>sum</em> of per-token KLs, so \(\beta\) is a per-sequence, not a per-token, price. <strong>(5)</strong> \(r\) is a fixed function. If it is a learned proxy, all its errors are inherited.</p>
+  </aside>
+
+  <h3 id="kl-numbers">Worked numbers: a three-response prompt</h3>
+  <p>Take \(\beta = 1\), \(\pi_{\text{ref}} = (0.5, 0.3, 0.2)\) and rewards \(r = (0, 1, 2)\) for three possible responses.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Response</th><th class="num">\(\pi_{\text{ref}}\)</th><th class="num">\(r\)</th><th class="num">\(\pi_{\text{ref}}\,e^{r}\)</th><th class="num">\(\pi^\star\) (\(\beta=1\))</th><th class="num">\(\pi^\star\) (\(\beta=0.5\))</th><th class="num">\(\pi^\star\) (\(\beta=2\))</th></tr></thead>
+    <tbody>
+      <tr><td>\(y_1\)</td><td class="num">0.5</td><td class="num">0</td><td class="num">0.5000</td><td class="num">0.179</td><td class="num">0.037</td><td class="num">0.325</td></tr>
+      <tr><td>\(y_2\)</td><td class="num">0.3</td><td class="num">1</td><td class="num">0.8155</td><td class="num">0.292</td><td class="num">0.163</td><td class="num">0.322</td></tr>
+      <tr><td>\(y_3\)</td><td class="num">0.2</td><td class="num">2</td><td class="num">1.4778</td><td class="num">0.529</td><td class="num">0.801</td><td class="num">0.353</td></tr>
+      <tr class="hl"><td colspan="3">\(Z = \sum\)</td><td class="num">2.7933</td><td class="num" colspan="3"></td></tr>
+    </tbody>
+  </table></div>
+  <p>Check the identity. At \(\beta = 1\): \(\E_{\pi^\star}[r] = 0.292 + 2(0.529) = 1.350\), \(\KL(\pi^\star\|\pi_{\text{ref}}) = 0.323\), so \(J(\pi^\star) = 1.350 - 0.323 = 1.0272\), and \(\beta \log Z = \log 2.7933 = 1.0272\). The reference policy itself scores \(J = 0.7\), and a plausible-looking rival \((0.2, 0.3, 0.5)\) scores \(1.0251\), just below the optimum, as the identity predicts. Smaller \(\beta\) concentrates mass on the highest-reward response (\(\beta = 0.5\) puts 0.80 on \(y_3\)), while larger \(\beta\) tilts less (at \(\beta = 2\) the mass of \(y_1\) has only fallen from 0.5 to 0.325, and as \(\beta\to\infty\) we recover \(\pi_{\text{ref}}\)). Also note the units: \(\beta\log Z(x) = \beta \log \E_{\pi_{\text{ref}}}[e^{r/\beta}]\) is a "soft maximum" of the reward. It tends to \(\E_{\pi_{\text{ref}}}[r]\) as \(\beta\to\infty\) and to \(\max_y r\) as \(\beta \to 0\).</p>
+
+  <p>Why not just use \(\pi^\star\) directly? Because \(Z(x)\) sums over every possible response. With \(V = 128{,}256\) tokens and 200-token responses that is \(V^{200}\) terms, and a Monte Carlo estimate from \(\pi_{\text{ref}}\) samples has huge variance since \(e^{r/\beta}\) is heavy-tailed. This intractable constant is exactly what DPO's trick removes.</p>
+</section>
+
+<section>
+  <h2 id="dpo">Deriving Direct Preference Optimization</h2>
+
+  <p><strong>Direct Preference Optimization</strong> <span class="zh">直接偏好优化</span> (DPO) rests on two facts we already have. The Bradley-Terry model needs only <em>differences</em> of rewards. And the optimum of the KL-regularized problem is an explicit function of the reward. Solve the second for the reward and substitute it into the first: the intractable \(Z(x)\) sits in a term that differences cannot see. Figure 3 is the whole argument; the numbered steps below are the version to write on a whiteboard.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 452" role="img" aria-labelledby="fig-21-3-title">
+<title id="fig-21-3-title">The DPO derivation as a chain: KL-regularized objective, closed-form optimal policy, reward reparameterization, Bradley-Terry with the partition function cancelling, DPO loss</title>
+<defs><marker id="arrow-21-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="8" y="8" width="72" height="64" rx="6"/>
+<text x="44" y="36" text-anchor="middle" class="s-big">1</text>
+<text x="44" y="56" text-anchor="middle" class="s-small">objective</text>
+<rect class="s-plain" x="88" y="8" width="452" height="64" rx="6"/>
+<text x="102" y="44.0" class="s-mono">max over π of  E[ r(x,y) ] − β · KL( π ‖ π_ref )</text>
+<text x="552" y="34" class="s-small s-muted">sequence-level KL; the max is over</text>
+<text x="552" y="50" class="s-small s-muted">ALL distributions; needs π_ref(y|x) &gt; 0</text>
+<path class="s-line" d="M314,72 L314,96" marker-end="url(#arrow-21-3)"/>
+<text x="326" y="88" class="s-small s-muted">solve the constrained problem (Gibbs variational argument)</text>
+<rect class="s-a" x="8" y="96" width="72" height="64" rx="6"/>
+<text x="44" y="124" text-anchor="middle" class="s-big">2</text>
+<text x="44" y="144" text-anchor="middle" class="s-small">optimum</text>
+<rect class="s-plain" x="88" y="96" width="452" height="64" rx="6"/>
+<text x="102" y="132.0" class="s-mono">π*(y|x) = π_ref(y|x) · exp( r(x,y) / β ) / Z(x)</text>
+<text x="552" y="122" class="s-small s-muted">Z(x) = Σ_y π_ref e^(r/β): a sum over</text>
+<text x="552" y="138" class="s-small s-muted">every possible sequence, intractable</text>
+<path class="s-line" d="M314,160 L314,184" marker-end="url(#arrow-21-3)"/>
+<text x="326" y="176" class="s-small s-muted">take logs, solve for r</text>
+<rect class="s-b" x="8" y="184" width="72" height="64" rx="6"/>
+<text x="44" y="212" text-anchor="middle" class="s-big">3</text>
+<text x="44" y="232" text-anchor="middle" class="s-small">invert</text>
+<rect class="s-plain" x="88" y="184" width="452" height="64" rx="6"/>
+<text x="102" y="220.0" class="s-mono">r(x,y) = β · log[ π*(y|x) / π_ref(y|x) ] + β · log Z(x)</text>
+<text x="552" y="210" class="s-small s-muted">true for ANY reward r; log Z(x) is</text>
+<text x="552" y="226" class="s-small s-muted">a shift that depends on the prompt only</text>
+<path class="s-line" d="M314,248 L314,272" marker-end="url(#arrow-21-3)"/>
+<text x="326" y="264" class="s-small s-muted">plug into the preference model</text>
+<rect class="s-c" x="8" y="272" width="72" height="64" rx="6"/>
+<text x="44" y="300" text-anchor="middle" class="s-big">4</text>
+<text x="44" y="320" text-anchor="middle" class="s-small">Bradley-Terry</text>
+<rect class="s-plain" x="88" y="272" width="452" height="64" rx="6"/>
+<text x="102" y="298" class="s-mono" xml:space="preserve">P(y_w ≻ y_l | x) = σ( r(x,y_w) − r(x,y_l) )</text>
+<text x="102" y="318" class="s-mono" xml:space="preserve">             = σ( β·log[π*(y_w)/π_ref(y_w)] − β·log[π*(y_l)/π_ref(y_l)] )</text>
+<text x="552" y="298" class="s-small s-muted">only the difference of rewards</text>
+<text x="552" y="314" class="s-small s-muted">enters, so both β·log Z(x) cancel</text>
+<path class="s-line" d="M314,336 L314,360" marker-end="url(#arrow-21-3)"/>
+<text x="326" y="352" class="s-small s-muted">replace π* by the trainable πθ and take maximum likelihood</text>
+<rect class="s-d" x="8" y="360" width="72" height="64" rx="6"/>
+<text x="44" y="388" text-anchor="middle" class="s-big">5</text>
+<text x="44" y="408" text-anchor="middle" class="s-small">DPO loss</text>
+<rect class="s-plain" x="88" y="360" width="452" height="64" rx="6"/>
+<text x="102" y="386" class="s-mono" xml:space="preserve">L = − E log σ( β·log[πθ(y_w|x)/π_ref(y_w|x)]</text>
+<text x="102" y="406" class="s-mono" xml:space="preserve">                 − β·log[πθ(y_l|x)/π_ref(y_l|x)] )</text>
+<text x="552" y="386" class="s-small s-muted">fit πθ by maximum likelihood:</text>
+<text x="552" y="402" class="s-small s-muted">a binary cross-entropy, no RL loop</text>
+<text x="8" y="462" class="s-small">Theorem 1 (Rafailov et al.): step 3 loses no generality. Every Bradley-Terry reward class contains one member of the form β·log(π/π_ref).</text>
+</svg>
+    <figcaption><b>Figure 3.</b> The DPO derivation as a chain. Steps 1 and 2 are the previous section. Step 3 is pure algebra and is valid for any reward function. Step 4 is where the partition function vanishes: the two \(\beta\log Z(x)\) terms are identical because both responses answer the same prompt. Step 5 turns the result into a training loss by replacing the optimal policy with a trainable one. Notice that no sampling from the policy and no reward model appear anywhere.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Preference model (Bradley-Terry).</strong> \(p^*(y_1 \succ y_2 \mid x) = \sigma\big(r^*(x,y_1) - r^*(x,y_2)\big)\), where \(r^*\) is an unobserved latent reward (DPO paper Eq. 1).</li>
+    <li><strong>Optimal policy for a reward \(r\).</strong> \(\pi_r(y|x) = \frac{1}{Z(x)}\pi_{\text{ref}}(y|x)\,e^{r(x,y)/\beta}\) (Eq. 4, derived in the previous section).</li>
+    <li><strong>Invert.</strong> Take the log of step 2: \(\log\pi_r = \log\pi_{\text{ref}} + r/\beta - \log Z\). Solve for \(r\):
+      \[ r(x,y) = \beta\log\frac{\pi_r(y|x)}{\pi_{\text{ref}}(y|x)} + \beta\log Z(x) \qquad \text{(Eq. 5)} \]
+      This holds for <em>every</em> reward function, with \(\pi_r\) its own optimum. Check it on the three-response example of the last section: \(\log(\pi^\star/\pi_{\text{ref}}) = (-1.0272,\ -0.0272,\ +0.9728)\), and adding \(\log Z = 1.0272\) returns exactly \(r = (0, 1, 2)\). The constant \(\log Z\) is what makes the rewards come back.</li>
+    <li><strong>Substitute into Bradley-Terry; \(Z\) cancels.</strong> For the same prompt \(x\),
+      \[ r^*(x,y_w) - r^*(x,y_l) = \beta\log\frac{\pi^*(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi^*(y_l|x)}{\pi_{\text{ref}}(y_l|x)} + \underbrace{\beta\log Z(x) - \beta\log Z(x)}_{=\,0}, \]
+      so \(p^*(y_w \succ y_l|x) = \sigma\Big(\beta\log\frac{\pi^*(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi^*(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\Big)\) (Eq. 6).</li>
+    <li><strong>Maximum likelihood over policies.</strong> Replace the unknown \(\pi^*\) by a parametric \(\pi_\theta\) and minimize the negative log-likelihood of the observed pairs (Eq. 7):</li>
+  </ol>
+
+  <div class="eq-box">
+  \[ \mathcal L_{\text{DPO}}(\pi_\theta;\pi_{\text{ref}}) = -\,\E_{(x,y_w,y_l)\sim\mathcal D}\left[\log\sigma\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right] \]
+  <div class="eq-label">The DPO loss: Bradley-Terry with the implicit reward \(\hat r_\theta(x,y) = \beta\log\frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}\)</div>
+  </div>
+
+  <h3 id="why-z-cancels">Why \(Z\) really cancels, and why step 5 loses nothing</h3>
+  <p>The algebraic reason is one line: \(\log Z(x)\) depends on the prompt only, and both responses answer the same prompt. The structural reason is better to know. Bradley-Terry is invariant to \(r \to r + f(x)\), so rewards come in equivalence classes, and \(\beta\log Z(x)\) is exactly such an \(f(x)\). DPO calls two rewards <em>equivalent</em> when they differ by a prompt-only function (Def. 1) and proves: (Lemma 1) equivalent rewards give the same preference distribution, and (Lemma 2) equivalent rewards give the same optimal policy under the KL-constrained problem. So the one quantity Bradley-Terry cannot see is the one the RL problem does not care about, and it is also the intractable one.</p>
+  <p>Step 5 is legitimate because of <strong>Theorem 1</strong>: every reward class consistent with Bradley-Terry (or Plackett-Luce) contains a member of the form \(r = \beta\log\frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)}\) for some policy \(\pi\). That member is the one with \(\sum_y \pi_{\text{ref}}(y|x)e^{r(x,y)/\beta} = 1\), that is, \(Z(x) = 1\). For it, \(\sum_y \pi_{\text{ref}}e^{\hat r/\beta} = \sum_y \pi_\theta = 1\), so the optimal policy of \(\hat r_\theta\) is \(\pi_\theta\) itself. Minimizing \(\mathcal L_{\text{DPO}}\) over policies is therefore the same as fitting a Bradley-Terry reward model over all reward classes, with the KL-optimal policy attached for free. The policy <em>is</em> the reward model, which is the paper's title, "your language model is secretly a reward model". A caution: this equivalence is a statement about the unrestricted optimum. Whether gradient descent on a finite dataset finds a policy with those properties is a separate empirical question, and much of the next section is about how it fails.</p>
+
+  <h3 id="sequence-logprobs">From sequence probabilities to code</h3>
+  <p>\(\log\pi_\theta(y|x) = \sum_{t}\log\pi_\theta(y_t \mid x, y_{&lt;t})\), summed over <em>response</em> tokens only. For plain DPO the prompt's terms are identical in the chosen and rejected sums and cancel in the difference, so masking them does not change the loss. It matters as soon as you compute anything per response (implicit-reward logging, length normalization, an added NLL term), and padding must always be masked. Llama 3 also masks special formatting tokens (headers, end-of-turn) from both responses: they appear in both, and "the contrastive nature of the DPO loss" then asks the model to raise and lower their likelihood at once, which they saw cause tail repetition and abrupt terminations <a href="https://arxiv.org/abs/2407.21783">[Llama 3, §4.1.4]</a>.</p>
+
+<pre><code class="language-python">def sequence_logprob(logits, labels, mask):
+    # logits: (B, T, V) aligned so logits[:, t] predicts labels[:, t]; mask: (B, T), 1 on response tokens
+    logp = torch.log_softmax(logits.float(), -1)                          # fp32 for stability
+    tok = logp.gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)  # (B, T), -100 labels are safe
+    return (tok * mask).sum(-1)                                           # (B,)
+
+def dpo_step(policy, ref, chosen_ids, rejected_ids, chosen_mask, rejected_mask, beta=0.1):
+    ids = torch.cat([chosen_ids, rejected_ids])                           # (2B, T): one forward pass for both
+    mask = torch.cat([chosen_mask, rejected_mask])[:, 1:]                 # shift: token t is predicted at t-1
+    lp = sequence_logprob(policy(ids).logits[:, :-1], ids[:, 1:], mask)   # (2B,), gradients flow
+    with torch.no_grad():                                                 # frozen reference; can be precomputed
+        ref_lp = sequence_logprob(ref(ids).logits[:, :-1], ids[:, 1:], mask)
+    pi_w, pi_l = lp.chunk(2); ref_w, ref_l = ref_lp.chunk(2)
+    margin = beta * ((pi_w - ref_w) - (pi_l - ref_l))                     # implicit reward of chosen minus rejected
+    return -F.logsigmoid(margin).mean(), (margin > 0).float().mean()      # loss, implicit-reward accuracy
+</code></pre>
+  <p class="small muted">The full drill, with the IPO, SimPO and ORPO variants and tests, is <code>exercises/drills/dpo.py</code>. Tulu 3 saves memory by precomputing and caching the reference log-probabilities once instead of keeping a reference model on the GPU, and runs chosen and rejected sequences in separate forward passes <a href="https://arxiv.org/abs/2411.15124">[§5.4.2]</a>.</p>
+
+  <h3 id="dpo-gradient">The gradient and what it does per example</h3>
+  <p>Let \(u = \hat r_\theta(x,y_w) - \hat r_\theta(x,y_l)\), so \(\mathcal L = -\log\sigma(u)\). Then \(\partial\mathcal L/\partial u = -\sigma(-u)\), and \(\nabla_\theta u = \beta\big(\nabla_\theta\log\pi_\theta(y_w|x) - \nabla_\theta\log\pi_\theta(y_l|x)\big)\). Since \(\sigma(-u) = \sigma(\hat r_l - \hat r_w)\):</p>
+
+  <div class="eq-box">
+  \[ \nabla_\theta\mathcal L_{\text{DPO}} = -\beta\,\E_{(x,y_w,y_l)}\Big[\underbrace{\sigma\big(\hat r_\theta(x,y_l) - \hat r_\theta(x,y_w)\big)}_{\text{higher weight when the implicit reward ranks the pair wrongly}}\Big(\underbrace{\nabla_\theta\log\pi_\theta(y_w|x)}_{\text{increase chosen}} - \underbrace{\nabla_\theta\log\pi_\theta(y_l|x)}_{\text{decrease rejected}}\Big)\Big] \]
+  <div class="eq-label">DPO gradient (Rafailov et al. §4, "What does the DPO update do?")</div>
+  </div>
+
+  <ul>
+    <li><strong>Direction.</strong> Gradient descent raises the sequence log-probability of \(y_w\) and lowers that of \(y_l\), with equal coefficients. Every response token gets the same sequence-level coefficient, and the update on \(y_l\) is an unlikelihood term.</li>
+    <li><strong>Weight.</strong> \(\sigma(\hat r_l - \hat r_w) \in (0,1)\). At initialization \(\pi_\theta = \pi_{\text{ref}}\), both implicit rewards are 0 and the weight is exactly \(0.5\). It approaches 1 for pairs the model ranks wrongly and decays toward 0 as the margin grows. This built-in curriculum matters: the DPO paper reports that a "naive" version without the weight makes the model degenerate <a href="https://arxiv.org/abs/2305.18290">[Rafailov et al. 2023, §4, App. Tab. 3]</a>.</li>
+    <li><strong>\(\beta\).</strong> The gradient is \(\beta\) times the weight, and the weight is a function of the margin in <em>reward</em> units \(\beta\Delta\), where \(\Delta\) is the difference of log-ratios. A large \(\beta\) saturates the weight after a small log-ratio move, so the policy stays near the reference; a small \(\beta\) lets it travel far (the next section quantifies this).</li>
+    <li><strong>No reward model, no sampling.</strong> The gradient uses only four sequence log-probabilities per pair. That is DPO's whole cost advantage and, as we will see, the source of its off-policy weakness.</li>
+  </ul>
+
+  <p>The token-level view is worth one paragraph. Because \(\log\pi(y|x) = \sum_t \log\pi(y_t|x,y_{&lt;t})\), the implicit reward is a sum of per-token log-ratios. Rafailov et al. (2024) re-derive DPO in the token-level MDP and show the log-ratio is an optimal <em>advantage</em> for some reward, with the value \(V^*(s_0)\) of the shared prompt cancelling exactly as \(Z(x)\) did, and they show qualitatively that per-token implicit rewards highlight the erroneous tokens in a summary <a href="https://arxiv.org/abs/2404.12358">[From r to Q*, §4-5.1]</a>.</p>
+
+  <h3 id="recipes">Typical settings</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Recipe</th><th class="num">\(\beta\)</th><th class="num">Learning rate</th><th>Other details</th></tr></thead>
+    <tbody>
+      <tr><td>DPO paper <a href="https://arxiv.org/abs/2305.18290">[App. B]</a></td><td class="num">0.1 (0.5 for TL;DR)</td><td class="num">\(10^{-6}\), RMSprop</td><td>batch 64, 150 warmup steps; \(\pi_{\text{ref}} = \pi_{\text{SFT}}\), or SFT on the chosen responses if the pair generator is unknown</td></tr>
+      <tr><td>Llama 3 <a href="https://arxiv.org/abs/2407.21783">[§4.1.4, §4.1.6]</a></td><td class="num">0.1</td><td class="num">\(10^{-5}\)</td><td>six rounds; latest preference batches only; NLL term on chosen with coefficient 0.2; formatting tokens masked</td></tr>
+      <tr><td>Tulu 3 <a href="https://arxiv.org/abs/2411.15124">[Tab. 20, Eq. 6]</a></td><td class="num">5 (length-normalized loss)</td><td class="num">\(5\times10^{-7}\) (8B), \(2\times10^{-7}\) (70B)</td><td>batch 128, 1 epoch, max length 2,048, linear schedule with 0.1 warmup</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">\(\beta\) is not comparable across rows: Tulu 3 divides each log-ratio by the response length, so the same \(\beta\) means something quite different. Learning rates are 10 to 100 times smaller than for SFT.</p>
+
+  <div class="decision">
+    <div class="decision-title">Direct Preference Optimization</div>
+    <dl>
+      <dt>Problem</dt><dd>RLHF needs a reward model, an online RL loop with sampling, a critic and a reference, and is notoriously finicky to tune.</dd>
+      <dt>Idea</dt><dd>Reparameterize the reward as \(\beta\log(\pi_\theta/\pi_{\text{ref}})\) and train it with the Bradley-Terry loss directly on preference pairs.</dd>
+      <dt>Why it works</dt><dd>The KL-regularized optimum is an explicit function of the reward, and the intractable normalizer cancels in a pairwise comparison. The result is a binary cross-entropy that recovers the same optimum, under the assumptions of the previous section.</dd>
+      <dt>Evidence</dt><dd>On TL;DR summarization DPO reached about a 61% GPT-4 win rate against reference summaries, against 57% for PPO at its best temperature (both 0.0), and was more robust to sampling temperature <a href="https://arxiv.org/abs/2305.18290">[Rafailov et al. 2023, §6.2]</a>. Llama 3 found DPO cheaper and better than PPO at scale, especially on IFEval <a href="https://arxiv.org/abs/2407.21783">[§4.1.4]</a>.</dd>
+      <dt>Cost</dt><dd>It is offline and off-policy by default, its reference model matters, it can drive the chosen likelihood down, and it exploits length. The next section is about these.</dd>
+      <dt>Used by</dt><dd>Zephyr-style open recipes, Llama 3 (six rounds), Tulu 3 (length-normalized), OLMo 3 (delta-learning pairs), and as a light final stage in Llama 4.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="dpo-numbers">Worked numbers: a pair by hand</h2>
+
+  <p>Take \(\beta = 0.1\). Sequence log-probabilities, summed over response tokens, are in nats. The table evaluates four situations. The implicit reward is \(\hat r = \beta(\log\pi - \log\pi_{\text{ref}})\), the margin is \(\hat r_w - \hat r_l\), the loss is \(\log(1 + e^{-\text{margin}})\), the weight is \(\sigma(-\text{margin})\), and the last column is \(\partial\mathcal L/\partial\log\pi_\theta(y_w) = -\beta\cdot\text{weight}\).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Case</th><th class="num">\(\log\pi(y_w)\)</th><th class="num">\(\log\pi_{\text{ref}}(y_w)\)</th><th class="num">\(\hat r_w\)</th><th class="num">\(\log\pi(y_l)\)</th><th class="num">\(\log\pi_{\text{ref}}(y_l)\)</th><th class="num">\(\hat r_l\)</th><th class="num">margin</th><th class="num">loss</th><th class="num">weight</th><th class="num">\(\partial\mathcal L/\partial\log\pi(y_w)\)</th></tr></thead>
+    <tbody>
+      <tr><td>Init (\(\pi = \pi_{\text{ref}}\))</td><td class="num">−44</td><td class="num">−44</td><td class="num">0.0</td><td class="num">−52</td><td class="num">−52</td><td class="num">0.0</td><td class="num">0.0</td><td class="num">0.693</td><td class="num">0.500</td><td class="num">−0.050</td></tr>
+      <tr class="hl"><td>A: moved the right way</td><td class="num">−41</td><td class="num">−44</td><td class="num">+0.3</td><td class="num">−57</td><td class="num">−52</td><td class="num">−0.5</td><td class="num">0.8</td><td class="num">0.371</td><td class="num">0.310</td><td class="num">−0.031</td></tr>
+      <tr><td>B: ranks the pair wrongly</td><td class="num">−50</td><td class="num">−47</td><td class="num">−0.3</td><td class="num">−48</td><td class="num">−52</td><td class="num">+0.4</td><td class="num">−0.7</td><td class="num">1.103</td><td class="num">0.668</td><td class="num">−0.067</td></tr>
+      <tr><td>C: chosen falls, rejected falls more</td><td class="num">−45</td><td class="num">−44</td><td class="num">−0.1</td><td class="num">−72</td><td class="num">−52</td><td class="num">−2.0</td><td class="num">1.9</td><td class="num">0.139</td><td class="num">0.130</td><td class="num">−0.013</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Three lessons. (1) At initialization the loss is \(\log 2\) and the weight is \(0.5\) for any \(\beta\): a good sanity check for a new implementation (the drill's test does exactly this). (2) Example B, which the implicit reward ranks wrongly, gets \(0.668/0.310 = 2.2\times\) the weight of example A: the gradient concentrates on mistakes. (3) In case C the loss is <em>lower</em> than in A although the chosen response became <em>less</em> likely (down 1 nat). The loss sees only the gap between the two log-ratios, \(\Delta = (-1) - (-20) = 19\) nats. That is likelihood displacement in one line, and we return to it below.</p>
+
+  <h3 id="margin-for-loss">What margin does a loss of 0.1 require at \(\beta = 0.1\)?</h3>
+  <p>Solve \(-\log\sigma(m) = 0.1\): \(\sigma(m) = e^{-0.1} = 0.9048\), so \(m = \log\frac{0.9048}{1 - 0.9048} = \log 9.508 = \mathbf{2.252}\). The margin is \(\beta\Delta\), so the log-ratio gap must be \(\Delta = 2.252/0.1 = \mathbf{22.5}\) nats. At that point the weight is \(\sigma(-m) = 1 - e^{-0.1} = 0.095\), so learning has slowed by 5 times relative to initialization.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Target loss</th><th class="num">margin \(m = \operatorname{logit}(e^{-L})\)</th><th class="num">log-ratio gap \(\Delta = m/0.1\) (nats)</th><th class="num">gradient weight</th></tr></thead>
+    <tbody>
+      <tr><td>0.5</td><td class="num">0.433</td><td class="num">4.3</td><td class="num">0.393</td></tr>
+      <tr><td>0.3</td><td class="num">1.050</td><td class="num">10.5</td><td class="num">0.259</td></tr>
+      <tr class="hl"><td>0.1</td><td class="num">2.252</td><td class="num">22.5</td><td class="num">0.095</td></tr>
+      <tr><td>0.05</td><td class="num">2.971</td><td class="num">29.7</td><td class="num">0.049</td></tr>
+      <tr><td>0.01</td><td class="num">4.600</td><td class="num">46.0</td><td class="num">0.010</td></tr>
+    </tbody>
+  </table></div>
+  <p>To feel the scale: a 22.5-nat gap multiplies the relative odds of the two responses by \(e^{22.5} \approx 6\times10^9\), yet spread over a 200-token response it is only 0.11 nats per token. This is why sequence-level probabilities can move so much with tiny per-token changes, why \(\beta\) is small (\(0.1\)), and why a small learning rate and one or two epochs are enough. It also shows what DPO never does: it never stops pushing. The weight decays as \(e^{-m}\) but is never zero.</p>
+</section>
+
+<section>
+  <h2 id="failure-modes">What DPO assumes, and where it breaks</h2>
+
+  <p>The derivation is exact for the unrestricted optimum. Real training is neither unrestricted nor at the optimum, and the data were not written by the policy being trained. The table lists what each step needs and what the literature shows happens when it fails.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Assumption</th><th>Where it is used</th><th>What breaks</th><th>Evidence and fixes</th></tr></thead>
+    <tbody>
+      <tr><td>Preferences follow Bradley-Terry with one scalar reward</td><td>Step 1 (and every MLE)</td><td>Deterministic or near-deterministic labels send the reward gap to infinity, so the KL term stops constraining anything</td><td>IPO's argument <a href="https://arxiv.org/abs/2310.12036">[Azar et al. 2023, §4.2]</a>; IPO, cDPO, rDPO</td></tr>
+      <tr><td>Optimum over <em>all</em> policies, and reached</td><td>The KL argument; step 5</td><td>A finite model on finite pairs converges to one of many minima, some with mass on responses never seen</td><td><a href="https://arxiv.org/abs/2406.02900">[Rafailov et al. 2024, §4]</a>: the loss is under-constrained</td></tr>
+      <tr><td>\(\pi_{\text{ref}}\) has support where it matters, and pairs come from it</td><td>Ratios defined; the MLE is over pairs drawn from \(\pi_{\text{ref}}\)</td><td>Pairs from another policy: off-policy training, unconstrained behavior off the data</td><td><a href="https://arxiv.org/abs/2404.10719">[Xu et al. 2024, §4]</a>, <a href="https://arxiv.org/abs/2405.08448">[Tang et al. 2024]</a>; online or iterative DPO</td></tr>
+      <tr><td>Labels are correct</td><td>Maximum likelihood</td><td>25 to 30% label noise biases the fit</td><td>cDPO, rDPO <a href="https://arxiv.org/abs/2403.00409">[Chowdhury et al. 2024]</a></td></tr>
+      <tr><td>The sum of token log-ratios is the right reward</td><td>Sequence-level \(\hat r\)</td><td>Longer responses accumulate larger log-ratios: length exploitation</td><td>Length-normalized DPO, SimPO, R-DPO</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="off-policy">Off-policy data</h3>
+  <p>DPO's pairs were written by some policy \(\mu\) (the SFT model, a mix of models, a human), not by the current \(\pi_\theta\). Nothing in the loss looks at what \(\pi_\theta\) generates, so probability mass can move to responses that no pair ever compared. Xu et al. prove that every policy PPO can find with a learned reward also minimizes the DPO loss, but not conversely, and give a three-response example: with \(\pi_{\text{ref}} = (0.5, 0.5, 0)\) and one pair \(y_1 \succ y_2\), the DPO loss is \(\log\big(1 + (\pi(y_2)/\pi(y_1))^\beta\big)\), minimized by \(\pi(y_2) \to 0\) whatever happens to \(y_3\), so \((0.1, 0, 0.9)\) is a global minimizer even though the reference gives \(y_3\) probability zero. PPO cannot produce it, since \(\pi^\star \propto \pi_{\text{ref}}\) <a href="https://arxiv.org/abs/2404.10719">[Xu et al. 2024, Thm. 4.1, Tab. 1]</a>. Empirically they find DPO more sensitive than PPO to changing the reference to one closer or farther from the data <a href="https://arxiv.org/abs/2404.10719">[App. C.1]</a>.</p>
+  <p>Tang et al. compare online and offline algorithms at equal KL from the SFT model on four tasks and find online generally ahead at the same KL budget, with a higher peak. Data coverage and data quality alone did not explain it: offline policies were better at pairwise classification but worse at generation, and the reverse for online ones. What did help was making the offline data more on-policy, that is, close to the starting policy. They also note that an offline algorithm on a repeatedly refreshed dataset is "effectively an online algorithm" <a href="https://arxiv.org/abs/2405.08448">[Tang et al. 2024, §1, §5, §6, §8]</a>. Tajwar et al. find on-policy sampling and a negative gradient (pushing down rejected responses) help independently and are complementary <a href="https://arxiv.org/abs/2404.14367">[Tajwar et al. 2024, §5]</a>.</p>
+
+  <h3 id="reference-role">The reference model</h3>
+  <p>\(\pi_{\text{ref}}\) plays three roles: it anchors the KL, it defines the zero point of the implicit reward (\(\hat r = 0\) when \(\pi_\theta = \pi_{\text{ref}}\)), and it is <em>assumed</em> to be the distribution that generated the pairs. When the pairs come from other models, as in UltraFeedback, the third role is violated. The DPO paper's remedy is to first fine-tune on the chosen responses and use that as \(\pi_{\text{ref}}\) <a href="https://arxiv.org/abs/2305.18290">[§4]</a>. The reference is not decoration: scoring DPO models as reward models with a similar but wrong reference drops RewardBench accuracy to about chance <a href="https://arxiv.org/abs/2403.13787">[App. B]</a>. Costs: one extra forward pass per sequence, avoided by caching reference log-probabilities (Tulu 3) or by reference-free objectives (SimPO, ORPO), which give up the anchor.</p>
+
+  <h3 id="beta-sensitivity">\(\beta\) and other hyperparameter sensitivity</h3>
+  <p>DPO is often called tuning-free, but \(\beta\), the learning rate, the number of epochs and the data size interact. Tulu 3's ablation with length-normalized DPO (learning rate \(5\times10^{-7}\), batch 32, average over their evaluation suite): \(\beta = 2\) scored 46.8, \(\beta = 5\) scored 53.4 and \(\beta = 10\) scored 55.2 after 3 epochs, against 55.7 for the SFT starting point; \(\beta = 5\) with <em>one</em> epoch scored 57.3 <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, Tab. 18]</a>. OLMo 3 reports that quality rises up to a task-dependent point and then falls as preference tuning continues, so it sweeps learning rate and data size <a href="https://arxiv.org/abs/2512.13961">[App. A.6.2]</a>. The KTO paper warns that the best DPO settings do not carry over even to analogous hyperparameters such as \(\beta\) <a href="https://arxiv.org/abs/2402.01306">[Ethayarajh et al. 2024, §4.2]</a>, and Park et al. show smaller \(\beta\) gives longer answers <a href="https://arxiv.org/abs/2403.19159">[Park et al. 2024, §4.2]</a>.</p>
+
+  <h3 id="length">Length exploitation</h3>
+  <p>Preference data lean long (55.7 to 63.1% of pairs favor the longer response, above), judges lean long, and the sum of token log-ratios grows with length. DPO amplifies this. In Singhal et al.'s runs DPO raised average response length from 59 to 68 tokens (RLCD), 203 to 248 (Stack) and 100 to 164 (WebGPT), and its implicit reward was no more accurate than a separately trained reward model (78% versus 80%, 62% versus 70%, 57% versus 62%) <a href="https://arxiv.org/abs/2310.03716">[Singhal et al. 2023, App. C.1, Tab. 7]</a>. Park et al. find DPO answers about twice as long as the data, mostly out of the length distribution of the preference set, and that the DPO implicit reward correlates with length out of distribution (length explains 30 to 46% of reward variance) but hardly in distribution <a href="https://arxiv.org/abs/2403.19159">[Park et al. 2024, §4.2, §4.6]</a>. Fixes act at three levels: the data (OLMo 3 Instruct filters its chat and multi-turn pairs so the chosen and rejected lengths differ by at most 100 tokens <a href="https://arxiv.org/abs/2512.13961">[§5.3.1]</a>), the loss (R-DPO, length-normalized DPO, SimPO), and the evaluation (length-controlled win rates). Length normalization is a heuristic and not free: SimPO's own follow-up finds it helps DPO mainly where the data have a strong length bias (Mistral-Base) and not where chosen and rejected lengths are similar (Instruct setting) <a href="https://arxiv.org/abs/2405.14734">[Meng et al. 2024, App. I]</a>.</p>
+
+  <h3 id="displacement">Likelihood displacement: why the chosen likelihood can fall</h3>
+  <p>The DPO loss depends only on the <em>difference</em> of the two log-ratios, so it can be lowered by pushing \(y_l\) down more than \(y_w\), even if \(y_w\) also goes down (case C in the table). Nothing in the loss ties \(\log\pi_\theta(y_w|x)\) to increase. Researchers call the resulting fall in the preferred response's probability <strong>likelihood displacement</strong>. Four complementary explanations, none contradicting the others:</p>
+  <ol>
+    <li><strong>KL accounting (Rafailov et al. 2024).</strong> If \(\pi_{\text{ref}}\) is fitted to the chosen responses by SFT, then \(\E_{y\sim\pi_{\text{ref}}}[\beta\log\pi/\pi_{\text{ref}}] = -\beta\,\KL(\pi_{\text{ref}}\|\pi) \le 0\). The average implicit reward of chosen responses must fall as the policy moves away from the reference: "the likelihood of the chosen response should decrease" <a href="https://arxiv.org/abs/2404.12358">[From r to Q*, §5.4, Eq. 16]</a>. Their companion study argues this is not necessarily harmful and is "even necessary for improvement" <a href="https://arxiv.org/abs/2406.02900">[Rafailov et al. 2024, §3.5]</a>.</li>
+    <li><strong>Shared tokens (Pal et al.).</strong> When chosen and rejected differ by only a few tokens, the gradient on the shared prefix cancels and the gradient on later tokens pushes the "right" logits down. On MetaMath the mean log-probability of tokens after the first differing token was \(-0.37\) for the reference and \(-1.82\) after DPO, against \(-0.26\) for their fix DPOP <a href="https://arxiv.org/abs/2402.13228">[Pal et al. 2024, §3, §5]</a>.</li>
+    <li><strong>Embedding geometry (Razin et al.).</strong> Similar responses have similar hidden states, so pushing \(y_l\) down drags \(y_w\) with it, and the freed probability goes to whichever tokens have unembeddings aligned with the update direction, which can be tokens of the <em>opposite</em> meaning. With one prompt and one-token responses on OLMo-1B, training to prefer "No" over "Never" took \(\pi(\text{No})\) from 0.85 down to 0.01 at its lowest (averaged over ten prompts), while "Yes" gained. Training Llama-3-8B-Instruct to refuse unsafe prompts, where over 70% of pairs had two refusals, dropped its refusal rate on SORRY-Bench training prompts from 74.4% to 33.4% <a href="https://arxiv.org/abs/2410.08847">[Razin et al. 2024, §3, §6.2]</a>. They score pairs by the similarity of their hidden embeddings (the CHES score) and filtering high-score pairs prevented the unalignment.</li>
+    <li><strong>Data dependence (Tajwar et al.).</strong> With semantically distinct pairs (UltraFeedback, GPT-4 versus GPT-3.5 answers on Mistral-7B) the chosen likelihood rose while the rejected fell. With Pythia-1.4B on AlpacaFarm both fell <a href="https://arxiv.org/abs/2404.14367">[Tajwar et al. 2024, §5.2, Fig. 17]</a>.</li>
+  </ol>
+
+  <p>Explanation 3 can be reproduced in a dozen lines. Give a single-prompt, one-token "model" a free hidden state \(h\) (6 tokens, fixed unembeddings \(W\)) and make tokens 0 and 1 (chosen and rejected) nearly parallel, while token 2 is aligned with \(W_0 - W_1\). The DPO gradient on \(h\) is exactly along \(W_0 - W_1\), so the logit of token \(k\) moves at rate \(\langle W_k, W_0 - W_1\rangle\):</p>
+
+<pre><code class="language-python">W = torch.tensor([[2., .3, 0], [2., -.3, 0], [0, 3., 0], [-1, 0, .5], [0, -1, .5], [-.5, -.5, -.5]])  # tokens w, l, z, a, b, c
+h0 = torch.tensor([.3, .2, 0.]); ref = torch.log_softmax(W @ h0, -1)
+h = h0.clone().requires_grad_(); opt = torch.optim.SGD([h], lr=0.5)
+for step in range(100):
+    lp = torch.log_softmax(W @ h, -1)
+    m = 0.1 * ((lp[0] - ref[0]) - (lp[1] - ref[1]))       # beta = 0.1; token 0 chosen, token 1 rejected
+    opt.zero_grad(); torch.nn.functional.softplus(-m).backward(); opt.step()   # softplus(-m) = -log sigmoid(m)
+</code></pre>
+  <p>Running this (we did): the loss falls monotonically from 0.693 to 0.650 and the log-ratio gap grows from 0 to 0.88 nats, yet \(\pi(w)\) falls from 0.248 to 0.020, \(\pi(l)\) from 0.220 to 0.007, and the unrelated token \(z\) absorbs the mass, rising from 0.233 to 0.965. The first-order change of \(\log\pi_w\) is \(c\,[\langle W_w, W_w - W_l\rangle - \E_\pi\langle W_k, W_w - W_l\rangle] = c\,[0.18 - 0.33] < 0\): the first term is small because \(W_w\) and \(W_l\) are nearly parallel, and the second is large because \(z\) carries probability and is aligned with the update. This is our construction in the "unconstrained features" setting of Razin et al., not a claim about a real LLM.</p>
+
+  <p><strong>Mitigations.</strong> An NLL (SFT) term on the chosen response: Llama 3 adds one with coefficient 0.2, "preventing the decrease of log probability of chosen responses" <a href="https://arxiv.org/abs/2407.21783">[§4.1.4]</a>. DPOP's penalty \(\lambda\max(0, \log\frac{\pi_{\text{ref}}(y_w)}{\pi_\theta(y_w)})\) inside the sigmoid. Filtering pairs whose responses are too similar (CHES). On-policy pairs and modest learning rates. Razin et al. also observe that an SFT term was less effective than data curation for the refusal task.</p>
+
+  <h3 id="deterministic">Overfitting to deterministic preferences (the IPO argument)</h3>
+  <p>If annotators always prefer \(y\) to \(y'\), Bradley-Terry needs \(r(y) - r(y') \to \infty\), so \(\pi^*(y')/\pi^*(y) \to 0\) <em>for any \(\beta\)</em>: the more deterministic the preferences, the weaker the KL regularization. With finite data it is worse: if the true preference is 0.8 but you observed the pair only once or twice, the empirical preference can be 1. Azar et al.'s two-action example with a uniform reference and \(p^*(y_1 \succ y_2) = 1\) has DPO converging to \(\pi(y_1) = 1\) for every regularization strength, while IPO's optimum is \(\sigma(0.5/\tau)\): 0.622 for \(\tau = 1\), 0.993 for \(\tau = 0.1\) <a href="https://arxiv.org/abs/2310.12036">[Azar et al. 2023, §4.2, §5.3.1]</a>. The IPO paper's own experiments are small bandit problems; on LLM benchmarks IPO does not consistently beat DPO (below), so read this as a valid theoretical warning, not proof that IPO is better in practice.</p>
+</section>
+
+<section>
+  <h2 id="variants">The zoo: what each variant changes</h2>
+
+  <p>Write \(h_\theta = \log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\) for the difference of log-ratios, so DPO's loss is \(-\log\sigma(\beta h_\theta)\). Everything below is a change to this loss, to the data it needs, or to the reference.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Per-example objective</th><th>Reference</th><th>Data</th><th>Targets</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>DPO</td><td>\(-\log\sigma(\beta h_\theta)\)</td><td>yes</td><td>pairs</td><td>baseline</td></tr>
+      <tr><td>IPO</td><td>\(\big(h_\theta - \tfrac{1}{2\tau}\big)^2\)</td><td>yes</td><td>pairs</td><td>overfitting to deterministic preferences</td></tr>
+      <tr><td>cDPO</td><td>\((1-\varepsilon)\,\ell(h) + \varepsilon\,\ell(-h)\), \(\ell(h) = -\log\sigma(\beta h)\)</td><td>yes</td><td>noisy pairs</td><td>label noise (heuristic)</td></tr>
+      <tr><td>rDPO</td><td>\(\dfrac{(1-\varepsilon)\,\ell(h) - \varepsilon\,\ell(-h)}{1-2\varepsilon}\)</td><td>yes</td><td>noisy pairs, known \(\varepsilon &lt; \tfrac12\)</td><td>unbiased under label flips</td></tr>
+      <tr><td>DPOP</td><td>\(-\log\sigma\big(\beta[\,h_\theta - \lambda\max(0, \log\tfrac{\pi_{\text{ref}}(y_w)}{\pi_\theta(y_w)})]\big)\)</td><td>yes</td><td>pairs</td><td>chosen-likelihood collapse</td></tr>
+      <tr><td>R-DPO</td><td>\(-\log\sigma\big(\beta h_\theta + \alpha(|y_w| - |y_l|)\big)\)</td><td>yes</td><td>pairs</td><td>length exploitation</td></tr>
+      <tr><td>Length-normalized DPO</td><td>\(-\log\sigma\big(\tfrac{\beta}{|y_w|}\log\tfrac{\pi_\theta(y_w)}{\pi_{\text{ref}}(y_w)} - \tfrac{\beta}{|y_l|}\log\tfrac{\pi_\theta(y_l)}{\pi_{\text{ref}}(y_l)}\big)\)</td><td>yes</td><td>pairs</td><td>length exploitation</td></tr>
+      <tr><td>KTO</td><td>\(\lambda_y - v(x,y)\), with \(v = \lambda_D\,\sigma(\beta(r_\theta - z_0))\) if desirable, \(\lambda_U\,\sigma(\beta(z_0 - r_\theta))\) if not; \(r_\theta = \log\tfrac{\pi_\theta}{\pi_{\text{ref}}}\)</td><td>yes</td><td>unpaired good/bad labels</td><td>no pairs needed; imbalance</td></tr>
+      <tr><td>ORPO</td><td>\(\mathcal L_{\text{NLL}}(y_w) - \lambda\log\sigma\big(\log\tfrac{\text{odds}_\theta(y_w)}{\text{odds}_\theta(y_l)}\big)\), \(\text{odds} = \tfrac{P}{1-P}\), \(P = e^{\text{mean token log-prob}}\)</td><td>no</td><td>pairs</td><td>one stage, no reference</td></tr>
+      <tr><td>SimPO</td><td>\(-\log\sigma\big(\tfrac{\beta}{|y_w|}\log\pi_\theta(y_w) - \tfrac{\beta}{|y_l|}\log\pi_\theta(y_l) - \gamma\big)\)</td><td>no</td><td>pairs</td><td>length bias, train/generate mismatch, memory</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: IPO Eq. 17; rDPO Eq. 12 and cDPO from Mitchell (2023); DPOP Eq. 3; R-DPO Eq. 9; length-normalized DPO Tulu 3 Eq. 6 and SimPO App. I; KTO §4.1 (v5); ORPO Eq. 6-7 (with \(\log P\) the <em>average</em> token log-probability, Eq. 3); SimPO Eq. 6.</p>
+
+  <h3 id="ipo">IPO: a squared loss to a target margin</h3>
+  <p>IPO (Identity Preference Optimization) regresses \(h_\theta\) onto \(1/(2\tau)\): "the weaker the regularisation becomes, the higher would be the log-likelihood ratio of \(y_w\) to \(y_l\)" <a href="https://arxiv.org/abs/2310.12036">[Azar et al. 2023, Eq. 17]</a>. It comes from setting the ΨPO mapping \(\Psi\) to the identity, so preferences enter as probabilities and not as Bradley-Terry log-odds, which bypasses the unbounded target. \(\tau\) plays the role of \(\beta\) (\(\tau = \beta\) in common code). The important behavioral difference is that the loss is two-sided. On pair A with \(\tau = 0.1\) the target is 5 nats and \(h = 8\), so the loss is \((8-5)^2 = 9\) and the gradient \(2(h - 5) = 6\) pulls the gap <em>back down</em>, whereas DPO's weight there is still 0.31 and keeps pushing it up. Rafailov et al. find IPO less prone to over-optimization and better at controlling KL <a href="https://arxiv.org/abs/2406.02900">[§3.1]</a>, but the SimPO benchmark table has IPO below DPO in each of four settings (for example AlpacaEval 2 length-controlled 11.8 versus 15.1 for Mistral-Base and 35.6 versus 40.3 for Llama-3-Instruct) <a href="https://arxiv.org/abs/2405.14734">[Meng et al. 2024, Tab. 4]</a>.</p>
+
+  <h3 id="robust">cDPO and rDPO: noisy labels</h3>
+  <p>If each label is flipped with probability \(\varepsilon\), the labeled loss is a mixture. cDPO (conservative DPO, label smoothing) uses \((1-\varepsilon)\ell(h) + \varepsilon\ell(-h)\), which is biased: the log-odds under noise differ from those without. rDPO uses \(\frac{(1-\varepsilon)\ell(h) - \varepsilon\ell(-h)}{1-2\varepsilon}\), whose expectation over the flips equals the clean loss, at the price of needing \(\varepsilon\) and a factor \(1/(1-2\varepsilon)\) in the guarantee <a href="https://arxiv.org/abs/2403.00409">[Chowdhury et al. 2024, Lemma 3.1, Thm. 4.2]</a>. Their gradients differ only in the weight: DPO \(\sigma(-m)\), cDPO \(\sigma(-m) - \varepsilon\), rDPO \(\sigma(-m) + \frac{\varepsilon}{1-2\varepsilon}\) <a href="https://arxiv.org/abs/2403.00409">[Lemma 3.2]</a>. At margin \(m = 0.8\) and \(\varepsilon = 0.1\): \(0.310\), \(0.210\) and \(0.435\). rDPO deliberately pushes harder on correct-looking pairs, because it knows a fraction are flipped and corrects the average.</p>
+
+  <h3 id="kto">KTO: unpaired binary feedback</h3>
+  <p>KTO (Kahneman-Tversky Optimization) uses only a binary signal "this output is desirable / undesirable for this input". Its value function is a logistic curve around a reference point \(z_0 = \KL(\pi_\theta\|\pi_{\text{ref}})\), estimated per microbatch by pairing each prompt with another example's response (\(\hat z_0 = \max(0, \tfrac1m\sum_i \log\tfrac{\pi_\theta(y_j|x_i)}{\pi_{\text{ref}}(y_j|x_i)})\), not backpropagated through), with loss aversion set by \(\lambda_D, \lambda_U\) <a href="https://arxiv.org/abs/2402.01306">[Ethayarajh et al. 2024, §4.1]</a>. The authors report matching or exceeding DPO from 1B to 30B, matching it with up to 90% fewer desirable examples, a gain of 13.5 points on GSM8K over DPO when aligning Zephyr-\(\beta\)-SFT on UltraFeedback, a recommended learning rate 2 to 10 times DPO's (\(5\times10^{-6}\)), \(\beta = 0.1\), and \(\lambda_D n_D / \lambda_U n_U \in [1, 3/2]\) <a href="https://arxiv.org/abs/2402.01306">[§1, §4.2, §4.3]</a>. Caveats: these are the authors' own comparisons, KTO ignores examples with extreme implied reward (which protects against noise but can underfit hard data, their Prop. 4.1), and in SimPO's benchmark KTO's length-controlled AlpacaEval 2 score is below DPO's in all four settings <a href="https://arxiv.org/abs/2405.14734">[Tab. 4]</a>.</p>
+
+  <h3 id="orpo">ORPO: preference learning folded into SFT</h3>
+  <p>ORPO (Odds Ratio Preference Optimization) trains once, from a base model, on \(\mathcal L_{\text{NLL}}(y_w) + \lambda\,\mathcal L_{\text{OR}}\) with \(\mathcal L_{\text{OR}} = -\log\sigma(\log\frac{\text{odds}_\theta(y_w|x)}{\text{odds}_\theta(y_l|x)})\), no reference model and no separate SFT stage. Here \(P_\theta(y|x)\) is the <em>length-normalized</em> probability \(\exp(\frac1m\sum_t\log P(y_t|\cdot))\) <a href="https://arxiv.org/abs/2403.07691">[Hong et al. 2024, Eq. 3-7]</a>. Its gradient is \(\delta(d)\cdot h(d)\) with \(\delta = (1 + \text{OR})^{-1}\) and \(h = \frac{\nabla\log P_w}{1-P_w} - \frac{\nabla\log P_l}{1-P_l}\): like DPO, a weight that shrinks when the pair is ranked correctly, plus a contrast term that is amplified when a probability is low. The paper argues odds ratios are gentler than probability ratios when combined with SFT. Reported: Mistral-ORPO-\(\beta\) 12.20% on AlpacaEval 2.0 and 7.32 on MT-Bench, with \(\lambda\) between 0.1 and 0.25 and only UltraFeedback as data <a href="https://arxiv.org/abs/2403.07691">[§4.2, §6.1]</a>. In SimPO's table its AlpacaEval 2 length-controlled score is below DPO's in all four settings (for example 14.7 versus 15.1 on Mistral-Base and 28.5 versus 40.3 on Llama-3-Instruct) <a href="https://arxiv.org/abs/2405.14734">[Tab. 4]</a>. On a pair with mean log-probs \(-0.65\) and \(-1.10\): \(P = 0.522\) and \(0.333\), \(\log\) odds ratio \(= 0.783\), \(\mathcal L_{\text{OR}} = 0.376\), \(\delta = 0.314\).</p>
+
+  <h3 id="simpo">SimPO: a reference-free, length-normalized reward</h3>
+  <p>SimPO argues that DPO's reward \(\beta\log(\pi_\theta/\pi_{\text{ref}})\) is not what generation optimizes, which is roughly the average log-likelihood. Among training pairs where DPO's reward ranks the pair correctly, almost half (about 21.2k of 44.2k) have the chosen response with <em>lower</em> average log-likelihood <a href="https://arxiv.org/abs/2405.14734">[Meng et al. 2024, §4.4, Fig. 4b]</a>. So it uses \(r(x,y) = \frac{\beta}{|y|}\log\pi_\theta(y|x)\), adds a target margin \(\gamma\) to the Bradley-Terry objective, and drops the reference (Eq. 4-6; \(\beta \in [2.0, 2.5]\), \(\gamma \in [0.3, 1.6]\) in their search). Ablations on Mistral-Base: removing length normalization drops the AlpacaEval 2 length-controlled win rate from 21.5 to 11.9, and \(\gamma = 0\) to 16.8, against 15.1 for DPO <a href="https://arxiv.org/abs/2405.14734">[Tab. 4-5]</a>. In their setup it also ran in 60 instead of 73 minutes with 69 instead of 77 GB peak memory <a href="https://arxiv.org/abs/2405.14734">[Fig. 5c]</a>. The reference-free choice removes the KL anchor; they argue low learning rates and diverse data keep the KL small. The evidence is mixed: Tulu 3's ablation found SimPO (average 51.8 and 52.9 for two settings) worse than its SFT starting point (55.7) while length-normalized DPO helped <a href="https://arxiv.org/abs/2411.15124">[Tab. 18]</a>. Worked example: chosen 120 tokens with total log-prob \(-78\), rejected 300 tokens with \(-190\). The <em>total</em> favors the chosen by 112 nats, but the per-token averages are \(-0.650\) and \(-0.633\), so with \(\beta = 2\), \(\gamma = 0.5\) the margin is \(-0.033 - 0.5 = -0.533\) and the loss is \(0.995\). The pair looks won only because the chosen response is shorter.</p>
+
+  <h3 id="online-dpo">Online and iterative DPO</h3>
+  <p>The cleanest fix for off-policy weaknesses is to stop being off-policy: sample two or more responses from the current (or last-round) policy, label them with a reward model or LLM judge, and train with the DPO loss, repeating for a few rounds (Figure 1C). Xiong et al. formalize the KL-constrained problem as a contextual bandit, show that online exploration helps in theory, and derive an iterative DPO that outperformed offline DPO and rejection-sampling optimization in their experiments <a href="https://arxiv.org/abs/2312.11456">[Xiong et al. 2023]</a>. Tajwar et al. find on-policy DPO converged faster and to better solutions than offline DPO and on-policy RL in their synthetic settings, while noting it need not always beat PPO <a href="https://arxiv.org/abs/2404.14367">[§5.3]</a>. In production, "iterative" often means rounds of new human or model-generated pairs: Llama 3 ran six rounds using mostly the latest preference batches, collected with the best current models, so "our training data conforms better to the distribution of the policy model" <a href="https://arxiv.org/abs/2407.21783">[§4.1.4, §4.1.6]</a>. The cost is that the labeler (reward model or judge) becomes the bottleneck and the proxy problem of the over-optimization section returns.</p>
+</section>
+
+<section>
+  <h2 id="dpo-vs-ppo">DPO versus online RL: the evidence, and when each wins</h2>
+
+  <p><strong>Cost and simplicity favor DPO.</strong> PPO needs sampling, a reward model, a critic and a reference (<a href="23-rlhf.html">page 23</a>), and is sensitive to implementation details. DPO needs two sequences through two models per pair, and the reference pass can be cached. In a controlled comparison inside the Tulu 3 project, PPO reached a comparable but slightly lower average score and took about 28 hours on two nodes, against about 4 hours on one node for DPO <a href="https://arxiv.org/abs/2411.15124">[Tulu 3, §5.4.1]</a>. Llama 3 tried PPO and found DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval" <a href="https://arxiv.org/abs/2407.21783">[§4.1.4]</a>.</p>
+
+  <p><strong>Ceiling and generalization favor online RL, when it is tuned.</strong> Xu et al. compare the two on HH-RLHF, SafeRLHF and two code tasks. On HH-RLHF with an independent OpenAssistant reward model, DPO scored 0.611, iterative DPO 0.678 and PPO 0.718 (SFT: 0.532). On CodeContest with CodeLlama-34B (10@1k on the test set), PPO reached 22.4%, above AlphaCode-41B with clustering at 16.4%, while DPO scored 0.0% and iterative DPO 3.2% <a href="https://arxiv.org/abs/2404.10719">[Xu et al. 2024, Tab. 4, 8]</a>. Their PPO needed three ingredients: advantage normalization, a large batch, and an exponential moving average for the reference model. On APPS introductory problems (pass@5, CodeLlama-34B) baseline PPO with batch 64 <em>hurt</em> (38.6% for SFT to 18.0%), and the three additions recovered and exceeded it (38.1%, 42.3%, 44.4%) <a href="https://arxiv.org/abs/2404.10719">[Tab. 3]</a>. Together with Tang et al. and Tajwar et al. above, the picture is: DPO with a static off-policy dataset underperforms online methods that use the same labeler, and the gap is larger where the reward is verifiable and exploration matters.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Read the evidence critically</div>
+    <p>These comparisons are confounded by tuning effort. Xu et al. argue that earlier PPO baselines were under-tuned, they trained DPO at a fixed \(\beta = 0.1\) and learning rate \(10^{-6}\) (sweeping only the batch size, and one epoch for code), and Tulu 3 itself calls its PPO comparison a "non-tuned setup". The tasks also differ: open-ended chat preferences (where DPO is competitive) versus verifiable reasoning and code (where online RL dominates). No study here is a clean bake-off across both.</p>
+  </aside>
+
+  <p><strong>What recent open recipes do (as of September 2026, from the reports we checked).</strong> They use both, in stages, and the order is not settled.</p>
+  <ul>
+    <li><strong>Llama 3</strong> (2024): SFT, rejection sampling and DPO, six rounds; no PPO in the final recipe <a href="https://arxiv.org/abs/2407.21783">[§4.1]</a>.</li>
+    <li><strong>Tulu 3</strong> (2024): SFT, then length-normalized DPO on on- and off-policy pairs, then RL with verifiable rewards (PPO-based). DPO was used for iteration speed; PPO was reserved for the verifiable stage <a href="https://arxiv.org/abs/2411.15124">[§5.4.1, §6]</a>.</li>
+    <li><strong>OLMo 3 Think</strong> (2025): SFT, DPO on delta-learning pairs, then RLVR. DPO before RL beats going straight from SFT to RL: average 74.1 for SFT+DPO+RLVR versus 71.9 for SFT+RLVR on their 7B subset <a href="https://arxiv.org/abs/2512.13961">[Tab. 22]</a>.</li>
+    <li><strong>Llama 4</strong> (April 2025): lightweight SFT, then online RL, then a lightweight DPO stage. Meta reports that "SFT and DPO can over-constrain the model, restricting exploration during the online RL stage" <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Meta AI blog]</a>.</li>
+  </ul>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Situation</th><th>Prefer</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Offline preference logs, one node, fast iteration, style and instruction following</td><td>DPO (or a variant)</td><td>Cheap and stable; the data distribution is close enough to the policy</td></tr>
+      <tr><td>Pairs written by other models, or the policy has moved far from the data</td><td>Online or iterative DPO, or re-sample pairs from the current policy</td><td>Removes the off-policy gap (Tang, Xu)</td></tr>
+      <tr><td>Verifiable rewards (math, code, tests) and a need to discover new behavior</td><td>Online RL (<a href="24-rlvr-reasoning.html">page 24</a>)</td><td>Exploration and exact rewards; DPO-Iter failed on code in Xu et al.</td></tr>
+      <tr><td>Large compute, reward model available, want the best ceiling on open-ended quality</td><td>PPO-style RLHF, tuned</td><td>Highest scores in Xu et al. when tuned; costs 4 models and careful engineering</td></tr>
+      <tr><td>No reference model in memory, or unpaired binary feedback</td><td>SimPO or ORPO, or KTO</td><td>Cheaper, at the cost of the KL anchor or of tuning sensitivity</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"DPO has no reward model, so it cannot over-optimize."</strong> The reward model is implicit, not absent. DPO, IPO and SLiC show the same hump-shaped win-rate-versus-KL curve as RLHF, often within the first quarter of an epoch, because the implicit reward is unconstrained off the data <a href="https://arxiv.org/abs/2406.02900">[Rafailov et al. 2024]</a>.</li>
+    <li><strong>"DPO raises the chosen response's probability and lowers the rejected one's."</strong> It raises the <em>gap</em> between two log-ratios. Both probabilities can fall, and the freed mass can land on unrelated or opposite-meaning responses (case C in the worked numbers; Pal, Razin, Rafailov).</li>
+    <li><strong>"A small \(\beta\) keeps the policy close to the reference."</strong> It is the opposite. \(\beta\) is the price of KL in the objective, so a larger \(\beta\) keeps \(\pi_\theta\) nearer \(\pi_{\text{ref}}\). In the loss, a small \(\beta\) lets the log-ratio gap grow to \(\sim 22\) nats before the weight decays. And \(\beta\) values are not comparable across formulations (0.1 for plain DPO, 5 for Tulu 3's length-normalized loss, 2 to 2.5 for reference-free SimPO).</li>
+    <li><strong>"DPO approximates or ignores the partition function."</strong> It cancels exactly, because Bradley-Terry sees reward differences and both responses share the prompt. The approximations in DPO are elsewhere: a parametric policy, finite off-policy data, and few gradient steps.</li>
+    <li><strong>"The DPO optimum equals the RLHF optimum."</strong> Only for the unrestricted optimum, with Bradley-Terry preferences and adequate support. Xu et al. prove PPO's solutions are a proper subset of DPO's minimizers, and give a case where DPO puts 0.9 of its mass on a response the reference never produces.</li>
+    <li><strong>"A more accurate reward model is a better RL signal."</strong> Accuracy on noisy labels caps near 70 to 80%, and higher benchmark scores do not reliably predict PPO outcomes (Tulu 3). Robustness to optimization pressure, not only pairwise accuracy, decides how far you can push.</li>
+    <li><strong>"Length normalization fixes length bias."</strong> It changes the objective (it is no longer the KL-regularized optimum's Bradley-Terry fit), helps mainly where the data are strongly length-biased, and leaves other exploitable features untouched.</li>
+    <li><strong>"Online RL makes DPO obsolete."</strong> Llama 3, Tulu 3 and OLMo 3 all use DPO, and OLMo 3 finds that DPO before RL beats SFT straight into RL. The comparisons are confounded by tuning effort, and DPO ran about 7 times faster in wall-clock time in Tulu 3's controlled test (4 hours on one node versus 28 hours on two).</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is a Bradley-Terry reward model, and what loss trains it?</summary>
+    <div class="answer">
+      <p>It assumes each response has a latent scalar reward and that a labeler prefers \(y_1\) to \(y_2\) with probability \(\sigma(r(x,y_1) - r(x,y_2))\), which is the Elo model. Maximum likelihood on \((x, y_w, y_l)\) gives \(\mathcal L = -\E\log\sigma(r_w - r_l) = \E\log(1 + e^{-(r_w - r_l)})\): logistic regression on the reward gap. The gradient with respect to the gap is \(-\sigma(-\text{gap})\), so mistakes get large gradients. Rewards are identified only up to a prompt-dependent shift \(f(x)\). With \(r_w = 1.2\) and \(r_l = 0.4\) the loss is \(\log(1 + e^{-0.8}) = 0.371\), and with equal rewards it is \(\log 2 = 0.693\). Architecture: an LM backbone with the unembedding replaced by a linear head, read at the last token.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does the DPO loss equal when \(\pi_\theta = \pi_{\text{ref}}\), and what is the gradient weight? Why is it a useful check?</summary>
+    <div class="answer">
+      <p>Both implicit rewards are zero, so the margin is 0, the loss is \(-\log\sigma(0) = \log 2 \approx 0.693\) for any \(\beta\) and any data, and the weight \(\sigma(\hat r_l - \hat r_w) = 0.5\). The per-example gradient on \(\log\pi_\theta(y_w)\) is then \(-\beta/2\). It is the first thing to check in a new DPO implementation: if the initial loss is not \(\log 2\), the reference and the initial policy are not computing the same function (dropout left on in one model, a precision or tokenization mismatch, different weights, or a bug). It is also the loss you should see at step 0 in any log.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What does \(\beta\) control in DPO?</summary>
+    <div class="answer">
+      <p>It is the coefficient of \(\KL(\pi\|\pi_{\text{ref}})\) in the RLHF objective that DPO solves, and it appears in the loss as the scale of the implicit reward, \(\hat r = \beta\log(\pi_\theta/\pi_{\text{ref}})\). Larger \(\beta\) means a stronger pull toward the reference: the closed-form optimum tilts \(\pi_{\text{ref}}\) by \(e^{r/\beta}\), so \(\beta \to \infty\) recovers \(\pi_{\text{ref}}\) and \(\beta \to 0\) concentrates on the highest-reward response. In training, the weight \(\sigma(-\beta\Delta)\) depends on \(\beta\Delta\), so at \(\beta = 0.1\) a loss of 0.1 needs a 22.5-nat gap between log-ratios, whereas at \(\beta = 1\) it needs 2.25. Typical values are 0.1 for plain DPO and 5 for length-normalized DPO (Tulu 3). \(\beta\) is not transferable across objectives (KTO paper).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> How are preference pairs collected, and how noisy are they?</summary>
+    <div class="answer">
+      <p>Human labelers rank several responses to a prompt (InstructGPT: 4 to 9 per prompt, giving \(\binom K2\) pairs) or choose between two with a strength label (Llama 2, over a million comparisons). Increasingly an LLM judge does it: Constitutional AI, UltraFeedback (GPT-4 scoring four aspects, then binarizing), Tulu 3 (GPT-4o over 22 candidate models, chosen = best, rejected = a random below-average response). Noise is large: InstructGPT labelers agreed 72.6% of the time (77.3% for held-out labelers), and public test sets have 60 to 70% accuracy ceilings. Under Bradley-Terry a pair with 73% agreement has a true reward gap of only about one nat. GPT-4 agrees with humans about as often as humans agree with each other (85% versus 81% on non-tied MT-bench votes) but has position and length biases. Data also lean long, so length is a built-in confound.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive DPO from the KL-regularized RL objective.</summary>
+    <div class="answer">
+      <p><strong>1. Objective.</strong> For each prompt, maximize \(\E_{y\sim\pi}[r(x,y)] - \beta\,\KL(\pi\|\pi_{\text{ref}})\) over all distributions \(\pi\).</p>
+      <p><strong>2. Optimum.</strong> The objective equals \(-\beta\,\E_\pi[\log\frac{\pi}{\pi_{\text{ref}}} - \frac r\beta]\). Define \(Z(x) = \sum_y\pi_{\text{ref}}(y|x)e^{r(x,y)/\beta}\) and \(\pi^\star = \pi_{\text{ref}}e^{r/\beta}/Z\); then \(\log\frac{\pi}{\pi_{\text{ref}}} - \frac r\beta = \log\frac{\pi}{\pi^\star} - \log Z\), so \(J(\pi) = \beta\log Z - \beta\,\KL(\pi\|\pi^\star)\), uniquely maximized at \(\pi^\star\) by Gibbs' inequality.</p>
+      <p><strong>3. Invert.</strong> \(r(x,y) = \beta\log\frac{\pi^\star(y|x)}{\pi_{\text{ref}}(y|x)} + \beta\log Z(x)\).</p>
+      <p><strong>4. Bradley-Terry.</strong> \(p(y_w \succ y_l) = \sigma(r_w - r_l)\). Substituting step 3, the two \(\beta\log Z(x)\) terms cancel, leaving \(\sigma\big(\beta\log\frac{\pi^\star(y_w)}{\pi_{\text{ref}}(y_w)} - \beta\log\frac{\pi^\star(y_l)}{\pi_{\text{ref}}(y_l)}\big)\).</p>
+      <p><strong>5. Loss.</strong> Replace \(\pi^\star\) with \(\pi_\theta\) and minimize the negative log-likelihood: \(\mathcal L = -\E\log\sigma\big(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\big)\). This loses no generality: every Bradley-Terry reward class contains \(r = \beta\log(\pi/\pi_{\text{ref}})\) for some \(\pi\) (the member with \(Z = 1\)).</p>
+      <p><strong>Assumptions to state:</strong> the optimum is over all policies, not the parametric family; \(\pi_{\text{ref}}\) has support where \(\pi^\star\) does (and the reward is identified only there); \(Z\) finite; preferences are Bradley-Terry with a scalar reward; pairs come from \(\pi_{\text{ref}}\); \(\beta > 0\); the KL is at sequence level.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What does the DPO gradient do, per example?</summary>
+    <div class="answer">
+      <p>\(\nabla_\theta\mathcal L = -\beta\,\sigma(\hat r_l - \hat r_w)\,[\nabla\log\pi_\theta(y_w|x) - \nabla\log\pi_\theta(y_l|x)]\), with \(\hat r = \beta\log\pi_\theta/\pi_{\text{ref}}\). Descent raises the sequence log-probability of the chosen response and lowers that of the rejected one, with equal coefficients (each token in a response gets the same sequence-level coefficient). The weight \(\sigma(\hat r_l - \hat r_w)\) is 0.5 at initialization, tends to 1 for pairs the implicit reward ranks wrongly, and decays as \(e^{-\text{margin}}\) as it ranks them correctly, which acts as a curriculum on errors. The DPO paper reports that removing the weight ("naive" unlikelihood-style objective) makes the model degenerate. Derivation: \(\partial\mathcal L/\partial u = -\sigma(-u)\) for \(u = \hat r_w - \hat r_l\), and \(\nabla u = \beta(\nabla\log\pi_\theta(y_w) - \nabla\log\pi_\theta(y_l))\). Note that it never says to raise \(\log\pi(y_w)\) <em>in absolute terms</em>, only relative to \(y_l\).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why doesn't the partition function \(Z(x)\) appear in the DPO loss?</summary>
+    <div class="answer">
+      <p>Algebraically: solving the optimal-policy equation for the reward gives \(r = \beta\log(\pi^\star/\pi_{\text{ref}}) + \beta\log Z(x)\). The Bradley-Terry likelihood uses \(r(x,y_w) - r(x,y_l)\), and both responses answer the same prompt, so the two \(\beta\log Z(x)\) terms are identical and cancel. Structurally: Bradley-Terry is invariant to adding any function of the prompt to the reward, so rewards form equivalence classes, and \(\beta\log Z(x)\) is precisely such a prompt-only shift (Lemmas 1 and 2 in the DPO paper: equivalent rewards give the same preferences and the same optimal policy). So the one degree of freedom the data cannot identify is exactly the one the optimal policy ignores, and it is also the intractable one (a sum over all sequences). It would <em>not</em> cancel across different prompts, which is why rewards are only comparable within a prompt. In the token-level MDP the analogous cancelling term is the value \(V^*(s_0)\) of the shared prompt.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate. With \(\log\pi(y_w) = -41\), \(\log\pi_{\text{ref}}(y_w) = -44\), \(\log\pi(y_l) = -57\), \(\log\pi_{\text{ref}}(y_l) = -52\) and \(\beta = 0.1\), find the DPO loss and the gradient weight. What log-ratio gap would give loss 0.1?</summary>
+    <div class="answer">
+      <p>Log-ratios: chosen \(+3\), rejected \(-5\). Implicit rewards \(\hat r_w = +0.3\), \(\hat r_l = -0.5\), margin \(0.8\). Loss \(= \log(1 + e^{-0.8}) = 0.371\). Weight \(\sigma(-0.8) = 0.310\), so \(\partial\mathcal L/\partial\log\pi(y_w) = -\beta\cdot 0.310 = -0.031\) and \(+0.031\) for the rejected response. (Compare a wrongly ranked pair with margin \(-0.7\): loss \(1.103\), weight \(0.668\).)</p>
+      <p>Loss \(0.1\) needs \(\sigma(m) = e^{-0.1} = 0.9048\), so \(m = \log(0.9048/0.0952) = 2.252\), a log-ratio gap \(\Delta = m/\beta = 22.5\) nats, at which the weight is \(1 - e^{-0.1} = 0.095\). That is a relative-odds change of \(e^{22.5}\approx 6\times10^9\), which over 200 tokens is only 0.11 nats per token.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you train and evaluate a reward model? What is reward over-optimization?</summary>
+    <div class="answer">
+      <p><strong>Training.</strong> Start from an SFT or chat LM, replace the unembedding with a scalar head at the last token, and minimize \(-\log\sigma(r_w - r_l)\) for one epoch at a low learning rate (multiple epochs overfit). Put all pairs of a prompt in one batch element, since within-prompt pairs are correlated. Optionally add a rating-based margin (Llama 2; dropped in Llama 3), train separate helpfulness and safety models, and use ensembles. <strong>Evaluation.</strong> Held-out pairwise accuracy (capped near 70 to 80% by annotator noise, and better read per difficulty bucket), RewardBench-style structured sets (Chat, Chat Hard, Safety, Reasoning), and ultimately downstream best-of-\(n\) or RL results, since benchmark scores do not reliably predict them.</p>
+      <p><strong>Over-optimization.</strong> The reward model is a proxy fitted on finite noisy data. As a policy is optimized against it (KL from the initial policy increasing), the proxy score keeps rising while the true (gold) reward rises, peaks and falls. Gao et al. fit \(R_{\text{bon}} = d(\alpha - \beta d)\) and \(R_{\text{RL}} = d(\alpha - \beta\log d)\) with \(d = \sqrt{\KL}\), and find the coefficients scale smoothly with reward-model size. Mitigations: bigger models and more data, fresh labels each round, ensembles with conservative scoring, early stopping on a held-out gold signal, and a KL penalty (which mostly acts as early stopping).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> IPO, KTO, SimPO, ORPO: what problem does each address?</summary>
+    <div class="answer">
+      <p>With \(h = \log\frac{\pi_\theta(y_w)}{\pi_{\text{ref}}(y_w)} - \log\frac{\pi_\theta(y_l)}{\pi_{\text{ref}}(y_l)}\):</p>
+      <ul>
+        <li><strong>IPO:</strong> loss \((h - \frac{1}{2\tau})^2\). Targets overfitting when preferences are (near) deterministic, where DPO's target gap is infinite and its KL control vanishes. A two-sided squared loss keeps the gap near a finite target. Mainly toy-bandit evidence; often behind DPO on LLM benchmarks.</li>
+        <li><strong>KTO:</strong> \(\lambda_y - v(x,y)\) with a logistic value around a reference point \(z_0\) (a batch-estimated KL). Targets the need for <em>paired</em> data: it learns from unpaired desirable/undesirable labels and handles imbalance with \(\lambda_D, \lambda_U\).</li>
+        <li><strong>SimPO:</strong> \(-\log\sigma(\frac{\beta}{|y_w|}\log\pi(y_w) - \frac{\beta}{|y_l|}\log\pi(y_l) - \gamma)\). Targets DPO's mismatch between the training reward and the average log-likelihood used at generation, length exploitation, and the reference model's memory; adds a target margin.</li>
+        <li><strong>ORPO:</strong> SFT loss plus \(\lambda\,(-\log\sigma(\log\text{odds}_w - \log\text{odds}_l))\) with length-normalized probabilities. Targets pipeline complexity: one stage, no reference model, no separate SFT.</li>
+      </ul>
+      <p>Also cDPO/rDPO (label noise), DPOP (chosen-likelihood collapse), and online or iterative DPO (off-policy data). Caveat to volunteer: most gains are reported by the method's authors on chat benchmarks, and independent tables often show the plain DPO baseline competitive (SimPO's table has IPO, KTO and ORPO all below DPO on AlpacaEval 2, while Tulu 3 found SimPO below its SFT baseline).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Design and trade-offs: when would you prefer DPO over PPO, and when the reverse?</summary>
+    <div class="answer">
+      <p><strong>DPO</strong> when you have a fixed preference dataset close to the policy's distribution, limited compute (Tulu 3: about 4 hours on one node versus 28 hours on two for PPO, with slightly lower PPO scores in an untuned comparison), and the goal is style, helpfulness or instruction following (Llama 3: DPO was cheaper and better on IFEval). It is stable, has few hyperparameters (\(\beta\), learning rate, epochs) and needs no reward model or generation loop.</p>
+      <p><strong>Online RL</strong> when rewards are verifiable (math, code) or you need to discover behavior outside the data. It samples from the current policy, so it does not suffer the off-policy gap, and it queries a reward on exactly the responses being produced. Xu et al. (tuned PPO with advantage normalization, large batches and a reference EMA) get 0.718 versus DPO's 0.611 on HH-RLHF with an independent reward model, and 22.4% versus 0.0% on CodeContest. Tang et al. show online beats offline at equal KL. Costs: four models, sampling throughput, engineering, and sensitivity to reward-model quality.</p>
+      <p><strong>In practice</strong> use both: DPO as a cheap stage before RL (OLMo 3: 74.1 versus 71.9 average), or online RL followed by a light DPO stage (Llama 4). Caveat: existing comparisons are confounded by tuning effort.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why can the chosen response's likelihood decrease during DPO training?</summary>
+    <div class="answer">
+      <p>Because the loss depends only on the gap between the two log-ratios. Pushing \(y_l\) down by 20 nats while \(y_w\) drops 1 nat lowers the loss (0.139 versus 0.371 in our worked example). Four mechanisms have been identified. (1) <em>KL accounting</em>: if \(\pi_{\text{ref}}\) was fitted to the chosen responses, \(\E_{\pi_{\text{ref}}}[\beta\log\pi/\pi_{\text{ref}}] = -\beta\,\KL(\pi_{\text{ref}}\|\pi) \le 0\), so the average implicit reward of chosen responses must decrease as the policy moves (Rafailov et al.), and this is not necessarily harmful. (2) <em>Shared structure</em>: when \(y_w\) and \(y_l\) differ in few tokens, the shared prefix gradient cancels and the later tokens' logits are pushed the wrong way (Pal et al.). (3) <em>Embedding geometry</em>: similar responses have similar hidden states and unembeddings, so lowering \(y_l\) lowers \(y_w\), and the mass moves to tokens aligned with the update direction, possibly of opposite meaning (Razin et al.: Llama-3-8B-Instruct's refusal rate fell from 74.4% to 33.4% when trained to refuse). (4) <em>Data dependence</em>: distinct pairs (GPT-4 versus GPT-3.5) can raise both, similar pairs cannot (Tajwar et al.).</p>
+      <p>Mitigations: an NLL term on the chosen (Llama 3, coefficient 0.2), DPOP's penalty, filtering similar pairs by CHES, on-policy pairs, smaller learning rates and fewer epochs. A one-token toy model with a free hidden state reproduces it: the loss falls monotonically while \(\pi(y_w)\) drops from 0.25 to 0.02 and an unrelated token takes the mass.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> State every assumption in the DPO derivation. What breaks if \(\pi_{\text{ref}}\) has zero probability on a response?</summary>
+    <div class="answer">
+      <p>Assumptions: (a) preferences follow Bradley-Terry with a scalar reward (fails for intransitive or deterministic preferences); (b) the maximization is over all distributions, not the model family, and is reached; (c) \(\beta > 0\) and \(Z(x) < \infty\); (d) \(\pi_{\text{ref}}\) has support wherever \(\pi^\star\) should; (e) the KL is at sequence level; (f) the dataset pairs are samples from \(\pi_{\text{ref}}\), so the MLE is well posed; (g) labels are correct (else use cDPO/rDPO).</p>
+      <p>If \(\pi_{\text{ref}}(y|x) = 0\) then \(\pi^\star(y|x) = 0\) for <em>any</em> reward, since \(\pi^\star \propto \pi_{\text{ref}}\); the inversion \(r = \beta\log(\pi^\star/\pi_{\text{ref}}) + \beta\log Z\) is \(0/0\), so \(r(x,y)\) is unidentified; and any policy with mass on \(y\) has infinite KL, so it is infeasible for the true RL problem. DPO's loss, however, only evaluates ratios at dataset responses and does not penalize \(\pi_\theta\) for mass placed elsewhere. Xu et al.'s example: \(\pi_{\text{ref}} = (0.5, 0.5, 0)\), one pair \(y_1\succ y_2\): the loss is \(\log(1 + (\pi(y_2)/\pi(y_1))^\beta)\), minimized by \(\pi(y_2)\to 0\) with, for example, \(\pi = (0.1, 0, 0.9)\), which PPO can never reach. For a softmax LM every sequence has positive probability, so the failure is one of <em>coverage</em>, not literal zeros: the KL control exists only on the data. That is why DPO needs pairs near the reference distribution, or a refreshed on-policy dataset.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Gao et al.: write the functional forms, find where the gold reward peaks, and explain why a KL penalty does not fix over-optimization.</summary>
+    <div class="answer">
+      <p>With \(d = \sqrt{\KL(\pi\|\pi_{\text{init}})}\): \(R_{\text{bon}}(d) = d(\alpha_{\text{bon}} - \beta_{\text{bon}}d)\) and \(R_{\text{RL}}(d) = d(\alpha_{\text{RL}} - \beta_{\text{RL}}\log d)\), with \(R(0) = 0\). Best-of-\(n\) has \(\KL = \log n - \frac{n-1}{n}\) (\(n = 1000\): 5.91 nats; \(n = 60{,}000\): 10.0 nats). Setting the derivative to zero: the BoN peak is at \(d^\star = \alpha/(2\beta)\) with height \(\alpha^2/(4\beta)\); the RL peak at \(d^\star = e^{\alpha/\beta - 1}\) with height \(\beta d^\star\). (Peaks in KL are \(d^{\star 2}\).) The \(\alpha\) term corresponds to regressional Goodhart (the proxy fits noise, a slope gap) and \(\beta\) to extremal Goodhart (leaving the reward model's support). Coefficients vary smoothly, roughly logarithmically, with reward-model size.</p>
+      <p>The KL penalty does not improve the gold-reward-versus-KL frontier in their experiments. It changes how far along the same curve training gets by the time it converges, which is early stopping in effect (with the caveat that this result may depend on hyperparameters). Better fixes change the curve: a larger or ensembled reward model with conservative scoring (Coste et al.: worst-case or uncertainty-weighted ensembles needed a KL penalty of only 0.01 where a single reward model needed 0.2), fresh preference labels each round (a gain of \(\beta_{\text{RL}}d\log k\) for \(k\) rounds), and stopping on a held-out gold signal.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you have 300k preference pairs written by a mix of stronger models, a budget for a few DPO runs on an 8B model, and a reward model of unknown quality. Lay out the recipe.</summary>
+    <div class="answer">
+      <p><strong>Reference and starting point.</strong> The pairs are off-policy, so first SFT on the chosen responses (or use an instruct model) and freeze that as \(\pi_{\text{ref}}\). <strong>Data.</strong> Drop near-identical pairs (low margin, or high CHES similarity), keep only clear wins as Llama 3 does, cap the length difference between chosen and rejected (OLMo 3 Instruct: 100 tokens), and check the fraction of pairs where the chosen is longer. <strong>Objective.</strong> Start with length-normalized DPO or plain DPO plus an NLL term on the chosen (coefficient 0.2 as in Llama 3); sweep \(\beta\) on a log grid and the learning rate (order \(10^{-7}\) to \(10^{-5}\)); 1 to 2 epochs, since more can hurt (Tulu 3's 57.3 versus 53.4 at 1 versus 3 epochs). Cache the reference log-probabilities. Tulu 3's 8B DPO took about 10 hours on 8 H100s.</p>
+      <p><strong>Monitoring.</strong> Held-out implicit-reward accuracy, chosen and rejected log-probabilities separately (watch displacement), KL from the reference, response length, and a length-controlled win rate against a fixed baseline, plus safety refusal rates if relevant. <strong>Second round.</strong> Sample from the DPO model, label with the judge or reward model, keep hard prompts, and run a short on-policy DPO round against the same reference. Check the reward model on a RewardBench-like set and against a swapped-order LLM judge first, and stop when a held-out gold signal (not the proxy) peaks. <strong>If the task turns out verifiable</strong>, move to online RL with a DPO stage in front.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Preference-loss toolkit.</strong> Implement <code>sequence_logprob</code> (masked, stable, tolerant of <code>-100</code> labels), <code>bt_reward_loss</code> with an optional margin, <code>pairwise_accuracy</code>, <code>dpo_loss</code> (per example, with detached implicit rewards and optional cDPO label smoothing), <code>dpo_grad_weight</code>, <code>ipo_loss</code>, <code>simpo_loss</code> and the ORPO odds-ratio term (with a float32 trap near probability 1). The tests check values against the hand numbers on this page, gradient signs, the \(\log 2\) initial loss, that the partition-function shift cancels, that the chosen likelihood can fall while the loss falls, and a short end-to-end DPO training loop. An interviewer would expect <code>sequence_logprob</code> plus <code>dpo_loss</code> and its gradient argument in 20 minutes, and the full set in about 40. <span class="ex-path">exercises/drills/dpo.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_dpo.py</code>; add <code>--solutions</code> to check the reference implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2305.18290">Rafailov et al. (2023). Direct Preference Optimization: Your Language Model is Secretly a Reward Model.</a> <span class="why">Why read it: §4 and App. A.1-A.6 are the derivation this page follows, including Lemmas 1-2, Theorem 1 and the gradient; App. B has the reference PyTorch loss.</span></li>
+    <li><a href="https://arxiv.org/abs/2203.02155">Ouyang et al. (2022). Training language models to follow instructions with human feedback.</a> <span class="why">Why read it: §3.4-3.5 and App. C give the reward-model recipe (K = 4 to 9 ranking, all pairs per batch element, one epoch, 6B RM) and labeler agreement numbers.</span></li>
+    <li><a href="https://arxiv.org/abs/2210.10760">Gao, Schulman and Hilton (2022). Scaling Laws for Reward Model Overoptimization.</a> <span class="why">Why read it: the functional forms, the best-of-n KL formula, and the finding that the KL penalty acts like early stopping.</span></li>
+    <li><a href="https://arxiv.org/abs/2404.10719">Xu et al. (2024). Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study.</a> <span class="why">Why read it: Theorem 4.1 and the three-response counterexample, plus the PPO ablations (advantage normalization, batch size, reference EMA) and the code results.</span></li>
+    <li><a href="https://arxiv.org/abs/2410.08847">Razin et al. (2024). Unintentional Unalignment: Likelihood Displacement in Direct Preference Optimization.</a> <span class="why">Why read it: the mechanism behind falling chosen likelihoods, the embedding-geometry theory, and the refusal-rate collapse.</span></li>
+    <li><a href="https://arxiv.org/abs/2310.12036">Azar et al. (2023). A General Theoretical Paradigm to Understand Learning from Human Preferences.</a> <span class="why">Why read it: the ΨPO view, the overfitting argument in §4.2, and the IPO loss (Eq. 17).</span></li>
+    <li><a href="https://arxiv.org/abs/2402.01306">Ethayarajh et al. (2024). KTO: Model Alignment as Prospect Theoretic Optimization.</a> <span class="why">Why read it: learning from unpaired binary feedback, the KL reference point, and honest hyperparameter guidance.</span></li>
+    <li><a href="https://arxiv.org/abs/2403.07691">Hong, Lee and Thorne (2024). ORPO: Monolithic Preference Optimization without Reference Model.</a> <span class="why">Why read it: the odds-ratio term, its gradient analysis and how it folds preference learning into SFT.</span></li>
+    <li><a href="https://arxiv.org/abs/2405.14734">Meng, Xia and Chen (2024). SimPO: Simple Preference Optimization with a Reference-Free Reward.</a> <span class="why">Why read it: length-normalized reward, the target margin, the DPO train/generate mismatch analysis, and a broad baseline table with hyperparameter ranges.</span></li>
+    <li><a href="https://arxiv.org/abs/2411.15124">Lambert et al. (2024). Tülu 3: Pushing Frontiers in Open Language Model Post-Training.</a> <span class="why">Why read it: an open, ablated SFT to DPO to RLVR recipe with the length-normalized DPO loss, β and learning-rate sensitivity, and a controlled DPO-versus-PPO cost comparison.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Bradley-Terry:</strong> \(P(y_w \succ y_l) = \sigma(r_w - r_l)\). RM loss \(-\log\sigma(r_w - r_l)\); equal rewards give \(\log 2\). Rewards live up to \(+f(x)\). RM = LM + linear head at the last token, 1 epoch, all pairs of a prompt in one batch element. Label noise caps accuracy near 70 to 80% (agreement 72.6% in InstructGPT; gap \(=\operatorname{logit}(p)\)).</li>
+      <li><strong>Over-optimization (Gao):</strong> \(d = \sqrt{\KL}\); BoN \(R = d(\alpha - \beta d)\), RL \(R = d(\alpha - \beta\log d)\); \(\KL_{\text{bon}} = \log n - \frac{n-1}{n}\); peaks at \(d^\star = \alpha/2\beta\) (BoN) and \(e^{\alpha/\beta - 1}\) (RL). KL penalty behaves like early stopping. DAAs over-optimize too.</li>
+      <li><strong>KL-regularized optimum:</strong> \(\pi^\star = \pi_{\text{ref}}e^{r/\beta}/Z\), \(Z = \sum_y\pi_{\text{ref}}e^{r/\beta}\); \(J(\pi) = \beta\log Z - \beta\,\KL(\pi\|\pi^\star)\). Over all policies; needs support and finite \(Z\).</li>
+      <li><strong>DPO chain:</strong> optimum \(\to\) \(r = \beta\log\frac{\pi^\star}{\pi_{\text{ref}}} + \beta\log Z\) \(\to\) plug into Bradley-Terry, \(Z\) cancels \(\to\) \(\mathcal L = -\log\sigma\big(\beta[\log\frac{\pi_\theta(y_w)}{\pi_{\text{ref}}(y_w)} - \log\frac{\pi_\theta(y_l)}{\pi_{\text{ref}}(y_l)}]\big)\). Log-probs are sums over response tokens.</li>
+      <li><strong>DPO gradient:</strong> \(-\beta\,\sigma(\hat r_l - \hat r_w)[\nabla\log\pi(y_w) - \nabla\log\pi(y_l)]\). Weight 0.5 at init, loss \(\log 2\). Loss 0.1 at \(\beta = 0.1\) needs margin 2.252 = 22.5 nats, weight 0.095.</li>
+      <li><strong>Hand numbers (β = 0.1):</strong> chosen +3, rejected −5 nats gives margin 0.8, loss 0.371, weight 0.310. Wrongly ranked (margin −0.7): loss 1.103, weight 0.668.</li>
+      <li><strong>Failure modes:</strong> off-policy data (Xu, Tang); likelihood displacement (gap only; NLL term 0.2 in Llama 3; DPOP); length exploitation (R-DPO, length-normalized, SimPO); deterministic labels (IPO); noisy labels (cDPO \(\sigma(-m) - \varepsilon\), rDPO \(\sigma(-m) + \frac{\varepsilon}{1-2\varepsilon}\)); \(\beta\)/epochs sensitivity.</li>
+      <li><strong>Variants:</strong> IPO \((h - \frac1{2\tau})^2\). KTO unpaired, \(z_0\) = batch KL, lr about \(5\times10^{-6}\). ORPO NLL + \(\lambda\) odds-ratio, no reference. SimPO \(\frac{\beta}{|y|}\log\pi\) reward, \(\gamma\), \(\beta \in [2, 2.5]\), no reference.</li>
+      <li><strong>Settings:</strong> DPO paper \(\beta = 0.1\), lr \(10^{-6}\); Llama 3 lr \(10^{-5}\), \(\beta = 0.1\), NLL 0.2, 6 rounds; Tulu 3 length-normalized, \(\beta = 5\), lr \(5\times10^{-7}\) (8B) / \(2\times10^{-7}\) (70B), 1 epoch.</li>
+      <li><strong>DPO vs PPO:</strong> DPO about 4 h on one node vs PPO about 28 h on two (Tulu 3); tuned PPO wins on code and HH (Xu); labs combine them (OLMo 3: DPO before RLVR helps; Llama 4: online RL then light DPO).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

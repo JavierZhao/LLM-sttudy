@@ -98,8 +98,8 @@ window.LLM_MANIFEST = {
           desc: "Sliding window, Mixtral MoE, Gemma local/global and distillation, gpt-oss attention sinks and MXFP4." },
         { n: "32", drills: ["muonclip"], slug: "32-frontier-open-models", title: "Kimi, GLM, MiniMax, OLMo, Nemotron", tier: "P1", minutes: 50, status: "written",
           desc: "Kimi K2 and MuonClip, GLM-4.5, MiniMax lightning attention and CISPO, OLMo open recipes, Nemotron-H." },
-        { n: "33", drills: ["config_zoo"], slug: "33-architecture-atlas", title: "Architecture atlas", tier: "P0", minutes: 35, status: "planned",
-          desc: "Side-by-side configs for ~20 models, a timeline, and what converged and why." }
+        { n: "33", drills: ["config_zoo"], slug: "33-architecture-atlas", title: "Architecture atlas", tier: "P0", minutes: 35, status: "written",
+          desc: "Side-by-side configs for 30 models, a timeline, and what converged and why." }
       ]
     },
     {

@@ -272,6 +272,11 @@ def test_kv_cache_gemma4_shared_kv(impl):
     assert abs(got / 1e9 - 1.10) < 0.01
     # storing V separately would double the global part: 1.76 GB, which the report's table rules out
     assert impl.kv_cache_bytes(impl.Spec(**{**g4.__dict__, "global_k_eq_v": False}), 32_768, bytes_per_el=1) / 1e9 > 1.7
+    # attention FLOPs use each layer's own head dimension: 256 in the 50 windowed layers, 512 in the 10 global ones
+    T = 8192
+    keys_local = 1024 - 1024**2 / (2 * T)
+    expected = 50 * 2 * 32 * (256 + 256) * keys_local + 10 * 2 * 32 * (512 + 512) * T / 2
+    assert impl.attention_flops_per_token(g4, T) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------- FLOPs

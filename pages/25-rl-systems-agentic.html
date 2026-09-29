@@ -647,7 +647,7 @@ def rl_loss(logp, logp_old, logp_rollout, adv, mask, eps_low=0.2, eps_high=0.27,
   <p><strong>A defensive checklist</strong> (my synthesis of the sources above):</p>
   <ol>
     <li><strong>Isolate the verifier.</strong> Run tests where the agent cannot write, inject or restore the test files at scoring time, and prefer hidden tests. A verifier the agent shares a filesystem with is a suggestion.</li>
-    <li><strong>Require more than one signal.</strong> DeepSeek-V3.2's validity rule (fail-to-pass greater than 0, pass-to-fail equal to 0), held-out tests, or rubric-plus-execution rewards.</li>
+    <li><strong>Validate environments, then require more than one signal.</strong> Admit an environment only if its gold patch passes, as in DeepSeek-V3.2's rule (fail-to-pass greater than 0, pass-to-fail equal to 0), so the tests can tell a fix from no fix; then score on held-out tests or rubric plus execution rather than on the visible tests alone.</li>
     <li><strong>Detect what you know.</strong> Regexes and AST checks for known hacks (OpenAI used regexes for <code>exit(0)</code> and <code>SkipTest</code> as ground truth), LLM monitors over whole trajectories, and manual reading of the highest-reward trajectories every few hundred steps.</li>
     <li><strong>Do not train hard against the monitor.</strong> Use flags to patch environments and gate releases, not as a large reward term, and accept the "monitorability tax".</li>
     <li><strong>Offer a legitimate exit</strong> ("this task is broken") and <strong>evaluate on a different harness</strong>, the cheapest way to see train reward and true quality diverge.</li>

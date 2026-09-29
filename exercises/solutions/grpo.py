@@ -13,13 +13,17 @@ def group_advantages(rewards: Tensor, group_size: int, kind: str = "grpo", eps: 
     r = rewards.view(-1, group_size)                       # (P, G)
     mean = r.mean(dim=1, keepdim=True)
     if kind == "grpo":
-        return ((r - mean) / (r.std(dim=1, keepdim=True) + eps)).reshape(-1)
-    if kind == "dr_grpo":
-        return (r - mean).reshape(-1)
-    # RLOO: baseline of response i is the mean of the other G - 1 rewards
-    g = group_size
-    baseline = (r.sum(dim=1, keepdim=True) - r) / (g - 1)
-    return (r - baseline).reshape(-1)
+        adv = (r - mean) / (r.std(dim=1, keepdim=True) + eps)      # eps on the std, not inside the variance
+    elif kind == "dr_grpo":
+        adv = r - mean
+    else:
+        # RLOO: baseline of response i is the mean of the other G - 1 rewards
+        baseline = (r.sum(dim=1, keepdim=True) - r) / (group_size - 1)
+        adv = r - baseline
+    # A group of equal rewards must give exactly 0: float round-off in the mean (all 0.1) would otherwise
+    # leave ~1e-9 residuals that the 1/eps of the std division blows up, and eps=0 would give 0/0
+    uniform = r.max(dim=1, keepdim=True).values == r.min(dim=1, keepdim=True).values
+    return torch.where(uniform, torch.zeros_like(adv), adv).reshape(-1)
 
 
 def grpo_loss(logp_new: Tensor, logp_old: Tensor, logp_ref: Tensor, adv: Tensor, mask: Tensor,

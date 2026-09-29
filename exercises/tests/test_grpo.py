@@ -79,6 +79,28 @@ def test_uniform_group_has_exactly_zero_advantage(impl, kind):
     assert adv[8:].abs().sum() > 0
 
 
+def test_grpo_epsilon_is_added_to_the_std(impl):
+    # (r - mean) / (std + eps): with a large eps the placement is visible (not sqrt(var + eps), not a clamp)
+    std = math.sqrt(8 / 7 * 0.375 * 0.625)
+    adv = impl.group_advantages(f64(*R8), 8, "grpo", eps=0.5)
+    torch.testing.assert_close(adv[:3], torch.full((3,), 0.625 / (std + 0.5), dtype=torch.float64))
+    torch.testing.assert_close(adv[3:], torch.full((5,), -0.375 / (std + 0.5), dtype=torch.float64))
+
+
+@pytest.mark.parametrize("kind", ["grpo", "dr_grpo", "rloo"])
+def test_uniform_group_is_exactly_zero_even_for_inexact_rewards_and_zero_eps(impl, kind):
+    # 0.1 has no exact float representation: the mean of equal values can differ from them by one ulp, and
+    # dividing that residual by a tiny std + eps would turn round-off into a real advantage
+    for g in (3, 7, 8):
+        for v in (0.1, 0.3, 1 / 3):
+            r = torch.cat([torch.full((g,), v), torch.arange(g, dtype=torch.float32)])   # uniform group, mixed group
+            adv = impl.group_advantages(r, g, kind, eps=1e-6)
+            assert torch.equal(adv[:g], torch.zeros(g)), (kind, g, v)
+            assert adv[g:].abs().sum() > 0
+    adv = impl.group_advantages(torch.ones(4), 4, kind, eps=0.0)             # 0 / 0 must not leak a NaN
+    assert torch.equal(adv, torch.zeros(4))
+
+
 def test_group_advantages_validation_and_dtype(impl):
     with pytest.raises(ValueError):
         impl.group_advantages(torch.zeros(8), 4, "ppo")
@@ -242,6 +264,23 @@ def test_padding_never_matters(impl, agg):
     assert g1[m == 0].abs().sum() == 0
 
 
+@pytest.mark.parametrize("agg", ["seq_mean", "token_mean", "const"])
+def test_padding_junk_that_overflows_exp_cannot_reach_the_loss(impl, agg):
+    # junk of +-800 makes exp() overflow to inf at padded positions, and inf * 0 is NaN: the junk must be
+    # neutralized BEFORE the exponential, not just multiplied by the mask afterwards
+    lp = torch.randn(2, 4, dtype=torch.float64)
+    m = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.float64)
+    new, old, ref = lp.clone(), lp.clone(), lp.clone()
+    new[1, 2:], old[1, 2:], ref[1, 2:] = 800.0, -800.0, -800.0
+    new.requires_grad_(True)
+    for a in (f64(1.0, -1.0), f64(-1.0, 1.0)):
+        new.grad = None
+        loss = impl.grpo_loss(new, old, ref, a, m, beta=0.04, agg=agg, max_len=4)
+        loss.backward()
+        assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
+        assert new.grad[1, 2:].abs().sum() == 0
+
+
 def test_seq_mean_equals_token_mean_when_lengths_are_equal(impl):
     lp_new = torch.randn(4, 6, dtype=torch.float64)
     lp_old = lp_new + 0.1 * torch.randn(4, 6, dtype=torch.float64)
@@ -322,6 +361,16 @@ def test_gspo_loss_clips_whole_sequences(impl):
     assert (g1 != 0).all()
     # d(-(s * A)/2)/d logp_t = -A * s / (2 * |o|), the same for every token of the response
     assert torch.allclose(g1, torch.full((3,), 1.0 * math.exp(0.2) / (2 * 3), dtype=torch.float64))
+
+
+def test_gspo_loss_clips_sequences_not_tokens(impl):
+    # token log-ratios +0.01, -0.01, 0: two token ratios are far outside [1 - 3e-4, 1 + 4e-4], but their geometric
+    # mean is exactly 1, so the response is NOT clipped and every token keeps the same live gradient
+    lp_new = torch.tensor([[0.01, -0.01, 0.0]], dtype=torch.float64, requires_grad=True)
+    loss = impl.gspo_loss(lp_new, torch.zeros_like(lp_new), f64(1.0), torch.ones(1, 3, dtype=torch.float64))
+    loss.backward()
+    assert loss.item() == pytest.approx(-1.0)
+    torch.testing.assert_close(lp_new.grad, torch.full((1, 3), -1 / 3, dtype=torch.float64))
 
 
 # ----------------------------------------------------------------------------- dynamic sampling

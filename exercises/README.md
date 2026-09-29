@@ -59,3 +59,5 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 31 | Attention sinks and hybrid layers: softmax with sink, banded masks, layer schedules, hybrid KV bytes, MXFP4 quantizer and weight bytes | `drills/sinks.py` |
 | 32 | QK-Clip from Kimi K2 MuonClip: per-head max attention logit, per-head W_q/W_k rescale, MLA variant with the shared rotary key untouched | `drills/muonclip.py` |
 | 34 | Back-of-envelope formulas: params, FLOPs, training time and cost, memory, KV bytes, roofline decode/prefill, all-reduce, pipeline bubble, MoE all-to-all, Chinchilla optimum | `drills/napkin.py` |
+| 35 | LayerNorm and RMSNorm forward/backward by hand: cache, dx, dgamma, dbeta, checked against autograd and gradcheck | `drills/layernorm_backward.py` |
+| 35 | Beam search with GNMT length normalization, EOS handling, exact early stop, and a brute-force oracle | `drills/beam_search.py` |

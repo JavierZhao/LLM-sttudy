@@ -78,7 +78,7 @@ def hybrid_cache_bytes(
     kv_bytes: int = 2,
     state_bytes: int = 4,
 ) -> dict[str, int]:
-    n_full = n_layers // full_attn_interval                    # layers interval, 2*interval, ...
+    n_full = n_layers // full_attn_interval                    # layers interval, 2*interval, ... (floor: a partial trailing block has none)
     n_linear = n_layers - n_full
     kv_per_token = n_full * 2 * n_kv_heads * head_dim * kv_bytes          # K and V of the full layers only
     kv_total = kv_per_token * seq_len

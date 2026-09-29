@@ -27,11 +27,13 @@ def gated_attention_output(attn_out: Tensor, x: Tensor, W_gate: Tensor) -> Tenso
             output projection W_O.
         x: (B, T, d) the (pre-normalized) hidden states that entered the attention layer.
         W_gate: (d, H * D) for an elementwise, head-specific gate, or (d, H) for a headwise gate
-            (one scalar per head, broadcast over D).
+            (one scalar per head, broadcast over D). In the elementwise case column h * D + c
+            gates channel c of head h (head-major, i.e. the gate is viewed as (B, T, H, D)).
     Returns:
-        (B, T, H, D): attn_out multiplied by sigmoid(x @ W_gate), reshaped to (B, T, H, D)
-        (elementwise) or (B, T, H, 1) (headwise). The gate depends on the token's own hidden
-        state only, not on other tokens.
+        (B, T, H, D): attn_out multiplied by the gate sigmoid(x @ W_gate), where the gate is
+        viewed as (B, T, H, D) (elementwise) or (B, T, H, 1) and broadcast over D (headwise).
+        The gate depends on the token's own hidden state x only, not on other tokens, and the
+        sigmoid is applied to the gate logits, never to attn_out.
     """
     raise NotImplementedError
 
@@ -116,7 +118,9 @@ def hybrid_cache_bytes(
     Every `full_attn_interval`-th layer (layers interval, 2*interval, ...) is full attention and
     keeps a KV cache that grows with seq_len; every other layer is a linear-attention layer with a
     fixed recurrent state of shape (n_state_heads, d_k, d_v). Ignore the small convolution state.
-    With full_attn_interval = 1 the model is an ordinary Transformer.
+    With full_attn_interval = 1 the model is an ordinary Transformer. n_layers need not be a
+    multiple of the interval: a trailing partial block has no full-attention layer (layers are
+    numbered from 1, so 10 layers with interval 4 have full attention at layers 4 and 8 only).
 
     Returns a dict with:
         "kv_per_token": bytes of KV cache per token, summed over the full-attention layers.

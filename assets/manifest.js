@@ -92,7 +92,7 @@ window.LLM_MANIFEST = {
           desc: "R1-Zero and R1, V3.1 hybrid thinking, V3.2 sparse attention and agentic RL, V4's compressed attention, mHC, Muon and 1M context, and V4.1-Flash's cross-layer KV reuse." },
         { n: "29", drills: ["llama_config"], slug: "29-llama", title: "Llama 1 to 4", tier: "P1", minutes: 45, status: "planned",
           desc: "The Llama recipe, GQA, 15T-token overtraining, Llama 3 long context, Llama 4 MoE and iRoPE." },
-        { n: "30", drills: ["qwen_bits"], slug: "30-qwen", title: "Qwen 1 to 3 and Qwen3-Next", tier: "P1", minutes: 45, status: "planned",
+        { n: "30", drills: ["qwen_bits"], slug: "30-qwen", title: "Qwen 1 to 3 and Qwen3-Next", tier: "P1", minutes: 45, status: "written",
           desc: "Qwen2/2.5/3, QK-norm, hybrid thinking, global-batch balancing, Qwen3-Next Gated DeltaNet hybrid." },
         { n: "31", drills: ["sinks"], slug: "31-mistral-gemma-gptoss", title: "Mistral, Gemma, gpt-oss", tier: "P1", minutes: 45, status: "planned",
           desc: "Sliding window, Mixtral MoE, Gemma local/global and distillation, gpt-oss attention sinks and MXFP4." },

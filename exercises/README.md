@@ -54,4 +54,5 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 26 | DeepSeek parameter accounting (MLA + MoE, total vs activated, embedding conventions) and DeepSeek LLM batch-size and learning-rate laws | `drills/deepseek_params.py` |
 | 27 | FP8 fine-grained quantization: E4M3 rounding, per-tensor vs 1x128 tile vs 128x128 block scales, FP32-promoted FP8 GEMM | `drills/fp8.py` |
 | 28 | DeepSeek Sparse Attention: lightning-indexer scores, top-k MQA-mode attention, indexer KL loss, decode-FLOPs cost model | `drills/dsa.py` |
+| 30 | Qwen building blocks: gated attention output, micro- vs global-batch balance loss, Qwen3-MoE parameter counts, hybrid KV plus recurrent-state bytes | `drills/qwen_bits.py` |
 | 34 | Back-of-envelope formulas: params, FLOPs, training time and cost, memory, KV bytes, roofline decode/prefill, all-reduce, pipeline bubble, MoE all-to-all, Chinchilla optimum | `drills/napkin.py` |

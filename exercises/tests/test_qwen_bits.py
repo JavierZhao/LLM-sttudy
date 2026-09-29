@@ -208,3 +208,25 @@ def test_interval_one_is_a_plain_transformer(impl):
     r = impl.hybrid_cache_bytes(seq_len=131072, n_layers=64, full_attn_interval=1, n_kv_heads=8,
                                 head_dim=128, n_state_heads=1, d_k=1, d_v=1)
     assert r["kv_per_token"] == 262_144 and r["kv_total"] == 32 * 2**30 and r["state_total"] == 0
+
+
+def test_partial_trailing_block_has_no_full_attention_layer(impl):
+    # 10 layers, interval 4: full attention at layers 4 and 8 only (2 layers, not ceil(10/4) = 3)
+    r = impl.hybrid_cache_bytes(seq_len=100, n_layers=10, full_attn_interval=4, n_kv_heads=2,
+                                head_dim=8, n_state_heads=3, d_k=4, d_v=4)
+    assert r["kv_per_token"] == 2 * 2 * 2 * 8 * 2          # 2 layers * (K,V) * 2 heads * 8 dims * 2 bytes
+    assert r["state_total"] == 8 * 3 * 4 * 4 * 4           # 8 linear layers
+
+
+def test_state_uses_dk_times_dv(impl):
+    # d_k != d_v: the state is (n_state_heads, d_k, d_v), so swapping or squaring one of them must fail
+    r = impl.hybrid_cache_bytes(seq_len=1000, n_layers=8, full_attn_interval=4, n_kv_heads=1,
+                                head_dim=16, n_state_heads=5, d_k=64, d_v=128, kv_bytes=2, state_bytes=4)
+    assert r["state_total"] == 6 * 5 * 64 * 128 * 4
+    assert r["kv_per_token"] == 2 * 2 * 1 * 16 * 2
+    assert r["kv_total"] == 1000 * r["kv_per_token"]
+    assert r["total"] == r["kv_total"] + r["state_total"]
+    # non-default byte widths are honored
+    r2 = impl.hybrid_cache_bytes(seq_len=1000, n_layers=8, full_attn_interval=4, n_kv_heads=1,
+                                 head_dim=16, n_state_heads=5, d_k=64, d_v=128, kv_bytes=1, state_bytes=2)
+    assert r2["kv_per_token"] == r["kv_per_token"] // 2 and r2["state_total"] == r["state_total"] // 2

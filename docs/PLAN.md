@@ -69,8 +69,8 @@ VI (26–33) → VII (34–37).
 | 3 | 16–21 | done: written, fact-checked; 21 (DPO) audited by coordinator |
 | 4 | 22–25 | done: written, fact-checked; 22 (PPO) and 24 (GRPO) audited by coordinator |
 | 5 | 26–28 | done: written, fact-checked; 28 extended to V4.1-Flash (Sep 2026) |
-| 6 | 29–32, 34 | 30 and 34 in fact-check; 29, 31, 32 being written |
-| VI/VII | 33, 35–37 | briefs ready (after 29–32) |
+| 6 | 29, 30, 34 | done: written, fact-checked |
+| 7 | 31–33, 35–37 | 31, 32, 35 being written; then 33, 36, 37 |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),
 02 (4 errors: digit grouping, Unigram unk, vocab-extension count, byte-level claim),

@@ -79,3 +79,12 @@ Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, cit
 relative" claim), 06 (CTRL penalty direction, irreproducible simulation claim), 13 (about 15 imprecisions:
 Llama 3 6ND footnote, Kaplan exponent sources, Hoffmann appendix sizes, Sardana & Frankle scope,
 figure captions; drill validation tightened).
+
+## PRs from the Q&A session (user-authorized policy)
+
+The user answers questions about the material in a separate session that proposes edits as PRs
+against this branch. The coordinator watches for them (hourly check-in) and merges a PR (squash)
+only when: every Codex review comment is addressed and its thread resolved, the coordinator's own
+review passes (claims verified, QA clean, consistent with other pages, house style), CI is green on
+the head commit, and it is mergeable. Otherwise report the problem to the user. Pull the branch
+before every push so merged edits are never overwritten. PR #1 (page 01 Figure 1) merged.

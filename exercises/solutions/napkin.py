@@ -64,7 +64,8 @@ def moe_params(L: int, L_moe: int, d: int, attn: int, n_routed: int, n_shared: i
     (d, d_e) matrices each) and a router (d, n_routed). Norms: (2L + 1) gains of size d.
     'Activated' counts, for each token: all attention and dense layers, k routed + n_shared shared
     experts and the router per MoE layer, the norms, and BOTH vocabulary matrices (the 37.55B
-    convention of page 08; drop V*d for the non-embedding-head convention).
+    convention of page 08; subtract V*d for the 36.63B count without the input table, or 2*V*d for
+    the 35.70B non-embedding count).
     DeepSeek-V3 must give (671,026,404,352, 37,552,282,624).
     """
     expert = 3 * d * d_e

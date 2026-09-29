@@ -48,6 +48,8 @@ def test_per_layer_coefficient_is_not_13(impl):
 
 def test_mla_layer_params(impl):
     assert impl.mla_attn_params(**DSV3_MLA) == 187_107_328
+    # tiny config with d_v != d_nope: 96 + 72 + 112 + 70 + 96 + 11 (matrices, then the two latent norms)
+    assert impl.mla_attn_params(d=16, n_h=2, d_nope=4, d_rope=2, d_v=3, d_c=5, d_cq=6) == 457
 
 
 def test_deepseek_v3_total_and_activated(impl):
@@ -173,7 +175,11 @@ def test_decode_is_memory_bound_at_batch_64(impl):
     t = impl.decode_time(W8, impl.kv_bytes(32, 8, 128, 4096, 64), H100_BW, flops, H100_BF16)
     close(t, 15.05e-3, 1e-3)                       # the memory term wins
     t_c = impl.decode_time(0, 0, H100_BW, flops, H100_BF16)
-    assert t_c < 2e-3                              # compute alone is about 1.1 ms
+    close(t_c, flops / H100_BF16, 1e-12)           # compute alone is about 1.1 ms
+    assert t_c < 2e-3
+    # a compute-bound step: 1e15 FLOPs at 1e15 FLOP/s is 1 s, far above 1 GB / 1 TB/s = 1 ms
+    close(impl.decode_time(1e9, 0, 1e12, 1e15, 1e15), 1.0, 1e-12)
+    close(impl.decode_time(1e9, 0, 1e12), 1e-3, 1e-12)   # default peak_flops: no compute term
 
 
 def test_prefill_2048_tokens(impl):
@@ -197,6 +203,10 @@ def test_cost_per_million_tokens(impl):
     close(impl.cost_per_million_tokens(2.0, 1, 104 / t), 0.1146, 2e-3)
     t1 = impl.decode_time(W8, impl.kv_bytes(32, 8, 128, 4096, 1), H100_BW)
     close(impl.cost_per_million_tokens(2.0, 1, 1 / t1), 2.752, 2e-3)
+    # tokens_per_s is the TOTAL rate: 8 GPUs at 8x the rate cost the same per token
+    close(impl.cost_per_million_tokens(2.0, 8, 8 / t1), impl.cost_per_million_tokens(2.0, 1, 1 / t1), 1e-12)
+    # DeepSeek's decode node: 8 H800 at $2 = $16 per node-hour, 14.8k output tokens/s (page 17)
+    close(impl.cost_per_million_tokens(2.0, 8, 14_800), 0.3003, 1e-3)
 
 
 # ---- KV cache (drills 22 to 25) ------------------------------------------------------------------
@@ -313,6 +323,11 @@ def test_v3_weight_stream_on_8_h200(impl):
     t = impl.decode_time(671_026_404_352, 0, 8 * 4.8e12)
     close(t * 1e3, 17.47, 1e-3)
     close(1 / t, 57.2, 2e-3)
+    # batch 128 touches 98% of the routed experts, not all: page 17's 17.2 ms
+    routed = 58 * 256 * 3 * 7168 * 2048
+    frac = impl.experts_touched(256, 8, 128) / 256
+    t128 = impl.decode_time(671_026_404_352 - (1 - frac) * routed, 0, 8 * 4.8e12)
+    close(t128 * 1e3, 17.18, 1e-3)
     close(671.03e9 / 80e9, 8.39, 1e-3)
 
 

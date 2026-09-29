@@ -178,6 +178,7 @@ definition: `multi-head attention <span class="zh">多头注意力</span>`. Use 
 established translation the Chinese ML community actually uses (for example
 自回归, 困惑度, 分词器, 键值缓存, 混合专家, 旋转位置编码, 监督微调, 强化学习,
 奖励模型, 直接偏好优化). Do not translate model names or sentences.
+- Use one term per concept across pages. Fixed choices so far: MFU = 模型浮点运算利用率.
 
 ## 9. Exercises
 

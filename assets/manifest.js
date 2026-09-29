@@ -105,7 +105,7 @@ window.LLM_MANIFEST = {
     {
       id: "VII", title: "Interview toolkit",
       pages: [
-        { n: "34", drills: ["napkin"], slug: "34-back-of-envelope", title: "Back-of-envelope calculations", tier: "P0", minutes: 45, status: "planned",
+        { n: "34", drills: ["napkin"], slug: "34-back-of-envelope", title: "Back-of-envelope calculations", tier: "P0", minutes: 45, status: "written",
           desc: "Parameters, FLOPs, training time, memory, KV cache, MFU, with worked drills." },
         { n: "35", drills: ["layernorm_backward", "beam_search"], slug: "35-coding-drills", title: "Coding drills", tier: "P0", minutes: 90, status: "planned",
           desc: "From-scratch implementations you should be able to write in an interview, with tests." },

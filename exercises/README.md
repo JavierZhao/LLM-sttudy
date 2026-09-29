@@ -41,6 +41,7 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 13 | Scaling laws: fit, optimum, inference-aware sizing | `drills/scaling.py` |
 | 14 | Optimizers: AdamW step, LR schedules (cosine/WSD/step), Newton-Schulz, Muon step | `drills/optim.py` |
 | 15 | Distributed training by simulation: ring all-reduce, tensor-parallel MLP and attention, ZeRO memory, pipeline bubble, MFU | `drills/parallel.py` |
+| 16 | FlashAttention from scratch: online-softmax merge, tiled causal forward with logsumexp, recomputing backward, split-KV (Flash-Decoding) combine | `drills/flash.py` |
 | 17 | Speculative decoding: lossless accept/resample rule, acceptance rate, expected tokens per step and speedup | `drills/speculative.py` |
 | 18 | Evaluation statistics: unbiased pass@k, Wilson and Wald CIs, paired bootstrap, cloze scoring | `drills/evals.py` |
 | 19 | SFT plumbing: chat-template loss masks, packing with a document mask, token vs sequence loss normalization, forward and reverse KD losses | `drills/sft.py` |

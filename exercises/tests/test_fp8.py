@@ -191,3 +191,13 @@ def test_promotion_repairs_a_narrow_accumulator(impl):
     e_naive = ((naive - exact).norm() / exact.norm()).item()
     e_prom = ((promoted - exact).norm() / exact.norm()).item()
     assert e_prom < e_naive / 2                          # promotion every 128 elements cuts the error several-fold
+
+
+def test_fp8_linear_matches_manual_pipeline(impl):
+    a, w = _quantized_pair(4, 256, 128, seed=5)
+    out = impl.fp8_linear(a, w)
+    aq, asc = impl.quantize_tiles(a, (1, 128))
+    wq, wsc = impl.quantize_blocks(w)
+    torch.testing.assert_close(out, impl.fp8_matmul(aq, asc, wq, wsc))
+    rel = ((out - a @ w).norm() / (a @ w).norm()).item()
+    assert 0.005 < rel < 0.06

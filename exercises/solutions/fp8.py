@@ -77,3 +77,9 @@ def fp8_matmul(a_q: Tensor, a_scales: Tensor, w_q: Tensor, w_scales: Tensor,
         col_scale = w_scales[g].repeat_interleave(128)                     # (N,) one scale per 128 output columns
         out = out + partial * a_scales[:, g:g + 1] * col_scale[None, :]    # promote: dequantize and add in FP32
     return out
+
+
+def fp8_linear(a: Tensor, w: Tensor, promote_every: int = 128, acc_bits: int | None = None) -> Tensor:
+    a_q, a_s = quantize_tiles(a, (1, 128))          # activations: per token, per 128 channels
+    w_q, w_s = quantize_blocks(w, (128, 128))       # weights: per 128 x 128 block
+    return fp8_matmul(a_q, a_s, w_q, w_s, promote_every, acc_bits)

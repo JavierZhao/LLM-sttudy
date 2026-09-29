@@ -70,7 +70,7 @@
 from fractions import Fraction
 
 def extract_boxed(text):
-    """Content of the LAST \boxed{...} (brace-matched), or None."""
+    r"""Content of the LAST \boxed{...} (brace-matched), or None."""
     i = text.rfind("\\boxed{")
     if i &lt; 0:
         return None
@@ -141,7 +141,7 @@ def format_reward(response):               # R1-style structure check
     \[ \E\!\left[\frac1G\sum_{i}\frac1{|o_i|}\sum_{t}\Big(\hat A_{i,t}+\beta\Big(\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)}-1\Big)\Big)\nabla_\theta\log\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})\right]. \]</li>
   </ol>
 
-  <p>A note on notation. The R1 paper writes the same objective at the sequence level, with \(\rho_i=\pi_\theta(o_i\mid q)/\pi_{\theta_{\text{old}}}(o_i\mid q)\) and no token sum or \(1/|o_i|\) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Eq. 1]</a>, while DeepSeek-V3.2 writes the token form but with \(\hat A=R_i-\operatorname{mean}(R)\), no std <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, Eq. 5]</a>. <span class="unverified" title="DeepSeek's RL training code is not public, and the R1 paper writes the objective at the sequence level without a 1/|o_i| factor. Which aggregation and whether std normalization were used in R1 training is therefore not confirmed by a primary source.">Which normalization the R1 run itself used is not confirmed.</span> "GRPO" in an interview means DeepSeekMath's Eq. 3.</p>
+  <p>A note on notation. The R1 paper writes the same objective at the sequence level, with \(\rho_i=\pi_\theta(o_i\mid q)/\pi_{\theta_{\text{old}}}(o_i\mid q)\) and no token sum or \(1/|o_i|\) <a href="https://arxiv.org/abs/2501.12948">[DeepSeek-R1, Eq. 1]</a> (the Nature version prints the same equation in its Methods), with the same std-normalized advantage as DeepSeekMath (Eq. 3). DeepSeek-V3.2 writes the token form but with \(\hat A=R_i-\operatorname{mean}(R)\), no std <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, Eq. 5]</a>. <span class="unverified" title="The arXiv v2 and the Nature Methods section both print the sequence-level Eq. 1 and the std-normalized Eq. 3, and neither mentions token-level averaging. DeepSeek's RL code is not public, so whether the R1 runs averaged per sequence, per token or by a constant is not confirmed by any primary source.">How the R1 run averaged over tokens is not stated.</span> "GRPO" in an interview means DeepSeekMath's Eq. 3.</p>
 
   <figure class="fig">
 <svg viewBox="0 0 720 340" role="img" aria-labelledby="fig-24-1-title">
@@ -156,7 +156,7 @@ def format_reward(response):               # R1-style structure check
 <rect class="s-a" x="8" y="128" width="120" height="82" rx="6"/>
 <text x="68" y="150" text-anchor="middle" class="s-bold">policy π_old</text>
 <text x="68" y="167" text-anchor="middle" class="s-small">samples G = 8</text>
-<text x="68" y="182" text-anchor="middle" class="s-small">responses, T = 1</text>
+<text x="68" y="182" text-anchor="middle" class="s-small">responses, temp. 1</text>
 <text x="68" y="198" text-anchor="middle" class="s-small s-muted">no critic</text>
 <path class="s-line" d="M68,104 L68,128" marker-end="url(#arrow-24-1)"/>
 <path class="s-line" d="M128,169 L168,169" marker-end="url(#arrow-24-1)"/>
@@ -223,7 +223,7 @@ def format_reward(response):               # R1-style structure check
 <text x="12" y="240" class="s-small s-muted">π_old ← π_θ</text>
 <path class="s-line" d="M442,221 L442,252" marker-end="url(#arrow-24-1)"/>
 </svg>
-    <figcaption><b>Figure 1.</b> One GRPO step for one prompt. The verifier turns each response into a reward, the group turns rewards into advantages, and every token of a response receives its response's advantage. Green rows are correct (3 of 8), orange rows wrong. Token counts are illustrative. The advantages use the sample std, as in verl; the worked table below gives the other conventions.</figcaption>
+    <figcaption><b>Figure 1.</b> One GRPO step for one prompt. The verifier turns each response into a reward, the group turns rewards into advantages, and every token of a response receives its response's advantage. Green rows are correct (3 of 8), orange rows wrong. Token counts are illustrative. The advantages use the sample std, as in verl; the worked table below gives the other conventions. The update box writes the decoupled clip of DAPO; DeepSeekMath has \(\varepsilon_{\text{low}}=\varepsilon_{\text{high}}=\varepsilon\).</figcaption>
   </figure>
 
   <h3 id="grpo-vs-ppo">GRPO versus PPO, precisely</h3>
@@ -361,7 +361,7 @@ def format_reward(response):               # R1-style structure check
 <text x="504" y="138" text-anchor="middle" class="s-bold">4 Final RL</text>
 <text x="504" y="157" text-anchor="middle" class="s-small">rules + reward models</text>
 <text x="504" y="171" text-anchor="middle" class="s-small">(helpful, harmless),</text>
-<text x="504" y="185" text-anchor="middle" class="s-small">1,700 steps, T = 0.7</text>
+<text x="504" y="185" text-anchor="middle" class="s-small">1,700 steps, temp. 0.7</text>
 <text x="504" y="219" text-anchor="middle" class="s-small s-bold">AIME 79.8</text>
 <rect class="s-c" x="584" y="118" width="128" height="112" rx="6"/>
 <text x="648" y="138" text-anchor="middle" class="s-bold">DeepSeek-R1</text>

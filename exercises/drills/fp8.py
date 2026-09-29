@@ -136,3 +136,16 @@ def fp8_matmul(a_q: Tensor, a_scales: Tensor, w_q: Tensor, w_scales: Tensor,
         (M, N) float32 approximation of dequantize(a) @ dequantize(w).
     """
     raise NotImplementedError
+
+
+def fp8_linear(a: Tensor, w: Tensor, promote_every: int = 128, acc_bits: int | None = None) -> Tensor:
+    """One FP8 linear layer from float inputs: quantize, multiply with promotion, return FP32.
+
+    Quantize `a` in 1x128 tiles and `w` in 128x128 blocks, then call fp8_matmul on the results.
+
+    Args:
+        a: (M, K) float32 activations. w: (K, N) float32 weights. K and N are multiples of 128.
+    Returns:
+        (M, N) float32 approximation of a @ w.
+    """
+    raise NotImplementedError

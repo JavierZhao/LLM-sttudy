@@ -109,9 +109,9 @@ window.LLM_MANIFEST = {
           desc: "Parameters, FLOPs, training time, memory, KV cache, MFU, with worked drills." },
         { n: "35", drills: ["layernorm_backward", "beam_search"], slug: "35-coding-drills", title: "Coding drills", tier: "P0", minutes: 90, status: "written",
           desc: "From-scratch implementations you should be able to write in an interview, with tests." },
-        { n: "36", drills: [], slug: "36-question-bank", title: "Question bank & mock scenarios", tier: "P0", minutes: 120, status: "planned",
+        { n: "36", drills: [], slug: "36-question-bank", title: "Question bank & mock scenarios", tier: "P0", minutes: 120, status: "written",
           desc: "All page questions in one place, plus open-ended design and debugging scenarios." },
-        { n: "37", drills: [], slug: "37-reading-list-glossary", title: "Reading list & glossary", tier: "P2", minutes: 20, status: "planned",
+        { n: "37", drills: [], slug: "37-reading-list-glossary", title: "Reading list & glossary", tier: "P2", minutes: 20, status: "written",
           desc: "Prioritized papers and an English/Chinese glossary." }
       ]
     }

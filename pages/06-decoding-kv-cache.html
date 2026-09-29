@@ -52,7 +52,7 @@
 <section>
   <h2 id="generation-loop">The generation loop</h2>
 
-  <p>Pretraining teaches the model \(p_\theta(x_t \mid x_{<t})\) (<a href="01-big-picture.html">page 01</a>). To produce text we run the model in a loop, called <strong>autoregressive</strong> generation <span class="zh">自回归</span> or <strong>decoding</strong> <span class="zh">解码</span>. Picking a token from the model's distribution is <strong>sampling</strong> <span class="zh">采样</span>, and greedy selection is its deterministic special case. One request goes through these stages:</p>
+  <p>Pretraining teaches the model \(p_\theta(x_t \mid x_{\lt t})\) (<a href="01-big-picture.html">page 01</a>). To produce text we run the model in a loop, called <strong>autoregressive</strong> generation <span class="zh">自回归</span> or <strong>decoding</strong> <span class="zh">解码</span>. Picking a token from the model's distribution is <strong>sampling</strong> <span class="zh">采样</span>, and greedy selection is its deterministic special case. One request goes through these stages:</p>
   <ol>
     <li>Tokenize the prompt into ids \(x_1,\dots,x_P\) (<a href="02-tokenization.html">page 02</a>).</li>
     <li><strong>Prefill</strong> <span class="zh">预填充</span>: one forward pass over all \(P\) tokens at once. This is the same computation as a training forward pass with a causal mask, so it is parallel over positions. Only the last position's logits \(z_P \in \R^V\) are needed. As a side effect, the pass stores every layer's keys and values for all \(P\) tokens: the <strong>KV cache</strong> <span class="zh">键值缓存</span> (see <a href="#kv-cache">The KV cache</a>).</li>
@@ -84,7 +84,7 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   </ul>
 
   <figure class="fig">
-<svg viewBox="0 0 720 322" role="img" aria-labelledby="fig-06-1-title">
+<svg viewBox="0 0 720 336" role="img" aria-labelledby="fig-06-1-title">
 <title id="fig-06-1-title">Timeline of one request: a single wide prefill pass, then many thin decode steps, with the KV cache written once and then growing by one entry per step</title>
 <defs><marker id="arrow-06-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
 <rect class="s-a" x="20" y="68" width="198" height="46" rx="6"/>
@@ -106,27 +106,27 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
 <text x="472.9" y="88" class="s-small">each block: 1 token in, 1 token out</text>
 <text x="472.9" y="104" class="s-small s-muted">about 5 ms, widths to scale</text>
 <path class="s-line" d="M20,56 L20,50 L218,50 L218,56"/>
-<text x="119" y="42" text-anchor="middle" class="s-small">TTFT = queueing + prefill (first token comes out here)</text>
+<text x="119" y="42" text-anchor="middle" class="s-small">TTFT = queueing + prefill</text>
 <path class="s-line" d="M279.2,56 L279.2,50 L297.0,50 L297.0,56"/>
 <text x="305.0" y="42" class="s-small">TPOT: time between output tokens</text>
 <text x="222" y="132" class="s-small">t<tspan baseline-shift="sub" font-size="9">1</tspan></text>
-<text x="20" y="152" class="s-small s-muted">KV cache length</text>
+<text x="20" y="160" class="s-small s-muted">KV cache length</text>
 <line class="s-line" x1="20" y1="262" x2="442.9" y2="262"/>
-<polygon class="s-c" points="20.0,262.0 218.0,178.0 226.0,178.0 243.7,176.7 261.5,175.4 279.2,174.1 297.0,172.8 314.7,171.5 332.4,170.2 350.2,168.9 367.9,167.6 385.6,166.3 403.4,165.0 421.1,163.7 438.9,162.4 438.9,262.0"/>
-<text x="120" y="246" text-anchor="middle" class="s-small">P entries per layer, written during the pass</text>
-<text x="232.0" y="246" class="s-small">+1 entry per step (slope exaggerated)</text>
-<path class="s-line" d="M251.1,168 L251.1,118" marker-end="url(#arrow-06-1)"/>
-<path class="s-line" d="M322.1,168 L322.1,118" marker-end="url(#arrow-06-1)"/>
-<path class="s-line" d="M393.0,168 L393.0,118" marker-end="url(#arrow-06-1)"/>
+<polygon class="s-c" points="20.0,262.0 218.0,190.0 226.0,190.0 243.7,188.7 261.5,187.4 279.2,186.1 297.0,184.8 314.7,183.5 332.4,182.2 350.2,180.9 367.9,179.6 385.6,178.3 403.4,177.0 421.1,175.7 438.9,174.4 438.9,262.0"/>
+<text x="20" y="280" class="s-small">prefill writes P entries per layer</text>
+<text x="226.0" y="280" class="s-small">+1 entry per step (slope exaggerated)</text>
+<path class="s-line" d="M251.1,180 L251.1,118" marker-end="url(#arrow-06-1)"/>
+<path class="s-line" d="M322.1,180 L322.1,118" marker-end="url(#arrow-06-1)"/>
+<path class="s-line" d="M393.0,180 L393.0,118" marker-end="url(#arrow-06-1)"/>
 <text x="403.0" y="154" class="s-small">read the whole cache</text>
-<text x="472.9" y="168" class="s-bold s-small">Every decode step</text>
-<text x="472.9" y="184" class="s-small">reads all cached K and V of every</text>
-<text x="472.9" y="200" class="s-small">layer (128 KiB per token for</text>
-<text x="472.9" y="216" class="s-small">Llama-3-8B) and appends one entry.</text>
-<text x="20" y="288" class="s-small">≈ 2,048 FLOPs per weight byte:</text>
-<text x="20" y="304" class="s-small s-bold s-tb">compute-bound</text>
-<text x="226.0" y="288" class="s-small">≈ 1 FLOP per weight byte at batch 1:</text>
-<text x="226.0" y="304" class="s-small s-bold s-tb">memory-bound</text>
+<text x="472.9" y="184" class="s-bold s-small">Every decode step</text>
+<text x="472.9" y="200" class="s-small">reads all cached K and V of every</text>
+<text x="472.9" y="216" class="s-small">layer (128 KiB per token for</text>
+<text x="472.9" y="232" class="s-small">Llama-3-8B) and appends one entry.</text>
+<text x="20" y="306" class="s-small">≈ 2,048 FLOPs per weight byte:</text>
+<text x="20" y="322" class="s-small s-bold s-ta">compute-bound</text>
+<text x="226.0" y="306" class="s-small">≈ 1 FLOP per weight byte at batch 1:</text>
+<text x="226.0" y="322" class="s-small s-bold s-tb">memory-bound</text>
 </svg>
     <figcaption><b>Figure 1.</b> One request on one GPU. Widths are to scale for Llama-3-8B on an H100 (numbers derived in <a href="#performance">Prefill vs decode</a>): about 66 ms to prefill 2,048 tokens at 50% of peak FLOP/s, then about 5 ms per decode step at batch 1. The cache is written once and then grows by one entry per step, but every step must read all of it.</figcaption>
   </figure>
@@ -168,7 +168,7 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   \[ p_i(\tau) = \frac{\exp(z_i/\tau)}{\sum_j \exp(z_j/\tau)} \;\propto\; p_i^{\,1/\tau} \]
   <div class="eq-label">\(\tau &lt; 1\) sharpens the distribution, \(\tau &gt; 1\) flattens it, \(\tau = 1\) is the model's own distribution</div>
   </div>
-  <p>Limits: with \(\Delta_i = z_{\max} - z_i > 0\) we have \(p_i / p_{\max} = e^{-\Delta_i/\tau}\), which goes to 0 as \(\tau \to 0^+\), so the distribution collapses onto the argmax (uniform over ties). As \(\tau \to \infty\) every ratio goes to 1 and the distribution becomes uniform, \(1/V\). Entropy rises monotonically with \(\tau\). Because temperature raises probabilities to the power \(1/\tau\), \(\tau = 0.5\) squares them: \([0.5, 0.3, 0.15, 0.05]\) becomes \([0.685, 0.247, 0.062, 0.007]\).</p>
+  <p>Limits: with \(\Delta_i = z_{\max} - z_i \gt 0\) we have \(p_i / p_{\max} = e^{-\Delta_i/\tau}\), which goes to 0 as \(\tau \to 0^+\), so the distribution collapses onto the argmax (uniform over ties). As \(\tau \to \infty\) every ratio goes to 1 and the distribution becomes uniform, \(1/V\). Entropy rises monotonically with \(\tau\). Because temperature raises probabilities to the power \(1/\tau\), \(\tau = 0.5\) squares them: \([0.5, 0.3, 0.15, 0.05]\) becomes \([0.685, 0.247, 0.062, 0.007]\).</p>
   <p>The formula divides by \(\tau\), so APIs define \(\tau = 0\) as greedy. vLLM's sampler, for instance, switches to argmax below \(10^{-5}\) <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/sampler.py">[vLLM sampler.py]</a>. Temperature is the only knob that reshapes the whole distribution. The next three methods cut it instead. One more point matters later for RL (<a href="22-rl-foundations.html">page 22</a>): the policy you actually sample from is \(\softmax(z/\tau)\), so a policy-gradient loss must compute log-probabilities with the same \(\tau\).</p>
 
   <h3 id="truncation">Cutting the tail: top-k, top-p, min-p</h3>
@@ -218,7 +218,7 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
 <text x="489.0" y="20" text-anchor="middle" class="s-bold">top-p</text>
 <text x="489.0" y="36" text-anchor="middle" class="s-small s-muted">p = 0.9</text>
 <text x="571.0" y="20" text-anchor="middle" class="s-bold">min-p</text>
-<text x="571.0" y="36" text-anchor="middle" class="s-small s-muted">p_min = 0.2</text>
+<text x="571.0" y="36" text-anchor="middle" class="s-small s-muted">p<tspan baseline-shift="sub" font-size="9">min</tspan> = 0.2</text>
 <text x="84" y="65.0" text-anchor="end" class="s-mono"> sunny</text>
 <text x="118" y="65.0" text-anchor="middle" class="s-small">3.0</text>
 <rect class="s-fill-muted" x="146" y="53" width="57.8" height="16" rx="2"/>
@@ -306,9 +306,9 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
 <text x="84" y="254.0" text-anchor="end" class="s-mono"> fire</text>
 <text x="118" y="254.0" text-anchor="middle" class="s-small">-1.5</text>
 <rect class="s-fill-muted" x="146" y="242" width="0.6" height="16" rx="2"/>
-<text x="150.6" y="254.0" class="s-small">0.00</text>
+<text x="150.6" y="254.0" class="s-small"><0.01</text>
 <rect class="s-fill-a" x="254" y="242" width="0.2" height="16" rx="2"/>
-<text x="258.2" y="254.0" class="s-small">0.00</text>
+<text x="258.2" y="254.0" class="s-small"><0.01</text>
 <rect class="s-plain s-dash" x="372" y="239" width="70" height="22" rx="4"/>
 <text x="407.0" y="254.0" text-anchor="middle" class="s-small s-muted">removed</text>
 <rect class="s-plain s-dash" x="454" y="239" width="70" height="22" rx="4"/>
@@ -348,9 +348,9 @@ def generate(model, prompt_ids, max_new_tokens, eos_id, pick):
   <p>The upshot is practical: when you compare numbers across frameworks, or reproduce a paper's setup, check the order and the defaults. The min-p paper's own two human studies applied temperature after and before truncation respectively <a href="https://arxiv.org/abs/2506.13681">[Schaeffer et al. 2025, §2.4]</a>.</p>
 
   <h3 id="penalties">Repetition, frequency and presence penalties</h3>
-  <p>Penalties attack repetition by editing logits based on what has already been generated. The <strong>repetition penalty</strong> <span class="zh">重复惩罚</span> of CTRL divides the temperature by a factor \(\theta\) for tokens already in the generated set \(g\): \(p_i \propto \exp\big(z_i / (\tau \cdot I(i \in g))\big)\) with \(I = \theta\) inside \(g\) and 1 outside, and they found \(\theta \approx 1.2\) a good balance with greedy decoding <a href="https://arxiv.org/abs/1909.05858">[Keskar et al. 2019, §4.1]</a>. Dividing a <em>negative</em> logit by \(\theta > 1\) would raise it, so Hugging Face multiplies negative logits and divides positive ones, applies the penalty once per distinct token, and includes the prompt by default for decoder-only models <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py">[logits_process.py]</a>.</p>
+  <p>Penalties attack repetition by editing logits based on what has already been generated. The <strong>repetition penalty</strong> <span class="zh">重复惩罚</span> of CTRL divides the temperature by a factor \(\theta\) for tokens already in the generated set \(g\): \(p_i \propto \exp\big(z_i / (\tau \cdot I(i \in g))\big)\) with \(I = \theta\) inside \(g\) and 1 outside, and they found \(\theta \approx 1.2\) a good balance with greedy decoding <a href="https://arxiv.org/abs/1909.05858">[Keskar et al. 2019, §4.1]</a>. Dividing a <em>negative</em> logit by \(\theta \gt 1\) would raise it, so Hugging Face multiplies negative logits and divides positive ones, applies the penalty once per distinct token, and includes the prompt by default for decoder-only models <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py">[logits_process.py]</a>.</p>
   <p><strong>Frequency and presence penalties</strong> are additive. With \(c_j\) the number of times token \(j\) appeared in the output so far:</p>
-  \[ z_j \leftarrow z_j - \alpha_{\text{freq}}\, c_j - \alpha_{\text{pres}}\, \mathbf{1}[c_j > 0] \]
+  \[ z_j \leftarrow z_j - \alpha_{\text{freq}}\, c_j - \alpha_{\text{pres}}\, \mathbf{1}[c_j \gt 0] \]
   <p>vLLM implements exactly this, noting that it follows the OpenAI API definition <a href="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/utils.py">[vLLM layers/utils.py]</a>. Subtracting from a logit multiplies the probability by \(e^{-\alpha c_j}\). The frequency term grows with each repeat, while the presence term is a one-time charge for using a token at all.</p>
   <p>All penalties share one flaw: they cannot tell harmful repetition from necessary repetition. Variable names, closing brackets, digits and quoted text must repeat, so heavy penalties damage code, JSON and math. Modern post-trained models need them less, and shipped defaults are mild (Qwen2.5-7B-Instruct uses a repetition penalty of 1.05).</p>
 
@@ -388,7 +388,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 
 <section>
   <h2 id="beam-search">Beam search, and why chat models rarely use it</h2>
-  <p><strong>Beam search</strong> <span class="zh">束搜索</span> is a deterministic search for a high-probability <em>sequence</em>. It keeps \(b\) partial hypotheses (the beam). At each step it expands every hypothesis by all \(V\) tokens, scores each candidate by its cumulative log-probability \(\sum_t \log p(x_t \mid x_{<t})\), and keeps the best \(b\) of the \(bV\) candidates. Hypotheses that end in EOS are set aside as finished. It costs \(b\) times the compute and \(b\) times the KV cache per request, and each step must reorder the cache so that every surviving hypothesis points at its parent's entries.</p>
+  <p><strong>Beam search</strong> <span class="zh">束搜索</span> is a deterministic search for a high-probability <em>sequence</em>. It keeps \(b\) partial hypotheses (the beam). At each step it expands every hypothesis by all \(V\) tokens, scores each candidate by its cumulative log-probability \(\sum_t \log p(x_t \mid x_{\lt t})\), and keeps the best \(b\) of the \(bV\) candidates. Hypotheses that end in EOS are set aside as finished. It costs \(b\) times the compute and \(b\) times the KV cache per request, and each step must reorder the cache so that every surviving hypothesis points at its parent's entries.</p>
   <p>Because every extra token adds a negative log-probability, raw scores favor short outputs. GNMT's fix divides by a length penalty, \(s(Y,X) = \log P(Y \mid X) / lp(Y) + cp(X;Y)\) with \(lp(Y) = (5 + |Y|)^\alpha / 6^\alpha\), where \(\alpha \in [0.6, 0.7]\) was usually best on their development sets and \(cp\) is an NMT-specific coverage penalty. On WMT'14 En-Fr, tuning both terms raised BLEU from 30.3 (pure log-probability) to 31.4 <a href="https://arxiv.org/abs/1609.08144">[Wu et al. 2016, §7, Tab. 2]</a>.</p>
   <p><strong>Where it works.</strong> In translation, summarization and speech recognition the input nearly determines the output, so the mode of the distribution is what you want. GNMT used beams of 8 to 12 hypotheses, and Shazeer's translation experiments used beam 4 with \(\alpha = 0.6\) <a href="https://arxiv.org/abs/1911.02150">[Shazeer 2019, §4.2]</a>.</p>
   <p><strong>Why it fails for chat and open-ended text</strong>, in order of importance:</p>
@@ -418,7 +418,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <h3 id="kv-derivation">Why the cache is exact</h3>
   <p>In layer \(\ell\), token \(t\) contributes a query, key and value (row vectors, per head): \(q_t = x_t W^Q\), \(k_t = x_t W^K\), \(v_t = x_t W^V\), and its attention output is</p>
   \[ o_t = \sum_{j \le t} \softmax_j\!\left(\frac{q_t \cdot k_j}{\sqrt{d_h}}\right) v_j . \]
-  <p>Causal masking means the hidden state of token \(j\) at every layer depends only on tokens \(1..j\). By induction over layers, \(k_j^{(\ell)}\) and \(v_j^{(\ell)}\) for \(j < t\) do not change when token \(t\) is appended. So we compute each key and value once and store it. The <strong>KV cache</strong> <span class="zh">键值缓存</span> is therefore <em>exact</em>, not an approximation. A bidirectional encoder, like the one in your tagger, has no such cache: adding one input changes every position's representation.</p>
+  <p>Causal masking means the hidden state of token \(j\) at every layer depends only on tokens \(1..j\). By induction over layers, \(k_j^{(\ell)}\) and \(v_j^{(\ell)}\) for \(j \lt t\) do not change when token \(t\) is appended. So we compute each key and value once and store it. The <strong>KV cache</strong> <span class="zh">键值缓存</span> is therefore <em>exact</em>, not an approximation. A bidirectional encoder, like the one in your tagger, has no such cache: adding one input changes every position's representation.</p>
 
   <h3 id="kv-contents">What is stored, and what is not</h3>
   <p>Per layer and per KV head the cache holds \(K\) and \(V\) after the linear projections. Keys are stored <em>after</em> RoPE (<a href="05-positional-encoding.html#rope">page 05</a>): the rotation of a key depends only on that key's own position, so it can be applied once at write time, while each new query is rotated at its own position when used. Not stored: queries (used once and discarded), attention scores, FFN activations, and earlier tokens' hidden states, none of which later tokens need.</p>
@@ -428,7 +428,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-06-3-title">
 <title id="fig-06-3-title">One decode step in one layer: the new token contributes one query, one key and one value; the key and value are appended to the cache, and the query attends over every cached column</title>
 <defs><marker id="arrow-06-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
-<text x="20" y="18" class="s-small s-muted">One layer, one new token at position t. Shapes for Llama-3-8B (n_h = 32, n_kv = 8, d_h = 128); input x_t is 1 × 4096.</text>
+<text x="20" y="18" class="s-small s-muted">One layer, one new token at position t. Shapes for Llama-3-8B (n<tspan baseline-shift="sub" font-size="9">h</tspan> = 32, n<tspan baseline-shift="sub" font-size="9">kv</tspan> = 8, d<tspan baseline-shift="sub" font-size="9">h</tspan> = 128); input x<tspan baseline-shift="sub" font-size="9">t</tspan> is 1 × 4096.</text>
 <rect class="s-b" x="20" y="44" width="150" height="44" rx="6"/>
 <text x="95" y="63" text-anchor="middle" class="s-bold">q<tspan baseline-shift="sub" font-size="9">t</tspan>: 32 × 128</text>
 <text x="95" y="79" text-anchor="middle" class="s-small">RoPE at position t</text>
@@ -470,7 +470,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <path class="s-line" d="M420,198 L420,204 L658,204 L658,198"/>
 <text x="539.0" y="220" text-anchor="middle" class="s-small">positions 1 … t−1, already cached</text>
 <text x="671.0" y="210" text-anchor="middle" class="s-small">t</text>
-<text x="60" y="110" class="s-small s-muted">K cache (8 × t × 128), one column per token</text>
+<text x="60" y="110" class="s-small s-muted">K cache (8 × t × 128)</text>
 <text x="420" y="110" class="s-small s-muted">V cache (8 × t × 128)</text>
 <rect class="s-d" x="40" y="252" width="270" height="38" rx="6"/>
 <text x="175" y="269" text-anchor="middle" class="s-bold">scores = q K<tspan baseline-shift="super" font-size="9">T</tspan> / √d<tspan baseline-shift="sub" font-size="9">h</tspan></text>
@@ -567,9 +567,9 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <figure class="fig">
 <svg viewBox="0 0 720 340" role="img" aria-labelledby="fig-06-4-title">
 <title id="fig-06-4-title">Time per decode step for Llama-3-8B on one H100 as batch size grows at 4K context: a constant weight-reading slice plus a KV-cache slice that grows linearly with batch</title>
-<rect class="s-fill-a" x="70" y="8" width="14" height="12" rx="2"/>
+<rect class="s-a" x="70" y="8" width="14" height="12" rx="2"/>
 <text x="90" y="19" class="s-small">weights: 16.06 GB, read once per step</text>
-<rect class="s-fill-c" x="340" y="8" width="14" height="12" rx="2"/>
+<rect class="s-c" x="340" y="8" width="14" height="12" rx="2"/>
 <text x="360" y="19" class="s-small">KV cache: 0.54 GB per 4K-token sequence</text>
 <line class="s-line" x1="70" y1="262.0" x2="700" y2="262.0"/>
 <text x="62" y="266.0" text-anchor="end" class="s-small s-muted">0</text>
@@ -584,35 +584,35 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
 <text x="62" y="52.0" text-anchor="end" class="s-small s-muted">ms</text>
 <rect class="s-a" x="107" y="218.9" width="66" height="43.1"/>
 <rect class="s-c" x="107" y="217.4" width="66" height="1.4"/>
-<text x="140" y="195.4" text-anchor="middle" class="s-bold s-small">5.0 ms</text>
+<text x="140" y="195.4" text-anchor="middle" class="s-bold s-small">4.95 ms</text>
 <text x="140" y="209.4" text-anchor="middle" class="s-small">202 tok/s</text>
 <text x="140" y="282" text-anchor="middle" class="s-bold">B = 1</text>
 <text x="140" y="298" text-anchor="middle" class="s-small">202 tok/s per user</text>
 <text x="140" y="314" text-anchor="middle" class="s-small s-muted">compute 0.02 ms</text>
 <rect class="s-a" x="222" y="218.9" width="66" height="43.1"/>
 <rect class="s-c" x="222" y="207.3" width="66" height="11.5"/>
-<text x="255" y="185.3" text-anchor="middle" class="s-bold s-small">6.1 ms</text>
+<text x="255" y="185.3" text-anchor="middle" class="s-bold s-small">6.08 ms</text>
 <text x="255" y="199.3" text-anchor="middle" class="s-small">1,317 tok/s</text>
 <text x="255" y="282" text-anchor="middle" class="s-bold">B = 8</text>
 <text x="255" y="298" text-anchor="middle" class="s-small">165 tok/s per user</text>
 <text x="255" y="314" text-anchor="middle" class="s-small s-muted">compute 0.14 ms</text>
 <rect class="s-a" x="337" y="218.9" width="66" height="43.1"/>
 <rect class="s-c" x="337" y="172.7" width="66" height="46.2"/>
-<text x="370" y="150.7" text-anchor="middle" class="s-bold s-small">9.9 ms</text>
+<text x="370" y="150.7" text-anchor="middle" class="s-bold s-small">9.92 ms</text>
 <text x="370" y="164.7" text-anchor="middle" class="s-small">3,225 tok/s</text>
 <text x="370" y="282" text-anchor="middle" class="s-bold">B = 32</text>
 <text x="370" y="298" text-anchor="middle" class="s-small">101 tok/s per user</text>
 <text x="370" y="314" text-anchor="middle" class="s-small s-muted">compute 0.55 ms</text>
 <rect class="s-a" x="452" y="218.9" width="66" height="43.1"/>
 <rect class="s-c" x="452" y="126.5" width="66" height="92.3"/>
-<text x="485" y="104.5" text-anchor="middle" class="s-bold s-small">15.1 ms</text>
+<text x="485" y="104.5" text-anchor="middle" class="s-bold s-small">15.05 ms</text>
 <text x="485" y="118.5" text-anchor="middle" class="s-small">4,252 tok/s</text>
 <text x="485" y="282" text-anchor="middle" class="s-bold">B = 64</text>
 <text x="485" y="298" text-anchor="middle" class="s-small">66 tok/s per user</text>
 <text x="485" y="314" text-anchor="middle" class="s-small s-muted">compute 1.11 ms</text>
 <rect class="s-a" x="567" y="218.9" width="66" height="43.1"/>
 <rect class="s-c" x="567" y="68.8" width="66" height="150.0"/>
-<text x="600" y="46.8" text-anchor="middle" class="s-bold s-small">21.5 ms</text>
+<text x="600" y="46.8" text-anchor="middle" class="s-bold s-small">21.46 ms</text>
 <text x="600" y="60.8" text-anchor="middle" class="s-small">4,846 tok/s</text>
 <text x="600" y="282" text-anchor="middle" class="s-bold">B = 104</text>
 <text x="600" y="298" text-anchor="middle" class="s-small">47 tok/s per user</text>
@@ -691,7 +691,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   </details>
 
   <details class="qa" data-tier="warmup">
-    <summary><span class="tier">Warm-up</span> What does temperature do? What happens as \(\tau \to 0\) and \(\tau \to \infty\)?</summary>
+    <summary><span class="tier">Warm-up</span> <span>What does temperature do? What happens as \(\tau \to 0\) and \(\tau \to \infty\)?</span></summary>
     <div class="answer">
       <p>It divides the logits by \(\tau\) before the softmax, so \(p_i \propto \exp(z_i/\tau) \propto p_i^{1/\tau}\). For \(\tau &lt; 1\) the distribution sharpens, for \(\tau &gt; 1\) it flattens. As \(\tau \to 0^+\), \(p_i/p_{\max} = e^{-(z_{\max}-z_i)/\tau} \to 0\) for every non-maximal token, so the limit is greedy (uniform over exact ties). As \(\tau \to \infty\) all ratios tend to 1 and the distribution is uniform over the vocabulary. Entropy increases monotonically with \(\tau\). Implementations treat \(\tau = 0\) as an explicit greedy branch because the formula divides by zero.</p>
     </div>
@@ -731,7 +731,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Does it matter whether temperature is applied before or after top-p (or min-p)?</summary>
     <div class="answer">
-      <p>Yes for top-p and min-p, no for top-k. Top-k depends only on rank order, which \(\tau > 0\) preserves. Top-p's cumulative mass and min-p's ratio \(p_i/p_{\max}\) are computed from the probabilities, which temperature changes. With temperature first (Hugging Face, vLLM), higher \(\tau\) flattens the distribution and enlarges the nucleus, so \(\tau\) and \(p\) interact. With temperature last (llama.cpp default), the candidate set is independent of \(\tau\). On the toy logits of Figure 2 with top-k 5, top-p 0.9, min-p 0.2, Hugging Face's order keeps 2 tokens at \(\tau = 0.5\) and 5 at \(\tau = 2\); llama.cpp's keeps 4 in both cases.</p>
+      <p>Yes for top-p and min-p, no for top-k. Top-k depends only on rank order, which \(\tau \gt 0\) preserves. Top-p's cumulative mass and min-p's ratio \(p_i/p_{\max}\) are computed from the probabilities, which temperature changes. With temperature first (Hugging Face, vLLM), higher \(\tau\) flattens the distribution and enlarges the nucleus, so \(\tau\) and \(p\) interact. With temperature last (llama.cpp default), the candidate set is independent of \(\tau\). On the toy logits of Figure 2 with top-k 5, top-p 0.9, min-p 0.2, Hugging Face's order keeps 2 tokens at \(\tau = 0.5\) and 5 at \(\tau = 2\); llama.cpp's keeps 4 in both cases.</p>
       <p>Also mention renormalization: each Hugging Face filter takes a softmax over survivors, so top-p after top-k sees renormalized mass (top-p 0.5 on \([0.4,0.3,0.2,0.1]\) keeps two tokens, but after top-k 2 it keeps one). Min-p is a ratio test and is unaffected. Always check the order and defaults (Hugging Face silently applies top-k 50 when unset).</p>
     </div>
   </details>
@@ -803,7 +803,7 @@ def sample(z, gen, temperature=1.0, top_k=None, top_p=None, min_p=None):
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> What do repetition, frequency and presence penalties do to the logits, and when do they backfire?</summary>
     <div class="answer">
-      <p>With \(c_j\) the number of times token \(j\) has occurred: <strong>frequency</strong> subtracts \(\alpha_f c_j\), so probability is multiplied by \(e^{-\alpha_f c_j}\) and each repeat costs more; <strong>presence</strong> subtracts \(\alpha_p\) once if \(c_j > 0\), discouraging any reuse; both are additive in logit space and scale-free. The <strong>repetition penalty</strong> of CTRL is multiplicative: logits of tokens already seen are divided by \(\theta\) (around 1.2). Because dividing a negative logit by \(\theta > 1\) would increase it, implementations such as Hugging Face's multiply negative logits and divide positive ones, apply it once per distinct token, and include the prompt by default. vLLM counts only generated tokens for frequency and presence.</p>
+      <p>With \(c_j\) the number of times token \(j\) has occurred: <strong>frequency</strong> subtracts \(\alpha_f c_j\), so probability is multiplied by \(e^{-\alpha_f c_j}\) and each repeat costs more; <strong>presence</strong> subtracts \(\alpha_p\) once if \(c_j \gt 0\), discouraging any reuse; both are additive in logit space and scale-free. The <strong>repetition penalty</strong> of CTRL is multiplicative: logits of tokens already seen are divided by \(\theta\) (around 1.2). Because dividing a negative logit by \(\theta \gt 1\) would increase it, implementations such as Hugging Face's multiply negative logits and divide positive ones, apply it once per distinct token, and include the prompt by default. vLLM counts only generated tokens for frequency and presence.</p>
       <p>They backfire because they cannot separate harmful repetition from required repetition: identifiers, brackets, digits, quoted text, names, and repeated tags in JSON or code. Heavy penalties therefore corrupt structured output and can push the model toward rare, wrong tokens. Repetition is better treated at its source (better data and post-training, sampling with truncation), and shipped defaults are mild, for example 1.05 for Qwen2.5-7B-Instruct.</p>
     </div>
   </details>

@@ -77,7 +77,7 @@ window.LLM_MANIFEST = {
           desc: "The InstructGPT pipeline, 4-model memory footprint, reward hacking, length bias, RLAIF, PRMs vs ORMs." },
         { n: "24", drills: ["grpo"], slug: "24-rlvr-reasoning", title: "RLVR & reasoning models: GRPO and successors", tier: "P0", minutes: 80, status: "planned",
           desc: "GRPO, R1-Zero, verifiers, DAPO, Dr. GRPO, GSPO, CISPO, entropy collapse, test-time scaling." },
-        { n: "25", drills: ["rl_systems"], slug: "25-rl-systems-agentic", title: "RL systems & agentic RL", tier: "P1", minutes: 50, status: "planned",
+        { n: "25", drills: ["rl_systems"], slug: "25-rl-systems-agentic", title: "RL systems & agentic RL", tier: "P1", minutes: 50, status: "written",
           desc: "Rollout/trainer split, async staleness, train-inference mismatch, multi-turn tool-use RL." }
       ]
     },

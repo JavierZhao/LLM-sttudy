@@ -47,3 +47,4 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 19 | SFT plumbing: chat-template loss masks, packing with a document mask, token vs sequence loss normalization, forward and reverse KD losses | `drills/sft.py` |
 | 20 | LoRALinear with merge/unmerge, NF4 block quantization, bits per parameter with double quantization, QLoRA forward | `drills/lora.py` |
 | 21 | Preference losses: masked sequence log-probs, Bradley-Terry with margin, DPO (gradient weight, cDPO), IPO, SimPO, ORPO | `drills/dpo.py` |
+| 25 | RL systems primitives: truncated IS weights, agent loss mask, sequence-ratio drift, AReaL staleness rule | `drills/rl_systems.py` |

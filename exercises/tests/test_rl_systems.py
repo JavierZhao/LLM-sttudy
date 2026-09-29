@@ -66,7 +66,7 @@ def test_agent_mask_hand_built_trajectory(impl):
     ids, mask = impl.agent_loss_mask(segs)
     assert ids == [1, 2, 3, 10, 11, 12, 20, 21, 22, 23, 13, 14, 15]
     assert mask == [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1]
-    assert all(isinstance(m, int) for m in mask)
+    assert all(type(m) is int for m in mask)          # real ints, not bools
 
 
 def test_agent_mask_counts_only_policy_tokens(impl):
@@ -87,6 +87,8 @@ def test_agent_mask_custom_train_roles(impl):
 def test_agent_mask_unknown_role_raises(impl):
     with pytest.raises(ValueError):
         impl.agent_loss_mask([("user", [1]), ("critic", [2])])
+    with pytest.raises(ValueError):                    # an empty segment still has to name a valid role
+        impl.agent_loss_mask([("critic", [])])
 
 
 # ---------------------------------------------------------------- sequence_ratio_drift
@@ -107,6 +109,14 @@ def test_drift_grows_with_length_but_geometric_mean_does_not(impl):
     assert (slr[1:] > slr[:-1]).all()
     assert (sr[1:] > sr[:-1]).all()
     torch.testing.assert_close(geo, geo[:1].expand(4).clone())
+
+
+def test_drift_float32_input_is_accumulated_in_float64(impl):
+    d = torch.full((1, 4000), 0.05)                    # float32 input; e^200 overflows float32
+    slr, sr, geo = impl.sequence_ratio_drift(d, torch.tensor([4000]))
+    assert slr.dtype == sr.dtype == geo.dtype == torch.float64
+    assert math.isfinite(sr[0].item())
+    assert sr[0].item() == pytest.approx(math.exp(200), rel=1e-4)
 
 
 def test_drift_ignores_padding_and_handles_empty(impl):

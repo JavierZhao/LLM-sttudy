@@ -13,7 +13,8 @@ def truncated_is_weights(logp_trainer: Tensor, logp_rollout: Tensor, cap: float,
     """Truncated importance-sampling weights for training-inference mismatch.
 
     Args:
-        logp_trainer: (B, T) log-probs of the sampled tokens under the TRAINER (pi_train).
+        logp_trainer: (B, T) log-probs of the sampled tokens under the TRAINER (pi_train), evaluated
+            at the pre-update weights (the same weights that generated the tokens).
         logp_rollout: (B, T) log-probs of the same tokens as reported by the INFERENCE ENGINE (mu).
         cap: truncation threshold C > 0. The cap is one-sided: weights are limited from above only.
         mask: (B, T) bool or {0, 1}. 1 marks real, trainable tokens; 0 marks padding or non-policy

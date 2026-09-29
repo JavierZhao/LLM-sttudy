@@ -28,7 +28,7 @@ window.LLM_MANIFEST = {
       pages: [
         { n: "07", drills: ["gqa", "mla"], slug: "07-kv-efficient-attention", title: "KV-efficient attention: MQA, GQA, MLA", tier: "P0", minutes: 70, status: "written",
           desc: "MQA, GQA and DeepSeek’s Multi-head Latent Attention: low-rank KV compression, weight absorption, decoupled RoPE." },
-        { n: "08", drills: ["moe"], slug: "08-mixture-of-experts", title: "Mixture of Experts", tier: "P0", minutes: 75, status: "planned",
+        { n: "08", drills: ["moe"], slug: "08-mixture-of-experts", title: "Mixture of Experts", tier: "P0", minutes: 75, status: "written",
           desc: "Routing, load balancing (aux loss and aux-loss-free), fine-grained and shared experts, capacity, expert parallelism." },
         { n: "09", drills: ["efficient_attention"], slug: "09-beyond-full-attention", title: "Beyond full attention: sparse, linear, SSM, hybrid", tier: "P1", minutes: 75, status: "planned",
           desc: "Sliding window, sparse attention (NSA, DSA), linear attention, Mamba, Gated DeltaNet, and hybrid stacks." },

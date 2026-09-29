@@ -28,7 +28,7 @@
 <aside class="callout lens" id="interview-lens">
   <div class="callout-title">What interviewers probe</div>
   <ul>
-    <li><strong>Fluency on the core components:</strong> causal attention, KV-cache decode, RoPE, sampling, cross-entropy. Expect one of them, then a follow-up: add GQA, handle a chunked prefill, make it stable in bf16.</li>
+    <li><strong>Fluency on the core components:</strong> causal attention, KV-cache decode, RoPE, sampling, cross-entropy. A common shape is one of them, then a follow-up: add GQA, handle a chunked prefill, make it stable in bf16.</li>
     <li><strong>Correctness discipline:</strong> shapes stated in comments, mask polarity, end-aligned masks, fully masked rows, upcasting before reductions, said out loud before you run anything.</li>
     <li><strong>Debugging from symptoms:</strong> given broken code, find the bugs from what the loss, the gradients or the outputs do (loss below the entropy floor, NaNs, a train/eval gap).</li>
     <li><strong>Testing instinct:</strong> "what would you test?" is answered with properties (causality, rows sum to one, decode equals prefill, gradient equals autograd), not with one example.</li>
@@ -59,7 +59,7 @@
 
   <h3 id="formats">Four formats to prepare for</h3>
   <ol>
-    <li><strong>Implement a component from a spec.</strong> "Write causal multi-head attention", "implement top-p sampling", "write the DPO loss", in PyTorch or NumPy, with follow-ups that change one requirement (add a KV cache, make it stable in bf16). Most drills below are this format.</li>
+    <li><strong>Implement a component from a spec.</strong> "Write causal multi-head attention", "implement top-p sampling", "write the DPO loss", in PyTorch or NumPy, with follow-ups that change one requirement (add a KV cache <span class="zh">键值缓存</span>, make it stable in bf16). Most drills below are this format.</li>
     <li><strong>Debug broken code.</strong> A module or training loop that runs but is wrong, with a symptom (loss too low, NaN after step 300). <a href="#debug">The training-loop exercise</a> is this format.</li>
     <li><strong>Optimize a slow function.</strong> Vectorize a loop over tokens, avoid materializing a \(T\times T\) matrix, fuse two passes. The vocabulary is complexity and memory traffic.</li>
     <li><strong>Systems-flavored coding.</strong> Simulate an all-reduce, write a tokenizer or a request scheduler, sometimes with concurrency, more often in research-engineer loops. Classic algorithm questions also appear; this course does not cover them, so budget separate practice.</li>
@@ -69,7 +69,7 @@
   <p>Read this as a rubric for your own solutions:</p>
   <ul>
     <li><strong>Shapes:</strong> you can state every intermediate shape. Write it in a comment on each line, as the course code does.</li>
-    <li><strong>Masking:</strong> mask polarity, the mask applied to scores before the softmax, the end-aligned mask when queries are fewer than keys.</li>
+    <li><strong>Masking:</strong> mask polarity, the causal mask <span class="zh">因果掩码</span> applied to scores before the softmax, the end-aligned mask when queries are fewer than keys.</li>
     <li><strong>Numerical stability:</strong> subtract the row maximum, upcast before reductions, keep \(-\infty\) from turning into NaN, prefer <code>log_softmax</code> to <code>log(softmax)</code>.</li>
     <li><strong>Tests:</strong> a tiny case by hand, then properties, before being asked. A candidate who runs a causality test unprompted has answered half the follow-ups.</li>
     <li><strong>Complexity:</strong> time, memory and, for anything that decodes, cost per generated token. Say it unprompted.</li>
@@ -120,12 +120,12 @@
   <h3 id="protocol">The practice protocol</h3>
   <p>Do every drill the same way, so the time targets in the index mean something.</p>
   <ol>
-    <li><strong>Timebox.</strong> Set a timer for the index target. When it rings, stop and note how far you got. A first attempt takes about twice the target.</li>
+    <li><strong>Timebox.</strong> Set a timer for the index target. When it rings, stop and note how far you got. A first attempt often takes about twice the target.</li>
     <li><strong>No references.</strong> Open the stub in <code>exercises/drills/</code> (signatures and docstring only) and write the body without a browser or the earlier page. If you cannot recall an API, write what you would call it and move on, as in an interview.</li>
     <li><strong>Run the tests.</strong> <code>pytest exercises/tests/test_&lt;name&gt;.py</code>. Read only the first failure, fix it, rerun. Test names state the property being checked, which is often the hint you needed.</li>
     <li><strong>Compare with the reference.</strong> Confirm with <code>--solutions</code>, then read <code>exercises/solutions/&lt;name&gt;.py</code> beside your code. Sort each difference into a typo, a missed edge case or a conceptual gap. Only the last deserves another drill.</li>
     <li><strong>Log the class of mistake</strong> with the labels of the <a href="#checklist">checklist</a>. After ten drills the log shows the two or three classes that cost you time.</li>
-    <li><strong>Redo from scratch</strong> two or three days later at half the target, then explain the solution aloud. Speaking is a separate skill from typing, and rounds test both.</li>
+    <li><strong>Redo from scratch</strong> two or three days later at half the target, then explain the solution aloud. Speaking is a separate skill from typing, and most rounds involve both.</li>
   </ol>
 
   <aside class="callout bridge">
@@ -212,7 +212,7 @@
   <p>Interviewers like this problem: it has one checkable answer, it applies the chain rule through a mean and a variance, and it leads into kernel design. The drill is <code>exercises/drills/layernorm_backward.py</code>: write <code>layernorm_forward</code> (returning the output and a cache), <code>layernorm_backward</code> (returning \(dx, d\gamma, d\beta\)) and the same pair for RMSNorm. The tests compare with autograd in float64, run <code>gradcheck</code> through your pair, and check properties that need no reference.</p>
 
   <h3 id="ln-forward">The forward pass and what to cache</h3>
-  <p>Both norms act on the last axis of one token's vector \(x\in\R^d\) (<a href="04-transformer-block.html#rmsnorm">page 04</a> explains why RMSNorm replaced LayerNorm). With \(r\) the reciprocal standard deviation and \(\hat x\) the normalized vector:</p>
+  <p>Both norms, LayerNorm <span class="zh">层归一化</span> and RMSNorm <span class="zh">均方根归一化</span>, act on the last axis of one token's vector \(x\in\R^d\) (<a href="04-transformer-block.html#rmsnorm">page 04</a> explains why RMSNorm replaced LayerNorm). With \(r\) the reciprocal standard deviation and \(\hat x\) the normalized vector:</p>
   \[ \text{LayerNorm:}\quad \mu=\tfrac1d\sum_i x_i,\;\; r=\big(\tfrac1d\sum_i (x_i-\mu)^2+\epsilon\big)^{-1/2},\;\; \hat x_i=(x_i-\mu)\,r,\;\; y_i=\gamma_i\hat x_i+\beta_i \]
   \[ \text{RMSNorm:}\quad r=\big(\tfrac1d\sum_i x_i^2+\epsilon\big)^{-1/2},\;\; \hat x_i=x_i\,r,\;\; y_i=\gamma_i\hat x_i \]
   <p>The variance divides by \(d\), not \(d-1\), and \(\epsilon\) sits inside the root. Everything the backward pass needs is \(\hat x\), \(r\) and \(\gamma\), so that is the cache. Compute the statistics in at least float32 (in code: <code>torch.promote_types(x.dtype, torch.float32)</code>), so bf16 inputs are upcast while float64 inputs, which the gradient checks need, are left alone.</p>
@@ -403,7 +403,7 @@ def rmsnorm_backward(dy: Tensor, cache: tuple) -&gt; tuple[Tensor, Tensor]:
 
 <section>
   <h2 id="beam">Beam search with length normalization and EOS handling</h2>
-  <p><a href="06-decoding-kv-cache.html#beam-search">Page 06</a> explains when beam search is the right tool and why chat models rarely use it. Here you write it. The interview version has four parts: the search itself (a flat top-\(k\) over \(b\times V\) candidates), what happens at EOS, how finished hypotheses of different lengths are compared, and when to stop. The drill is <code>exercises/drills/beam_search.py</code>, and its tests check your result against exhaustive search.</p>
+  <p><a href="06-decoding-kv-cache.html#beam-search">Page 06</a> explains when beam search <span class="zh">束搜索</span> is the right tool and why chat models rarely use it. Here you write it. The interview version has four parts: the search itself (a flat top-\(k\) over \(b\times V\) candidates), what happens at EOS, how finished hypotheses of different lengths are compared (length normalization <span class="zh">长度归一化</span>), and when to stop. The drill is <code>exercises/drills/beam_search.py</code>, and its tests check your result against exhaustive search.</p>
 
   <h3 id="beam-interface">The interface and the conventions</h3>
   <p>The model is a black box called once per step on all live hypotheses, like a batched decoder with a KV cache: <code>step_logprobs_fn(prefixes)</code> takes an \((n,t)\) tensor of token ids (every row starts with BOS) and returns \((n,V)\) log-probabilities of the next token, possibly \(-\infty\) for forbidden tokens. State your conventions before coding, since libraries differ:</p>
@@ -674,7 +674,7 @@ for step in range(600):
       <tr><td>3</td><td><strong>No <code>zero_grad</code>.</strong> Gradients accumulate across steps.</td><td>Val 1.508 against 1.411, pre-clip gradient norm 1.34 against 0.50. Milder than in many setups, where it diverges.</td><td><code>opt.zero_grad(set_to_none=True)</code> each step. <strong>Test:</strong> run two steps on the same batch with learning rate 0; the gradient norm must be identical both times.</td></tr>
       <tr><td>4</td><td><strong>Wrong reduction.</strong> <code>reduction="sum"</code> where a token mean was meant.</td><td>Val 1.413, unchanged, because AdamW is nearly invariant to gradient scale. But the pre-clip gradient norm is 495, so a clip at 1.0 fires on every step. The log line divides by the token count, which hides the sum.</td><td>Mean over tokens. <strong>Test:</strong> a batch and the same batch duplicated give equal losses. Scale matters for clipping, accumulation over unequal micro-batches, logging and SGD-like optimizers.</td></tr>
       <tr><td>5</td><td><strong>Validation in train mode.</strong> No <code>model.eval()</code>, no <code>torch.no_grad()</code>.</td><td>Val 1.414 against 1.411: a small, noisy shift here (dropout 0.1 on one branch), plus an autograd graph built for nothing.</td><td><code>model.eval()</code> and <code>no_grad</code>, then <code>model.train()</code>. <strong>Test:</strong> two evaluations of the same batch give bitwise-identical losses.</td></tr>
-      <tr><td>6</td><td><strong>Clip after the step.</strong> <code>opt.step()</code> then <code>clip_grad_norm_</code>.</td><td>No visible effect here: after the first three steps (norms 1.13, 1.07, 1.05) the gradient norm sits near 0.50, under the threshold. It bites on loss spikes, when an unclipped huge gradient drives the update.</td><td>Backward, clip, then step. <strong>Test:</strong> with plain SGD and a gradient of norm 100, one step must move the parameters by <code>lr</code> times 1 (the clip value), not <code>lr</code> times 100.</td></tr>
+      <tr><td>6</td><td><strong>Clip after the step.</strong> <code>opt.step()</code> then <code>clip_grad_norm_</code> (gradient clipping <span class="zh">梯度裁剪</span>).</td><td>No visible effect here: after the first three steps (norms 1.13, 1.07, 1.05) the gradient norm sits near 0.50, under the threshold. It bites on loss spikes <span class="zh">损失尖峰</span>, when an unclipped huge gradient drives the update.</td><td>Backward, clip, then step. <strong>Test:</strong> with plain SGD and a gradient of norm 100, one step must move the parameters by <code>lr</code> times 1 (the clip value), not <code>lr</code> times 100.</td></tr>
     </tbody>
   </table></div>
   <p class="small muted">All six together (the listing above, unseeded): train loss below 0.001 per token and val above 10. Digits move between runs and torch versions, so read the pattern, not the digits.</p>
@@ -784,7 +784,7 @@ for step in range(600):
 <section id="pitfalls">
   <h2>Common misconceptions</h2>
   <ul>
-    <li><strong>"Coding rounds test whether you remember the code."</strong> They test whether you produce correct code and can defend it. Recited code fails at the first follow-up ("now with a KV cache", "now in bf16").</li>
+    <li><strong>"Coding rounds test whether you remember the code."</strong> They usually test whether you produce correct code and can defend it. Recited code fails at the first follow-up ("now with a KV cache", "now in bf16").</li>
     <li><strong>"It passes my example, so it is right."</strong> One example cannot see mask polarity, an off-by-one, or a broadcast that misbehaves only on square inputs. Test properties, with dimensions that are all different.</li>
     <li><strong>"A lower training loss means a healthier run."</strong> A loss below what the data allows is a leak. In the debug exercise the leaky loop reports 0.000 while the honest validation loss is about eleven.</li>
     <li><strong>"The LayerNorm backward is the RMSNorm backward plus a bias gradient."</strong> LayerNorm has an extra \(-\bar u\) term from the mean, and its input gradient sums to zero. Dropping the term passes every shape check.</li>

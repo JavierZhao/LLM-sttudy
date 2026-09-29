@@ -1,0 +1,1232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Beyond full attention: sparse, linear, SSM, hybrid · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="09" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part II · Modern architecture · Page 09</div>
+  <h1>Beyond full attention: sparse, linear, SSM, hybrid</h1>
+  <div class="meta">
+    <span class="badge p1">P1</span>
+    <span>~75 min</span>
+    <span>Prereqs: <a href="03-attention.html">03 Attention</a>, <a href="05-positional-encoding.html">05 Positional encoding</a>, <a href="06-decoding-kv-cache.html">06 Decoding &amp; KV cache</a>, <a href="07-kv-efficient-attention.html">07 KV-efficient attention</a></span>
+  </div>
+  <p class="lede">Full attention pays \(O(T^2)\) compute and an \(O(T)\) cache to keep every token exactly addressable. Every alternative gives up some of that exactness to save FLOPs, bytes read, or resident memory. This page derives each family, states what it trades away (almost always exact recall), and explains why, as of September 2026, frontier open models use hybrids and learned sparse attention rather than pure linear or state-space models.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li>Whether you can name what each efficient-attention family actually saves (FLOPs, bytes read per decoded token, or resident memory) and what it gives up, instead of saying "linear complexity" for all of them.</li>
+    <li>A whiteboard derivation of causal linear attention as an RNN with a matrix-valued state, its state size, and why a fixed-size state cannot do exact retrieval.</li>
+    <li>The delta rule written correctly (with a convention you state), and how Mamba, linear attention, and Gated DeltaNet differ in one line each.</li>
+    <li>DeepSeek Sparse Attention: the indexer, top-k selection, the two-stage training, and the honest answer about what it does not save (cache memory, and an \(O(L^2)\) indexer).</li>
+    <li>Reading the 2025 to 2026 evidence critically: why hybrids and sparse attention won, why MiniMax went from a lightning hybrid to full attention to sparse attention, and which evaluations can actually tell architectures apart.</li>
+    <li>Designing and validating a 1M-context model: ratio, window, and gate ablations, RULER-style recall tests, and cost measured in real decode throughput.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Compute decode state per sequence and prefill FLOPs for full, sliding-window, sparse, linear, and hybrid layers from a config (for example 16 GiB versus 2.05 GiB at 128K on a Llama-3-8B-shaped stack).</li>
+    <li>Derive the recurrent form of causal linear attention with its normalizer, and state its per-head state size and why it is a fixed-capacity associative memory.</li>
+    <li>Write the DeltaNet, Gated DeltaNet, and Kimi Delta Attention updates in one consistent convention, and explain the chunkwise (WY and UT) trick that makes them trainable.</li>
+    <li>Explain attention sinks, why evicting the first tokens breaks sliding-window inference, and how learned sink logits (gpt-oss, MiMo, DeepSeek-V4) fix it.</li>
+    <li>Explain DSA, NSA, MoBA, and DeepSeek-V4's CSA and HCA, and say for each whether it saves FLOPs, bandwidth, or memory.</li>
+    <li>Argue for and against a hybrid for a 1M-context model using the published ablations, and design the experiments that would settle it.</li>
+  </ul>
+</section>
+
+<!-- ===================================================================== 1 -->
+<section>
+  <h2 id="landscape">The cost landscape: what to save, and what it costs</h2>
+  <p>Page <a href="06-decoding-kv-cache.html">06</a> established the two regimes. During training and prefill, full attention computes all \(T(T+1)/2\) causal query-key pairs, so compute grows as \(O(T^2 d)\). During decoding, each new token reads the entire KV cache and does \(O(Td)\) FLOPs against it, so both the bytes read per step and the resident cache grow as \(O(T)\). Decoding is memory-bound: for grouped-query attention the arithmetic intensity is about \(n_h/n_{kv}\) FLOPs per byte, far below what a GPU needs to be compute-bound. Page <a href="07-kv-efficient-attention.html">07</a> attacked the feature axis of that cache (MQA, GQA, MLA). This page attacks the sequence axis, and asks whether the cache must be a list of tokens at all.</p>
+
+  <p>Three different quantities can be saved, and methods differ in which ones they touch:</p>
+  <ul>
+    <li><strong>FLOPs</strong> in prefill and training (compute-bound work): reduced by any method that computes fewer query-key pairs.</li>
+    <li><strong>Bytes read per decoded token</strong> (decode latency and throughput): reduced by reading fewer cache entries, or a smaller state.</li>
+    <li><strong>Resident memory</strong> (the batch size and context that fit on a GPU): reduced only if entries are dropped, merged, or replaced by a fixed-size state. A method can cut FLOPs and bytes read while leaving resident memory untouched, which is exactly what learned top-k selection does.</li>
+  </ul>
+
+  <p>A useful way to organize everything that follows: a sequence mixer keeps a <em>memory of the past</em>, and the families differ in the shape of that memory.</p>
+  <ol>
+    <li><strong>Append-only list</strong> (full attention): memory grows with \(T\), nothing is lost, any token can be addressed exactly.</li>
+    <li><strong>Truncated list</strong> (sliding window): constant memory, everything older than \(W\) tokens is forgotten by that layer.</li>
+    <li><strong>List plus a selector</strong> (sparse attention): memory still grows, but each query reads only \(k\) entries chosen by content.</li>
+    <li><strong>Compressed list</strong> (MLA, DeepSeek-V4's CSA and HCA): memory grows more slowly because entries are merged along the feature or sequence axis.</li>
+    <li><strong>Fixed-size matrix state</strong> (linear attention, state-space models, delta-rule models): constant memory, the past is compressed into \(d_k \times d_v\) numbers per head, and retrieval is approximate by construction.</li>
+  </ol>
+
+  <p>Table 1 puts numbers on the first, second, third, and fifth. The shapes are the reference Llama-3-8B layer (\(n_h=32\), \(n_{kv}=8\), \(d_h=128\), bf16 cache) at \(T = 128\text{K} = 131{,}072\) tokens. The linear row uses \(H=32\) heads with \(d_k=d_v=128\) and an fp32 state, a conservative choice (MiniMax reports that linear attention is more sensitive to low-precision storage than full attention <a href="https://arxiv.org/abs/2605.26494">[MiniMax-M2 report, §2.2.2]</a>).</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 1. Per-layer cost of one decoded token at \(T = 131{,}072\) (Llama-3-8B layer shape). FLOPs count a multiply-add as 2.</caption>
+    <thead><tr><th>Family</th><th>Prefill / training compute</th><th>Decode FLOPs per token</th><th>State per sequence</th><th>Bytes read per token</th></tr></thead>
+    <tbody>
+      <tr><td>Full attention (GQA)</td><td>\(O(T^2 d)\)</td><td>\(4 n_h d_h T\) = 2.15 GFLOP</td><td class="num">512 MiB</td><td class="num">512 MiB</td></tr>
+      <tr><td>Sliding window, \(W=4096\)</td><td>\(O(T W d)\)</td><td>\(4 n_h d_h W\) = 67 MFLOP</td><td class="num">16 MiB (constant in \(T\))</td><td class="num">16 MiB</td></tr>
+      <tr><td>Top-\(k\) selection, \(k=2048\)</td><td>\(O(T k d)\) core, plus the selector</td><td>\(4 n_h d_h k\) = 33.6 MFLOP, plus the selector</td><td class="num">512 MiB (unchanged, plus selector keys)</td><td class="num">8 MiB plus selector keys</td></tr>
+      <tr><td>Linear, SSM, delta rule</td><td>chunkwise, \(O(T(C + d_k) d)\)</td><td>\(4 d_k d_v H\) = 2.1 MFLOP (delta rule: 3.1)</td><td class="num">2 MiB fp32 (constant in \(T\))</td><td class="num">2 MiB read, 2 MiB written</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Arithmetic for the first row: a decoded token's query attends to \(T\) keys; each (query, key, head) triple costs \(2 d_h\) FLOPs for the score and \(2 d_h\) for the value mix, so \(4 n_h d_h T = 4 \cdot 32 \cdot 128 \cdot 131072 = 2{,}147{,}483{,}648\). The cache is \(2 n_{kv} d_h T \cdot 2\ \text{B} = 2 \cdot 8 \cdot 128 \cdot 131072 \cdot 2 = 536{,}870{,}912\) B, which is 512 MiB per layer and 16 GiB over 32 layers. The ratio of the two is 4.0 FLOPs per byte, the \(n_h/n_{kv}\) rule. For the linear row, the update \(\phi(k)^\top v\) costs \(2 d_k d_v\) per head and the readout \(\phi(q) S\) another \(2 d_k d_v\), so \(4 \cdot 128 \cdot 128 \cdot 32 = 2{,}097{,}152\) FLOPs. The state is \(32 \cdot 128 \cdot 128 \cdot 4\ \text{B} = 2\) MiB.</p>
+
+  <aside class="callout key"><div class="callout-title">Key idea</div><p>The linear layer does 1,024 times fewer FLOPs than the full-attention layer at 128K, but its intensity is worse (2.1 MFLOP over 4 MiB moved is 0.5 FLOPs per byte, versus 4.0). It is still memory-bound. It wins because it moves 256 times fewer bytes (2 MiB versus 512 MiB). The crossover, where the fp32 state equals the KV cache, is at \(2\ \text{MiB} / 4096\ \text{B} = 512\) tokens (256 tokens for a bf16 state). Below 512 tokens the fixed state is actually larger than the cache; the entire benefit is at long \(T\).</p></aside>
+
+  <p>Two consequences shape every design on this page. First, because decoding is bandwidth-bound, real speedups track <em>memory access volume</em>, not FLOPs: NSA's paper notes that its expected decode speedup is "approximately linear with the volume of memory access" <a href="https://arxiv.org/abs/2502.11089">[NSA, §5.2, Tab. 4]</a>. Second, prefill and training are compute-bound, so a method that helps decoding (a smaller cache) may do nothing for training cost, and vice versa. NSA states the split directly: reduce computation during training and prefilling, reduce memory access during decoding.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="fig-09-1-title">
+<title id="fig-09-1-title">Four attention patterns: full causal, sliding window, local and global layers interleaved, and block-sparse top-k selection</title>
+<text x="90" y="20" text-anchor="middle" class="s-bold">Full causal</text>
+<text x="90" y="36" text-anchor="middle" class="s-muted s-small">T(T+1)/2 pairs</text>
+<rect class="s-plain" x="26" y="58" width="128" height="128"/>
+<rect class="s-a" x="26" y="58" width="8" height="8"/>
+<rect class="s-a" x="26" y="66" width="8" height="8"/>
+<rect class="s-a" x="34" y="66" width="8" height="8"/>
+<rect class="s-a" x="26" y="74" width="8" height="8"/>
+<rect class="s-a" x="34" y="74" width="8" height="8"/>
+<rect class="s-a" x="42" y="74" width="8" height="8"/>
+<rect class="s-a" x="26" y="82" width="8" height="8"/>
+<rect class="s-a" x="34" y="82" width="8" height="8"/>
+<rect class="s-a" x="42" y="82" width="8" height="8"/>
+<rect class="s-a" x="50" y="82" width="8" height="8"/>
+<rect class="s-a" x="26" y="90" width="8" height="8"/>
+<rect class="s-a" x="34" y="90" width="8" height="8"/>
+<rect class="s-a" x="42" y="90" width="8" height="8"/>
+<rect class="s-a" x="50" y="90" width="8" height="8"/>
+<rect class="s-a" x="58" y="90" width="8" height="8"/>
+<rect class="s-a" x="26" y="98" width="8" height="8"/>
+<rect class="s-a" x="34" y="98" width="8" height="8"/>
+<rect class="s-a" x="42" y="98" width="8" height="8"/>
+<rect class="s-a" x="50" y="98" width="8" height="8"/>
+<rect class="s-a" x="58" y="98" width="8" height="8"/>
+<rect class="s-a" x="66" y="98" width="8" height="8"/>
+<rect class="s-a" x="26" y="106" width="8" height="8"/>
+<rect class="s-a" x="34" y="106" width="8" height="8"/>
+<rect class="s-a" x="42" y="106" width="8" height="8"/>
+<rect class="s-a" x="50" y="106" width="8" height="8"/>
+<rect class="s-a" x="58" y="106" width="8" height="8"/>
+<rect class="s-a" x="66" y="106" width="8" height="8"/>
+<rect class="s-a" x="74" y="106" width="8" height="8"/>
+<rect class="s-a" x="26" y="114" width="8" height="8"/>
+<rect class="s-a" x="34" y="114" width="8" height="8"/>
+<rect class="s-a" x="42" y="114" width="8" height="8"/>
+<rect class="s-a" x="50" y="114" width="8" height="8"/>
+<rect class="s-a" x="58" y="114" width="8" height="8"/>
+<rect class="s-a" x="66" y="114" width="8" height="8"/>
+<rect class="s-a" x="74" y="114" width="8" height="8"/>
+<rect class="s-a" x="82" y="114" width="8" height="8"/>
+<rect class="s-a" x="26" y="122" width="8" height="8"/>
+<rect class="s-a" x="34" y="122" width="8" height="8"/>
+<rect class="s-a" x="42" y="122" width="8" height="8"/>
+<rect class="s-a" x="50" y="122" width="8" height="8"/>
+<rect class="s-a" x="58" y="122" width="8" height="8"/>
+<rect class="s-a" x="66" y="122" width="8" height="8"/>
+<rect class="s-a" x="74" y="122" width="8" height="8"/>
+<rect class="s-a" x="82" y="122" width="8" height="8"/>
+<rect class="s-a" x="90" y="122" width="8" height="8"/>
+<rect class="s-a" x="26" y="130" width="8" height="8"/>
+<rect class="s-a" x="34" y="130" width="8" height="8"/>
+<rect class="s-a" x="42" y="130" width="8" height="8"/>
+<rect class="s-a" x="50" y="130" width="8" height="8"/>
+<rect class="s-a" x="58" y="130" width="8" height="8"/>
+<rect class="s-a" x="66" y="130" width="8" height="8"/>
+<rect class="s-a" x="74" y="130" width="8" height="8"/>
+<rect class="s-a" x="82" y="130" width="8" height="8"/>
+<rect class="s-a" x="90" y="130" width="8" height="8"/>
+<rect class="s-a" x="98" y="130" width="8" height="8"/>
+<rect class="s-a" x="26" y="138" width="8" height="8"/>
+<rect class="s-a" x="34" y="138" width="8" height="8"/>
+<rect class="s-a" x="42" y="138" width="8" height="8"/>
+<rect class="s-a" x="50" y="138" width="8" height="8"/>
+<rect class="s-a" x="58" y="138" width="8" height="8"/>
+<rect class="s-a" x="66" y="138" width="8" height="8"/>
+<rect class="s-a" x="74" y="138" width="8" height="8"/>
+<rect class="s-a" x="82" y="138" width="8" height="8"/>
+<rect class="s-a" x="90" y="138" width="8" height="8"/>
+<rect class="s-a" x="98" y="138" width="8" height="8"/>
+<rect class="s-a" x="106" y="138" width="8" height="8"/>
+<rect class="s-a" x="26" y="146" width="8" height="8"/>
+<rect class="s-a" x="34" y="146" width="8" height="8"/>
+<rect class="s-a" x="42" y="146" width="8" height="8"/>
+<rect class="s-a" x="50" y="146" width="8" height="8"/>
+<rect class="s-a" x="58" y="146" width="8" height="8"/>
+<rect class="s-a" x="66" y="146" width="8" height="8"/>
+<rect class="s-a" x="74" y="146" width="8" height="8"/>
+<rect class="s-a" x="82" y="146" width="8" height="8"/>
+<rect class="s-a" x="90" y="146" width="8" height="8"/>
+<rect class="s-a" x="98" y="146" width="8" height="8"/>
+<rect class="s-a" x="106" y="146" width="8" height="8"/>
+<rect class="s-a" x="114" y="146" width="8" height="8"/>
+<rect class="s-a" x="26" y="154" width="8" height="8"/>
+<rect class="s-a" x="34" y="154" width="8" height="8"/>
+<rect class="s-a" x="42" y="154" width="8" height="8"/>
+<rect class="s-a" x="50" y="154" width="8" height="8"/>
+<rect class="s-a" x="58" y="154" width="8" height="8"/>
+<rect class="s-a" x="66" y="154" width="8" height="8"/>
+<rect class="s-a" x="74" y="154" width="8" height="8"/>
+<rect class="s-a" x="82" y="154" width="8" height="8"/>
+<rect class="s-a" x="90" y="154" width="8" height="8"/>
+<rect class="s-a" x="98" y="154" width="8" height="8"/>
+<rect class="s-a" x="106" y="154" width="8" height="8"/>
+<rect class="s-a" x="114" y="154" width="8" height="8"/>
+<rect class="s-a" x="122" y="154" width="8" height="8"/>
+<rect class="s-a" x="26" y="162" width="8" height="8"/>
+<rect class="s-a" x="34" y="162" width="8" height="8"/>
+<rect class="s-a" x="42" y="162" width="8" height="8"/>
+<rect class="s-a" x="50" y="162" width="8" height="8"/>
+<rect class="s-a" x="58" y="162" width="8" height="8"/>
+<rect class="s-a" x="66" y="162" width="8" height="8"/>
+<rect class="s-a" x="74" y="162" width="8" height="8"/>
+<rect class="s-a" x="82" y="162" width="8" height="8"/>
+<rect class="s-a" x="90" y="162" width="8" height="8"/>
+<rect class="s-a" x="98" y="162" width="8" height="8"/>
+<rect class="s-a" x="106" y="162" width="8" height="8"/>
+<rect class="s-a" x="114" y="162" width="8" height="8"/>
+<rect class="s-a" x="122" y="162" width="8" height="8"/>
+<rect class="s-a" x="130" y="162" width="8" height="8"/>
+<rect class="s-a" x="26" y="170" width="8" height="8"/>
+<rect class="s-a" x="34" y="170" width="8" height="8"/>
+<rect class="s-a" x="42" y="170" width="8" height="8"/>
+<rect class="s-a" x="50" y="170" width="8" height="8"/>
+<rect class="s-a" x="58" y="170" width="8" height="8"/>
+<rect class="s-a" x="66" y="170" width="8" height="8"/>
+<rect class="s-a" x="74" y="170" width="8" height="8"/>
+<rect class="s-a" x="82" y="170" width="8" height="8"/>
+<rect class="s-a" x="90" y="170" width="8" height="8"/>
+<rect class="s-a" x="98" y="170" width="8" height="8"/>
+<rect class="s-a" x="106" y="170" width="8" height="8"/>
+<rect class="s-a" x="114" y="170" width="8" height="8"/>
+<rect class="s-a" x="122" y="170" width="8" height="8"/>
+<rect class="s-a" x="130" y="170" width="8" height="8"/>
+<rect class="s-a" x="138" y="170" width="8" height="8"/>
+<rect class="s-a" x="26" y="178" width="8" height="8"/>
+<rect class="s-a" x="34" y="178" width="8" height="8"/>
+<rect class="s-a" x="42" y="178" width="8" height="8"/>
+<rect class="s-a" x="50" y="178" width="8" height="8"/>
+<rect class="s-a" x="58" y="178" width="8" height="8"/>
+<rect class="s-a" x="66" y="178" width="8" height="8"/>
+<rect class="s-a" x="74" y="178" width="8" height="8"/>
+<rect class="s-a" x="82" y="178" width="8" height="8"/>
+<rect class="s-a" x="90" y="178" width="8" height="8"/>
+<rect class="s-a" x="98" y="178" width="8" height="8"/>
+<rect class="s-a" x="106" y="178" width="8" height="8"/>
+<rect class="s-a" x="114" y="178" width="8" height="8"/>
+<rect class="s-a" x="122" y="178" width="8" height="8"/>
+<rect class="s-a" x="130" y="178" width="8" height="8"/>
+<rect class="s-a" x="138" y="178" width="8" height="8"/>
+<rect class="s-a" x="146" y="178" width="8" height="8"/>
+<text x="276" y="20" text-anchor="middle" class="s-bold">Sliding window</text>
+<text x="276" y="36" text-anchor="middle" class="s-muted s-small">W = 4: about T·W pairs</text>
+<rect class="s-plain" x="212" y="58" width="128" height="128"/>
+<rect class="s-b" x="212" y="58" width="8" height="8"/>
+<rect class="s-b" x="212" y="66" width="8" height="8"/>
+<rect class="s-b" x="220" y="66" width="8" height="8"/>
+<rect class="s-b" x="212" y="74" width="8" height="8"/>
+<rect class="s-b" x="220" y="74" width="8" height="8"/>
+<rect class="s-b" x="228" y="74" width="8" height="8"/>
+<rect class="s-b" x="212" y="82" width="8" height="8"/>
+<rect class="s-b" x="220" y="82" width="8" height="8"/>
+<rect class="s-b" x="228" y="82" width="8" height="8"/>
+<rect class="s-b" x="236" y="82" width="8" height="8"/>
+<rect class="s-b" x="220" y="90" width="8" height="8"/>
+<rect class="s-b" x="228" y="90" width="8" height="8"/>
+<rect class="s-b" x="236" y="90" width="8" height="8"/>
+<rect class="s-b" x="244" y="90" width="8" height="8"/>
+<rect class="s-b" x="228" y="98" width="8" height="8"/>
+<rect class="s-b" x="236" y="98" width="8" height="8"/>
+<rect class="s-b" x="244" y="98" width="8" height="8"/>
+<rect class="s-b" x="252" y="98" width="8" height="8"/>
+<rect class="s-b" x="236" y="106" width="8" height="8"/>
+<rect class="s-b" x="244" y="106" width="8" height="8"/>
+<rect class="s-b" x="252" y="106" width="8" height="8"/>
+<rect class="s-b" x="260" y="106" width="8" height="8"/>
+<rect class="s-b" x="244" y="114" width="8" height="8"/>
+<rect class="s-b" x="252" y="114" width="8" height="8"/>
+<rect class="s-b" x="260" y="114" width="8" height="8"/>
+<rect class="s-b" x="268" y="114" width="8" height="8"/>
+<rect class="s-b" x="252" y="122" width="8" height="8"/>
+<rect class="s-b" x="260" y="122" width="8" height="8"/>
+<rect class="s-b" x="268" y="122" width="8" height="8"/>
+<rect class="s-b" x="276" y="122" width="8" height="8"/>
+<rect class="s-b" x="260" y="130" width="8" height="8"/>
+<rect class="s-b" x="268" y="130" width="8" height="8"/>
+<rect class="s-b" x="276" y="130" width="8" height="8"/>
+<rect class="s-b" x="284" y="130" width="8" height="8"/>
+<rect class="s-b" x="268" y="138" width="8" height="8"/>
+<rect class="s-b" x="276" y="138" width="8" height="8"/>
+<rect class="s-b" x="284" y="138" width="8" height="8"/>
+<rect class="s-b" x="292" y="138" width="8" height="8"/>
+<rect class="s-b" x="276" y="146" width="8" height="8"/>
+<rect class="s-b" x="284" y="146" width="8" height="8"/>
+<rect class="s-b" x="292" y="146" width="8" height="8"/>
+<rect class="s-b" x="300" y="146" width="8" height="8"/>
+<rect class="s-b" x="284" y="154" width="8" height="8"/>
+<rect class="s-b" x="292" y="154" width="8" height="8"/>
+<rect class="s-b" x="300" y="154" width="8" height="8"/>
+<rect class="s-b" x="308" y="154" width="8" height="8"/>
+<rect class="s-b" x="292" y="162" width="8" height="8"/>
+<rect class="s-b" x="300" y="162" width="8" height="8"/>
+<rect class="s-b" x="308" y="162" width="8" height="8"/>
+<rect class="s-b" x="316" y="162" width="8" height="8"/>
+<rect class="s-b" x="300" y="170" width="8" height="8"/>
+<rect class="s-b" x="308" y="170" width="8" height="8"/>
+<rect class="s-b" x="316" y="170" width="8" height="8"/>
+<rect class="s-b" x="324" y="170" width="8" height="8"/>
+<rect class="s-b" x="308" y="178" width="8" height="8"/>
+<rect class="s-b" x="316" y="178" width="8" height="8"/>
+<rect class="s-b" x="324" y="178" width="8" height="8"/>
+<rect class="s-b" x="332" y="178" width="8" height="8"/>
+<text x="470" y="20" text-anchor="middle" class="s-bold">Local / global interleave</text>
+<text x="470" y="36" text-anchor="middle" class="s-muted s-small">what the newest token reads</text>
+<rect class="s-plain" x="398" y="58" width="128" height="16"/>
+<rect class="s-b" x="494" y="58" width="32" height="16"/>
+<text x="532" y="70" class="s-small s-muted">L1</text>
+<rect class="s-plain" x="398" y="79" width="128" height="16"/>
+<rect class="s-b" x="494" y="79" width="32" height="16"/>
+<text x="532" y="91" class="s-small s-muted">L2</text>
+<rect class="s-plain" x="398" y="100" width="128" height="16"/>
+<rect class="s-b" x="494" y="100" width="32" height="16"/>
+<text x="532" y="112" class="s-small s-muted">L3</text>
+<rect class="s-plain" x="398" y="121" width="128" height="16"/>
+<rect class="s-b" x="494" y="121" width="32" height="16"/>
+<text x="532" y="133" class="s-small s-muted">L4</text>
+<rect class="s-plain" x="398" y="142" width="128" height="16"/>
+<rect class="s-b" x="494" y="142" width="32" height="16"/>
+<text x="532" y="154" class="s-small s-muted">L5</text>
+<rect class="s-plain" x="398" y="163" width="128" height="16"/>
+<rect class="s-a" x="398" y="163" width="128" height="16"/>
+<text x="532" y="175" class="s-small s-muted">G (1 in 6)</text>
+<text x="398" y="198" class="s-small s-muted">older tokens</text>
+<text x="526" y="198" text-anchor="end" class="s-small s-muted">newest</text>
+<text x="612" y="20" text-anchor="middle" class="s-bold">Block-sparse top-k</text>
+<text x="612" y="36" text-anchor="middle" class="s-muted s-small">local block + 2 chosen blocks</text>
+<rect class="s-plain" x="548" y="58" width="128" height="128"/>
+<rect class="s-c" x="548" y="58" width="8" height="8"/>
+<rect class="s-c" x="548" y="66" width="8" height="8"/>
+<rect class="s-c" x="556" y="66" width="8" height="8"/>
+<rect class="s-c" x="548" y="74" width="8" height="8"/>
+<rect class="s-c" x="556" y="74" width="8" height="8"/>
+<rect class="s-c" x="548" y="82" width="8" height="8"/>
+<rect class="s-c" x="556" y="82" width="8" height="8"/>
+<rect class="s-c" x="564" y="74" width="8" height="8"/>
+<rect class="s-c" x="564" y="82" width="8" height="8"/>
+<rect class="s-c" x="572" y="82" width="8" height="8"/>
+<rect class="s-c" x="548" y="90" width="8" height="8"/>
+<rect class="s-c" x="556" y="90" width="8" height="8"/>
+<rect class="s-c" x="548" y="98" width="8" height="8"/>
+<rect class="s-c" x="556" y="98" width="8" height="8"/>
+<rect class="s-c" x="564" y="90" width="8" height="8"/>
+<rect class="s-c" x="572" y="90" width="8" height="8"/>
+<rect class="s-c" x="564" y="98" width="8" height="8"/>
+<rect class="s-c" x="572" y="98" width="8" height="8"/>
+<rect class="s-c" x="580" y="90" width="8" height="8"/>
+<rect class="s-c" x="580" y="98" width="8" height="8"/>
+<rect class="s-c" x="588" y="98" width="8" height="8"/>
+<rect class="s-c" x="548" y="106" width="8" height="8"/>
+<rect class="s-c" x="556" y="106" width="8" height="8"/>
+<rect class="s-c" x="548" y="114" width="8" height="8"/>
+<rect class="s-c" x="556" y="114" width="8" height="8"/>
+<rect class="s-c" x="580" y="106" width="8" height="8"/>
+<rect class="s-c" x="588" y="106" width="8" height="8"/>
+<rect class="s-c" x="580" y="114" width="8" height="8"/>
+<rect class="s-c" x="588" y="114" width="8" height="8"/>
+<rect class="s-c" x="596" y="106" width="8" height="8"/>
+<rect class="s-c" x="596" y="114" width="8" height="8"/>
+<rect class="s-c" x="604" y="114" width="8" height="8"/>
+<rect class="s-c" x="548" y="122" width="8" height="8"/>
+<rect class="s-c" x="556" y="122" width="8" height="8"/>
+<rect class="s-c" x="548" y="130" width="8" height="8"/>
+<rect class="s-c" x="556" y="130" width="8" height="8"/>
+<rect class="s-c" x="580" y="122" width="8" height="8"/>
+<rect class="s-c" x="588" y="122" width="8" height="8"/>
+<rect class="s-c" x="580" y="130" width="8" height="8"/>
+<rect class="s-c" x="588" y="130" width="8" height="8"/>
+<rect class="s-c" x="612" y="122" width="8" height="8"/>
+<rect class="s-c" x="612" y="130" width="8" height="8"/>
+<rect class="s-c" x="620" y="130" width="8" height="8"/>
+<rect class="s-c" x="548" y="138" width="8" height="8"/>
+<rect class="s-c" x="556" y="138" width="8" height="8"/>
+<rect class="s-c" x="548" y="146" width="8" height="8"/>
+<rect class="s-c" x="556" y="146" width="8" height="8"/>
+<rect class="s-c" x="580" y="138" width="8" height="8"/>
+<rect class="s-c" x="588" y="138" width="8" height="8"/>
+<rect class="s-c" x="580" y="146" width="8" height="8"/>
+<rect class="s-c" x="588" y="146" width="8" height="8"/>
+<rect class="s-c" x="628" y="138" width="8" height="8"/>
+<rect class="s-c" x="628" y="146" width="8" height="8"/>
+<rect class="s-c" x="636" y="146" width="8" height="8"/>
+<rect class="s-c" x="548" y="154" width="8" height="8"/>
+<rect class="s-c" x="556" y="154" width="8" height="8"/>
+<rect class="s-c" x="548" y="162" width="8" height="8"/>
+<rect class="s-c" x="556" y="162" width="8" height="8"/>
+<rect class="s-c" x="612" y="154" width="8" height="8"/>
+<rect class="s-c" x="620" y="154" width="8" height="8"/>
+<rect class="s-c" x="612" y="162" width="8" height="8"/>
+<rect class="s-c" x="620" y="162" width="8" height="8"/>
+<rect class="s-c" x="644" y="154" width="8" height="8"/>
+<rect class="s-c" x="644" y="162" width="8" height="8"/>
+<rect class="s-c" x="652" y="162" width="8" height="8"/>
+<rect class="s-c" x="564" y="170" width="8" height="8"/>
+<rect class="s-c" x="572" y="170" width="8" height="8"/>
+<rect class="s-c" x="564" y="178" width="8" height="8"/>
+<rect class="s-c" x="572" y="178" width="8" height="8"/>
+<rect class="s-c" x="612" y="170" width="8" height="8"/>
+<rect class="s-c" x="620" y="170" width="8" height="8"/>
+<rect class="s-c" x="612" y="178" width="8" height="8"/>
+<rect class="s-c" x="620" y="178" width="8" height="8"/>
+<rect class="s-c" x="660" y="170" width="8" height="8"/>
+<rect class="s-c" x="660" y="178" width="8" height="8"/>
+<rect class="s-c" x="668" y="178" width="8" height="8"/>
+<text x="26" y="210" class="s-small">Row = query, column = key. Filled = the pair is computed.</text>
+<rect class="s-a" x="26" y="222" width="12" height="12"/><text x="44" y="232" class="s-small">dense (full attention)</text>
+<rect class="s-b" x="196" y="222" width="12" height="12"/><text x="214" y="232" class="s-small">fixed local window</text>
+<rect class="s-c" x="366" y="222" width="12" height="12"/><text x="384" y="232" class="s-small">content-selected (learned or dynamic)</text>
+<text x="26" y="262" class="s-small s-muted">Cost per layer at length T: dense O(T²) | window O(T·W) | interleave: 5 layers of O(T·W) plus 1 of O(T²) | top-k O(T·k) core attention, plus the selector</text>
+<text x="26" y="280" class="s-small s-muted">KV cache per layer at length T: dense O(T) | window O(W), rolling buffer | interleave: only the global layer keeps O(T) | top-k O(T) unless entries are also compressed</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Row is the query, column is the key, and a filled cell is a pair that is computed. Full attention fills the whole lower triangle. A sliding window keeps a diagonal band. Interleaving keeps the band in most layers and a full triangle in a few (the third panel shows what the newest token reads in each layer, using a 5:1 ratio). Block-sparse top-k keeps the local block plus a few content-chosen blocks per query row, so its pattern differs from row to row. Fixed patterns (windows, strides) cannot know where the relevant key is; learned selection can, at the price of a selector.</figcaption>
+  </figure>
+</section>
+
+<!-- ===================================================================== 2 -->
+<section>
+  <h2 id="local">Local attention and sliding windows</h2>
+  <p>Language is mostly local: the next token depends overwhelmingly on the last few hundred tokens, plus a small number of long-range references. <span class="zh">滑动窗口注意力</span> (sliding-window attention) exploits this by letting query \(i\) attend only to the \(W\) most recent keys. Longformer introduced the pattern for encoders: each token attends to \(w/2\) tokens on each side, giving \(O(n \cdot w)\) cost, with optional dilation and a few task-specific "global" tokens that attend to, and are attended by, everything <a href="https://arxiv.org/abs/2004.05150">[Longformer, §3.1]</a>. For a causal language model the window is one-sided. In this page's convention (and the drill's), \(W\) counts the keys a query sees including itself:</p>
+  \[ M^{\text{sw}}_{ij} = \mathbb{1}[\,i - W \lt j \le i\,], \qquad \operatorname{Attn}_i = \softmax_{j:\,M_{ij}=1}\!\left(\frac{q_i k_j^\top}{\sqrt{d_h}}\right) V. \]
+
+  <h3 id="receptive-field">Why depth restores long-range reach, and why it is only a bound</h3>
+  <p>One layer of window \(W\) lets information travel \(W-1\) positions. Stack \(\ell\) layers and the top layer's value at position \(i\) can depend on inputs up to about \(\ell (W-1)\) positions back. Longformer states this as a receptive field of \(\ell \times w\) at the top layer, "similar to CNNs" <a href="https://arxiv.org/abs/2004.05150">[Longformer, §3.1]</a>, and Mistral 7B uses the same argument: with \(W = 4096\) and 32 layers "we have a theoretical attention span of approximately 131K tokens" <a href="https://arxiv.org/abs/2310.06825">[Mistral 7B, §2]</a>. The arithmetic is \(32 \times 4096 = 131{,}072\).</p>
+  <p>The word "theoretical" matters. The receptive field is an upper bound on where information can come from, not a capacity. A token 100K positions away can influence the current output only if a chain of about 25 intermediate positions each attends to the previous link and copies the information forward, and every hop passes through a softmax average and a residual stream shared with everything else. Exact retrieval of a specific fact (a name, a number, an identifier) does not survive that chain reliably. The evidence is stark when a full-attention model is converted without retraining: GLM's team replaced half of a 40-layer GLM-9B's layers by 4096-token windows in a fixed 1:1 interleave, with no further training, and RULER fell from 95.19 (full attention) to 94.87 at 4K, then 54.02 at 8K, 25.89 at 16K, and 6.51 at 128K <a href="https://arxiv.org/abs/2602.15763">[GLM-5, §2.1.2, Tab. 4]</a>, although 20 window layers have a nominal reach of \(20 \times 4096 = 81{,}920\) tokens. A model trained to relay information does better than a converted one, but MiniMax's continued-pretraining experiments with hybrid SWA (hundreds of billions to trillions of tokens) still showed degraded retrieval, multi-hop, and in-context-learning scores, with RULER at 128K falling from 99.0 to 93.0 on multi-query needles and from 90.0 to 72.0 on common-words extraction, while the 32K scores were identical <a href="https://arxiv.org/abs/2605.26494">[MiniMax-M2 report, §2.2.2, Tab. 2]</a>. Depth gives reach; it does not give reliable long-range lookup.</p>
+
+  <h3 id="rolling-buffer">The rolling-buffer cache</h3>
+  <p>Because a window layer never looks further back than \(W\) tokens, its cache can have a fixed size. Mistral stores the keys and values of position \(i\) in slot \(i \bmod W\), overwriting the entry that just fell out of the window, so "the size of the cache stops increasing" and on a 32K sequence memory falls 8x "without impacting model quality" <a href="https://arxiv.org/abs/2310.06825">[Mistral 7B, §2]</a> (\(32768 / 4096 = 8\)). For prefill, Mistral chunks a long prompt with the window size as the chunk size, so each chunk attends to the cache plus itself.</p>
+<pre><code class="language-python">import torch
+
+class RollingKV:
+    """Fixed-size KV cache for one sliding-window layer (batch 1, one KV head)."""
+    def __init__(self, W: int, d: int):
+        self.W, self.k, self.v, self.n = W, torch.zeros(W, d), torch.zeros(W, d), 0
+    def append(self, k_t, v_t):           # k_t, v_t: (d,)
+        slot = self.n % self.W            # position i is stored at i mod W
+        self.k[slot], self.v[slot] = k_t, v_t
+        self.n += 1
+    def read(self):                       # keys, values currently inside the window
+        m = min(self.n, self.W)           # slot order is scrambled, which softmax does not care about
+        return self.k[:m], self.v[:m]     # (RoPE is applied to keys before caching, so relative positions survive)
+</code></pre>
+
+  <h3 id="interleave">Interleaved local and global layers</h3>
+  <p>If local layers cannot do long-range lookup, give that job to a few layers that can. Modern models interleave: most layers are local (cheap, constant cache) and a minority are global (full attention, growing cache). Verified configurations:</p>
+  <ul>
+    <li><strong>Gemma 2</strong> alternates local and global layers one to one: local window 4096, global span 8192 <a href="https://arxiv.org/abs/2408.00118">[Gemma 2, §2]</a>.</li>
+    <li><strong>Gemma 3</strong> uses 5 local layers per global layer, starting with a local layer, with a local window of only 1024 tokens; RoPE base 10k on local layers and 1M on global layers <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §2]</a>. Ablations show minimal perplexity impact from changing the local:global ratio (2B and 9B models, even at 7:1), and that the window can be cut from 4096 to as low as 512 without hurting perplexity (2B models). For a 2B model at 32K context, a global-only stack has a KV-cache memory overhead of 60%, versus under 15% for a 1:3 ratio with a 1024 window <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §5.2, Figs. 3-6]</a>.</li>
+    <li><strong>gpt-oss</strong> alternates banded-window and fully dense layers with a bandwidth of 128 tokens, 64 query heads of dimension 64 and 8 KV heads, and extends the dense layers to 131,072 tokens with YaRN <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>.</li>
+    <li><strong>Gemma 4</strong> keeps 5:1 local to global (4:1 for the 2.3B model), with p-RoPE, KV sharing and keys reused as values in global layers; together these cut the global KV cache by up to 37.5% <a href="https://arxiv.org/abs/2607.02770">[Gemma 4 report, §1]</a>.</li>
+    <li><strong>MiMo-V2-Flash</strong> (309B total, 15B active) uses 5:1 with a 128-token window and a learnable sink bias, described as "nearly a 6x reduction in KV-cache storage and attention computation" <a href="https://arxiv.org/abs/2601.02780">[MiMo-V2-Flash, §1]</a>.</li>
+  </ul>
+  <p>The window sizes span a factor of 32 (128 to 4096), which is itself a finding. MiMo's ablation on a 32B dense model shows why the small window can work and the medium one can fail. All variants were trained on 250B tokens at 8K, extended to 32K on 40B more, then SFT'd. With sinks, \(W=128\) and \(W=512\) match all-global attention on general benchmarks, but after long-context extension \(W=512\) collapses on NoLiMa (38.5 versus 49.7 for all-global) and MRCR (19.6 versus 32.5) while \(W=128\) is slightly better than all-global (51.2 and 34.4) <a href="https://arxiv.org/abs/2601.02780">[MiMo-V2-Flash, §2.2.1, Tabs. 2-3]</a>. The authors' hypothesis is a division of labor: a tight window forces local layers to model local structure and delegate long-range work to the global layers, whereas a medium window lets local layers half-solve long-range dependencies and blurs the split. They stress that this is empirical and specific to their setup, and it sits in tension with MiniMax's finding above. One reconciling detail: MiMo's long-context evaluations top out at 32K, while MiniMax found SWA hybrids diverging beyond 32K.</p>
+
+  <div class="decision">
+    <div class="decision-title">Interleaved local/global attention</div>
+    <dl>
+      <dt>Problem</dt><dd>Full attention at every layer makes the KV cache and the decode bandwidth grow linearly with context, and prefill quadratically.</dd>
+      <dt>Idea</dt><dd>Make most layers sliding-window (constant cache, \(O(TW)\) compute) and keep a small fraction (1 in 2 to 1 in 6) fully global.</dd>
+      <dt>Why it works</dt><dd>Most dependencies are local, so local layers handle them at a fraction of the cost. The global layers carry exact long-range lookup, so retrieval quality does not depend on relaying information through many windowed hops. Cache and decode bytes fall by roughly the local fraction (a 5:1 ratio removes about 5/6 of the cache).</dd>
+      <dt>Evidence</dt><dd>Gemma 3: perplexity is insensitive to the ratio (even 7:1) and to window sizes down to 1024 <a href="https://arxiv.org/abs/2503.19786">[Gemma 3, §5.2]</a>. MiMo: \(W=128\) with sinks matches or beats all-global at 32K <a href="https://arxiv.org/abs/2601.02780">[MiMo-V2-Flash, Tab. 3]</a>. Against: MiniMax found SWA hybrids degrade on retrieval and on long-context tasks beyond 32K <a href="https://arxiv.org/abs/2605.26494">[MiniMax-M2 report, §2.2.2]</a>, and naive interleaving of a pretrained model is catastrophic (GLM-5 Tab. 4).</dd>
+      <dt>Cost</dt><dd>Local layers cannot retrieve beyond \(W\). The global layers still cost \(O(T^2)\) prefill and \(O(T)\) cache, so long-context cost is reduced by a constant factor, not made sub-quadratic. Perplexity and short-context benchmarks barely register the loss.</dd>
+      <dt>Used by</dt><dd>Gemma 2, 3, 4; gpt-oss; MiMo-V2-Flash; Mistral 7B (all layers windowed, relying on depth).</dd>
+    </dl>
+  </div>
+
+  <h3 id="swa-numbers">Worked number: prefill FLOPs, full versus window</h3>
+  <p>For the Llama-3-8B stack at \(T = 131{,}072\) and \(W = 4096\). Count causal pairs, not the full square: full attention computes \(T(T+1)/2 = 131072 \cdot 131073 / 2 = 8{,}590{,}000{,}128\) pairs per layer, while a window computes \(W(W+1)/2 + (T-W)W = 8{,}390{,}656 + 520{,}093{,}696 = 528{,}484{,}352\) (a ramp for the first \(W\) queries, then \(W\) each). The ratio is \(8.59\text{e}9 / 5.28\text{e}8 = 16.25\), not \(T/W = 32\), because causal full attention already skips half the square.</p>
+  <p>Each pair costs \(4 n_h d_h = 16{,}384\) FLOPs per layer, so attention totals \(16384 \cdot 32 \cdot 8{,}590{,}000{,}128 = 4.50 \times 10^{15}\) FLOPs for full attention and \(2.77 \times 10^{14}\) for the window, a 16.25x cut. But the whole model also does the dense matmuls (QKV and output projections, SwiGLU MLP), which windowing does not touch: the model has \(6{,}979{,}321{,}856\) matmul parameters per token outside the embeddings (per layer \(4096^2 + 2 \cdot 4096 \cdot 1024 + 4096^2 + 3 \cdot 4096 \cdot 14336 = 218{,}103{,}808\), times 32), so \(2 N T = 2 \cdot 6{,}979{,}321{,}856 \cdot 131072 = 1.83 \times 10^{15}\) FLOPs. Totals: \(6.33 \times 10^{15}\) full versus \(2.11 \times 10^{15}\) windowed, a ratio of <strong>3.01x</strong>. At 128K, attention is 71.1% of full prefill, so the windowed model is dominated by the projections and MLP. This is why sliding windows (and every attention-only trick) give large gains in the attention term but bounded gains in total FLOPs, and why the gain grows with \(T\) (attention share rises) and shrinks for wide models.</p>
+
+  <h3 id="sinks">Attention sinks</h3>
+  <p>Pure window attention has a puzzling failure. StreamingLLM ran Llama-2-13B on the first book of PG-19 (65K tokens) with a 1024-token window and got perplexity 5158.07; keeping the first 4 tokens and the most recent 1020 restored it to 5.40 <a href="https://arxiv.org/abs/2309.17453">[StreamingLLM, Tab. 1]</a>. The first tokens carry no special meaning: replacing them with newline tokens still gave 5.60. What matters is that they are there.</p>
+  <p>The explanation is the softmax. Attention weights must sum to one, so when a query has no strong match anywhere, the mass has to go somewhere. Beyond the bottom two layers, the model "heavily attends to the initial token across all layers and heads" <a href="https://arxiv.org/abs/2309.17453">[StreamingLLM, Fig. 2, §3.1]</a>. The initial tokens are visible to every later position in a causal model, which makes them the easiest thing to train into a dump. These tokens are attention sinks, and they hold a large share of the softmax denominator. Evict them and the denominator changes for every head in every layer, so all later attention distributions shift off what the model learned. The fix, StreamingLLM, keeps the KV of about 4 sink tokens plus a rolling window, and assigns positions <em>within the cache</em> rather than original text positions: with cache tokens \([0,1,2,3,6,7,8]\) and the 9th token being decoded, the positions are \([0,1,2,3,4,5,6,7]\). For RoPE it caches keys before rotation and rotates them at each step. The reported result is stable modeling to 4 million tokens and up to a 22.2x speedup over recomputing a window each step.</p>
+  <aside class="callout warn"><div class="callout-title">Pitfall</div><p>StreamingLLM does not extend memory. It keeps the model <em>stable</em> on unbounded streams, but information older than the cache is gone: the paper's own test shows retrieval accuracy falling to zero once the query-answer distance exceeds the cache size <a href="https://arxiv.org/abs/2309.17453">[StreamingLLM, App., Tab. 7]</a>. Sinks fix a distribution shift, not a capacity limit.</p></aside>
+  <p>If the sink is a learned artifact, give the model an explicit one. StreamingLLM pretrained 160M models with a learnable placeholder token: with a 1024-token cache and no initial tokens, perplexity was 27.87 (vanilla), 29,214 (softmax-off-by-one, "Zero Sink"), and 1,235 (learnable sink token), but with just one initial token kept, 18.49, 19.90, and 18.01 <a href="https://arxiv.org/abs/2309.17453">[StreamingLLM, Tab. 3]</a>. A single dedicated sink suffices where vanilla models need about four, while zero sink (a key and value of zero, equivalent to \(\mathrm{softmax}_1\)) is not enough alone. Current models put the sink inside the softmax as a per-head learned logit \(z'_h\):</p>
+  \[ s_{h,i,j} = \frac{\exp(z_{h,i,j})}{\sum_{k}\exp(z_{h,i,k}) + \exp(z'_h)}. \]
+  <p>This adds a fictitious key with logit \(z'_h\) and a zero value, so a head's real weights can sum to nearly zero when nothing is relevant. gpt-oss describes it as "a learned bias in the denominator of the softmax" that "enables the attention mechanism to pay no attention to any tokens" <a href="https://arxiv.org/abs/2508.10925">[gpt-oss model card, §2.2]</a>; MiMo-V2-Flash and DeepSeek-V4 (Eq. 27 of §2.3.3) use the same form. MiMo's ablation shows it is load-bearing for small windows: without the sink bias, \(W=128\) loses 2.4 MMLU points to all-global (54.9 versus 57.3); with it, \(W=128\) reaches 58.3 <a href="https://arxiv.org/abs/2601.02780">[MiMo-V2-Flash, Tab. 2]</a>. Sinks also relate to massive activations and gated attention, treated as a stability topic in page <a href="11-stability-tweaks.html">11</a>, and to the long-context recipes of page <a href="10-long-context.html">10</a>.</p>
+</section>
+
+<!-- ===================================================================== 3 -->
+<section>
+  <h2 id="sparse">Sparse attention: choosing which keys to read</h2>
+  <p>Windows decide which keys matter by position. <span class="zh">稀疏注意力</span> (sparse attention) in the modern sense decides by content: each query attends to a small subset of keys that are likely to matter, so compute per query is \(O(k)\) instead of \(O(T)\). The design questions are how the subset is chosen, whether the choice is trainable, and which resource (FLOPs, bytes, memory) is actually saved.</p>
+
+  <h3 id="fixed-sparse">Fixed patterns: Sparse Transformer and BigBird</h3>
+  <p>The Sparse Transformer factorizes attention into two sparse heads whose composition reconnects every pair of positions in two hops. The <em>strided</em> pattern (a local window plus every \(\ell\)-th earlier position) suits data with periodic structure such as images; for text the authors found strided routing can fail and use a <em>fixed</em> pattern in which specific "summary" cells propagate information to all later positions (for stride 128 and \(c=8\), every position past 128 attends to positions 120 to 128), reducing cost to \(O(n\sqrt{n})\) <a href="https://arxiv.org/abs/1904.10509">[Sparse Transformer, Abstract, §4.3]</a>. BigBird combines three components (a sliding window, a few global tokens, and random keys), reaches \(O(n)\), proves the pattern is a universal approximator of sequence functions and Turing complete, and handles sequences up to 8x longer on the same hardware <a href="https://arxiv.org/abs/2007.14062">[BigBird, Abstract]</a>. Both save FLOPs. Neither is what current LLMs use, for two reasons: a fixed pattern cannot know where the relevant key is (it relies on depth and on the fixed global cells to route information), and the irregular sparsity is hard to make fast on tensor cores.</p>
+
+  <h3 id="learned-sparse">Learned and dynamic selection</h3>
+  <p><strong>Native Sparse Attention (NSA)</strong> computes attention over three compact key-value sets per query and mixes them with learned gates <a href="https://arxiv.org/abs/2502.11089">[NSA, §3.2, Eq. 5]</a>:</p>
+  \[ o^*_t = \sum_{c \in \{\text{cmp},\,\text{slc},\,\text{win}\}} g^c_t \cdot \operatorname{Attn}\!\big(q_t,\ \tilde K^c_t,\ \tilde V^c_t\big), \qquad g^c_t \in [0,1]. \]
+  <p>The compressed branch summarizes blocks of keys into coarse tokens; the selected branch keeps the highest-scoring blocks at full resolution, with block importance read off the compressed-branch attention scores at no extra cost; the window branch keeps recent tokens. For GQA and MQA models, all heads in a group must select the same blocks so the KV cache is loaded once. The configuration is compression block \(l=32\) with stride \(d=16\), selection block \(l'=64\), \(n=16\) selected blocks (one initial and two local blocks fixed), window \(w=512\), on a 27B-parameter (3B active) GQA and MoE model with 30 layers. Pretraining on 270B tokens at 8K matched or beat full attention on general, long-context, and reasoning benchmarks. Speedups at 64K are 9.0x forward, 6.0x backward, and 11.6x decoding <a href="https://arxiv.org/abs/2502.11089">[NSA, Fig. 1, §4.1, §5]</a>. The decode figure follows from bytes: per step NSA loads the equivalent of 5,632 tokens at 64K versus 65,536 for full attention, and \(65536/5632 = 11.6\) (Table 4). The paper's intro says 260B tokens and its setup says 270B; I use the setup value.</p>
+
+  <p><strong>Mixture of Block Attention (MoBA)</strong> borrows the MoE recipe: split the context into blocks and route each query to the top-\(k\) blocks with a parameter-free gate <a href="https://arxiv.org/abs/2502.13189">[MoBA, §2, Eqs. 5-6]</a>,</p>
+  \[ g_i = \mathbb{1}\big[s_i \in \operatorname{Top\text{-}k}(\{s_j\})\big], \qquad s_i = \big\langle q,\ \operatorname{meanpool}(K[I_i])\big\rangle . \]
+  <p>Future blocks get \(s_i=-\infty\), and the query's own block is always attended (causally masked). No new parameters means MoBA can be switched on or off in an existing model, and the authors train with MoBA for 90% of tokens then switch to full attention for the last 10%, reaching a position-wise loss almost identical to full attention (1.5B models, 30B tokens, block size 2048, top-3). Reported speedup is up to 6.5x when prefilling 1M tokens, and a 16x cut in attention time at 10M tokens with fixed sparsity <a href="https://arxiv.org/abs/2502.13189">[MoBA, §3.2 and §3.4]</a>.</p>
+
+  <h3 id="dsa">DeepSeek Sparse Attention (DSA)</h3>
+  <p>DSA is the design to be able to explain in detail, because V3.2, GLM-5, and (in modified form) V4, MiniMax-M3, and Qwen3.8 all use variants of it. It has two parts: a <em>lightning indexer</em> that scores every earlier token for the current query, and a top-\(k\) selector that keeps only those key-value entries for core attention <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.1, Eqs. 1-2]</a>:</p>
+  \[ I_{t,s} = \sum_{j=1}^{H^I} w^I_{t,j}\, \operatorname{ReLU}\!\big(q^I_{t,j} \cdot k^I_s\big), \qquad u_t = \operatorname{Attn}\!\big(h_t,\ \{c_s \mid I_{t,s} \in \operatorname{Top\text{-}k}(I_{t,:})\}\big). \]
+  <p>The indexer has few heads (\(H^I = 64\), index head dimension \(d^I = 128\), from the released config), uses ReLU for throughput, and runs in FP8. The core attention is built on the MQA mode of MLA, where each cached latent is shared by all query heads of the token, because kernel efficiency requires each selected entry to be reused across many queries. In V3.2, \(k = 2048\).</p>
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def dsa_select(q_idx, w, k_idx, k_top):
+    """q_idx: (B,T,H_I,d_I)  w: (B,T,H_I)  k_idx: (B,T,d_I).  Returns top-k key indices (B,T,k)."""
+    s = torch.einsum('bthd,bsd->bths', q_idx, k_idx)          # per-head dot products
+    I = (w[..., None] * F.relu(s)).sum(2)                     # (B,T,S): weighted sum of ReLU scores
+    T = I.shape[1]
+    future = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    I = I.masked_fill(future, float('-inf'))                  # causal: only s &lt;= t
+    return I.topk(min(k_top, T), dim=-1).indices              # entries the core attention will read
+</code></pre>
+  <p><strong>Training.</strong> Top-\(k\) is not differentiable, so the indexer is trained as a student of the model's own dense attention. Starting from a dense 128K-context checkpoint (V3.1-Terminus), there are two stages <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.1.1, Eqs. 3-4]</a>:</p>
+  <ol>
+    <li><strong>Dense warm-up.</strong> Keep dense attention, freeze everything except the indexer, and minimize \(\mathcal{L}^I = \sum_t D_{\mathrm{KL}}\big(p_{t,:}\,\|\,\softmax(I_{t,:})\big)\), where \(p_{t,:}\) is the main attention distribution summed over heads and L1-normalized. 1000 steps of 16 sequences of 128K tokens, learning rate \(10^{-3}\): \(1000 \cdot 16 \cdot 131072 = 2.1\)B tokens.</li>
+    <li><strong>Sparse training.</strong> Turn on top-\(k\) selection and train all parameters (learning rate \(7.3\times10^{-6}\), \(k=2048\)), with the KL loss restricted to the selected set. The indexer input is detached, so the indexer learns only from \(\mathcal{L}^I\) and the main model only from the language-modeling loss. 15,000 steps of 480 sequences of 128K tokens: \(15000 \cdot 480 \cdot 131072 = 943.7\)B tokens.</li>
+  </ol>
+  <p>Parity was reported against V3.1-Terminus: no substantial degradation on short- or long-context benchmarks, similar ChatbotArena Elo, and AA-LCR four points higher in reasoning mode <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.2]</a>. GLM-5 (744B parameters, trained on 28.5T tokens) adopted the same recipe, with a 1000-step indexer warm-up (14 sequences of 202,752 tokens per step) and only 20B tokens of sparse adaptation, far below V3.2's 943.7B; it reports that the DSA and MLA models tie in SFT loss and benchmarks (for example 128K SQuAD 86.0 versus 79.7, HotpotQA 63.0 versus 66.3) <a href="https://arxiv.org/abs/2602.15763">[GLM-5, §2.1.1, Tab. 3]</a>.</p>
+
+  <h4>What DSA saves, and what it does not</h4>
+  <p>The paper's own accounting: "DSA reduces the core attention complexity of the main model from \(O(L^2)\) to \(O(Lk)\)... Although the lightning indexer still has a complexity of \(O(L^2)\), it requires much less computation" <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.3]</a>. The numbers below are my arithmetic from the V3.2 config (128 heads, latent \(d_c = 512\), RoPE dim 64, \(H^I=64\), \(d^I=128\), \(k=2048\)), counting per layer for one decoded token. In MLA's absorbed MQA mode, each key costs \(2 n_h\big((d_c + d_r) + d_c\big) = 2 \cdot 128 \cdot (576 + 512) = 278{,}528\) FLOPs of core attention; each key costs the indexer \(2 H^I d^I = 2 \cdot 64 \cdot 128 = 16{,}384\) (ignoring the weights and ReLU).</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 2. DSA cost per layer for one decoded token, V3.2 shapes. Our estimate, not a reported figure.</caption>
+    <thead><tr><th>Context</th><th>Dense core</th><th>Sparse core (\(k=2048\))</th><th>Indexer</th><th>Total ratio</th></tr></thead>
+    <tbody>
+      <tr><td>128K</td><td class="num">36.5 GFLOP</td><td class="num">0.57 GFLOP</td><td class="num">2.15 GFLOP</td><td class="num">13.4x</td></tr>
+      <tr><td>1M</td><td class="num">292 GFLOP</td><td class="num">0.57 GFLOP</td><td class="num">17.2 GFLOP</td><td class="num">16.5x</td></tr>
+    </tbody>
+  </table></div>
+  <p>At 128K, \(278528 \cdot 131072 = 36.5\) GFLOP dense versus \(278528 \cdot 2048 = 0.57\) sparse plus \(16384 \cdot 131072 = 2.15\) for the indexer, total 2.72, ratio 13.4x. Three lessons follow. First, the indexer, not the core attention, becomes the cost: at 1M it is 30 times the sparse core, and the saving saturates at \(278528 / 16384 = 17\) as \(L\to\infty\). This is the reason the successors compress before indexing (V4's CSA merges 4 tokens first) or pool the indexer keys (Qwen Sparse Attention's "compressed lightweight indexer"). Second, the bytes read fall less than the FLOPs. Dense reads \(131072 \cdot 1152\ \text{B} = 144\) MiB (bf16 latents of 576 elements); sparse reads \(2048 \cdot 1152 = 2.25\) MiB of latents plus the indexer keys (\(131072 \cdot 128\) B \(= 16\) MiB if stored in FP8, my assumption), 18.25 MiB total, a 7.9x cut. Third, and most important for capacity planning: <strong>the KV cache is not smaller</strong>. Every token's latent must still be stored, since any future query might select it, and the indexer adds its own keys. DSA is a compute and bandwidth optimization, not a memory one.</p>
+
+  <div class="decision">
+    <div class="decision-title">DeepSeek Sparse Attention</div>
+    <dl>
+      <dt>Problem</dt><dd>At 128K and beyond, core attention dominates prefill and decode cost, but most keys receive negligible attention weight for a given query.</dd>
+      <dt>Idea</dt><dd>A cheap learned scorer (the lightning indexer) ranks all earlier tokens, and core MLA attention (in MQA mode) reads only the top 2048 latents.</dd>
+      <dt>Why it works</dt><dd>Attention is empirically sparse, and training the indexer to match the dense model's own attention distribution (KL loss) makes it a distilled, low-cost proxy. Detaching it from the main loss keeps the language-modeling objective clean. Continued training from a dense checkpoint avoids the cost of training sparse from scratch.</dd>
+      <dt>Evidence</dt><dd>V3.2 matches V3.1-Terminus on standard and long-context evaluations after 2.1B warm-up plus 943.7B sparse tokens <a href="https://arxiv.org/abs/2512.02556">[DeepSeek-V3.2, §2.1-2.2]</a>. GLM-5 reaches parity with 20B sparse tokens (Tab. 3). In a small GLM-4.7-Flash experiment, RULER at 128K falls from 79.21 to 71.35 with indexer warm-up alone and recovers to 78.86 after 150B tokens of joint training <a href="https://arxiv.org/abs/2602.15763">[GLM-5, Tab. 6]</a>.</dd>
+      <dt>Cost</dt><dd>\(O(L^2)\) indexer (small constant, but dominant at 1M); no reduction of resident KV cache (plus indexer keys); top-k selection is discontinuous, which caused instability in RL until GLM-5 switched to a deterministic top-k and froze the indexer <a href="https://arxiv.org/abs/2602.15763">[GLM-5, "DSA RL insights"]</a>.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3.2, GLM-5; descendants in DeepSeek-V4, MiniMax-M3 (MSA), Qwen3.8-Next (QSA).</dd>
+    </dl>
+  </div>
+
+  <aside class="callout bridge"><div class="callout-title">From your jet tagger</div><p>If you have used ParticleNet-style dynamic graph networks, top-k attention will feel familiar: EdgeConv builds a k-nearest-neighbor graph in a learned feature space, and each particle aggregates only from its neighbors. DSA and MoBA do the same over tokens (neighbors chosen by a learned score rather than a fixed distance), with the extra constraint that neighbors must be in the past.</p></aside>
+
+  <h3 id="msa-qsa">Successors: MSA and QSA</h3>
+  <p><strong>MiniMax Sparse Attention (MSA)</strong> is block-based and built on GQA: a single-head Index Branch scores key-value blocks and picks a top-\(k\) set independently for each GQA group, the query's local block is always included, and the Main Branch runs exact attention over the chosen blocks. A KL loss aligns the index distribution with the group-averaged main-branch distribution, with the index gradient detached, the same recipe as DSA. On a 109B natively multimodal model it matches GQA while cutting per-token attention compute 28.4x at 1M context, with 14.2x prefill and 7.6x decode speedups on H800 with a co-designed kernel <a href="https://arxiv.org/abs/2606.13392">[MSA, Abstract]</a>. The released MiniMax-M3 config (read from <code>config.json</code>) has 60 layers, 64 query heads and 4 KV heads, dense attention in the first 3 layers, and 16 selected blocks of 128 tokens, so each query reads \(16 \cdot 128 = 2048\) tokens (0.2% of a 1M context). <strong>Qwen Sparse Attention (QSA)</strong> attacks the indexer bottleneck directly: it scores context at micro-block granularity with an average-pooled, compressed indexer, and in Qwen3.8-Flash-Next it replaces the full-attention layers of the GDN hybrid at continued pretraining <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next, §2.1.2]</a>.</p>
+
+  <h3 id="v4">DeepSeek-V4: compress first, then select</h3>
+  <p>DeepSeek-V4 (preview released April 2026; V4-Pro is 1.6T total and 49B active, V4-Flash 284B and 13B, both with 1M context) replaces MLA. Its attention layers come in two kinds, Compressed Sparse Attention (CSA) and Heavily Compressed Attention (HCA), interleaved <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, §2.3]</a>. This subsection gives the equations; page <a href="07-kv-efficient-attention.html#after-mla">07</a> summarizes the same design from the KV-cache side.</p>
+  <p><strong>CSA compression.</strong> With hidden states \(H \in \mathbb{R}^{n \times d}\) and head dimension \(c\), compute two series of entries and weights, \(C^a = H W^{a}_{KV}\), \(C^b = H W^{b}_{KV}\), \(Z^a = H W^a_Z\), \(Z^b = H W^b_Z\) (Eqs. 9-10). Each block of \(m\) tokens becomes one entry through a learned softmax over the block and the previous block (\(2m\) rows in all), with learned positional biases \(B^a, B^b \in \mathbb{R}^{m \times c}\) (Eqs. 11-12):</p>
+  \[ \big[S^a_{mi:m(i+1)-1};\, S^b_{m(i-1):mi-1}\big] = \operatorname{Softmax}_{\text{row}}\big([Z^a_{mi:m(i+1)-1} + B^a;\ Z^b_{m(i-1):mi-1} + B^b]\big), \]
+  \[ C^{\text{Comp}}_i = \sum_{j=mi}^{m(i+1)-1} S^a_j \odot C^a_j + \sum_{j=m(i-1)}^{mi-1} S^b_j \odot C^b_j. \]
+  <p>Each compressed entry mixes \(2m\) source entries, but the ranges overlap between neighbors, so the sequence length shrinks by \(1/m\), not \(1/2m\). <strong>CSA selection</strong> then applies DSA to the compressed entries: indexer keys \(K^{\text{IComp}}\) are compressed the same way, the indexer query is built from the same low-rank latent \(c^Q_t = h_t W^{DQ}\) as the attention queries, and for a compressed block \(s \lt \lfloor t/m \rfloor\) (Eqs. 13-17)</p>
+  \[ I_{t,s} = \sum_{h=1}^{n^I_h} w^I_{t,h}\, \operatorname{ReLU}\!\big(q^I_{t,h} \cdot K^{\text{IComp}}_s\big), \qquad C^{\text{SprsComp}}_t = \big\{C^{\text{Comp}}_s \mid I_{t,s} \in \operatorname{Top\text{-}k}(I_{t,:})\big\}. \]
+  <p><strong>Shared-KV MQA core.</strong> The selected entry is both key and value for all query heads: \(o_{t,i} = \operatorname{CoreAttn}(q_{t,i},\ C^{\text{SprsComp}}_t,\ C^{\text{SprsComp}}_t)\) (Eq. 19). <strong>HCA</strong> is the same idea without selection or overlap: blocks of \(m' \gg m\) tokens, \(S = \operatorname{Softmax}_{\text{row}}(Z + B)\), \(C^{\text{Comp}}_i = \sum_j S_j \odot C_j\) (Eqs. 20-23), and dense MQA over all compressed entries (Eq. 26). Four further details are in §2.3.3: an RMSNorm on each query head and on the KV entry before core attention (for logit stability); partial RoPE on the last 64 dimensions of queries, KV entries, <em>and</em> outputs, with the output rotated by position \(-i\) so that, because keys double as values, the contribution of each entry stays relative; an extra uncompressed sliding window of \(n_{\text{win}} = 128\) recent tokens in both layer types (a query cannot otherwise see the other tokens of its own block, and recent tokens matter most); and attention sinks with a learned logit per head (Eq. 27, above). Compression keeps causality by letting a query see only earlier compressed blocks.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 3. DeepSeek-V4 attention configuration <a href="https://arxiv.org/abs/2606.19348">[§4.2.1]</a>, cross-checked against the released <code>config.json</code> files.</caption>
+    <thead><tr><th></th><th>V4-Flash</th><th>V4-Pro</th></tr></thead>
+    <tbody>
+      <tr><td>Layers, hidden size \(d\)</td><td class="num">43, 4096</td><td class="num">61, 7168</td></tr>
+      <tr><td>Layer types</td><td>first 2 sliding-window only, then CSA/HCA alternating</td><td>first 2 HCA, then CSA/HCA alternating (30 CSA, 31 HCA)</td></tr>
+      <tr><td>CSA: \(m\), indexer heads \(n^I_h\), \(c^I\), top-\(k\)</td><td class="num">4, 64, 128, 512</td><td class="num">4, 64, 128, 1024</td></tr>
+      <tr><td>HCA \(m'\), sliding window \(n_{\text{win}}\)</td><td class="num">128, 128</td><td class="num">128, 128</td></tr>
+      <tr><td>Query heads \(n_h\), head dim \(c\), \(d_c\), output groups \(g\)</td><td class="num">64, 512, 1024, 8</td><td class="num">128, 512, 1536, 16</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Reported savings.</strong> At a 1M-token context, V4-Pro needs 27% of V3.2's single-token inference FLOPs and 10% of its KV cache; Figure 1 of the report gives 3.7x lower FLOPs and 9.5x smaller KV cache for Pro and 9.8x and 13.7x for Flash, and the KV cache is about 2% of a BF16 GQA-8 baseline with head dimension 128 <a href="https://arxiv.org/abs/2606.19348">[DeepSeek-V4, Abstract, Fig. 1, §2.3.4]</a>. KV entries are stored in FP8 except the 64 RoPE dimensions (BF16), and the indexer runs in FP4. I reconstructed the 2% from the config: an entry is \(448 \cdot 1 + 64 \cdot 2 = 576\) B; at \(T = 2^{20}\), a CSA layer holds \(2^{20}/4\) entries (151.0 MB) plus indexer keys (\(2^{20}/4 \cdot 128 \cdot 0.5\) B = 16.8 MB, assuming 4-bit storage), an HCA layer \(2^{20}/128\) entries (4.7 MB), and each layer a 128-entry window (74 KB). Summing 30 CSA and 31 HCA layers gives 5.18 GB (4.83 GiB), against \(61 \cdot 2 \cdot 8 \cdot 128 \cdot 2 \cdot 2^{20} = 262\) GB for the baseline: 1.98%, matching the report. Against V3.2 the same arithmetic gives 7% (if V3.2's cache is BF16) to 12% (at an assumed 656 B per token per layer in FP8), bracketing the reported 10%.</p>
+  <aside class="callout note"><div class="callout-title">Contrast with the linear and state-space hybrids</div><p>V4 makes a different bet from GDN or Mamba hybrids. It never gives up an addressable memory: every layer still attends to entries derived from actual tokens, so exact content lookup is preserved, at the cost of a cache that still grows as \(T/4\) and \(T/128\). Linear and SSM hybrids make three of every four layers constant-memory but pay with approximate recall in those layers, and lean on the remaining full-attention layers for retrieval. V4 reduces the sequence factor of \(\text{layers} \times \text{tokens} \times \text{features} \times \text{bytes}\) by merging tokens, where the hybrids remove the cache from most layers altogether. Which bet wins at 1M tokens and beyond is an open question (see the decision section).</p></aside>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 4. What each method saves. "Yes" means reduced in the asymptotic or reported sense; sources for the numbers are in the text.</caption>
+    <thead><tr><th>Method</th><th>Prefill / training FLOPs</th><th>Bytes read per decoded token</th><th>Resident cache memory</th></tr></thead>
+    <tbody>
+      <tr><td>Sliding window (rolling buffer)</td><td>Yes: \(O(TW)\)</td><td>Yes: \(O(W)\)</td><td>Yes: \(O(W)\)</td></tr>
+      <tr><td>Sparse Transformer, BigBird (fixed)</td><td>Yes</td><td>Only for the window part</td><td>No (global or strided keys must persist)</td></tr>
+      <tr><td>NSA</td><td>Yes (9.0x fwd, 6.0x bwd at 64K)</td><td>Yes (11.6x at 64K)</td><td>No (all KV kept, plus compressed keys)</td></tr>
+      <tr><td>MoBA</td><td>Yes (6.5x at 1M prefill)</td><td>Fewer blocks read, by design</td><td>No</td></tr>
+      <tr><td>DSA (V3.2)</td><td>Core yes, indexer still \(O(L^2)\)</td><td>Yes (about 7.9x at 128K, my estimate)</td><td>No (plus indexer keys)</td></tr>
+      <tr><td>MLA (page 07)</td><td>Not much</td><td>Yes</td><td>Yes (feature axis)</td></tr>
+      <tr><td>V4 CSA/HCA</td><td>Yes (3.7x lower single-token FLOPs at 1M)</td><td>Yes</td><td>Yes (sequence axis, 9.5x smaller)</td></tr>
+      <tr><td>Linear, SSM, delta rule</td><td>Yes: \(O(T)\)</td><td>Yes: constant</td><td>Yes: constant</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ===================================================================== 4 -->
+<section>
+  <h2 id="linear">Linear attention: a recurrent network with a matrix state</h2>
+  <p>Start from causal softmax attention for one head, in the row-vector convention of this course (\(q_t, k_s \in \mathbb{R}^{1\times d_k}\), \(v_s \in \mathbb{R}^{1\times d_v}\)):</p>
+  \[ o_t = \frac{\sum_{s \le t} \exp\!\big(q_t k_s^\top/\sqrt{d_k}\big)\, v_s}{\sum_{s \le t} \exp\!\big(q_t k_s^\top/\sqrt{d_k}\big)}. \]
+  <p>The exponential of a dot product does not factor into a function of \(q_t\) times a function of \(k_s\), which is why every query must be compared with every key. <span class="zh">线性注意力</span> (linear attention) replaces \(\exp(q\cdot k)\) by a kernel that does factor, \(\operatorname{sim}(q,k) = \phi(q)\phi(k)^\top\), with a feature map \(\phi\). Katharopoulos et al. use \(\phi(x) = \operatorname{elu}(x) + 1\), which is positive so the normalizer never vanishes <a href="https://arxiv.org/abs/2006.16236">[Katharopoulos et al. 2020, §3.2, Eq. 7]</a>.</p>
+
+  <h3 id="linear-derivation">The derivation, step by step</h3>
+  <p>Substitute the kernel and use associativity of matrix products, \((\phi(q_t)\phi(k_s)^\top)\, v_s = \phi(q_t)\,(\phi(k_s)^\top v_s)\). The factor \(\phi(q_t)\) does not depend on \(s\), so it leaves the sum:</p>
+  \[ o_t = \frac{\sum_{s\le t} \phi(q_t)\phi(k_s)^\top v_s}{\sum_{s\le t} \phi(q_t)\phi(k_s)^\top} = \frac{\phi(q_t)\, \Big(\sum_{s\le t} \phi(k_s)^\top v_s\Big)}{\phi(q_t)\, \Big(\sum_{s\le t} \phi(k_s)^\top\Big)}. \]
+  <p>The two bracketed sums depend only on the prefix, so define a state \(S_t\) and a normalizer state \(z_t\) that grow by one term per token:</p>
+  <div class="eq-box">\[ S_t = S_{t-1} + \phi(k_t)^\top v_t, \qquad z_t = z_{t-1} + \phi(k_t)^\top, \qquad o_t = \frac{\phi(q_t)\, S_t}{\phi(q_t)\, z_t}, \qquad S_t \in \mathbb{R}^{d_k \times d_v},\ z_t \in \mathbb{R}^{d_k}. \]<div class="eq-label">Causal linear attention as an RNN (Katharopoulos et al. 2020, §3.3-3.4)</div></div>
+  <p>The state has \(d_k d_v\) numbers (plus \(d_k\) for the normalizer) per head, independent of \(t\). With \(d_k = d_v = 128\) that is 16,384 numbers per head, the same as the cache of 64 tokens for one KV head (each token stores \(2 \cdot 128 = 256\) numbers per KV head). The per-token cost is \(O(d_k d_v)\) for the update and the readout, and the parallel form \(O = \big((\phi(Q)\phi(K)^\top) \odot M\big) V\), normalized by row sums, gives the same numbers in \(O(T^2 d)\). The drill asks you to write both and check they agree. Katharopoulos et al. report linear transformers that are "up to 4000x faster on autoregressive prediction of very long sequences" <a href="https://arxiv.org/abs/2006.16236">[Abstract]</a>.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 330" role="img" aria-labelledby="fig-09-2-title">
+<title id="fig-09-2-title">Linear attention computed in parallel form as a masked matrix product and in recurrent form as a state update, with tensor shapes</title>
+<defs><marker id="arrow-09-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="175" y="20" text-anchor="middle" class="s-bold">Parallel form (training)</text>
+<text x="175" y="36" text-anchor="middle" class="s-muted s-small">O(T² d) if done naively, but all T outputs at once</text>
+<rect class="s-b" x="14" y="60" width="44" height="90" rx="4"/><text x="36" y="108" text-anchor="middle">φ(Q)</text><text x="36" y="164" text-anchor="middle" class="s-small s-muted">T×d_k</text>
+<text x="68" y="108" text-anchor="middle">×</text>
+<rect class="s-b" x="78" y="60" width="90" height="44" rx="4"/><text x="123" y="86" text-anchor="middle">φ(K)ᵀ</text><text x="123" y="118" text-anchor="middle" class="s-small s-muted">d_k×T</text>
+<text x="180" y="86" text-anchor="middle">⊙</text>
+<rect class="s-plain" x="192" y="58" width="60" height="60"/>
+<rect class="s-a" x="192" y="58" width="10" height="10"/>
+<rect class="s-a" x="192" y="68" width="10" height="10"/>
+<rect class="s-a" x="202" y="68" width="10" height="10"/>
+<rect class="s-a" x="192" y="78" width="10" height="10"/>
+<rect class="s-a" x="202" y="78" width="10" height="10"/>
+<rect class="s-a" x="212" y="78" width="10" height="10"/>
+<rect class="s-a" x="192" y="88" width="10" height="10"/>
+<rect class="s-a" x="202" y="88" width="10" height="10"/>
+<rect class="s-a" x="212" y="88" width="10" height="10"/>
+<rect class="s-a" x="222" y="88" width="10" height="10"/>
+<rect class="s-a" x="192" y="98" width="10" height="10"/>
+<rect class="s-a" x="202" y="98" width="10" height="10"/>
+<rect class="s-a" x="212" y="98" width="10" height="10"/>
+<rect class="s-a" x="222" y="98" width="10" height="10"/>
+<rect class="s-a" x="232" y="98" width="10" height="10"/>
+<rect class="s-a" x="192" y="108" width="10" height="10"/>
+<rect class="s-a" x="202" y="108" width="10" height="10"/>
+<rect class="s-a" x="212" y="108" width="10" height="10"/>
+<rect class="s-a" x="222" y="108" width="10" height="10"/>
+<rect class="s-a" x="232" y="108" width="10" height="10"/>
+<rect class="s-a" x="242" y="108" width="10" height="10"/>
+<text x="222.0" y="132" text-anchor="middle" class="s-small s-muted">causal mask M</text>
+<text x="266" y="86" text-anchor="middle">×</text>
+<rect class="s-c" x="276" y="60" width="44" height="90" rx="4"/><text x="298" y="108" text-anchor="middle">V</text><text x="298" y="164" text-anchor="middle" class="s-small s-muted">T×d_v</text>
+<path class="s-line" d="M175,178 L175,200" marker-end="url(#arrow-09-2)"/>
+<text x="175" y="222" text-anchor="middle" class="s-mono">O = ((φ(Q)φ(K)ᵀ) ⊙ M) V</text>
+<text x="175" y="244" text-anchor="middle" class="s-small s-muted">no softmax: scores are positive dot products,</text>
+<text x="175" y="259" text-anchor="middle" class="s-small s-muted">divide each row by its sum (the normalizer)</text>
+<line class="s-line s-dash" x1="352" y1="10" x2="352" y2="290"/>
+<text x="540" y="20" text-anchor="middle" class="s-bold">Recurrent form (decoding)</text>
+<text x="540" y="36" text-anchor="middle" class="s-muted s-small">O(d_k d_v) per token, state never grows</text>
+<rect class="s-box" x="372" y="96" width="92" height="60" rx="6"/><text x="418" y="122" text-anchor="middle">S<tspan baseline-shift="sub" font-size="9">t−1</tspan></text><text x="418" y="142" text-anchor="middle" class="s-small s-muted">d_k×d_v</text>
+<circle class="s-a" cx="512" cy="126" r="16"/><text x="512" y="131" text-anchor="middle">+</text>
+<rect class="s-box" x="556" y="96" width="92" height="60" rx="6"/><text x="602" y="122" text-anchor="middle">S<tspan baseline-shift="sub" font-size="9">t</tspan></text><text x="602" y="142" text-anchor="middle" class="s-small s-muted">d_k×d_v</text>
+<path class="s-line" d="M464,126 L494,126" marker-end="url(#arrow-09-2)"/>
+<path class="s-line" d="M528,126 L554,126" marker-end="url(#arrow-09-2)"/>
+<rect class="s-b" x="470" y="48" width="84" height="32" rx="4"/><text x="512" y="63" text-anchor="middle" class="s-small">φ(k<tspan baseline-shift="sub" font-size="8">t</tspan>)ᵀ v<tspan baseline-shift="sub" font-size="8">t</tspan></text><text x="512" y="75" text-anchor="middle" class="s-small s-muted">outer product</text>
+<path class="s-line" d="M512,80 L512,108" marker-end="url(#arrow-09-2)"/>
+<rect class="s-c" x="556" y="200" width="92" height="40" rx="4"/><text x="602" y="216" text-anchor="middle" class="s-small">o<tspan baseline-shift="sub" font-size="8">t</tspan> = φ(q<tspan baseline-shift="sub" font-size="8">t</tspan>) S<tspan baseline-shift="sub" font-size="8">t</tspan></text><text x="602" y="231" text-anchor="middle" class="s-small s-muted">1×d_v</text>
+<path class="s-line" d="M602,156 L602,198" marker-end="url(#arrow-09-2)"/>
+<rect class="s-b" x="440" y="200" width="70" height="40" rx="4"/><text x="475" y="216" text-anchor="middle" class="s-small">φ(q<tspan baseline-shift="sub" font-size="8">t</tspan>)</text><text x="475" y="231" text-anchor="middle" class="s-small s-muted">1×d_k</text>
+<path class="s-line" d="M510,220 L554,220" marker-end="url(#arrow-09-2)"/>
+<text x="540" y="262" text-anchor="middle" class="s-small s-muted">also keep z<tspan baseline-shift="sub" font-size="8">t</tspan> = z<tspan baseline-shift="sub" font-size="8">t−1</tspan> + φ(k<tspan baseline-shift="sub" font-size="8">t</tspan>), and divide o<tspan baseline-shift="sub" font-size="8">t</tspan> by φ(q<tspan baseline-shift="sub" font-size="8">t</tspan>)·z<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+<text x="360" y="300" text-anchor="middle" class="s-small s-muted">Both forms give the same numbers. Training uses the parallel or chunkwise form, decoding uses the recurrent form.</text>
+<text x="360" y="316" text-anchor="middle" class="s-small s-muted">Per head, the entire past is compressed into S (d_k·d_v numbers): fixed capacity, regardless of T.</text>
+</svg>
+    <figcaption><b>Figure 2.</b> Left: the parallel form is an ordinary masked matrix product with no softmax, good for training because it is all matmuls. Right: the recurrent form carries a \(d_k \times d_v\) state that each token updates with an outer product and reads with a vector-matrix product, good for decoding because nothing grows. Chunkwise training (below) splits the difference. Shapes are per head.</figcaption>
+  </figure>
+
+  <h3 id="chunkwise">Chunkwise form: how these models train fast</h3>
+  <p>The pure recurrence is sequential, and the parallel form is quadratic, so neither is good for training on long sequences. The standard solution splits the sequence into chunks of \(C\) tokens (64 or 128 in practice <a href="https://arxiv.org/abs/2406.06484">[DeltaNet, §2.1]</a>), uses the parallel masked form inside each chunk, and passes the state between chunks with the recurrence. For chunk \(i\) with state \(S_{i-1}\) coming in (dropping the normalizer, as all modern variants do in favor of a norm on the output):</p>
+  \[ O_{[i]} = \underbrace{\phi(Q_{[i]})\, S_{i-1}}_{\text{inter-chunk}} + \underbrace{\big(\phi(Q_{[i]})\phi(K_{[i]})^\top \odot M\big) V_{[i]}}_{\text{intra-chunk}}, \qquad S_i = S_{i-1} + \phi(K_{[i]})^\top V_{[i]}. \]
+  <p>Cost is \(O(T C d + T d_k d_v)\) per head: intra-chunk work is \(T/C\) chunks times \(C^2 d\), and the state passing is \(T/C\) matmuls of size \(d_k \times d_v\). Both are dense matmuls, so they run on tensor cores. RetNet introduced the same triple (parallel, recurrent, chunkwise) for its decayed variant <a href="https://arxiv.org/abs/2307.08621">[RetNet, §2.1, Eqs. 5-7]</a>, and Gated Linear Attention showed it can be implemented faster than FlashAttention-2 even at 1K length <a href="https://arxiv.org/abs/2312.06635">[GLA, Abstract]</a>.</p>
+
+  <h3 id="why-lags">Why plain linear attention lags</h3>
+  <p>Three separate reasons, each fixed by a different later idea.</p>
+  <ol>
+    <li><strong>Fixed capacity.</strong> \(S\) holds \(d_k d_v\) numbers per head. It cannot store more than \(O(d_k)\) independent associations exactly. Formal versions of this appear in the recall section below.</li>
+    <li><strong>Crosstalk.</strong> The readout is \(\phi(q)S = \sum_s (\phi(q)\phi(k_s)^\top)\, v_s\). Querying with \(q = k_j\) returns \(\phi(k_j)\phi(k_j)^\top v_j\) plus \(\sum_{s\ne j} \phi(k_j)\phi(k_s)^\top v_s\). If the feature vectors were orthogonal the second term would vanish, but with a positive map such as \(\operatorname{elu}+1\) every pair has a positive inner product, so the noise terms cannot cancel. A positive kernel also produces a smooth, low-contrast average, where the exponential in softmax amplifies the best match and can focus almost all weight on one key.</li>
+    <li><strong>No forgetting.</strong> \(S_t\) is a plain sum, so its norm grows with \(t\) and old associations never make room for new ones. The normalizer rescales the output but does not free capacity.</li>
+  </ol>
+
+  <h3 id="decay-gates">Decay and gates: RetNet and GLA</h3>
+  <p>The cheapest fix for the third problem multiplies the old state by a decay before adding the new association. RetNet uses a constant per-head \(\gamma\) <a href="https://arxiv.org/abs/2307.08621">[RetNet, Eq. 6]</a>:</p>
+  \[ S_n = \gamma\, S_{n-1} + K_n^\top V_n, \qquad \operatorname{Retention}(X_n) = Q_n S_n, \]
+  <p>where different heads get different \(\gamma\) ("multi-scale" retention) and a GroupNorm replaces the softmax normalizer. A constant \(\gamma\) builds in an exponential recency bias, but it is data-independent: the layer cannot decide to keep one thing and drop another. Gated Linear Attention (GLA) makes the decay depend on the input, with a gate per key dimension: \(S_t = G_t \odot S_{t-1} + k_t^\top v_t\), where \(G_t = \alpha_t^\top \mathbf{1}\) repeats the row vector \(\alpha_t \in (0,1)^{d_k}\) across the value dimension (that is, \(S_t = \operatorname{Diag}(\alpha_t) S_{t-1} + k_t^\top v_t\)), and \(\alpha_t = \sigma(x_t W^1_\alpha W^2_\alpha + b_\alpha)^{1/\tau}\) with a rank-16 factorization and \(\tau = 16\) "to encourage the model to have a slower forgetting rate" <a href="https://arxiv.org/abs/2312.06635">[GLA, §4.1, §4.4, Tab. 1]</a>. GLA's Table 1 shows that many recent recurrent layers are the same equation with a different gate parameterization: Mamba-2 uses a scalar \(\gamma_t\) shared by the whole state, RWKV-6 a per-key-dimension vector, and so on.</p>
+  <p>Decay is a trade, not a free lunch. It frees capacity by construction, but an item written at time \(s\) and read at \(t\) is multiplied by \(\prod_{u=s+1}^{t} \alpha_u\). Retrieving something far in the past requires the gates on its channels to have stayed near 1 the whole way, and the model must decide that at write time, before it knows what will be asked.</p>
+
+  <aside class="callout bridge"><div class="callout-title">From your jet tagger</div><p>An encoder that pools a jet into one embedding is also a fixed-size summary, and that works because the readout (the jet class) is known when the model is trained, so the summary can specialize. A linear-attention state is a fixed-size summary written <em>before</em> the queries are known: the same state must answer any later lookup. That is the source of both its efficiency and its recall problem.</p></aside>
+
+  <div class="decision">
+    <div class="decision-title">Linear attention with decay or gates</div>
+    <dl>
+      <dt>Problem</dt><dd>Softmax attention costs \(O(T^2)\) in training and \(O(T)\) memory per step in decoding.</dd>
+      <dt>Idea</dt><dd>Replace \(\exp(q\cdot k)\) by \(\phi(q)\phi(k)^\top\), so the sum over the prefix collapses into a running state \(S_t \in \mathbb{R}^{d_k \times d_v}\); add a decay or gate so the state can forget.</dd>
+      <dt>Why it works</dt><dd>Associativity moves the sum over \(s\) inside a running matrix, giving \(O(d_k d_v)\) per token and a constant-size state. The chunkwise form turns training into dense matmuls.</dd>
+      <dt>Evidence</dt><dd>Matches Transformers in perplexity at moderate scale with decay and gating (GLA, RetNet <a href="https://arxiv.org/abs/2312.06635">[GLA, Abstract]</a>) but trails on recall (Zoology: gated-convolution and linear models trail attention by up to 2.1 perplexity points on the Pile, 82% of it explained by associative recall <a href="https://arxiv.org/abs/2312.04927">[Zoology, Abstract]</a>).</dd>
+      <dt>Cost</dt><dd>Fixed capacity, crosstalk, forgetting by construction; approximate retrieval only. Needs custom chunkwise kernels, and may need a higher-precision state than a KV cache (MiniMax reports sensitivity to low-precision storage).</dd>
+      <dt>Used by</dt><dd>As a component of hybrids: MiniMax-01 (lightning attention, an I/O-aware linear attention), and, in delta-rule form, Qwen3-Next and Kimi Linear. No frontier model as of September 2026 is pure linear.</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ===================================================================== 5 -->
+<section>
+  <h2 id="ssm">State-space models: S4, Mamba, Mamba-2</h2>
+  <p><span class="zh">状态空间模型</span> (state-space models, SSMs) come from control theory and reach the same destination by a different road. <strong>S4</strong> starts from a continuous linear system \(x'(t) = Ax(t) + Bu(t)\), \(y(t) = Cx(t)\), discretizes it with step size \(\Delta\) (S4 uses the bilinear rule) into a recurrence \(x_k = \bar A x_{k-1} + \bar B u_k\), and observes that because \(\bar A, \bar B, \bar C\) are the same at every step (the system is linear time-invariant, LTI), unrolling gives a global convolution \(y = \bar K * u\) with kernel \(\bar K = (\bar C\bar B, \bar C\bar A\bar B, \dots, \bar C\bar A^{L-1}\bar B)\), computed with FFTs for training. The recurrence gives constant-memory decoding. The hard part is choosing \(A\) so that the state remembers long histories (the HiPPO matrices) and computing \(\bar K\) stably; S4's normal-plus-low-rank parameterization reduces this to a Cauchy kernel with \(\tilde O(N + L)\) cost, and solved the 16K-length Path-X task that all prior models failed <a href="https://arxiv.org/abs/2111.00396">[S4, §2-3]</a>. The weakness is exactly the LTI property: the dynamics are the same for every input, so the model cannot decide, based on content, what to store.</p>
+
+  <p><strong>Mamba</strong> (selective SSM) removes that limitation by making the parameters functions of the input: \(B_t\) and \(C_t\) come from linear projections of \(x_t\), and the step size is \(\Delta_t = \tau_\Delta(\text{param} + s_\Delta(x_t))\) with a softplus \(\tau_\Delta\) <a href="https://arxiv.org/abs/2312.00752">[Mamba, §3.2, Alg. 2]</a>. With the zero-order-hold rule \(\bar A_t = \exp(\Delta_t A)\), \(\bar B_t = (\Delta_t A)^{-1}(\exp(\Delta_t A) - I)\,\Delta_t B_t\) (Eq. 4), each channel runs</p>
+  \[ h_t = \bar A_t\, h_{t-1} + \bar B_t\, x_t, \qquad y_t = C_t\, h_t. \]
+  <p>A large \(\Delta_t\) drives \(\bar A_t \to 0\): the state resets and the current input is written. A small \(\Delta_t\) gives \(\bar A_t \approx I\): the state persists and the input is ignored. That is a content-dependent gate, and it is what lets Mamba solve the Selective Copying and Induction Heads tasks that LTI models fail. The price is that time-varying parameters break the convolution trick, so Mamba computes the recurrence with a hardware-aware parallel scan that materializes the expanded state (batch, length, channels, state dimension) only in fast SRAM, with recomputation in the backward pass. The paper reports 5x higher throughput than Transformers, and a 3B model that outperforms same-size Transformers and matches ones twice its size.</p>
+
+  <p><strong>Mamba-2</strong> makes one restriction and gets a theory in return. The matrix \(A\) becomes a scalar times the identity per head, \(A_t = a_t I\), and the head dimension \(P\) becomes 64 or 128 instead of Mamba's 1 <a href="https://arxiv.org/abs/2405.21060">[Mamba-2, §2.4]</a>. Unrolling the recurrence shows the whole layer is a matrix product \(Y = MX\) with</p>
+  <div class="eq-box">\[ M = L \circ (C B^\top), \qquad L_{ji} = a_{j:i} = a_j a_{j-1} \cdots a_{i+1}\ (j \ge i),\ \text{else } 0. \]<div class="eq-label">SSD: structured state-space duality (Dao and Gu 2024, §5.1)</div></div>
+  <p>\(L\) is a 1-semiseparable mask, and \(M\) is exactly masked kernel attention with queries \(C\), keys \(B\), values \(X\) and a decay mask \(L\). If every \(a_t = 1\), \(L\) is the causal mask and the layer is ordinary causal linear attention. So a Mamba-2 layer <em>is</em> a linear-attention layer with a scalar, data-dependent decay, and the two vocabularies map one to one:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 5. Translation between SSM and linear-attention notation for a Mamba-2 layer (Mamba-2, §5).</caption>
+    <thead><tr><th>SSM (Mamba-2)</th><th>Linear attention</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>\(C_t\)</td><td>\(q_t\)</td><td>read vector</td></tr>
+      <tr><td>\(B_t\)</td><td>\(k_t\)</td><td>write address</td></tr>
+      <tr><td>\(x_t\)</td><td>\(v_t\)</td><td>written content</td></tr>
+      <tr><td>\(a_t\)</td><td>decay \(\gamma_t\)</td><td>forget factor</td></tr>
+      <tr><td>state \(h_t \in \mathbb{R}^{N \times P}\)</td><td>\(S_t \in \mathbb{R}^{d_k \times d_v}\) (\(N = d_k\), \(P = d_v\))</td><td>memory matrix</td></tr>
+    </tbody>
+  </table></div>
+  <p>The duality gives an algorithm. SSD is computed by a block decomposition that uses the quadratic form inside chunks and the recurrence between them, the same chunkwise idea as above, and because \(A\) is a scalar per head it consists of matmuls. The paper reports that SSD is 2 to 8 times faster than Mamba's fused scan, faster than FlashAttention-2 from length 2K, and 6 times faster at 16K, and allows states 8 times larger than Mamba's <a href="https://arxiv.org/abs/2405.21060">[Mamba-2, Abstract, §1]</a>. Nemotron-H's Mamba-2 layers use state dimension 128 (8B) and 256 (56B) <a href="https://arxiv.org/abs/2504.03624">[Nemotron-H, §2.1]</a>. The paper is candid that the restriction "slightly decreas[es] the expressive power in return for significant training efficiency improvements". The same trade recurs below: any decay structure that is not scalar or diagonal needs a special chunkwise algorithm to stay on tensor cores.</p>
+</section>
+
+<!-- ===================================================================== 6 -->
+<section>
+  <h2 id="delta">Delta-rule models: writing by error correction</h2>
+  <p>Decay lets a linear-attention state forget, but it cannot <em>edit</em>. Suppose the state already stores a value under some key and the sequence now presents a new value under the same key (a variable being reassigned, a fact being corrected). Plain linear attention adds the new pair on top, so a later read returns the sum of old and new. The DeltaNet paper points to a related capacity problem: a purely additive rule makes it difficult to deallocate old associations, which "eventually leads to key collisions when \(L > d\)" <a href="https://arxiv.org/abs/2406.06484">[DeltaNet, §2.2]</a>. The delta rule fixes this by writing only the <em>error</em>.</p>
+
+  <h3 id="delta-derivation">DeltaNet, derived carefully</h3>
+  <p>Treat the state as the weights of a tiny linear regressor that maps keys to values, and take one online SGD step on the reconstruction loss at each token. In our row-vector convention (\(S \in \mathbb{R}^{d_k \times d_v}\), \(k_t \in \mathbb{R}^{1\times d_k}\), so the prediction for key \(k_t\) is \(k_t S\)):</p>
+  \[ \mathcal{L}_t(S) = \tfrac12\,\big\| k_t S - v_t \big\|^2, \qquad \nabla_S \mathcal{L}_t = k_t^\top (k_t S - v_t). \]
+  <div class="eq-box">\[ S_t = S_{t-1} - \beta_t\, k_t^\top (k_t S_{t-1} - v_t) = S_{t-1} + \beta_t\, k_t^\top \big(v_t - k_t S_{t-1}\big) = \big(I - \beta_t k_t^\top k_t\big) S_{t-1} + \beta_t\, k_t^\top v_t, \qquad o_t = q_t S_t. \]<div class="eq-label">DeltaNet recurrence (row-vector convention, \(S_t \in \mathbb{R}^{d_k \times d_v}\))</div></div>
+  <p>Read it as retrieve, compare, correct. \(k_t S_{t-1}\) is what the memory currently returns for key \(k_t\) (the "old value"), \(v_t - k_t S_{t-1}\) is the prediction error, and \(\beta_t \in (0,1)\) is a learned per-token write strength. Equivalently, with \(v^{\text{new}}_t = \beta_t v_t + (1-\beta_t) v^{\text{old}}_t\), the update removes the old association and writes the new one: \(S_t = S_{t-1} - k_t^\top v^{\text{old}}_t + k_t^\top v^{\text{new}}_t\). Linear attention is the same derivation applied to the loss \(-\langle k_t S, v_t\rangle\), which has no error term and so never corrects anything <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, §2.2]</a>.</p>
+  <aside class="callout warn"><div class="callout-title">Pitfall: three conventions in the literature</div><p>The DeltaNet paper stores \(S \in \mathbb{R}^{d_v \times d_k}\) and writes \(S_t = S_{t-1}(I - \beta_t k_t k_t^\top) + \beta_t v_t k_t^\top\) with column vectors and \(o_t = S_t q_t\) <a href="https://arxiv.org/abs/2406.06484">[DeltaNet, §2.2]</a>. Kimi Linear uses \(S \in \mathbb{R}^{d_k \times d_v}\) with column vectors, \(S_t = (I - \beta_t k_t k_t^\top) S_{t-1} + \beta_t k_t v_t^\top\) and \(o_t = S_t^\top q_t\) <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, §2.2, §3]</a>; that is the transpose of the DeltaNet form and identical to this page's form once column \(k_t\) is written as the row \(k_t\). When you write it on a whiteboard, state \(S\)'s shape and whether vectors are rows or columns first. The brief's shorthand "\(S_{t-1} + \beta_t (v_t - k_t S_{t-1})^\top k_t\)" is the DeltaNet-paper layout with row vectors.</p></aside>
+  <p>Why this stores more. With unit-norm \(k_t\) and \(\beta_t = 1\), after the update \(k_t S_t = k_t S_{t-1} + (v_t - k_t S_{t-1}) = v_t\): the memory returns exactly the value just written for that key, replacing what was there (this is a test in the drill: writing \(v_1\) then \(v_2\) under the same key returns \(v_2\), where linear attention would return \(v_1 + v_2\)). For a key \(k_j\) orthogonal to \(k_t\), \(k_j (I - k_t^\top k_t) = k_j\), so the update does not disturb it. A \(d_k\)-dimensional key space can therefore hold \(d_k\) orthonormal associations exactly. The capacity is still bounded by the state size; the delta rule just uses it without waste. For stability, the eigenvalues of \(I - \beta k^\top k\) are 1 (with multiplicity \(d_k - 1\)) and \(1 - \beta\|k\|^2\), so DeltaNet applies L2 normalization to \(q\) and \(k\) (after a SiLU) and keeps \(\beta \in (0,1)\), which puts every eigenvalue in \([0,1]\) <a href="https://arxiv.org/abs/2406.06484">[DeltaNet, §3.3]</a>.</p>
+
+  <h3 id="delta-chunkwise">Chunkwise training: the WY and UT tricks</h3>
+  <p>The update multiplies the state by a different rank-one-perturbed matrix at every step, and the recurrence looks inherently sequential. Unrolling shows a hidden linear structure: \(S_t = \sum_{i \le t} k_i^\top u_i\) with "pseudo-values" \(u_i = \beta_i (v_i - k_i S_{i-1}) = \beta_i\big(v_i - \sum_{j\lt i} (k_i k_j^\top)\, u_j\big)\), because \(S_{i-1} = \sum_{j\lt i} k_j^\top u_j\). So DeltaNet is linear attention with \(v\) replaced by \(u\) <a href="https://arxiv.org/abs/2406.06484">[DeltaNet, §3.1]</a>, and computing \(u\) within a chunk is a small triangular linear system. For a chunk of \(C\) tokens with incoming state \(S_0\) (rows are tokens):</p>
+  \[ T = I + \operatorname{diag}(\beta)\,\operatorname{StrictTril}(K K^\top), \quad U = T^{-1}\operatorname{diag}(\beta)\,(V - K S_0), \quad O = Q S_0 + (Q K^\top \odot M)\,U, \quad S_C = S_0 + K^\top U. \]
+  <p>I checked these four equations against the token-by-token recurrence numerically (they match to float precision). The published papers write the same thing with \(W = T^{-1}\operatorname{diag}(\beta)K\) and \(U' = T^{-1}\operatorname{diag}(\beta)V\), giving \((U' - W S_0)\) in place of \(U\) <a href="https://arxiv.org/abs/2412.06464">[Gated DeltaNet, Eqs. 8-9]</a>. The \(T^{-1}\) comes from the WY representation of products of Householder-like matrices; the "UT transform" of Kimi Linear computes it by forward substitution and reduces the non-matmul FLOPs that would otherwise limit tensor-core use <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, §3.1, Eqs. 6-7]</a>. The chunk cost is the linear-attention cost plus a \(C \times C\) triangular solve, so training stays \(O(T)\) in sequence length.</p>
+
+  <h3 id="gdn">Gated DeltaNet and Kimi Delta Attention</h3>
+  <p>The delta rule edits but is slow to clear: to erase an old item you must present its key. Decay clears everything at once but cannot target. Gated DeltaNet composes them with a scalar decay \(\alpha_t \in (0,1)\) <a href="https://arxiv.org/abs/2412.06464">[Gated DeltaNet, §3.1, Eq. 10]</a>:</p>
+  <div class="eq-box">\[ S_t = \alpha_t\,\big(I - \beta_t k_t^\top k_t\big)\, S_{t-1} + \beta_t\, k_t^\top v_t. \]<div class="eq-label">Gated DeltaNet (row-vector convention). \(\alpha_t \to 0\) clears the state, \(\alpha_t \to 1\) is the pure delta rule.</div></div>
+  <p>The paper's online-learning view makes the roles precise (its Table 1): Mamba-2 relaxes linear attention's objective with a scale \(\alpha_t\) on the old state, DeltaNet uses the regression error, and Gated DeltaNet does both. On the S-NIAH needle benchmarks at 1.3B parameters (100B tokens), the three failure modes are visible:</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 6. Selected S-NIAH accuracy (%) for 1.3B models <a href="https://arxiv.org/abs/2412.06464">[Gated DeltaNet, Tab. 2]</a>. S-NIAH-1: pass-key; -2: number in haystack; -3: UUID in haystack.</caption>
+    <thead><tr><th>Model</th><th>-1 @ 8K</th><th>-2 @ 4K</th><th>-2 @ 8K</th><th>-3 @ 2K</th><th>-3 @ 4K</th></tr></thead>
+    <tbody>
+      <tr><td>DeltaNet (delta rule, no decay)</td><td class="num">98.8</td><td class="num">18.6</td><td class="num">14.4</td><td class="num">47.0</td><td class="num">22.4</td></tr>
+      <tr><td>Mamba-2 (decay, no delta rule)</td><td class="num">30.4</td><td class="num">56.2</td><td class="num">17.0</td><td class="num">47.6</td><td class="num">4.6</td></tr>
+      <tr><td>Gated DeltaNet (both)</td><td class="num">91.8</td><td class="num">92.2</td><td class="num">29.6</td><td class="num">84.2</td><td class="num">27.6</td></tr>
+    </tbody>
+  </table></div>
+  <p>DeltaNet nails the single needle (its edits are precise) but drowns in distractors without decay; Mamba-2 forgets the needle; the combination is best. Even so, on number-in-haystack at 8K the best of the three retrieves under 30%, which foreshadows why frontier models do not stop here. Kimi Linear's Kimi Delta Attention (KDA) refines the decay from a scalar to a per-key-dimension diagonal gate <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, §3, Eq. 1]</a>:</p>
+  \[ S_t = \big(I - \beta_t k_t^\top k_t\big)\, \operatorname{Diag}(\alpha_t)\, S_{t-1} + \beta_t\, k_t^\top v_t, \qquad \alpha_t \in (0,1)^{d_k}. \]
+  <p>This gives fine-grained control (some key dimensions persist, others decay), at the price of a specialized chunkwise algorithm, a variant of diagonal-plus-low-rank transitions. Kimi Linear also observes that a data-dependent transition acts like a learned multiplicative positional encoding, relaxing the orthogonality that RoPE imposes, and it applies NoPE to its full-attention layers, delegating position information to the KDA layers. Gated DeltaNet-2 (NVIDIA, May 2026) notes that even the delta-rule family uses a single scalar to control two different things, how much old content to erase and how much new content to write, and separates them into a channel-wise erase gate and a channel-wise write gate; it reduces to KDA when the two collapse to one scalar and to Gated DeltaNet when the decay also becomes scalar. At 1.3B parameters and 100B FineWeb-Edu tokens the authors report the strongest overall results among Mamba-2, Gated DeltaNet, KDA, and Mamba-3 variants, with the largest gains on RULER needle tasks <a href="https://arxiv.org/abs/2605.22791">[Gated DeltaNet-2, Abstract]</a>. That is a single-source claim at small scale, so treat it as promising rather than established.</p>
+
+  <div class="table-wrap"><table class="data">
+    <caption>Table 7. One machine, many parameterizations: the state update of each layer, in this page's convention (\(S_t \in \mathbb{R}^{d_k \times d_v}\), \(o_t = q_t S_t\), feature maps and normalizers omitted).</caption>
+    <thead><tr><th>Layer</th><th>Update \(S_t =\)</th><th>Decay</th><th>Error-correcting write</th></tr></thead>
+    <tbody>
+      <tr><td>Linear attention</td><td>\(S_{t-1} + k_t^\top v_t\)</td><td>none</td><td>no</td></tr>
+      <tr><td>RetNet</td><td>\(\gamma S_{t-1} + k_t^\top v_t\)</td><td>constant scalar per head</td><td>no</td></tr>
+      <tr><td>Mamba-2 (SSD)</td><td>\(a_t S_{t-1} + k_t^\top v_t\)</td><td>input-dependent scalar</td><td>no</td></tr>
+      <tr><td>GLA</td><td>\(\operatorname{Diag}(\alpha_t) S_{t-1} + k_t^\top v_t\)</td><td>input-dependent, per key dim</td><td>no</td></tr>
+      <tr><td>DeltaNet</td><td>\((I - \beta_t k_t^\top k_t) S_{t-1} + \beta_t k_t^\top v_t\)</td><td>none</td><td>yes</td></tr>
+      <tr><td>Gated DeltaNet</td><td>\(\alpha_t (I - \beta_t k_t^\top k_t) S_{t-1} + \beta_t k_t^\top v_t\)</td><td>input-dependent scalar</td><td>yes</td></tr>
+      <tr><td>Kimi Delta Attention</td><td>\((I - \beta_t k_t^\top k_t)\operatorname{Diag}(\alpha_t) S_{t-1} + \beta_t k_t^\top v_t\)</td><td>input-dependent, per key dim</td><td>yes</td></tr>
+    </tbody>
+  </table></div>
+  <p>Mamba-1 sits outside this table: its \((D \times N)\) state is updated elementwise with a different decay per (channel, state) pair, which cannot be written as a matmul and is why it needs a custom scan kernel.</p>
+
+  <div class="decision">
+    <div class="decision-title">Gated DeltaNet as the linear layer of a hybrid</div>
+    <dl>
+      <dt>Problem</dt><dd>Plain linear attention piles new associations on old ones, and decay-only layers cannot edit a specific association.</dd>
+      <dt>Idea</dt><dd>Apply a delta-rule correction (write only the error) and a decay gate (clear the state when needed) in one update, trained with a chunkwise WY algorithm.</dd>
+      <dt>Why it works</dt><dd>The correction removes interference for keys already stored and lets orthogonal keys coexist; the gate frees capacity when context shifts. Both are cheap rank-one and scalar operations, so the layer stays \(O(T)\) with tensor-core friendly chunks.</dd>
+      <dt>Evidence</dt><dd>Best of DeltaNet, Mamba-2, and Gated DeltaNet on S-NIAH at 1.3B (Table 6), though far from perfect at 8K <a href="https://arxiv.org/abs/2412.06464">[Gated DeltaNet, Tab. 2]</a>. Adopted at frontier scale in Qwen3-Next, Qwen3.5, and Qwen3.8-Flash-Next; its KDA refinement in Kimi Linear and Kimi K3.</dd>
+      <dt>Cost</dt><dd>Still a fixed-size state, so exact long-range recall is out of reach and full-attention layers are kept. Chunkwise kernels are more complex than attention kernels, and the state may need higher precision than a KV cache.</dd>
+      <dt>Used by</dt><dd>Qwen3-Next-80B-A3B, Qwen3.5-397B-A17B, Qwen3.8-Flash-Next (GDN); Kimi Linear 48B, Kimi K3 (KDA).</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ===================================================================== 7 -->
+<section>
+  <h2 id="hybrids">Recall, and why hybrids won</h2>
+  <p>Every fixed-state layer on this page is a lossy compressor of the past. The question that decides architecture is which lookups the state can still answer. This section gives the theory that says "not all of them", the evidence that a few softmax layers repair it, the verified hybrid recipes, the state-size arithmetic, and the counter-evidence.</p>
+
+  <h3 id="recall-theory">The tension between constant state and exact recall</h3>
+  <p><span class="zh">联想召回</span> (associative recall) means answering "what followed this key last time?" from the context: name-to-attribute lookups, variable reads, in-context translation, copying a span. Two theorems make the limitation precise. Based (Arora et al. 2024) proves that any recurrent model depending causally on the input needs \(\Omega(N)\) bits of state to solve multi-query associative recall (MQAR) over \(N\) tokens <a href="https://arxiv.org/abs/2402.18668">[Based, Thm. 3.1]</a>. Jelassi et al. show that for the task of copying a uniformly random string, a fixed-size "generalized state-space model" with state space \(S\) has error above \(1 - |S|/D^L\) (for vocabulary size \(D\) and length \(L\)), so any such model with fewer than \(L \log D - 1\) bits of memory errs more than half the time, while a two-layer transformer of dimension \(O(n\log D)\) can copy strings of length up to \(D^n\) with small error <a href="https://arxiv.org/abs/2402.01032">[Jelassi et al. 2024, Thms. 2.3, 2.7, Cor. 2.8]</a>. The argument is information-theoretic: \(B\) bits of state can distinguish only \(2^B\) contexts, but exact recall of arbitrary content needs bits proportional to the content. Attention avoids the bound by not compressing: the KV cache <em>is</em> the raw context, and even a few attention layers can address it by content (induction heads).</p>
+  <p>The empirical picture agrees:</p>
+  <ul>
+    <li><strong>Zoology.</strong> Across 17 pretrained models, gated-convolution and similar attention-free architectures trail attention by up to 2.1 perplexity points on the Pile, and 82% of that gap is explained by associative-recall ability; a 70M-parameter attention model beats a 1.4B-parameter gated-convolution model on recall <a href="https://arxiv.org/abs/2312.04927">[Zoology, Abstract]</a>. The synthetic MQAR task, unlike earlier single-query versions, reproduces the real gap.</li>
+    <li><strong>Based</strong> pairs a Taylor-feature linear attention with a tiny sliding window (64 to 128 tokens) and reports 10.36 accuracy points over Mamba on recall-intensive tasks and up to 24x higher generation throughput than FlashAttention-2 <a href="https://arxiv.org/abs/2402.18668">[Based, Abstract, Fig. 1]</a>. It is a cheap hybrid: the window handles precise local comparison, the state provides bounded long-range memory.</li>
+    <li><strong>NVIDIA's 8B study</strong> (up to 3.5T tokens): pure Mamba and Mamba-2 match or beat Transformers on many tasks but lag on 5-shot MMLU, Phonebook lookup, and long-context reasoning. An 8B hybrid with 43% Mamba-2, 7% attention, and 50% MLP layers beats the Transformer on all 12 standard tasks (+2.65 points on average), is predicted to generate up to 8x faster, and closely matches or exceeds it on 23 further long-context tasks <a href="https://arxiv.org/abs/2406.07887">[Waleffe et al. 2024, Abstract]</a>.</li>
+    <li><strong>Jamba</strong> reports that a pure Mamba model fails to follow an in-context output format on IMDB where a hybrid with just 1 attention layer in 8 succeeds, and links this to induction heads <a href="https://arxiv.org/abs/2403.19887">[Jamba, §6]</a>.</li>
+  </ul>
+  <p>Mamba-2's authors put the division of labor this way: SSM layers "function well as a general sequence-to-sequence mapping, and attention layers act as a retrieval mechanism" <a href="https://arxiv.org/abs/2405.21060">[Mamba-2, §9.2.3]</a>. Qwen's 2026 architecture report phrases the same idea: recurrent layers compress the prefix at linear cost, while one full-attention layer in four "retains the direct token-level retrieval that no finite-state memory reproduces exactly" <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next, §1]</a>.</p>
+
+  <h3 id="hybrid-recipes">Hybrid recipes, with verified ratios</h3>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 8. Hybrid designs with a linear or state-space layer. Numbers are from the linked report or model card unless marked as read from <code>config.json</code>.</caption>
+    <thead><tr><th>Model</th><th>Non-attention layer</th><th>Full-attention share</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Mamba-2 ablation (350M, 48 layers) <a href="https://arxiv.org/abs/2405.21060">[§9.2.3]</a></td><td>Mamba-2 (SSD)</td><td>around 10%</td><td>"around 10% of the total number of layers being attention performs best"</td></tr>
+      <tr><td>Mamba-2-Hybrid 8B <a href="https://arxiv.org/abs/2406.07887">[Waleffe]</a></td><td>Mamba-2, 43% of layers (plus 50% MLP)</td><td>7%</td><td>+2.65 average over the Transformer on 12 tasks</td></tr>
+      <tr><td>Jamba <a href="https://arxiv.org/abs/2403.19887">[§2]</a></td><td>Mamba</td><td>1 in 8 (1:7)</td><td>MoE every 2 layers, 52B total and 12B active; 256K context; KV cache 4 GB at 256K versus 32 GB for Mistral 7B and 128 GB for Llama-2 6.7B</td></tr>
+      <tr><td>Nemotron-H 8B, 56B <a href="https://arxiv.org/abs/2504.03624">[§2.1]</a></td><td>Mamba-2 alternating with FFN</td><td>about 8% (4 of 52, 10 of 118)</td><td>attention layers spread evenly; first layer is Mamba-2; up to 3x faster inference than similar-size Transformers</td></tr>
+      <tr><td>MiniMax-01 <a href="https://arxiv.org/abs/2501.08313">[§2]</a></td><td>lightning attention (linear)</td><td>1 in 8 (7:1), 80 layers</td><td>456B total, 45.9B active; trained to 1M tokens, extrapolates to 4M</td></tr>
+      <tr><td>Qwen3-Next-80B-A3B <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">[model card]</a></td><td>Gated DeltaNet</td><td>1 in 4 (3:1), 48 layers</td><td>80B total and 3B active; "12 * (3 * (Gated DeltaNet, MoE), 1 * (Gated Attention, MoE))"; 262,144 native</td></tr>
+      <tr><td>Kimi Linear <a href="https://arxiv.org/abs/2510.26692">[§5.2]</a></td><td>KDA</td><td>1 in 4 (3:1)</td><td>48B total and 3B active; NoPE on the MLA layers; 3:1 chosen by ablation</td></tr>
+      <tr><td>Qwen3.5-397B-A17B <a href="https://huggingface.co/Qwen/Qwen3.5-397B-A17B">[model card]</a></td><td>Gated DeltaNet (45 layers)</td><td>15 of 60 (3:1)</td><td>full-attention layers are GQA with 2 KV heads, head dim 256 (config)</td></tr>
+      <tr><td>Kimi K3 <a href="https://huggingface.co/moonshotai/Kimi-K3">[model card]</a></td><td>KDA (69 layers)</td><td>24 of 93</td><td>2.8T total and 104B active; global layers are gated MLA; layers 92 and 93 are both global (config); 1,048,576 context</td></tr>
+      <tr><td>Qwen3.8-Flash-Next <a href="https://arxiv.org/abs/2608.30320">[§2.1]</a></td><td>Gated DeltaNet</td><td>1 in 4</td><td>125B total and 6B active; global layers become QSA at continued pretraining</td></tr>
+    </tbody>
+  </table></div>
+  <p>The ratios cluster between 1:3 and 1:7, and the ablations say the optimum is flat. Jamba found 1:3 and 1:7 equal in quality and picked 1:7 as the most compute-efficient of the best variants <a href="https://arxiv.org/abs/2403.19887">[Jamba, §2, §6]</a>. Kimi Linear's ablation of KDA-to-MLA ratio (validation perplexity, lower is better) gives 5.65 at 3:1, 5.66 at 1:1, 5.70 at 7:1, 5.82 at 15:1, and 5.77 for pure MLA (0:1) <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, Tab. 1]</a>: a 3:1 hybrid beats the all-attention model, 7:1 is close, and 15:1 is worse than none. Note what perplexity can and cannot show here; the next subsections return to that.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 362" role="img" aria-labelledby="fig-09-3-title">
+<title id="fig-09-3-title">Three hybrid layer stacks: 3 to 1 linear to full attention, 7 to 1 linear to full attention, and DeepSeek-V4 style alternating compressed and sparse attention</title>
+<text x="360" y="18" text-anchor="middle" class="s-bold">16 layers shown, bottom of the network on the left</text>
+<text x="8" y="50" class="s-bold s-small">3 : 1</text>
+<text x="8" y="64" class="s-muted s-small">Qwen3-Next, Kimi Linear</text>
+<rect class="s-b" x="98" y="36" width="34" height="32" rx="4"/>
+<text x="115.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="136" y="36" width="34" height="32" rx="4"/>
+<text x="153.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="174" y="36" width="34" height="32" rx="4"/>
+<text x="191.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-a" x="212" y="36" width="34" height="32" rx="4"/>
+<text x="229.0" y="56" text-anchor="middle" class="s-small">A</text>
+<rect class="s-b" x="250" y="36" width="34" height="32" rx="4"/>
+<text x="267.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="288" y="36" width="34" height="32" rx="4"/>
+<text x="305.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="326" y="36" width="34" height="32" rx="4"/>
+<text x="343.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-a" x="364" y="36" width="34" height="32" rx="4"/>
+<text x="381.0" y="56" text-anchor="middle" class="s-small">A</text>
+<rect class="s-b" x="402" y="36" width="34" height="32" rx="4"/>
+<text x="419.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="440" y="36" width="34" height="32" rx="4"/>
+<text x="457.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="478" y="36" width="34" height="32" rx="4"/>
+<text x="495.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-a" x="516" y="36" width="34" height="32" rx="4"/>
+<text x="533.0" y="56" text-anchor="middle" class="s-small">A</text>
+<rect class="s-b" x="554" y="36" width="34" height="32" rx="4"/>
+<text x="571.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="592" y="36" width="34" height="32" rx="4"/>
+<text x="609.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-b" x="630" y="36" width="34" height="32" rx="4"/>
+<text x="647.0" y="56" text-anchor="middle" class="s-small">D</text>
+<rect class="s-a" x="668" y="36" width="34" height="32" rx="4"/>
+<text x="685.0" y="56" text-anchor="middle" class="s-small">A</text>
+<text x="98" y="88" class="s-small s-muted">Cache: only 4 of 16 layers keep a KV cache that grows with T (25% of the full-attention cache); the other 12 keep a fixed-size state.</text>
+<text x="8" y="134" class="s-bold s-small">7 : 1</text>
+<text x="8" y="148" class="s-muted s-small">MiniMax-01, Jamba (1:7)</text>
+<rect class="s-b" x="98" y="120" width="34" height="32" rx="4"/>
+<text x="115.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="136" y="120" width="34" height="32" rx="4"/>
+<text x="153.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="174" y="120" width="34" height="32" rx="4"/>
+<text x="191.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="212" y="120" width="34" height="32" rx="4"/>
+<text x="229.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="250" y="120" width="34" height="32" rx="4"/>
+<text x="267.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="288" y="120" width="34" height="32" rx="4"/>
+<text x="305.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="326" y="120" width="34" height="32" rx="4"/>
+<text x="343.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-a" x="364" y="120" width="34" height="32" rx="4"/>
+<text x="381.0" y="140" text-anchor="middle" class="s-small">A</text>
+<rect class="s-b" x="402" y="120" width="34" height="32" rx="4"/>
+<text x="419.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="440" y="120" width="34" height="32" rx="4"/>
+<text x="457.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="478" y="120" width="34" height="32" rx="4"/>
+<text x="495.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="516" y="120" width="34" height="32" rx="4"/>
+<text x="533.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="554" y="120" width="34" height="32" rx="4"/>
+<text x="571.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="592" y="120" width="34" height="32" rx="4"/>
+<text x="609.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-b" x="630" y="120" width="34" height="32" rx="4"/>
+<text x="647.0" y="140" text-anchor="middle" class="s-small">L</text>
+<rect class="s-a" x="668" y="120" width="34" height="32" rx="4"/>
+<text x="685.0" y="140" text-anchor="middle" class="s-small">A</text>
+<text x="98" y="172" class="s-small s-muted">Cache: 2 of 16 layers (12.5%); 14 layers hold constant state. MiniMax-01 uses 80 layers; Jamba blocks have 8 layers.</text>
+<text x="8" y="218" class="s-bold s-small">Sparse + compressed</text>
+<text x="8" y="232" class="s-muted s-small">DeepSeek-V4-Flash layout</text>
+<rect class="s-e" x="98" y="204" width="34" height="32" rx="4"/>
+<text x="115.0" y="224" text-anchor="middle" class="s-small">S</text>
+<rect class="s-e" x="136" y="204" width="34" height="32" rx="4"/>
+<text x="153.0" y="224" text-anchor="middle" class="s-small">S</text>
+<rect class="s-c" x="174" y="204" width="34" height="32" rx="4"/>
+<text x="191.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="212" y="204" width="34" height="32" rx="4"/>
+<text x="229.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="250" y="204" width="34" height="32" rx="4"/>
+<text x="267.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="288" y="204" width="34" height="32" rx="4"/>
+<text x="305.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="326" y="204" width="34" height="32" rx="4"/>
+<text x="343.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="364" y="204" width="34" height="32" rx="4"/>
+<text x="381.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="402" y="204" width="34" height="32" rx="4"/>
+<text x="419.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="440" y="204" width="34" height="32" rx="4"/>
+<text x="457.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="478" y="204" width="34" height="32" rx="4"/>
+<text x="495.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="516" y="204" width="34" height="32" rx="4"/>
+<text x="533.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="554" y="204" width="34" height="32" rx="4"/>
+<text x="571.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="592" y="204" width="34" height="32" rx="4"/>
+<text x="609.0" y="224" text-anchor="middle" class="s-small">H</text>
+<rect class="s-c" x="630" y="204" width="34" height="32" rx="4"/>
+<text x="647.0" y="224" text-anchor="middle" class="s-small">C</text>
+<rect class="s-d" x="668" y="204" width="34" height="32" rx="4"/>
+<text x="685.0" y="224" text-anchor="middle" class="s-small">H</text>
+<text x="98" y="256" class="s-small s-muted">Every layer keeps some cache, but entries are merged 4x (C, then top-k selection) or 128x (H), plus a 128-token window. Only the first 16 of 43 layers shown.</text>
+<rect class="s-b" x="98" y="290" width="14" height="14" rx="3"/><text x="118" y="302" class="s-small">D / L: linear-attention layer (Gated DeltaNet, KDA, lightning, Mamba): fixed state</text>
+<rect class="s-a" x="98" y="310" width="14" height="14" rx="3"/><text x="118" y="322" class="s-small">A: full softmax attention (MLA, GQA): cache grows with T, exact retrieval</text>
+<rect class="s-c" x="98" y="330" width="14" height="14" rx="3"/><text x="118" y="342" class="s-small">C: CSA, merge every 4 tokens then top-k selection | H: HCA, merge every 128 tokens, dense</text>
+<rect class="s-e" x="98" y="350" width="14" height="14" rx="3"/><text x="118" y="362" class="s-small">S: sliding-window-only layer (128 tokens)</text>
+</svg>
+    <figcaption><b>Figure 3.</b> Three ways to build a long-context stack. Top: 3:1 linear to full attention (Qwen3-Next, Kimi Linear, Qwen3.5, Kimi K3 at about 74% linear). Middle: 7:1 (MiniMax-01; Jamba is the same ratio). Bottom: DeepSeek-V4-Flash's layout, in which no layer is constant-memory but every layer's cache is compressed. In the first two rows the cache scales with the number of A layers, so the ratio directly sets the cache saving; in the third the saving comes from merging tokens.</figcaption>
+  </figure>
+
+  <h3 id="hybrid-numbers">Worked numbers: decode state at 128K and at 1M</h3>
+  <p>Take the Llama-3-8B shape (32 layers, cache 4096 B per token per layer) and swap layers for linear-attention layers at the same width, with \(H=32\), \(d_k=d_v=128\), fp32 state (2 MiB per layer). At \(T = 131{,}072\) each attention layer holds \(4096 \cdot 131072 = 512\) MiB.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 9. Decode state per sequence at 128K, Llama-3-8B width (our arithmetic).</caption>
+    <thead><tr><th>Stack</th><th>Attention layers</th><th>Linear layers</th><th>KV cache</th><th>Linear state</th><th>Total</th><th>vs full</th></tr></thead>
+    <tbody>
+      <tr><td>Full attention</td><td class="num">32</td><td class="num">0</td><td class="num">16.000 GiB</td><td class="num">0</td><td class="num">16.000 GiB</td><td class="num">1x</td></tr>
+      <tr><td>1:3 hybrid</td><td class="num">8</td><td class="num">24</td><td class="num">4.000 GiB</td><td class="num">48 MiB</td><td class="num">4.047 GiB</td><td class="num">3.95x</td></tr>
+      <tr><td>1:7 hybrid</td><td class="num">4</td><td class="num">28</td><td class="num">2.000 GiB</td><td class="num">56 MiB</td><td class="num">2.055 GiB</td><td class="num">7.79x</td></tr>
+      <tr><td>Pure linear</td><td class="num">0</td><td class="num">32</td><td class="num">0</td><td class="num">64 MiB</td><td class="num">0.0625 GiB</td><td class="num">256x</td></tr>
+    </tbody>
+  </table></div>
+  <p>Arithmetic: 1:3 means one attention layer per three linear ones, so 8 attention and 24 linear layers; KV is \(8 \cdot 512\ \text{MiB} = 4\) GiB and state is \(24 \cdot 2\ \text{MiB} = 48\) MiB. For 1:7, \(4 \cdot 512\) MiB \(= 2\) GiB and \(28 \cdot 2 = 56\) MiB. Pure linear is \(32 \cdot 2 = 64\) MiB. Two lessons. The state is negligible next to the KV that remains, so a hybrid's saving is essentially its ratio (3.95x and 7.79x, not far from 4x and 8x), and it cannot beat that without also shrinking the attention layers. And the saving is a constant factor: at 1M tokens the full stack needs 128 GiB and even the 1:7 hybrid still 16 GiB, which is why the frontier designs stack orthogonal reductions (MLA in Kimi K3's global layers, compression in V4). Table 10 shows the same accounting for released models at \(T = 2^{20}\).</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 10. Decode attention state per sequence at 1,048,576 tokens, from public configs (our arithmetic, bf16 cache unless noted; excludes small convolution states).</caption>
+    <thead><tr><th>Model</th><th>Layers keeping a token cache</th><th>Cache per token</th><th>Cache at 1M</th><th>Fixed state</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3-8B (GQA)</td><td class="num">32 of 32</td><td class="num">128 KiB</td><td class="num">128 GiB</td><td class="num">none</td></tr>
+      <tr><td>MiniMax-M3 (GQA, 4 KV heads, MSA)</td><td class="num">60 of 60</td><td class="num">120 KiB</td><td class="num">120 GiB</td><td class="num">none (plus index keys)</td></tr>
+      <tr><td>DeepSeek-V3.2 (MLA, DSA)</td><td class="num">61 of 61</td><td class="num">68.6 KiB</td><td class="num">68.6 GiB</td><td class="num">none (plus indexer keys)</td></tr>
+      <tr><td>Qwen3.5-397B-A17B (GDN hybrid)</td><td class="num">15 of 60</td><td class="num">30 KiB</td><td class="num">30 GiB</td><td class="num">180 MiB (fp32 assumed)</td></tr>
+      <tr><td>Kimi K3 (KDA hybrid)</td><td class="num">24 of 93</td><td class="num">27 KiB</td><td class="num">27 GiB</td><td class="num">414 MiB (fp32 assumed)</td></tr>
+      <tr><td>DeepSeek-V4-Pro (CSA/HCA; FP8 and FP4 storage)</td><td class="num">61 of 61, compressed</td><td class="num">4.8 KiB (avg.)</td><td class="num">4.83 GiB (estimate, see V4 section)</td><td class="num">none</td></tr>
+    </tbody>
+  </table></div>
+  <p>Per-token arithmetic: Llama \(2 \cdot 8 \cdot 128 \cdot 2 \cdot 32 = 131{,}072\) B; M3 \(2 \cdot 4 \cdot 128 \cdot 2 \cdot 60 = 122{,}880\) B; V3.2 \(576 \cdot 2 \cdot 61 = 70{,}272\) B; Qwen3.5 \(2 \cdot 2 \cdot 256 \cdot 2 \cdot 15 = 30{,}720\) B; K3 \(576 \cdot 2 \cdot 24 = 27{,}648\) B. The Qwen3.5 GDN state is \(64 \cdot 128 \cdot 128 \cdot 4\) B \(= 4\) MiB per layer times 45 layers, and K3's KDA state \(96 \cdot 128 \cdot 128 \cdot 4\) B \(= 6\) MiB times 69. Qwen3.5's native context is 262,144, so its 1M row is an extrapolation of the cache formula. The row that stands out is V4: it is the only one that shrinks every layer's cache, by merging tokens and by low-precision storage. Note also that DSA and MSA leave the cache at full size; they buy bandwidth and compute, not capacity.</p>
+
+  <h3 id="counter-trend">The counter-trend and the conflicting evidence</h3>
+  <p>The story so far is "hybrids and sparse attention won". The evidence is less clean, and the most informative case is MiniMax, which has taken all three positions.</p>
+  <ul>
+    <li><strong>January 2025, MiniMax-01</strong> bet on a 7:1 lightning hybrid. Its report found that pure lightning attention "demonstrates limited retrieval capabilities", so it interleaved softmax layers, and showed at 1B and 3B scale that hybrid-lightning beat a hybrid whose linear layers were replaced by sliding-window attention on needle retrieval (NIAH scores 95.7 versus 25.7 to 53.9 at 1B for windows 256 to 1024, and 98.0 versus 40.9 to 57.9 at 3B) <a href="https://arxiv.org/abs/2501.08313">[MiniMax-01, §2.2.3, Tabs. 3-4]</a>. It also argued that hybrid-lightning has "larger capacity" than softmax because its recurrent state is \(O(d^2/h)\) versus \(O(d)\); that argument treats softmax as an RNN recomputed from scratch at each step, not the KV cache as the state, so I would not lean on it.</li>
+    <li><strong>M2 (October 2025 blog by the pre-training lead; report published 2026)</strong> went back to full attention in all 62 layers (229.9B total, 9.8B active, 29.2T tokens, 192K maximum context, 48 query heads and 8 KV heads). The stated reasons <a href="https://arxiv.org/abs/2605.26494">[MiniMax-M2 report, §2.2.2]</a>, <a href="https://www.minimax.io/news/why-did-m2-end-up-as-a-full-attention-model">[MiniMax blog]</a>: (1) <em>evaluation difficulty</em>: hybrids matched full attention on MMLU, BBH, MATH, and LongBench at small scale but showed "clear deficits in complex multi-hop reasoning" at larger scale, and their proxy metrics were "fragile"; (2) <em>infrastructure</em>: linear architectures are memory-bound even in training, and remain hard on low-precision storage, prefix caching, and speculative decoding; (3) <em>failed SWA hybrids</em>, described above. They add that they expect efficient attention to matter more as context grows and GPU scaling slows.</li>
+    <li><strong>M3 (MSA paper, June 2026)</strong> moved to MiniMax Sparse Attention on a GQA base, not back to linear layers.</li>
+  </ul>
+  <p>The positive results come from different places. Kimi Linear reports, under an identical recipe and 1.4T training tokens, MMLU-Pro 51.0 versus 47.2 and RULER at 128K 84.3 versus 81.3 against full MLA, with up to 75% less KV cache and up to 6x decoding throughput at 1M <a href="https://arxiv.org/abs/2510.26692">[Kimi Linear, Abstract, Fig. 1]</a>. Qwen's 25B-A3B ablation (400B tokens at 4K plus 80B at 32K) has the GDN hybrid averaging 53.81 over nine benchmarks against 49.87 for full attention and 51.15 for an SWA hybrid with window 128 <a href="https://arxiv.org/abs/2608.30320">[Qwen3.8-Next, §2.1.1, Tab. 1]</a>. MiMo found \(W=128\) SWA plus sinks better than all-global attention through 32K. Against these, GLM's team found that converting a pretrained model to any efficient variant lost accuracy: even the best conversion lost 5.69 RULER points at 128K "even when half of the layers retain full attention", and they concluded DSA was preferable because it discards no long-range dependency by construction <a href="https://arxiv.org/abs/2602.15763">[GLM-5, §2.1.2]</a>. That last claim needs a caveat: top-\(k\) with \(k=2048\) can miss a relevant token, and their own Table 6 shows an indexer trained only in warm-up losing 7.9 RULER points at 128K before joint training recovers them.</p>
+  <p>How to reconcile them: (a) most positive results are small-scale or evaluated at 32K and below, most negative ones at 64K to 128K and on multi-hop tasks; (b) from-scratch training differs from conversion; (c) perplexity and knowledge benchmarks, the usual arbiters, are exactly the metrics that do not see the difference (MiniMax's Table 2 shows MMLU 85.5 versus 85.6 and identical 32K needle scores while 128K common-words extraction falls from 90.0 to 72.0). I know of no public head-to-head at 1M tokens between a GDN or KDA hybrid, a compressed-sparse design, and full attention under one recipe. As of September 2026 the models I checked from primary sources are, by family: GDN or KDA hybrids at 3:1 (Qwen3.5, Qwen3.8-Flash-Next, Kimi K3); learned sparse or compressed attention (DeepSeek-V3.2, GLM-5, DeepSeek-V4, MiniMax-M3, and Qwen's QSA); sliding window with sinks (gpt-oss, Gemma 4, MiMo-V2-Flash); and no pure linear or state-space model at the frontier.</p>
+</section>
+
+<!-- ===================================================================== 8 -->
+<section>
+  <h2 id="design">Choosing an architecture for a long-context model</h2>
+  <p>The reader's own project sits here, so this section is opinionated, and marked as judgment where it goes beyond the sources. The decision starts from what binds: is your deployment bandwidth-bound in decode (many concurrent long sequences, long RL rollouts), compute-bound in prefill (huge prompts), or memory-capacity-bound (context or batch that will not fit)? Those map onto different tools.</p>
+  <div class="table-wrap"><table class="data">
+    <caption>Table 11. Options for a new long-context model.</caption>
+    <thead><tr><th>Option</th><th>Saves</th><th>Main risk</th><th>Maturity (Sept 2026)</th></tr></thead>
+    <tbody>
+      <tr><td>A. Full attention with GQA or MLA</td><td>cache (feature axis) only</td><td>\(O(T^2)\) prefill and \(O(T)\) reads at 1M</td><td>baseline; MiniMax-M2 chose it</td></tr>
+      <tr><td>B. Local/global interleave (5:1, small window, sink logits)</td><td>cache and reads by about the local fraction; prefill attention</td><td>local layers cannot retrieve; retrieval beyond 32K relies on the few global layers</td><td>simple, shipped (gpt-oss, Gemma, MiMo); conflicting long-context evidence</td></tr>
+      <tr><td>C. Learned sparse attention (DSA, MSA, QSA)</td><td>FLOPs and bytes, not cache</td><td>indexer cost at 1M, RL instability, extra training stage</td><td>shipped at frontier scale (V3.2, GLM-5, M3)</td></tr>
+      <tr><td>D. Compression plus sparse (V4)</td><td>everything, sequence axis included</td><td>complexity, custom KV management, unproven outside one lab</td><td>one strong open model</td></tr>
+      <tr><td>E. GDN or KDA hybrid at 3:1</td><td>cache in 3 of 4 layers, prefill and decode FLOPs</td><td>approximate recall in linear layers, kernel and prefix-cache infrastructure, position encoding choices</td><td>shipped (Qwen3.5, Kimi K3); one lab reports it beats full attention at matched budget</td></tr>
+      <tr><td>F. Pure linear or SSM</td><td>everything</td><td>recall lower bounds, empirical recall gaps</td><td>not used at the frontier</td></tr>
+    </tbody>
+  </table></div>
+  <p>My default recommendation for a research project: build option A as the baseline, and treat E and B or C as the candidates. Composition matters more than the choice: the reductions are on different axes (layers, tokens read, features, bytes), and the frontier designs stack them (K3: KDA layers plus MLA; V4: compression plus selection plus FP4; Gemma 4: interleave plus KV sharing).</p>
+
+  <h3 id="ablations">What to ablate</h3>
+  <ul>
+    <li><strong>Hybrid ratio and placement</strong>: 0:1, 1:1, 3:1, 7:1, 15:1 (Kimi Linear's grid), plus evenly spaced versus clustered global layers. Keep parameters and tokens fixed; compare at equal <em>measured</em> decode throughput, not FLOPs.</li>
+    <li><strong>Linear-layer type</strong>: plain gated linear attention, Mamba-2, Gated DeltaNet, KDA, and the state size (\(d_k\)) at fixed parameters; the S-NIAH results above suggest the delta rule matters for recall.</li>
+    <li><strong>Window and sinks</strong>: \(W \in \{128, 512, 4096\}\) with and without sink logits, evaluated <em>after</em> long-context extension, since MiMo's \(W=512\) failure only appears then.</li>
+    <li><strong>Positional encoding in global layers</strong>: NoPE (Kimi Linear) versus RoPE. Sources disagree: Kimi found NoPE works when the linear layers carry position, while Qwen found NoPE showed a substantially higher rate of endless generation after post-training. Test through post-training, not just pretraining loss.</li>
+    <li><strong>From scratch versus conversion</strong>: distilling an existing full-attention checkpoint (GLM's conversions, DSA's continued training) is far cheaper but lossy in reported cases.</li>
+    <li><strong>Selector variants</strong> if going sparse: indexer size and compression (CSA, QSA), \(k\), block size, and whether selection is per KV group (MSA) or shared.</li>
+  </ul>
+
+  <h3 id="evaluation">How to evaluate</h3>
+  <ol>
+    <li><strong>Synthetic recall as a unit test</strong> at small scale: MQAR, S-NIAH variants, copy, and phonebook lookup. They are cheap and they reproduce the real gaps (Zoology, Waleffe).</li>
+    <li><strong>RULER at several lengths, per-length curves.</strong> RULER has 13 tasks in four categories (retrieval, multi-hop tracing, aggregation, question answering), and found almost all models had large drops as length grew despite near-perfect vanilla NIAH <a href="https://arxiv.org/abs/2404.06654">[RULER, Abstract]</a>. Vanilla NIAH is saturated and superficial; MiMo also reports NoLiMa and MRCR, and MiniMax HELMET.</li>
+    <li><strong>Position-wise loss</strong> (MoBA's diagnostic): trailing-token loss at the end of long sequences catches degradation that mean perplexity hides.</li>
+    <li><strong>After SFT and RL, at 2x to 4x your target length.</strong> MiniMax saw SWA gaps widen after SFT beyond 32K; GLM saw RL collapse with a nondeterministic top-k. Architectures must be tested in the regime they will run in (long agentic trajectories).</li>
+    <li><strong>Short-context regressions</strong> (MMLU-style) as a sanity check only. They passed for every design that later failed at long context.</li>
+    <li><strong>Systems metrics</strong> measured with real kernels: time per output token, prefill throughput, cache bytes, compatibility with prefix caching and speculative decoding (MiniMax's infrastructure concerns).</li>
+  </ol>
+  <p>Long-context evaluations are noisy and expensive; MiniMax notes that the compute needed for statistically significant evaluation grows with task complexity. Use many needles, several seeds, and report confidence intervals per length before believing a two-point difference.</p>
+
+  <h3 id="open-problems">Open problems</h3>
+  <ul>
+    <li><strong>A middle path between constant and linear state.</strong> Theory says exact recall needs \(\Omega(N)\) bits; practice shows most tokens are not needed. Compressed caches that grow sublinearly (V4's \(T/4\) and \(T/128\) entries) and selective eviction are one side; better-used fixed states (delta rules) are the other.</li>
+    <li><strong>Selector cost at 1M and beyond.</strong> DSA's \(O(L^2)\) indexer motivated compression before scoring (CSA) and pooled indexers (QSA); hierarchical selection is open.</li>
+    <li><strong>Training and inference consistency for sparse selection in RL.</strong> GLM-5 found nondeterministic top-k caused collapse within a few steps, an analogue of MoE routing replay, and worked around it by freezing the indexer and using a deterministic top-k.</li>
+    <li><strong>Infrastructure for recurrent states.</strong> Prefix caching, speculative decoding, low-precision storage, and hybrid cache management are named by MiniMax as the practical obstacles; V4 needed a dedicated "state cache" for its sliding-window and uncompressed-tail entries.</li>
+    <li><strong>Evaluation that predicts agentic long-horizon behavior.</strong> The whole field is calibrating on proxies that MiniMax reports were fragile.</li>
+    <li><strong>Position encoding in hybrids.</strong> The NoPE and RoPE evidence is contradictory across labs.</li>
+  </ul>
+
+  <div class="decision">
+    <div class="decision-title">A 1M-context architecture</div>
+    <dl>
+      <dt>Problem</dt><dd>At 1M tokens a full-attention 8B-class stack needs 128 GiB of cache per sequence and quadratic prefill; agentic and RL workloads make decode bandwidth the bottleneck.</dd>
+      <dt>Idea</dt><dd>Keep a small fraction of exact-retrieval layers (full, compressed, or sparse attention) and make the rest cheap (windows with sinks, or gated delta-rule layers), stacking reductions on the layer, token, feature, and byte axes.</dd>
+      <dt>Why it works</dt><dd>Exact recall needs an addressable memory in only a few layers (theory: \(\Omega(N)\) bits for recall; practice: about 1 in 4 to 1 in 8 attention layers restores it), while most layers do local or summary mixing that a small state handles.</dd>
+      <dt>Evidence</dt><dd>Kimi Linear (identical recipe, 3:1 beats full MLA), Qwen3.5 and K3 at frontier scale, V4 (27% of V3.2's FLOPs and 10% of its cache at 1M), against MiniMax-M2's negative SWA results and GLM's lossy conversions.</dd>
+      <dt>Cost</dt><dd>Kernel and cache-management complexity; evaluation that must go beyond perplexity; extra training stages for indexers; unresolved position-encoding choices.</dd>
+      <dt>Used by</dt><dd>See Table 8 and the sparse section; pick by whether your constraint is cache memory (favors E, D), bandwidth (C, D, E), or engineering risk (B, then A).</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"Linear attention is softmax attention with a cheaper trick, so quality should match."</strong> It is a different function class with a fixed-size state. A positive kernel gives smooth, low-contrast weights, keys cross-talk, and exact recall needs \(\Omega(N)\) bits of state (Based Thm. 3.1). The gap is measurable: 82% of the Zoology perplexity gap is associative recall.</li>
+    <li><strong>"An \(\ell\)-layer window-\(W\) model sees \(\ell W\) tokens, so it does not need global layers."</strong> The receptive field is a bound on where information can come from, not a capacity. A converted GLM-9B with 4096-token windows on half its layers falls to RULER 6.51 at 128K although its nominal reach is over 80K tokens.</li>
+    <li><strong>"Sparse attention shrinks the KV cache."</strong> DSA, NSA, MoBA, and MSA keep every token's entries because any future query might select them. They cut FLOPs and bytes read. Cache shrinks only with MLA, compression (V4), windows, or fixed states.</li>
+    <li><strong>"Attention sinks mean the first tokens are semantically important, and StreamingLLM extends the context."</strong> Replacing the first four tokens with newlines works almost as well (5.60 versus 5.40 perplexity); it is their position and global visibility that matter. StreamingLLM keeps generation stable; information older than the cache is gone.</li>
+    <li><strong>"SSMs and attention are separate worlds."</strong> Mamba-2's SSD shows a scalar-decay SSM layer is masked linear attention with a 1-semiseparable decay mask. Only Mamba-1's per-channel selective scan sits outside the matmul family.</li>
+    <li><strong>"If perplexity and MMLU match, the architecture is fine."</strong> MiniMax's SWA hybrid matched full attention on MMLU (85.6 versus 85.5) and on 32K needles while common-words extraction at 128K fell from 90.0 to 72.0. Use recall-heavy, length-swept, post-SFT evaluations.</li>
+    <li><strong>"A hybrid can beat its ratio."</strong> The linear state is negligible next to the remaining KV cache, so the saving is about the ratio (3.95x at 1:3, 7.79x at 1:7 in Table 9). More needs a second reduction on another axis (MLA, compression, low precision).</li>
+    <li><strong>"DeltaNet's write strength and key norm are free choices."</strong> The transition \(I - \beta k^\top k\) has eigenvalue \(1 - \beta\|k\|^2\), so unnormalized keys or \(\beta \ge 2/\|k\|^2\) make the state diverge. DeltaNet L2-normalizes \(q\) and \(k\) and keeps \(\beta \in (0,1)\).</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Why doesn't sliding-window attention lose all long-range information in a deep model?</summary>
+    <div class="answer">
+      <p>Each layer lets a position read \(W-1\) positions back, and that position's hidden state already summarizes its own window from the layer below. Information therefore travels \(W-1\) positions per layer, and after \(\ell\) layers the top layer can depend on inputs about \(\ell(W-1)\) tokens away. Mistral 7B quotes this: \(W=4096\) and 32 layers give a "theoretical attention span of approximately 131K tokens".</p>
+      <p>The important qualification is that this is a reach bound, not a capacity. A fact 100K tokens back must be relayed through about 25 intermediate positions, each of which must attend to the previous link and copy it into a residual stream shared with everything else, through softmax averages that dilute it. Coarse information (topic, the entities in play) survives that chain; exact strings often do not. Evidence: converting a pretrained GLM-9B to 4096-token windows on half its layers, with no retraining, took RULER from 94.87 at 4K to 54.02 at 8K and 6.51 at 128K, and MiniMax's trained SWA hybrids lost 18 points on 128K common-words extraction while matching at 32K.</p>
+      <p>The fix used in practice is a minority of global layers (Gemma 3's 5:1, gpt-oss and MiMo's alternation), which take over exact long-range lookup. Local layers then only need to be good at local structure, and their cache is constant.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is an attention sink and why does it matter for streaming inference?</summary>
+    <div class="answer">
+      <p>Softmax forces attention weights to sum to one, so a head with nothing relevant to read must put its mass somewhere. Trained causal models learn to dump it on the first few tokens, which every later position can see; StreamingLLM calls them attention sinks and shows Llama-2 attends heavily to the initial token in all layers beyond the bottom two. It is positional, not semantic: replacing the first four tokens with newlines barely changes perplexity.</p>
+      <p>This matters for streaming because a sliding window evicts the first tokens once the sequence exceeds the cache. That removes a large part of the softmax denominator in every head, and the attention distributions shift off what the model learned: Llama-2-13B perplexity went from 5.40 (4 sink tokens plus 1020 recent) to 5158 (1024-token window alone). The fix is to keep the KV of about 4 initial tokens plus a rolling window, and to assign positions inside the cache (with RoPE, cache keys before rotation and rotate at each step). This gives stable generation over millions of tokens at bounded memory, up to 22.2x faster than recomputing a window each step. It does not extend memory: older content is still gone.</p>
+      <p>Current models make the sink explicit: a learned per-head logit \(z'_h\) added to the softmax denominator (gpt-oss, MiMo-V2-Flash, DeepSeek-V4), so a head can attend to nothing. Without it, MiMo's window-128 model loses 2.4 MMLU points.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Compute the decode state per sequence at 128K tokens for a Llama-3-8B-shaped model: full attention, a 1:7 hybrid, and pure linear attention.</summary>
+    <div class="answer">
+      <p>Full attention: per token per layer the cache is \(2 \cdot n_{kv} \cdot d_h \cdot 2\ \text{B} = 2 \cdot 8 \cdot 128 \cdot 2 = 4096\) B. At \(T = 131{,}072\) that is 512 MiB per layer, and \(32 \times 512\) MiB \(= 16\) GiB.</p>
+      <p>Linear layer with \(H = 32\) heads and \(d_k = d_v = 128\): the state is \(32 \cdot 128 \cdot 128 \cdot 4\ \text{B} = 2\) MiB in fp32, independent of \(T\) (1 MiB in bf16).</p>
+      <p>1:7 hybrid: 4 attention layers and 28 linear layers. KV \(= 4 \cdot 512\) MiB \(= 2\) GiB, state \(= 28 \cdot 2\) MiB \(= 56\) MiB, total 2.055 GiB, a 7.79x reduction. Pure linear: \(32 \cdot 2\) MiB \(= 64\) MiB, 256x smaller. The 1:3 hybrid gives 4.047 GiB (3.95x).</p>
+      <p>Comments a strong answer adds: the state equals the KV cache at \(2\ \text{MiB}/4096\ \text{B} = 512\) tokens, so the advantage exists only at long context; the hybrid's saving is essentially its ratio because state is negligible; at 1M tokens the full stack is 128 GiB and the 1:7 hybrid still 16 GiB, so real designs stack a second reduction (MLA, compression).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the recurrent form of causal linear attention. What is the state size?</summary>
+    <div class="answer">
+      <p>Causal softmax attention is \(o_t = \sum_{s\le t} \exp(q_t k_s^\top/\sqrt{d})\, v_s \big/ \sum_{s\le t} \exp(q_t k_s^\top/\sqrt{d})\). Replace the exponential of a dot product with a factorizable kernel, \(\operatorname{sim}(q,k) = \phi(q)\phi(k)^\top\) with \(\phi\) positive (for example \(\operatorname{elu}+1\)). Then</p>
+      \[ o_t = \frac{\phi(q_t)\sum_{s\le t}\phi(k_s)^\top v_s}{\phi(q_t)\sum_{s\le t}\phi(k_s)^\top}, \]
+      <p>because \((\phi(q_t)\phi(k_s)^\top)v_s = \phi(q_t)(\phi(k_s)^\top v_s)\) by associativity and \(\phi(q_t)\) does not depend on \(s\). The sums depend only on the prefix, so with \(S_t = \sum_{s \le t}\phi(k_s)^\top v_s\) and \(z_t = \sum_{s\le t}\phi(k_s)^\top\):</p>
+      \[ S_t = S_{t-1} + \phi(k_t)^\top v_t, \quad z_t = z_{t-1} + \phi(k_t)^\top, \quad o_t = \frac{\phi(q_t) S_t}{\phi(q_t) z_t}. \]
+      <p>State size: \(S_t \in \mathbb{R}^{d_k \times d_v}\), so \(d_k d_v\) numbers per head (16,384 for 128 by 128) plus \(d_k\) for the normalizer, constant in \(t\). Per-token cost \(O(d_k d_v)\). The parallel form \(((\phi(Q)\phi(K)^\top)\odot M)V\) with row normalization gives identical outputs at \(O(T^2 d)\); the chunkwise form uses the parallel form within chunks and passes \(S\) between them. Mention the memory-capacity reading: \(S\) is an associative memory that can store about \(d_k\) key-value pairs before interference, which sets up the next question.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why do pure linear-attention and SSM models underperform on retrieval? What fixes it?</summary>
+    <div class="answer">
+      <p>Three reasons. (1) <em>Information</em>: a fixed state of \(B\) bits cannot hold arbitrary context. Based proves any recurrent model needs \(\Omega(N)\) bits of state for MQAR over \(N\) tokens; Jelassi et al. show a fixed-state model copying a random string of length \(L\) errs more than half the time below \(L \log D - 1\) bits, while a two-layer transformer copies exponentially long strings. (2) <em>Interference and contrast</em>: reads \(\phi(q)S\) sum over all stored pairs, with a positive kernel every pair contributes, and there is no exponential to sharpen the best match. (3) <em>No editing</em>: additive writes cannot overwrite.</p>
+      <p>Empirically, Zoology found 82% of the perplexity gap between attention-free models and attention comes from associative recall; a 70M attention model beat a 1.4B gated-convolution model on recall. Pure Mamba and Mamba-2 lag at 8B on 5-shot MMLU and phonebook lookup.</p>
+      <p>Fixes at two levels. Within the layer: decay and gates to free capacity (Mamba-2, GLA), the delta rule to overwrite (Gated DeltaNet, KDA), larger states (Mamba-2 allows 8x). These help but do not close the gap: Gated DeltaNet still retrieves under 30% on S-NIAH-2 at 8K at 1.3B. Across layers: keep a minority of softmax layers, 1 in 4 to 1 in 8. A 7% attention hybrid beat the Transformer on all 12 tasks in NVIDIA's 8B study, and Jamba's pure Mamba failed in-context formatting where a 1-in-8 hybrid succeeded. Or use a tiny window plus linear attention (Based).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Explain DeepSeek Sparse Attention. What does it save and what does it not?</summary>
+    <div class="answer">
+      <p>A lightning indexer scores every earlier token for query \(t\): \(I_{t,s} = \sum_{j=1}^{H^I} w^I_{t,j}\operatorname{ReLU}(q^I_{t,j}\cdot k^I_s)\), with few heads (64), small dimension (128), ReLU, FP8. Top-\(k\) selection (\(k=2048\)) keeps those key-value entries, and MLA in its MQA mode attends only to them, so core attention is \(O(Lk)\) instead of \(O(L^2)\). The indexer is trained as a student of the dense attention: a dense warm-up with all else frozen minimizing \(\mathrm{KL}(p_t \| \softmax(I_t))\) (2.1B tokens), then sparse training with the indexer detached from the language-modeling loss (943.7B tokens).</p>
+      <p>Saves: core attention FLOPs and the bytes read per decoded token. My estimate for V3.2 shapes at 128K: 13.4x fewer FLOPs per layer (36.5 GFLOP dense versus 0.57 core plus 2.15 indexer) and 7.9x fewer bytes.</p>
+      <p>Does not save: (a) the KV cache, since every token must stay selectable, plus the indexer's own keys; (b) the indexer is still \(O(L^2)\): 16,384 FLOPs per key versus 278,528 for dense MLA core attention, so the total saving saturates at about 17x and the indexer is 30x the sparse core at 1M. That is why V4 compresses before indexing and Qwen pools its indexer. Also note discontinuity: top-\(k\) selection caused RL instability until GLM-5 used a deterministic top-\(k\) and froze the indexer.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Mamba versus linear attention versus Gated DeltaNet: what distinguishes them?</summary>
+    <div class="answer">
+      <p>All three carry a matrix-valued state written with a key-value outer product and read with a query. They differ in how the old state is transformed before the write (Table 7).</p>
+      <ul>
+        <li><strong>Linear attention</strong>: \(S_t = S_{t-1} + k_t^\top v_t\). No decay, no editing; the state saturates and cross-talks.</li>
+        <li><strong>Mamba (selective SSM)</strong>: input-dependent \(\Delta_t, B_t, C_t\) and a diagonal \(A\); the decay \(\exp(\Delta_t A)\) is content-dependent and per state channel, so Mamba can reset or persist based on the token. It forgets but never edits. Per-channel time-varying dynamics cannot be written as matmuls, so it needs a hardware-aware parallel scan. <strong>Mamba-2</strong> restricts \(A\) to a scalar per head, which makes the layer masked linear attention with a decay mask (queries \(C\), keys \(B\), values \(x\)) and allows chunked matmul training and larger states.</li>
+        <li><strong>Gated DeltaNet</strong>: \(S_t = \alpha_t(I - \beta_t k_t^\top k_t)S_{t-1} + \beta_t k_t^\top v_t\). The delta-rule term reads what the memory holds for \(k_t\) and writes only the error (an online SGD step on \(\tfrac12\|k S - v\|^2\)), so it can overwrite and keeps orthogonal keys from interfering. The scalar gate \(\alpha_t\) clears memory wholesale. Trained by a chunkwise WY/UT algorithm.</li>
+      </ul>
+      <p>Evidence: at 1.3B on S-NIAH, delta-only is strong on a single needle but drowns in distractors (14.4% on number-in-haystack at 8K), decay-only forgets the needle (30.4% pass-key at 8K), and the combination is best (91.8% and 29.6%). KDA further makes the decay per key dimension.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compute the prefill FLOPs ratio of full attention versus a sliding window (W = 4096) at T = 128K for Llama-3-8B. Why is the whole-model saving so much smaller than the attention saving?</summary>
+    <div class="answer">
+      <p>Causal pairs: full \(T(T+1)/2 = 8{,}590{,}000{,}128\); window \(W(W+1)/2 + (T-W)W = 528{,}484{,}352\). Ratio 16.25 (not \(T/W = 32\), since causal full attention already skips half the square). Each pair costs \(4 n_h d_h = 16{,}384\) FLOPs per layer, so attention is \(4.50\times10^{15}\) versus \(2.77\times10^{14}\) over 32 layers.</p>
+      <p>Windowing does not touch the projections and MLP: \(2NT = 2 \cdot 6{,}979{,}321{,}856 \cdot 131072 = 1.83\times10^{15}\) FLOPs, where \(N\) counts matmul parameters excluding embeddings. Totals: \(6.33\times10^{15}\) versus \(2.11\times10^{15}\), a 3.01x ratio. Attention is only 71% of full prefill at 128K, so removing nearly all of it leaves the dense matmuls.</p>
+      <p>Follow-up points: the whole-model gain grows with \(T\) (1.41x at 32K where attention is 38% of prefill, 17.9x at 1M where it is 95%) and shrinks with model width. Decoding is different, because reads are dominated by the cache: there the window cuts bytes by \(T/W = 32\) for that layer.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Write the DeltaNet update, say why it improves recall, and explain how it is trained in parallel.</summary>
+    <div class="answer">
+      <p>With \(S \in \mathbb{R}^{d_k\times d_v}\) and row vectors (state the convention first): \(S_t = S_{t-1} + \beta_t k_t^\top (v_t - k_t S_{t-1}) = (I - \beta_t k_t^\top k_t)S_{t-1} + \beta_t k_t^\top v_t\), \(o_t = q_t S_t\). It is one SGD step with rate \(\beta_t\) on \(\tfrac12\|k_t S - v_t\|^2\): read the current prediction \(k_t S_{t-1}\), and write the error along \(k_t\).</p>
+      <p>Why recall improves: with \(\|k_t\| = 1\) and \(\beta_t = 1\), \(k_t S_t = v_t\) exactly, so re-writing a key replaces the old value instead of adding to it; keys orthogonal to \(k_t\) are unchanged, so \(d_k\) orthonormal pairs coexist without cross-talk. Stability needs \(\|k\|=1\) and \(\beta\in(0,1)\) because the transition's eigenvalues are 1 and \(1-\beta\|k\|^2\).</p>
+      <p>Parallel training: unrolling gives \(S_t = \sum_{i\le t}k_i^\top u_i\) with pseudo-values \(u_i = \beta_i(v_i - \sum_{j\lt i}(k_ik_j^\top)u_j)\). Within a chunk of \(C\) tokens with incoming state \(S_0\): \(T = I + \operatorname{diag}(\beta)\operatorname{StrictTril}(KK^\top)\), \(U = T^{-1}\operatorname{diag}(\beta)(V - KS_0)\), \(O = QS_0 + (QK^\top\odot M)U\), \(S_C = S_0 + K^\top U\). The triangular inverse comes from the WY representation of Householder-like products, and the UT transform computes it with few non-matmul FLOPs. Cost is linear-attention cost plus a \(C\times C\) triangular solve.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> MiniMax used a 7:1 lightning-attention hybrid in MiniMax-01, full attention in M2, and sparse attention in M3. What happened, and what does it teach about evaluating architectures?</summary>
+    <div class="answer">
+      <p>MiniMax-01 (Jan 2025) found pure lightning attention had "limited retrieval capabilities", interleaved a softmax layer every 8, and showed hybrid-lightning beating hybrid-SWA on needle retrieval at 1B and 3B. For M2 the pre-training lead wrote (Oct 2025; the 2026 report repeats it) that they found no efficient variant that reliably matched full attention in production settings, for three reasons. <em>Evaluation</em>: hybrids matched on MMLU, BBH, MATH, and LongBench at small scale, but at larger scale showed clear deficits on multi-hop reasoning, and proxy metrics were fragile. <em>Infrastructure</em>: linear layers are memory-bound even in training, sensitive to low-precision storage, and awkward with prefix caching and speculative decoding. <em>SWA hybrids</em>: extensively tested with hundreds of billions to trillions of tokens, they degraded retrieval, multi-hop, and in-context learning, and after SFT were significantly worse beyond 32K. M3 then adopted MiniMax Sparse Attention (28.4x less attention compute at 1M in a 109B model).</p>
+      <p>Lessons. Standard benchmarks and perplexity do not discriminate: M2's Table 2 shows MMLU 85.5 versus 85.6 and equal 32K needles beside 90.0 versus 72.0 on 128K common-words extraction. Test at target length, after SFT, on multi-hop tasks. Infrastructure readiness is a first-class criterion. And it is not a verdict against linear hybrids: Kimi Linear and Qwen report wins under matched budgets, on different evaluations and recipes. The productive reading is that the conclusion depends on what you measure.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> You are designing a 1M-context model. Which attention architecture would you choose and how would you validate it?</summary>
+    <div class="answer">
+      <p>First pin down what binds: decode bandwidth (long agentic or RL rollouts, many concurrent sequences), prefill compute, or cache capacity. At 1M an 8B-class GQA stack needs 128 GiB per sequence, so capacity and bandwidth both bind, and I would not ship plain full attention.</p>
+      <p>Candidates, in order of risk. (1) Interleaved local/global at about 5:1 with small windows (128 to 1024) and sink logits on top of GQA or MLA: about 6x less cache, well understood. (2) A 3:1 Gated DeltaNet or KDA hybrid with MLA or GQA global layers, with a stacked reduction in the global layers: it makes 3/4 of layers constant-memory (Kimi K3: 27 GiB plus 0.4 GiB state at 1M). (3) Compressed sparse attention in the V4 style: the smallest cache (about 4.8 GiB at 1M by my estimate) but heavy engineering. I would pick (2) as the main bet with (1) as the low-risk arm, and keep a full-attention twin as the control.</p>
+      <p>Validation: same parameters and tokens; ablate ratio (1:1 to 15:1), placement, window and sinks, gate type and state size, NoPE versus RoPE. Evaluate in a ladder: MQAR and S-NIAH at small scale, RULER at 32K to 1M with per-length curves (not vanilla NIAH), position-wise loss, then after SFT and RL at 2 to 4 times the training length; use perplexity and MMLU only as regression checks. Compare on measured time per output token and prefill throughput with real kernels, and check prefix caching and speculative decoding work. Decide on the quality-versus-throughput Pareto frontier, with confidence intervals per length.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compare DeepSeek-V4's CSA/HCA with a Gated-DeltaNet hybrid. What does each keep and what does each lose?</summary>
+    <div class="answer">
+      <p>Both attack the sequence axis of the cache but differently. <em>V4</em> keeps an addressable memory in every layer: CSA merges each 4 tokens into one entry with a learned softmax (overlapping windows) and selects the top 1024 (Pro) with a lightning indexer; HCA merges 128 tokens and attends densely; a 128-token window keeps recent tokens exact. Lost: within-block token identity, since a merged entry is a learned mixture (the window and the small \(m=4\) mitigate it), and the \(O(L^2/m)\) indexer remains. Cache still grows as \(T/4\) and \(T/128\); my estimate at 1M is 4.83 GiB for Pro, and the report gives 10% of V3.2's cache and 27% of its FLOPs. Costs: custom KV cache management (a separate state cache for the window and tail), FP8 and FP4 kernels.</p>
+      <p>A <em>GDN hybrid</em> makes 3 in 4 layers constant-memory with a fixed state (Qwen3.5: 180 MiB for 45 layers) and keeps every token exactly in the remaining global layers, so its cache is 1/4 of a full model's (30 GiB at 1M for Qwen3.5, 27 GiB for K3 with MLA). Lost: exact recall in the linear layers (fixed capacity), so retrieval must route through the global layers. Costs: recurrent-state infrastructure (prefix caching, precision) and chunkwise kernels; position-encoding choices.</p>
+      <p>Trade-off summary: V4 preserves exact-content addressing everywhere at reduced fidelity and has the smaller cache at 1M; the hybrid removes memory from most layers entirely and has cheaper layers, but relies on the few global layers for recall. There is no public equal-recipe comparison, so I would measure both on recall-heavy tasks at target length and on throughput before choosing.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Gemma 3 uses 5:1 local/global with a 1024-token window, MiMo-V2-Flash uses 5:1 with a 128-token window, and MiniMax found SWA hybrids degrade beyond 32K. How would you choose a window size, and what would you test?</summary>
+    <div class="answer">
+      <p>The window is cheap: it costs \(4 n_h d_h W\) FLOPs and \(2 n_{kv}d_hW\) cache entries per layer, so even \(W=4096\) is 1/32 of full attention at 128K. The real question is what the local layers are <em>for</em>. MiMo's 32B dense ablation suggests they should be pure local mixers: with sinks, \(W=128\) and \(W=512\) look alike on general benchmarks, but after long-context extension \(W=512\) collapses (NoLiMa 38.5 versus 49.7 all-global, MRCR 19.6 versus 32.5) while \(W=128\) slightly beats all-global. Their hypothesis is a division of labor: a tight window forces long-range work into the global layers, while a medium window lets local layers half-solve it and blurs the split. Gemma 3's ablations found perplexity insensitive to the window from 4096 down to 512, which is exactly the metric that cannot see this.</p>
+      <p>MiniMax's negative results are compatible: their hybrids may have relied on SWA layers for some long-range work, and their evaluations go past 32K where MiMo's stop. I would test: (1) sink logits on and off; (2) window sizes 128, 512, 4096 and the global fraction (1:1 to 1:7), evaluated after context extension; (3) RULER and multi-hop tasks per length, out to well beyond 32K; (4) position-wise loss; (5) from scratch versus conversion. I would default to a small window, sinks, and a global layer every 4 to 6, and revise from the per-length curves.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Your hybrid matches the full-attention baseline on perplexity and MMLU but fails needle retrieval at 128K. How do you debug it?</summary>
+    <div class="answer">
+      <p>Start by localizing. (1) Sweep length: does it fail from a certain length (and is that length beyond what training and extension covered)? (2) Sweep task type with RULER's categories: single needle, multi-key, multi-hop, aggregation. Single-needle failure points at the global layers not learning retrieval; multi-key or aggregation failure points at state capacity in linear layers.</p>
+      <p>Then test causes. <em>Architecture</em>: too few or badly placed global layers (try 1:3 and even spacing), or a window in local layers so large that it blurs the division of labor (MiMo). <em>Position</em>: global layers with RoPE trained only to short lengths, or NoPE versus RoPE mismatch; check extension recipe (page 10). <em>Numerics</em>: state precision (linear layers are sensitive to low-precision storage), gate initialization that forgets too fast (\(\alpha\) near 0), missing L2 normalization of keys in delta-rule layers, chunk-size or kernel bugs; verify recurrent and chunkwise forms match token by token, as the drill does. <em>Data</em>: too little long-range-dependent data. <em>Inference</em>: prefix caching or quantization corrupting states.</p>
+      <p>Probes: check attention heads in the global layers for retrieval behavior (do they attend to the needle?); replace linear layers by full attention in a small ablation to see how much recall returns; compare with the full-attention twin trained on the same tokens. Only after such controls decide whether to change the ratio, the layer type, or the training data.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>Beyond full attention.</strong> One module with six pieces, all on small tensors, all testable on CPU: <code>sliding_window_mask</code> and <code>sliding_window_attention</code> (window counts keys including the query, so it matches a rolling buffer), <code>linear_attention_parallel</code> and <code>linear_attention_recurrent</code> (causal, \(\operatorname{elu}+1\) feature map, with normalizer; the tests assert the two forms agree), <code>delta_rule_recurrent</code> (DeltaNet, row-vector convention, no normalizer, checked against a naive loop and against the overwrite property), and <code>topk_sparse_attention</code> (causal attention over the top-\(k\) keys chosen by given index scores, the core-attention half of DSA). <span class="ex-path">exercises/drills/efficient_attention.py</span></p>
+    <p class="small muted">An interviewer would expect the mask, sliding-window attention, and the two linear-attention forms in 20 to 30 minutes, and the delta-rule recurrence and top-\(k\) attention in another 15 to 20 if you know the update. The tests include a receptive-field check (two stacked window-3 layers reach 4 positions back and no further) and a no-future-leakage check for top-\(k\).</p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_efficient_attention.py</code>; add <code>--solutions</code> to check the reference.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2006.16236">Katharopoulos et al. (2020). Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.</a> <span class="why">Why read it: the kernel trick and the recurrent form you must be able to derive at a whiteboard (§3.2 to §3.4).</span></li>
+    <li><a href="https://arxiv.org/abs/2309.17453">Xiao et al. (2023). Efficient Streaming Language Models with Attention Sinks.</a> <span class="why">Why read it: the explanation of sinks, Table 1 and Table 3 (sink token ablation), and the honest limitation that memory is not extended.</span></li>
+    <li><a href="https://arxiv.org/abs/2310.06825">Jiang et al. (2023). Mistral 7B</a>, with <a href="https://arxiv.org/abs/2503.19786">Gemma Team (2025). Gemma 3 Technical Report.</a> <span class="why">Why read them: sliding window and rolling buffer in §2 of Mistral; Gemma 3's 5:1 interleave and its ratio, window, and KV-memory ablations (§5.2).</span></li>
+    <li><a href="https://arxiv.org/abs/2512.02556">DeepSeek-AI (2025). DeepSeek-V3.2</a>, with <a href="https://arxiv.org/abs/2502.11089">Yuan et al. (2025). Native Sparse Attention.</a> <span class="why">Why read them: DSA's indexer, top-k selection, and two-stage KL training (§2.1), and NSA's three-branch design and memory-access argument.</span></li>
+    <li><a href="https://arxiv.org/abs/2405.21060">Dao and Gu (2024). Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality.</a> <span class="why">Why read it: the SSM-attention duality (§5), the chunked algorithm, and the hybrid ablation (§9.2.3). Pair with <a href="https://arxiv.org/abs/2111.00396">S4</a> and <a href="https://arxiv.org/abs/2312.00752">Mamba</a> for the lineage.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.06464">Yang et al. (2024). Gated Delta Networks</a>, with <a href="https://arxiv.org/abs/2406.06484">Yang et al. (2024). Parallelizing Linear Transformers with the Delta Rule</a>. <span class="why">Why read them: the delta-rule derivation and WY chunkwise algorithm (DeltaNet §2 to §3), and the gated delta rule with its S-NIAH evidence.</span></li>
+    <li><a href="https://arxiv.org/abs/2312.04927">Arora et al. (2023). Zoology: Measuring and Improving Recall in Efficient Language Models</a>, with <a href="https://arxiv.org/abs/2402.18668">Arora et al. (2024). Simple linear attention language models balance the recall-throughput tradeoff (Based).</a> <span class="why">Why read them: the 82% recall-gap finding and MQAR, and the Omega(N) state lower bound.</span></li>
+    <li><a href="https://arxiv.org/abs/2510.26692">Kimi Team (2025). Kimi Linear: An Expressive, Efficient Attention Architecture.</a> <span class="why">Why read it: KDA, the chunkwise UT algorithm, and the cleanest public hybrid-ratio and NoPE ablations (§5).</span></li>
+    <li><a href="https://arxiv.org/abs/2605.26494">MiniMax (2026). The MiniMax-M2 Series</a>, with <a href="https://arxiv.org/abs/2501.08313">MiniMax (2025). MiniMax-01</a>. <span class="why">Why read them: §2.2.2 of M2 is the best primary account of why a lab left efficient attention, with the Table 2 numbers; MiniMax-01 is the case for the other side.</span></li>
+    <li><a href="https://arxiv.org/abs/2606.19348">DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence.</a> <span class="why">Why read it: §2.3 for CSA and HCA (Eqs. 9 to 27) and §2.3.4 for the cache and FLOPs accounting at 1M tokens.</span></li>
+    <li><a href="https://arxiv.org/abs/2404.06654">Hsieh et al. (2024). RULER: What's the Real Context Size of Your Long-Context Language Models?</a> <span class="why">Why read it: the evaluation you should use to validate any efficient-attention model instead of vanilla needle-in-a-haystack.</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Three savings:</strong> FLOPs (prefill), bytes read per decoded token, resident memory. Sparse top-k saves the first two; windows, MLA, compression, and fixed states save memory too.</li>
+      <li><strong>Llama-3-8B at 128K:</strong> cache 4096 B per token per layer, 512 MiB per layer, 16 GiB in total. Linear state 32 x 128 x 128 x 4 B = 2 MiB per layer. Hybrids: 1:3 gives 4.047 GiB (3.95x), 1:7 gives 2.055 GiB (7.79x), pure linear 64 MiB.</li>
+      <li><strong>Window:</strong> \(W\) keys including self; cache slot \(i \bmod W\); receptive field about \(\ell(W-1)\), a bound only. Causal pairs: full \(T(T+1)/2\), window \(W(W+1)/2 + (T-W)W\). At 128K, W=4096: 16.25x fewer pairs, 3.01x fewer total prefill FLOPs (attention is 71% of prefill).</li>
+      <li><strong>Configs:</strong> Gemma 2 alternates 1:1 (window 4096); Gemma 3 5:1, window 1024; gpt-oss alternates with banded 128; MiMo-V2-Flash 5:1, window 128 with sink bias.</li>
+      <li><strong>Sinks:</strong> softmax must sum to 1; keep ~4 initial KV plus a rolling window; positions within the cache; \(s = e^{z_j}/(\sum_k e^{z_k} + e^{z'_h})\) for a learned sink logit. Llama-2-13B: 5158 versus 5.40 perplexity.</li>
+      <li><strong>Linear attention:</strong> \(S_t = S_{t-1} + \phi(k_t)^\top v_t\), \(z_t = z_{t-1} + \phi(k_t)^\top\), \(o_t = \phi(q_t)S_t/\phi(q_t)z_t\); state \(d_k \times d_v\). Decay: RetNet \(\gamma S\), GLA \(\operatorname{Diag}(\alpha_t)S\), Mamba-2 \(a_t S\).</li>
+      <li><strong>Mamba-2 (SSD):</strong> \(M = L \circ (CB^\top)\), \(L_{ji} = a_{j:i}\); \(C, B, x \leftrightarrow q, k, v\).</li>
+      <li><strong>DeltaNet (row convention):</strong> \(S_t = (I - \beta k^\top k)S_{t-1} + \beta k^\top v\); GDN adds \(\alpha_t\); KDA uses \(\operatorname{Diag}(\alpha_t)\). Need \(\|k\|=1\), \(\beta \in (0,1)\). Chunkwise: \(U = T^{-1}\operatorname{diag}(\beta)(V - KS_0)\).</li>
+      <li><strong>Recall:</strong> exact recall of \(N\) tokens needs \(\Omega(N)\) bits (Based Thm. 3.1); keep 1 in 4 to 1 in 8 layers as full attention. Kimi Linear val PPL: 3:1 5.65, 7:1 5.70, 15:1 5.82, pure MLA 5.77.</li>
+      <li><strong>DSA:</strong> \(I_{t,s}=\sum_j w_j \operatorname{ReLU}(q_j\cdot k_s)\), top-2048, MQA-mode MLA; warm-up 2.1B tokens (KL), sparse 943.7B. Saves core FLOPs and bytes; not cache; indexer \(O(L^2)\), saving capped near 17x.</li>
+      <li><strong>NSA:</strong> compressed + selected + window, gated; 11.6x decode at 64K (5,632 versus 65,536 tokens read). <strong>MoBA:</strong> top-k blocks by mean-pooled key. <strong>MSA:</strong> per-GQA-group block selection, 28.4x attention compute at 1M.</li>
+      <li><strong>DeepSeek-V4:</strong> CSA (merge 4, top-k 1024 Pro or 512 Flash) and HCA (merge 128, dense), 128-token window, shared 512-dim KV entries, sink logits; 1M tokens: 27% of V3.2 FLOPs, 10% of cache, about 2% of a GQA-8 BF16 baseline.</li>
+      <li><strong>Conflicting evidence:</strong> Kimi Linear (3:1 KDA beats MLA at 1.4T tokens) and Qwen (GDN hybrid beats full attention at 25B-A3B) versus MiniMax-M2 (SWA hybrids degrade beyond 32K) and GLM (conversions lose accuracy). Perplexity and MMLU do not discriminate.</li>
+      <li><strong>Validate with:</strong> MQAR and S-NIAH (small), RULER per length (13 tasks, 4 categories), position-wise loss, post-SFT and post-RL tests at 2 to 4 times training length, and measured decode throughput.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

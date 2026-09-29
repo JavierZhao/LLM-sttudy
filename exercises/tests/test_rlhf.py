@@ -90,6 +90,21 @@ def test_whiten_shift_mean_false_keeps_the_mean(impl):
     torch.testing.assert_close(out - 2.5, impl.whiten(x, mask), atol=1e-9, rtol=0)
 
 
+def test_whiten_shift_mean_false_respects_the_mask(impl):
+    x = T([1.0, 2.0, 3.0, 99.0], [4.0, 5.0, 99.0, 99.0])
+    mask = T([1, 1, 1, 0], [1, 1, 0, 0])
+    out = impl.whiten(x, mask, shift_mean=False)
+    valid = out[mask.bool()]
+    assert abs(valid.mean().item() - 3.0) < 1e-9 and abs(valid.var(unbiased=False).item() - 1.0) < 1e-6
+    assert out[~mask.bool()].abs().sum() == 0            # padding is exactly 0 in this variant too
+
+
+def test_whiten_accepts_a_bool_mask(impl):
+    x = T([1.0, 2.0, 3.0, 99.0], [4.0, 5.0, 99.0, 99.0])
+    mask = T([1, 1, 1, 0], [1, 1, 0, 0])
+    torch.testing.assert_close(impl.whiten(x, mask.bool()), impl.whiten(x, mask), atol=1e-12, rtol=0)
+
+
 def test_whiten_constant_input_is_finite(impl):
     out = impl.whiten(torch.full((2, 3), 7.0), torch.ones(2, 3))
     assert torch.isfinite(out).all() and out.abs().max() < 1e-3
@@ -102,6 +117,18 @@ def test_controller_exact_update(impl):
     new = c.update(current_kl=9.0, n_steps=512)          # error clipped from +0.5 to +0.2
     assert abs(new - 0.1 * (1 + 0.2 * 512 / 10_000)) < 1e-12
     assert abs(c.beta - new) < 1e-15
+    low = impl.AdaptiveKLController(init_beta=0.1, target_kl=6.0, horizon=10_000)
+    new_low = low.update(current_kl=3.0, n_steps=512)     # error -0.5 clipped to -0.2 (page 23 worked example)
+    assert abs(new_low - 0.1 * (1 - 0.2 * 512 / 10_000)) < 1e-12
+
+
+def test_controller_error_is_relative_to_the_target(impl):
+    # Unsaturated errors: error = KL / target - 1, so the same ratio gives the same step at any target scale.
+    for target, kl_up, kl_down in [(6.0, 6.3, 5.82), (0.5, 0.525, 0.485), (100.0, 105.0, 97.0)]:
+        up = impl.AdaptiveKLController(0.2, target, 10_000)
+        assert abs(up.update(kl_up, 500) - 0.2 * (1 + 0.05 * 500 / 10_000)) < 1e-12
+        down = impl.AdaptiveKLController(0.2, target, 10_000)
+        assert abs(down.update(kl_down, 500) - 0.2 * (1 - 0.03 * 500 / 10_000)) < 1e-12
 
 
 def test_controller_moves_beta_the_right_way(impl):

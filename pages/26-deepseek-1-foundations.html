@@ -1,0 +1,1084 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>26 · DeepSeek I: LLM, MoE, Math, V2 · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="26" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VI · Model case studies · Page 26</div>
+  <h1>DeepSeek I: LLM, MoE, Math, V2</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~60 min</span>
+    <span>Prereqs: <a href="07-kv-efficient-attention.html">07 MLA</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="13-scaling-laws.html">13 Scaling laws</a>, <a href="24-rlvr-reasoning.html">24 GRPO</a></span>
+  </div>
+  <p class="lede">Between November 2023 and September 2024 DeepSeek went from a LLaMA-shaped 67B dense model to a 236B mixture-of-experts model whose KV cache is an order of magnitude smaller, and almost every step was justified by the same argument: spend fewer FLOPs, bytes or GPU-hours per unit of quality. This page walks through that lineage paper by paper, with the numbers, the reasons and the caveats, so you can discuss DeepSeek's research style fluently and audit its headline claims.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>Lineage fluency:</strong> which paper introduced which idea (hyperparameter scaling laws, fine-grained plus shared experts, GRPO, MLA), what each one was for, and how V2 combines them.</li>
+    <li><strong>Scaling-law method:</strong> what DeepSeek LLM changed (the model-scale variable \(M\), the batch-size and learning-rate power laws, data quality moving the allocation), and whether you can evaluate the laws at a given compute on the spot.</li>
+    <li><strong>Reading headline numbers critically:</strong> V2's "42.5% cheaper, 93.3% smaller KV cache, 5.76× throughput" compare specific things on specific hardware and precision. Expect "how would you check that claim?"</li>
+    <li><strong>Parameter accounting:</strong> reconcile 236B total and 21B activated from a config, and say which embedding convention you used.</li>
+    <li><strong>Post-training as one family:</strong> the "unified paradigm" from DeepSeekMath (data source, reward function, gradient coefficient), why GRPO drops the critic, and why online beat offline in V2.</li>
+    <li><strong>Systems co-design:</strong> why V2 trains without tensor parallelism, what device-limited routing buys, and how the H800 interconnect shaped these choices.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Order the DeepSeek releases from November 2023 to September 2024, give each one's key idea and evidence, and say which later model inherited it.</li>
+    <li>Evaluate DeepSeek LLM's fitted laws \(\eta_{\text{opt}} = 0.3118\,C^{-0.1250}\) and \(B_{\text{opt}} = 0.2920\,C^{0.3271}\) at any compute (for example \(10^{22}\) and \(10^{24}\) FLOPs), and explain why the model scale is \(M\) (non-embedding FLOPs per token) rather than \(N\).</li>
+    <li>State DeepSeekMoE's two diagnoses and two fixes, quote the 2B, 16B and 145B evidence, and name where that evidence is weak.</li>
+    <li>Write DeepSeekMath's unified gradient form and place SFT, RFT, DPO, PPO and GRPO in it as (data source, reward function, gradient coefficient).</li>
+    <li>Derive DeepSeek-V2's 236B total and 21B activated parameters from <code>config.json</code>, stating the embedding convention.</li>
+    <li>Audit V2's efficiency claims: reconstruct the 93.3% KV-cache figure, explain why a 69% FLOP saving became a 42.5% GPU-hour saving, and say what "cheaper to train" does and does not mean here.</li>
+    <li>Describe DeepSeek's research style (hardware co-design, efficiency-first, open reports, published negative results) with a source for each claim.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="lineage">The lineage in one figure</h2>
+
+  <p>DeepSeek's early papers read like one long argument. At fixed quality you can cut cost along three axes: FLOPs per token (sparse experts), bytes per token at inference time (latent attention), and GPU-hours per FLOP (co-design with the interconnect). Each paper contributes one piece. DeepSeek-V2 (May 2024) combines them, and its architecture then carries into V3 (<a href="27-deepseek-2-v3.html">page 27</a>) and the reasoning line (<a href="28-deepseek-3-reasoning.html">page 28</a>). Figure 1 shows which paper feeds which.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-26-1-title">
+<title id="fig-26-1-title">Lineage of DeepSeek models from January to September 2024: DeepSeek LLM, DeepSeekMoE, DeepSeek-Coder and DeepSeekMath feed into DeepSeek-V2, which feeds Coder-V2 and V2.5</title>
+<defs><marker id="arrow-26-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="2" y="8" width="716" height="80" rx="6" style="opacity:.55"/>
+<text x="10" y="42" class="s-small s-bold s-muted">General</text>
+<text x="10" y="58" class="s-small s-bold s-muted">models</text>
+<rect class="s-box" x="2" y="92" width="716" height="80" rx="6" style="opacity:.55"/>
+<text x="10" y="126" class="s-small s-bold s-muted">Sparse</text>
+<text x="10" y="142" class="s-small s-bold s-muted">architecture</text>
+<rect class="s-box" x="2" y="176" width="716" height="80" rx="6" style="opacity:.55"/>
+<text x="10" y="210" class="s-small s-bold s-muted">Math</text>
+<text x="10" y="226" class="s-small s-bold s-muted">and RL</text>
+<rect class="s-box" x="2" y="260" width="716" height="80" rx="6" style="opacity:.55"/>
+<text x="10" y="294" class="s-small s-bold s-muted">Code</text>
+<text x="10" y="310" class="s-small s-bold s-muted">models</text>
+<rect class="s-d" x="335.2258064516129" y="15" width="158" height="234" rx="6"/>
+<text x="414.2258064516129" y="91.0" text-anchor="middle" class="s-bold">DeepSeek-V2</text>
+<text x="414.2258064516129" y="106.0" text-anchor="middle" class="s-small">May 2024 (7 May)</text>
+<text x="414.2258064516129" y="121.0" text-anchor="middle" class="s-small">236B total, 21B active</text>
+<text x="414.2258064516129" y="136.0" text-anchor="middle" class="s-small">8.1T tokens, 128K context</text>
+<text x="414.2258064516129" y="151.0" text-anchor="middle" class="s-small">MLA + DeepSeekMoE</text>
+<text x="414.2258064516129" y="166.0" text-anchor="middle" class="s-small">device-limited routing</text>
+<text x="414.2258064516129" y="181.0" text-anchor="middle" class="s-small">two-stage GRPO RL</text>
+<rect class="s-a" x="105.48387096774192" y="15" width="132" height="66" rx="6"/>
+<text x="171.48387096774192" y="29.5" text-anchor="middle" class="s-bold">DeepSeek LLM</text>
+<text x="171.48387096774192" y="44.5" text-anchor="middle" class="s-small">5 Jan 2024</text>
+<text x="171.48387096774192" y="59.5" text-anchor="middle" class="s-small">7B, 67B dense, 2T tokens</text>
+<text x="171.48387096774192" y="74.5" text-anchor="middle" class="s-small">LR/batch laws, SFT + DPO</text>
+<rect class="s-c" x="116.70967741935485" y="99" width="132" height="66" rx="6"/>
+<text x="182.70967741935485" y="113.5" text-anchor="middle" class="s-bold">DeepSeekMoE</text>
+<text x="182.70967741935485" y="128.5" text-anchor="middle" class="s-small">11 Jan 2024</text>
+<text x="182.70967741935485" y="143.5" text-anchor="middle" class="s-small">2B, 16B, 145B</text>
+<text x="182.70967741935485" y="158.5" text-anchor="middle" class="s-small">fine-grained + shared</text>
+<rect class="s-b" x="164.0" y="183" width="132" height="66" rx="6"/>
+<text x="230.0" y="197.5" text-anchor="middle" class="s-bold">DeepSeekMath</text>
+<text x="230.0" y="212.5" text-anchor="middle" class="s-small">5 Feb 2024</text>
+<text x="230.0" y="227.5" text-anchor="middle" class="s-small">7B, +500B tokens</text>
+<text x="230.0" y="242.5" text-anchor="middle" class="s-small">120B-token corpus, GRPO</text>
+<rect class="s-e" x="142.90322580645162" y="267" width="132" height="66" rx="6"/>
+<text x="208.90322580645162" y="281.5" text-anchor="middle" class="s-bold">DeepSeek-Coder</text>
+<text x="208.90322580645162" y="296.5" text-anchor="middle" class="s-small">25 Jan 2024</text>
+<text x="208.90322580645162" y="311.5" text-anchor="middle" class="s-small">1.3B to 33B, 2T tokens</text>
+<text x="208.90322580645162" y="326.5" text-anchor="middle" class="s-small">repo-level data, FIM</text>
+<rect class="s-e" x="404.93333333333334" y="267" width="138" height="66" rx="6"/>
+<text x="473.93333333333334" y="281.5" text-anchor="middle" class="s-bold">Coder-V2</text>
+<text x="473.93333333333334" y="296.5" text-anchor="middle" class="s-small">17 Jun 2024</text>
+<text x="473.93333333333334" y="311.5" text-anchor="middle" class="s-small">236B / 16B, +6T tokens</text>
+<text x="473.93333333333334" y="326.5" text-anchor="middle" class="s-small">continues from V2</text>
+<rect class="s-d" x="555.7333333333333" y="15" width="132" height="66" rx="6"/>
+<text x="621.7333333333333" y="29.5" text-anchor="middle" class="s-bold">DeepSeek-V2.5</text>
+<text x="621.7333333333333" y="44.5" text-anchor="middle" class="s-small">5 Sep 2024</text>
+<text x="621.7333333333333" y="59.5" text-anchor="middle" class="s-small">236B / 21B</text>
+<text x="621.7333333333333" y="74.5" text-anchor="middle" class="s-small">merges Chat + Coder</text>
+<path class="s-line" d="M237,48 L335,48" marker-end="url(#arrow-26-1)"/>
+<text x="286" y="42" text-anchor="middle" class="s-small s-muted">recipe</text>
+<path class="s-line" d="M249,132 L335,132" marker-end="url(#arrow-26-1)"/>
+<text x="292" y="126" text-anchor="middle" class="s-small s-muted">MoE</text>
+<path class="s-line" d="M296,216 L335,216" marker-end="url(#arrow-26-1)"/>
+<text x="316" y="210" text-anchor="middle" class="s-small s-muted">GRPO</text>
+<path class="s-line" d="M225,267 L204,249" marker-end="url(#arrow-26-1)"/>
+<text x="239" y="260" text-anchor="start" class="s-small s-muted">init</text>
+<path class="s-line" d="M444,249 L445,267" marker-end="url(#arrow-26-1)"/>
+<text x="454" y="262" text-anchor="start" class="s-small s-muted">continue</text>
+<path class="s-line" d="M275,300 L405,300" marker-end="url(#arrow-26-1)"/>
+<text x="340" y="294" text-anchor="middle" class="s-small s-muted">pipeline</text>
+<path class="s-line" d="M493,48 L556,48" marker-end="url(#arrow-26-1)"/>
+<path class="s-line" d="M543,275 L609,81" marker-end="url(#arrow-26-1)"/>
+<text x="621" y="160" class="s-small s-muted">merge</text>
+<path class="s-line" d="M262,357 L700,357" marker-end="url(#arrow-26-1)"/>
+<text x="8" y="361" class="s-small s-muted">2024, ordered by date, not to scale</text>
+</svg>
+    <figcaption><b>Figure 1.</b> Lineage of the 2024 releases. Boxes are ordered by date, not drawn to scale. Arrows mark what was actually reused: the training recipe and hyperparameter laws (DeepSeek LLM), the expert design (DeepSeekMoE), the RL algorithm (DeepSeekMath), a code checkpoint as initialization (Coder to Math), and V2's weights as the starting point for Coder-V2 and V2.5. Dates are arXiv v1 submissions (V2.5: release notes).</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th>Report</th><th class="num">Total / activated</th><th class="num">Training tokens</th><th>Key idea</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek LLM 7B, 67B <a href="https://arxiv.org/abs/2401.02954">[2401.02954]</a></td><td>5 Jan 2024 (weights 29 Nov 2023)</td><td class="num">6.9B, 67.4B (dense)</td><td class="num">2T each</td><td>LLaMA-style model; hyperparameter scaling laws; multi-step LR; GQA at 67B; SFT + DPO</td></tr>
+      <tr><td>DeepSeekMoE 2B, 16B, 145B <a href="https://arxiv.org/abs/2401.06066">[2401.06066]</a></td><td>11 Jan 2024</td><td class="num">16.4B / 2.8B; 144.6B / 22.2B</td><td class="num">100B; 2T; 245B</td><td>fine-grained experts and shared experts</td></tr>
+      <tr><td>DeepSeek-Coder 1.3B, 6.7B, 33B <a href="https://arxiv.org/abs/2401.14196">[2401.14196]</a></td><td>25 Jan 2024</td><td class="num">dense</td><td class="num">2T (87% code)</td><td>repository-level data, fill-in-the-middle, 16K window</td></tr>
+      <tr><td>DeepSeekMath 7B <a href="https://arxiv.org/abs/2402.03300">[2402.03300]</a></td><td>5 Feb 2024</td><td class="num">7B (dense)</td><td class="num">+500B on a code model</td><td>120B-token math corpus mined from Common Crawl; GRPO; unified paradigm</td></tr>
+      <tr class="hl"><td>DeepSeek-V2 <a href="https://arxiv.org/abs/2405.04434">[2405.04434]</a></td><td>7 May 2024</td><td class="num">236B / 21B (reported)</td><td class="num">8.1T</td><td>MLA plus DeepSeekMoE, device-limited routing, YaRN to 128K, two-stage GRPO</td></tr>
+      <tr><td>DeepSeek-V2-Lite</td><td>May 2024 (V2 App. B)</td><td class="num">15.7B / 2.4B</td><td class="num">5.7T</td><td>research-scale model with MLA and DeepSeekMoE, no query compression</td></tr>
+      <tr><td>DeepSeek-Coder-V2 <a href="https://arxiv.org/abs/2406.11931">[2406.11931]</a></td><td>17 Jun 2024</td><td class="num">236B / 21B; 16B / 2.4B</td><td class="num">+6T (10.2T seen)</td><td>continued pretraining from a V2 checkpoint; 338 languages; 128K context</td></tr>
+      <tr><td>DeepSeek-V2.5</td><td>5 Sep 2024 (release notes)</td><td class="num">236B / 21B</td><td class="num">none reported</td><td>merges V2-Chat-0628 and Coder-V2-Instruct-0724</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: the reports linked in the first column, DeepSeek-V2 App. B for V2-Lite, the <a href="https://api-docs.deepseek.com/news/news0905">V2.5 release note</a> and model card. Weights date: Hugging Face repository creation date for <code>deepseek-llm-7b-base</code> and <code>67b-base</code>. Parameter counts for the 7B and 67B are from their configs (6.91B and 67.43B, matching the 6.9B and 67.4B quoted in the DeepSeekMoE report).</p>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea: one recipe, reused</div>
+    <p>These are not seven separate projects. DeepSeekMoE 16B, DeepSeekMath and V2 all use DeepSeek LLM's optimizer (AdamW, \(\beta = (0.9, 0.95)\), weight decay 0.1), its 2,000-step warmup and its step schedule with two drops of \(\times 0.316\), and all are trained with the in-house HAI-LLM framework. DeepSeek-Coder states that it "adapt[s] batch sizes and learning rates by the scaling laws suggested in DeepSeek LLM" <a href="https://arxiv.org/abs/2401.14196">[Coder, §3.4]</a>. A shared, well-understood recipe is what lets a small team publish an architecture paper, a domain paper and a flagship within four months.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="deepseek-llm">DeepSeek LLM (January 2024): a LLaMA-shaped model and the scaling study behind it</h2>
+
+  <p>The report opens with a complaint about the literature: earlier scaling-law papers reached "varying conclusions" and "inadequately addressed hyperparameter discussions", so nobody could tell whether models at each compute budget were tuned <a href="https://arxiv.org/abs/2401.02954">[DeepSeek LLM, §1]</a>. The team therefore did the scaling study first, used it to set the hyperparameters, and then trained two models: 7B and 67B, both on 2T tokens of English and Chinese. Background on the laws themselves is on <a href="13-scaling-laws.html">page 13</a>. This section covers what DeepSeek did with them and why.</p>
+
+  <h3 id="llm-arch">Architecture: LLaMA on purpose, with two departures</h3>
+  <p>The micro design "largely follows" LLaMA: pre-norm with RMSNorm, a SwiGLU FFN of intermediate width \(\tfrac{8}{3} d\), and RoPE (<a href="04-transformer-block.html">page 04</a>). The stated reason is in the introduction: LLaMA had become "the de facto benchmark for architecture", so holding the architecture fixed keeps the study about data and scaling <a href="https://arxiv.org/abs/2401.02954">[§1, §2.2]</a>. The tokenizer is byte-level BPE with 100,000 regular tokens plus 15 special tokens, digits split individually, and a model vocabulary padded to 102,400 (<a href="02-tokenization.html">page 02</a>). Deduplication ran across 91 Common Crawl dumps, which removed 89.8% of documents against 22.2% when deduplicating within one dump, four times as many <a href="https://arxiv.org/abs/2401.02954">[Tab. 1]</a> (<a href="12-pretraining-data.html#global-dedup">page 12</a>).</p>
+
+  <div class="table-wrap"><table class="data"><thead><tr><th></th><th class="num">Layers</th><th class="num">\(d\)</th><th class="num">Heads / KV heads</th><th class="num">FFN width</th><th class="num">Batch (sequences of 4,096)</th><th class="num">Peak LR</th></tr></thead>
+  <tbody>
+    <tr><td>DeepSeek LLM 7B</td><td class="num">30</td><td class="num">4,096</td><td class="num">32 / 32</td><td class="num">11,008</td><td class="num">2,304</td><td class="num">4.2e-4</td></tr>
+    <tr><td>DeepSeek LLM 67B</td><td class="num">95</td><td class="num">8,192</td><td class="num">64 / 8</td><td class="num">22,016</td><td class="num">4,608</td><td class="num">3.2e-4</td></tr>
+    <tr><td>Llama 2 70B (for contrast)</td><td class="num">80</td><td class="num">8,192</td><td class="num">64 / 8</td><td class="num">28,672</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+  </tbody></table></div>
+  <p class="small muted">Sources: DeepSeek LLM Table 2 for layers, \(d\), heads, batch and learning rate; FFN widths from the released <code>config.json</code> files (<code>deepseek-llm-7b-base</code>, <code>-67b-base</code>, <code>Llama-2-70b-hf</code>).</p>
+
+  <p><strong>Departure 1: depth over width at 67B.</strong> GQA removes attention parameters, and the usual compensation is a wider FFN. DeepSeek 67B has 95 layers and an FFN of 22,016 (\(2.69\,d\)), where Llama 2 70B has 80 layers and 28,672 (\(3.5\,d\)). The report says it "expanded the 67B model's parameters in network depth rather than the common practice of widening the intermediate width of FFN layers, aiming for better performance", and adds that the layer counts "facilitate model pipeline partitioning" <a href="https://arxiv.org/abs/2401.02954">[§2.2]</a>. No ablation is given, so treat "better performance" as a claim rather than a measured result. <strong>Departure 2: GQA only where the cache is big.</strong> The 67B uses grouped-query attention with 8 KV heads "to optimize inference cost"; the 7B keeps full multi-head attention. The arithmetic shows why this matters (bf16, two tensors per layer):</p>
+  \[ \text{7B (MHA):}\ 30 \cdot 2 \cdot 32 \cdot 128 \cdot 2\,\text{B} = 480\ \text{KiB/token}, \qquad \text{67B (GQA-8):}\ 95 \cdot 2 \cdot 8 \cdot 128 \cdot 2\,\text{B} = 380\ \text{KiB/token}. \]
+  <p>The 67B model, ten times larger, has a smaller per-token cache than the 7B. Remember 380 KiB: it is the baseline against which V2's "93.3% smaller KV cache" is measured (<a href="#v2-claims">below</a>, and <a href="07-kv-efficient-attention.html#gqa">page 07</a>).</p>
+
+  <h3 id="llm-lr">The multi-step learning rate: chosen for continual training</h3>
+  <p>After 2,000 warmup steps the learning rate is held at its peak, drops to 31.6% after 80% of the training tokens, and to 10% after 90%. On a 1.6B model with 100B tokens the final performance was "essentially consistent" with cosine, and the schedule "allows for the reuse of training from the first phase, offering a unique convenience for continual training" <a href="https://arxiv.org/abs/2401.02954">[§2.3, Fig. 1a]</a>. The point is that a cosine curve is a function of the total budget \(T\): change \(T\) and you need a new run. A step schedule has an 80% constant-rate first stage that any longer run can extend. The report tried other stage proportions and found some "slightly better", but kept 80/10/10 "for the sake of balancing reuse ratios in continual training and model performance" (Fig. 1b). The factor 0.316 is \(1/\sqrt{10}\), so the two drops multiply to 0.1. V2 moved its first drop to about 60% of tokens; see <a href="14-optimization.html#decay">page 14</a> for how this family relates to warmup-stable-decay.</p>
+
+  <div class="decision">
+    <div class="decision-title">Multi-step learning rate instead of cosine</div>
+    <dl>
+      <dt>Problem</dt><dd>A cosine schedule is tied to the total token budget. Extending training, or running the many small experiments a scaling study needs, means restarting from scratch for each budget.</dd>
+      <dt>Idea</dt><dd>Hold the peak rate for 80% of tokens, then drop to 31.6% and 10% at 80% and 90%.</dd>
+      <dt>Why it works</dt><dd>The loss plateaus at the constant rate and falls at each drop. A run with a larger budget shares its first stage with a smaller one, so checkpoints from stage one can be reused.</dd>
+      <dt>Evidence</dt><dd>1.6B model, 100B tokens: final performance essentially matches cosine; other stage proportions are slightly better <a href="https://arxiv.org/abs/2401.02954">[DeepSeek LLM, Fig. 1]</a>. It is a single small-scale comparison.</dd>
+      <dt>Cost</dt><dd>Slightly worse than the best proportions; the drop points must still be chosen per run.</dd>
+      <dt>Used by</dt><dd>DeepSeek LLM, DeepSeekMoE 16B, DeepSeekMath, V2 and V2-Lite (with the first drop at 60% for V2). V3 keeps a long constant stage and a cosine decay at the end (<a href="14-optimization.html#v3-numbers">page 14</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="llm-hp">Scaling law 1: batch size and learning rate as power laws of compute</h3>
+  <p>DeepSeek first grid-searched batch size and learning rate at \(10^{17}\) FLOPs (a model with 177M FLOPs per token) and found the generalization error "stable across a wide range" of both: a broad basin, not a sharp optimum. It then trained models over a grid of batch sizes and learning rates at compute budgets from \(10^{17}\) to \(2 \times 10^{19}\), reusing the first stage of the step schedule to make this cheap. Settings whose generalization error was within 0.25% of the minimum were called near-optimal, and power laws were fitted through them <a href="https://arxiv.org/abs/2401.02954">[§3.1, Fig. 2-3]</a>:</p>
+  <div class="eq-box">
+  \[ \eta_{\text{opt}} = 0.3118\,C^{-0.1250}, \qquad B_{\text{opt}} = 0.2920\,C^{0.3271} \]
+  <div class="eq-label">\(C = M D\) in FLOPs (model scale \(M\) defined below); \(B\) in tokens; \(\eta\) is the peak learning rate</div>
+  </div>
+  <p>A check at \(10^{20}\) FLOPs (2.94B FLOPs per token) found the fitted point "centered in the optimal parameter space". Two caveats are in the paper itself: the optimum shifts slightly between models with the same \(C\) but different model-versus-data splits, so \(C\) alone is not the whole story, and the paper notes the laws are inconsistent with earlier work that modeled the optimal batch size as a function of the loss alone (see <a href="13-scaling-laws.html#hyperparameters">page 13</a> for critical batch size and an independent refit).</p>
+
+  <p><strong>Evaluating the laws.</strong> The worked arithmetic for the two compute levels the brief asks about:</p>
+  \[ C = 10^{22}:\quad \eta = 0.3118 \cdot 10^{-0.125 \cdot 22} = 0.3118 \cdot 10^{-2.75} = 5.54 \times 10^{-4}, \qquad B = 0.2920 \cdot 10^{0.3271 \cdot 22} = 0.2920 \cdot 10^{7.196} = 4.59\text{M tokens}. \]
+  \[ C = 10^{24}:\quad \eta = 0.3118 \cdot 10^{-3.0} = 3.12 \times 10^{-4}, \qquad B = 0.2920 \cdot 10^{7.850} = 20.7\text{M tokens}. \]
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Compute \(C\)</th><th class="num">\(B_{\text{opt}}\) (tokens)</th><th class="num">Sequences of 4,096</th><th class="num">\(\eta_{\text{opt}}\)</th><th>Where this sits</th></tr></thead>
+    <tbody>
+      <tr><td>\(10^{17}\)</td><td class="num">0.106M</td><td class="num">26</td><td class="num">2.34e-3</td><td>lower edge of the fit</td></tr>
+      <tr><td>\(2 \times 10^{19}\)</td><td class="num">0.601M</td><td class="num">147</td><td class="num">1.21e-3</td><td>upper edge of the fit</td></tr>
+      <tr class="hl"><td>\(10^{22}\)</td><td class="num">4.59M</td><td class="num">1,120</td><td class="num">5.54e-4</td><td>extrapolated 2.7 orders of magnitude</td></tr>
+      <tr class="hl"><td>\(10^{24}\)</td><td class="num">20.7M</td><td class="num">5,052</td><td class="num">3.12e-4</td><td>extrapolated 4.7 orders; DeepSeek 67B and V2 scale</td></tr>
+    </tbody>
+  </table></div>
+  <p>Each tenfold increase in compute multiplies the batch by \(10^{0.3271} = 2.12\) and the learning rate by \(10^{-0.125} = 0.75\). The laws were fitted on models up to \(2 \times 10^{19}\) FLOPs and applied about five orders of magnitude higher.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 330" role="img" aria-labelledby="fig-26-3-title">
+<title id="fig-26-3-title">Log-log plots of DeepSeek LLM optimal batch size in tokens and optimal learning rate against compute, showing the fitted range, the extrapolation to 1e24 FLOPs, and the actual settings of DeepSeek LLM 7B and 67B and DeepSeek-V2</title>
+<rect class="s-box" x="76.0" y="40" width="67.0" height="200" style="opacity:.8;stroke:none"/>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="76" y1="240.0" x2="338" y2="240.0"/>
+<text x="70" y="244.0" text-anchor="end" class="s-small s-muted">0.1M</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="76" y1="173.3" x2="338" y2="173.3"/>
+<text x="70" y="177.3" text-anchor="end" class="s-small s-muted">1M</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="76" y1="106.7" x2="338" y2="106.7"/>
+<text x="70" y="110.7" text-anchor="end" class="s-small s-muted">10M</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="76" y1="40.0" x2="338" y2="40.0"/>
+<text x="70" y="44.0" text-anchor="end" class="s-small s-muted">100M</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="76.0" y1="40" x2="76.0" y2="240"/>
+<text x="76.0" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">17</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="163.3" y1="40" x2="163.3" y2="240"/>
+<text x="163.3" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">20</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="250.7" y1="40" x2="250.7" y2="240"/>
+<text x="250.7" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">23</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="338.0" y1="40" x2="338.0" y2="240"/>
+<text x="338.0" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">26</tspan></text>
+<line class="s-line" x1="76" y1="240" x2="338" y2="240"/><line class="s-line" x1="76" y1="40" x2="76" y2="240"/>
+<polyline class="s-line-a" points="76.0,238.3 77.7,237.0 79.3,235.8 81.0,234.5 82.7,233.2 84.4,232.0 86.0,230.7 87.7,229.5 89.4,228.2 91.1,227.0 92.7,225.7 94.4,224.5 96.1,223.2 97.8,222.0 99.4,220.7 101.1,219.4 102.8,218.2 104.5,216.9 106.1,215.7 107.8,214.4 109.5,213.2 111.2,211.9 112.8,210.7 114.5,209.4 116.2,208.2 117.9,206.9 119.5,205.6 121.2,204.4 122.9,203.1 124.6,201.9 126.2,200.6 127.9,199.4 129.6,198.1 131.3,196.9 132.9,195.6 134.6,194.4 136.3,193.1 138.0,191.8 139.6,190.6 141.3,189.3 143.0,188.1"/>
+<polyline class="s-line-a s-dash" points="143.0,188.1 147.6,184.6 152.2,181.2 156.7,177.8 161.3,174.3 165.9,170.9 170.5,167.5 175.1,164.0 179.7,160.6 184.2,157.2 188.8,153.7 193.4,150.3 198.0,146.9 202.6,143.4 207.2,140.0 211.7,136.6 216.3,133.1 220.9,129.7 225.5,126.3 230.1,122.8 234.7,119.4 239.3,116.0 243.8,112.5 248.4,109.1 253.0,105.7 257.6,102.2 262.2,98.8 266.8,95.4 271.3,91.9 275.9,88.5 280.5,85.1 285.1,81.6 289.7,78.2 294.3,74.8 298.9,71.3 303.4,67.9 308.0,64.5 312.6,61.0 317.2,57.6 321.8,54.2 326.4,50.7"/>
+<circle class="s-fill-b" cx="248.5" cy="108.3" r="4.5" style="stroke:none"/>
+<text x="240.5" y="100.3" text-anchor="end" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">7B</text>
+<circle class="s-fill-b" cx="279.7" cy="88.3" r="4.5" style="stroke:none"/>
+<text x="289.7" y="84.3" text-anchor="start" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">67B</text>
+<circle class="s-fill-d" cx="279.6" cy="68.2" r="4.5" style="stroke:none"/>
+<text x="289.6" y="66.2" text-anchor="start" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">V2</text>
+<circle class="s-plain" cx="221.6" cy="129.2" r="5" style="stroke-width:2"/>
+<text x="213.6" y="120.2" text-anchor="end" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">4.6M</text>
+<circle class="s-plain" cx="279.8" cy="85.6" r="5" style="stroke-width:2"/>
+<text x="289.8" y="101.6" text-anchor="start" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">20.7M</text>
+<text x="207.0" y="274" text-anchor="middle" class="s-small">compute C = M·D in FLOPs (log scale)</text>
+<text x="26" y="140.0" text-anchor="middle" class="s-small" transform="rotate(-90 26 140.0)">optimal batch size (tokens)</text>
+<text x="46" y="24" class="s-bold">Batch size: B = 0.2920 C<tspan baseline-shift="super" font-size="10">0.3271</tspan></text>
+<text x="80.0" y="54" class="s-small s-muted">fit range</text>
+<text x="80.0" y="67" class="s-small s-muted">to 2e19</text>
+<rect class="s-box" x="440.0" y="40" width="67.0" height="200" style="opacity:.8;stroke:none"/>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="440" y1="240.0" x2="702" y2="240.0"/>
+<text x="434" y="244.0" text-anchor="end" class="s-small s-muted">1e-4</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="440" y1="180.4" x2="702" y2="180.4"/>
+<text x="434" y="184.4" text-anchor="end" class="s-small s-muted">3e-4</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="440" y1="115.0" x2="702" y2="115.0"/>
+<text x="434" y="119.0" text-anchor="end" class="s-small s-muted">1e-3</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="440" y1="55.4" x2="702" y2="55.4"/>
+<text x="434" y="59.4" text-anchor="end" class="s-small s-muted">3e-3</text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="440.0" y1="40" x2="440.0" y2="240"/>
+<text x="440.0" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">17</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="527.3" y1="40" x2="527.3" y2="240"/>
+<text x="527.3" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">20</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="614.7" y1="40" x2="614.7" y2="240"/>
+<text x="614.7" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">23</tspan></text>
+<line class="s-line" style="stroke-width:.6;opacity:.45" x1="702.0" y1="40" x2="702.0" y2="240"/>
+<text x="702.0" y="256" text-anchor="middle" class="s-small s-muted">10<tspan baseline-shift="super" font-size="9">26</tspan></text>
+<line class="s-line" x1="440" y1="240" x2="702" y2="240"/><line class="s-line" x1="440" y1="40" x2="440" y2="240"/>
+<polyline class="s-line-a" points="440.0,68.9 441.7,69.8 443.3,70.7 445.0,71.6 446.7,72.5 448.4,73.4 450.0,74.3 451.7,75.2 453.4,76.1 455.1,77.0 456.7,77.9 458.4,78.8 460.1,79.7 461.8,80.6 463.4,81.5 465.1,82.4 466.8,83.3 468.5,84.2 470.1,85.1 471.8,86.0 473.5,86.9 475.2,87.8 476.8,88.7 478.5,89.6 480.2,90.5 481.9,91.4 483.5,92.3 485.2,93.2 486.9,94.1 488.6,95.0 490.2,95.9 491.9,96.8 493.6,97.7 495.3,98.6 496.9,99.5 498.6,100.3 500.3,101.2 502.0,102.1 503.6,103.0 505.3,103.9 507.0,104.8"/>
+<polyline class="s-line-a s-dash" points="507.0,104.8 511.6,107.3 516.2,109.8 520.7,112.2 525.3,114.7 529.9,117.1 534.5,119.6 539.1,122.1 543.7,124.5 548.2,127.0 552.8,129.4 557.4,131.9 562.0,134.4 566.6,136.8 571.2,139.3 575.7,141.8 580.3,144.2 584.9,146.7 589.5,149.1 594.1,151.6 598.7,154.1 603.3,156.5 607.8,159.0 612.4,161.4 617.0,163.9 621.6,166.4 626.2,168.8 630.8,171.3 635.3,173.7 639.9,176.2 644.5,178.7 649.1,181.1 653.7,183.6 658.3,186.0 662.9,188.5 667.4,191.0 672.0,193.4 676.6,195.9 681.2,198.3 685.8,200.8 690.4,203.3"/>
+<circle class="s-fill-b" cx="612.5" cy="162.1" r="4.5" style="stroke:none"/>
+<text x="620.5" y="153.1" text-anchor="start" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">7B</text>
+<circle class="s-fill-b" cx="643.7" cy="176.9" r="4.5" style="stroke:none"/>
+<text x="653.7" y="168.9" text-anchor="start" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">67B</text>
+<circle class="s-fill-d" cx="643.6" cy="192.5" r="4.5" style="stroke:none"/>
+<text x="653.6" y="196.5" text-anchor="start" class="s-small s-bold" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">V2</text>
+<circle class="s-plain" cx="585.6" cy="147.0" r="5" style="stroke-width:2"/>
+<text x="593.6" y="138.0" text-anchor="start" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">5.5e-4</text>
+<circle class="s-plain" cx="643.8" cy="178.3" r="5" style="stroke-width:2"/>
+<text x="634.8" y="194.3" text-anchor="end" class="s-small" style="paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round">3.1e-4</text>
+<text x="571.0" y="274" text-anchor="middle" class="s-small">compute C = M·D in FLOPs (log scale)</text>
+<text x="390" y="140.0" text-anchor="middle" class="s-small" transform="rotate(-90 390 140.0)">optimal peak learning rate</text>
+<text x="410" y="24" class="s-bold">Learning rate: η = 0.3118 C<tspan baseline-shift="super" font-size="10">−0.1250</tspan></text>
+<text x="444.0" y="210" class="s-small s-muted">fit range</text>
+<text x="444.0" y="223" class="s-small s-muted">to 2e19</text>
+<circle class="s-fill-b" cx="70" cy="310" r="5" style="stroke:none"/><text x="80" y="314" class="s-small">DeepSeek LLM actual (Table 2)</text>
+<circle class="s-fill-d" cx="270" cy="310" r="5" style="stroke:none"/><text x="280" y="314" class="s-small">DeepSeek-V2 actual (C is our estimate)</text>
+<circle class="s-plain" cx="510" cy="310" r="5" style="stroke-width:2"/><text x="520" y="314" class="s-small">law at 1e22 and 1e24</text>
+</svg>
+    <figcaption><b>Figure 2.</b> The fitted laws (solid inside the fitted range, dashed beyond it) with DeepSeek's actual settings. The 7B and 67B settings (Table 2 of the report) fall on the extrapolated lines. V2's final batch is about 1.8× larger, and its peak learning rate about 0.77× smaller, than the law gives at V2's approximate compute (our estimate \(C \approx 6 N_{\text{act}} D\), see the text). Open circles mark \(10^{22}\) and \(10^{24}\) FLOPs.</figcaption>
+  </figure>
+
+  <p><strong>Against DeepSeek's own models</strong> (our arithmetic, with \(M\) from the formula below and \(D = 2\)T tokens): the 7B has \(M = 4.23 \times 10^{10}\), \(C = 8.5 \times 10^{22}\), and the law gives 9.2M tokens and \(4.25 \times 10^{-4}\) against the 9.4M and \(4.2 \times 10^{-4}\) actually used. The 67B has \(C = 9.9 \times 10^{23}\), and the law gives 20.7M and \(3.12 \times 10^{-4}\) against 18.9M and \(3.2 \times 10^{-4}\). Both hyperparameters land within 10% of the law. V2 is the interesting outlier. Its activated non-embedding parameters (20.3B, derived <a href="#v2-numbers">below</a>) and 8.1T tokens give \(C \approx 6 \cdot 20.3\text{B} \cdot 8.1\text{T} = 9.9 \times 10^{23}\), almost exactly the 67B's compute, so the law gives 20.6M tokens and \(3.1 \times 10^{-4}\). V2 used a batch ramping from 9.4M to 37.7M tokens and a peak rate of \(2.4 \times 10^{-4}\). The V2 report does not say the laws were applied, and they were fitted on dense models, so a MoE running off the line is not a contradiction. It is a reminder that "\(C\)" for a sparse model is a modeling choice.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>You probably tuned learning rate and batch size on the full task, or on a fixed grid. At 67B parameters nobody can afford a second run, so DeepSeek's move is to tune where it is cheap (\(10^{17}\) to \(2 \times 10^{19}\) FLOPs, about 5 to 6 orders of magnitude below the final run) and extrapolate a smooth trend. That only works because the optimum is a broad basin whose position drifts slowly with scale; the paper's own figures show the "near-optimal" region as a wide band.</p>
+  </aside>
+
+  <h3 id="llm-M">Scaling law 2: the model scale is FLOPs per token, not parameters</h3>
+  <p>For the model-versus-data allocation, DeepSeek replaced the parameter count \(N\) by the <strong>non-embedding FLOPs per token</strong> \(M\), and \(C \approx 6ND\) by \(C = MD\) <a href="https://arxiv.org/abs/2401.02954">[§3.2, Eq. 2]</a>:</p>
+  \[ 6N_1 = 72\,L\,d^2, \qquad 6N_2 = 72\,L\,d^2 + 6\,V\,d, \qquad M = 72\,L\,d^2 + 12\,L\,d\,l_{\text{seq}} \]
+  <p>Here \(N_1\) is Kaplan's non-embedding count, \(N_2\) Chinchilla's count including the vocabulary matrices, \(L\) the layers, \(d\) the width, \(V\) the vocabulary and \(l_{\text{seq}}\) the sequence length. The first term is \(6 \cdot 12 L d^2\): \(4d^2\) attention plus \(8d^2\) for a SwiGLU FFN of width \(\tfrac{8}{3}d\). The second is our derivation of the attention-score term: \(2 l d\) FLOPs for \(QK^\top\) plus \(2 l d\) for the value average per token per layer in the forward pass, times 3 for forward plus backward, counting the full \(l \times l\) matrix. \(M\) drops the vocabulary (the paper says vocabulary compute "contributes less to the model's capacity") and adds the sequence term that neither \(6N\) count has.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th class="num">Layers</th><th class="num">\(d\)</th><th class="num">\(N_1\)</th><th class="num">\(N_2\)</th><th class="num">\(M\) (FLOPs/token)</th><th class="num">\(6N_1/M\)</th><th class="num">\(6N_2/M\)</th></tr></thead>
+    <tbody>
+      <tr><td class="num">8</td><td class="num">512</td><td class="num">25.2M</td><td class="num">77.6M</td><td class="num">352M</td><td class="num">0.43</td><td class="num">1.32</td></tr>
+      <tr><td class="num">24</td><td class="num">1,024</td><td class="num">302M</td><td class="num">407M</td><td class="num">3.02B</td><td class="num">0.60</td><td class="num">0.81</td></tr>
+      <tr><td class="num">32</td><td class="num">4,096</td><td class="num">6.44B</td><td class="num">6.86B</td><td class="num">45.1B</td><td class="num">0.85</td><td class="num">0.91</td></tr>
+      <tr><td class="num">80</td><td class="num">8,192</td><td class="num">64.4B</td><td class="num">65.3B</td><td class="num">419B</td><td class="num">0.92</td><td class="num">0.94</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek LLM Table 3 (\(V = 102{,}400\), \(l_{\text{seq}} = 4{,}096\); four of its seven rows).</p>
+
+  <p>The approximation errors reach roughly 50% for small models, exactly the models an IsoFLOP study fits its curves on (8 budgets from \(10^{17}\) to \(3 \times 10^{20}\), about 10 allocations each). The appendix refit the curves under all three scale variables: \(6N_1\) "tends to overestimate the performance of large-scale models", \(6N_2\) underestimates it, and \(M\) "achieves the most accurate predictions" <a href="https://arxiv.org/abs/2401.02954">[App. A.2]</a>. Predicting the 7B and 67B from runs with about 1,000 times less compute worked for the loss curve (Fig. 5). This is the same failure mode that <a href="13-scaling-laws.html#discrepancy">page 13</a> traces in the Kaplan-versus-Chinchilla disagreement (Pearce and Song; Porian et al.): parameter counts that ignore attention and embeddings bias small-scale fits.</p>
+
+  <div class="decision">
+    <div class="decision-title">Non-embedding FLOPs per token \(M\) as the scale variable</div>
+    <dl>
+      <dt>Problem</dt><dd>Fits in \(N\) are biased at small scale: \(6N_1\) omits attention, \(6N_2\) charges for vocabulary. IsoFLOP curves are fitted on exactly those small models and then extrapolated.</dd>
+      <dt>Idea</dt><dd>Measure model size by the compute it actually costs per token, \(M = 72Ld^2 + 12Ldl_{\text{seq}}\), and define the budget as \(C = MD\).</dd>
+      <dt>Why it works</dt><dd>\(C\) then equals training FLOPs by construction, so the allocation question ("how many FLOPs go to model versus data") has no accounting error to absorb.</dd>
+      <dt>Evidence</dt><dd>Refitting under \(6N_1\), \(6N_2\) and \(M\): the first two mis-predict the 7B and 67B losses in opposite directions, \(M\) predicts them best [DeepSeek LLM, App. A.2, Fig. 6]. The differences shrink at high compute.</dd>
+      <dt>Cost</dt><dd>\(M\) is not a parameter count, so results do not map onto the usual "70B" naming. The formula assumes multi-head attention and a \(\tfrac{8}{3}d\) FFN: for the GQA-based 67B the true forward-backward FLOPs are about 13% below the formula (our count from the config), and MoE models need an activated-FLOPs version.</dd>
+      <dt>Used by</dt><dd>DeepSeek LLM; the MoE-era reports switch to activated parameters and tokens per activated parameter (<a href="13-scaling-laws.html#moe-scaling">page 13</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="llm-data">Data quality moves the optimal allocation</h3>
+  <p>During development the corpus was rebuilt several times, so the team could refit the allocation on datasets of different quality: an early in-house set, the current in-house set, and OpenWebText2 (Kaplan's data, judged by DeepSeek's internal assessment to be the cleanest because its small size allowed meticulous processing). With \(M_{\text{opt}} \propto C^a\) and \(D_{\text{opt}} \propto C^b\) <a href="https://arxiv.org/abs/2401.02954">[Tab. 4, Eq. 4]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Approach (data)</th><th class="num">\(a\) (model)</th><th class="num">\(b\) (data)</th></tr></thead>
+    <tbody>
+      <tr><td>OpenAI, Kaplan (OpenWebText2)</td><td class="num">0.73</td><td class="num">0.27</td></tr>
+      <tr><td>Chinchilla (MassiveText)</td><td class="num">0.49</td><td class="num">0.51</td></tr>
+      <tr><td>DeepSeek, early in-house data</td><td class="num">0.450</td><td class="num">0.550</td></tr>
+      <tr class="hl"><td>DeepSeek, current in-house data (used for the fit above)</td><td class="num">0.524</td><td class="num">0.476</td></tr>
+      <tr><td>DeepSeek, OpenWebText2</td><td class="num">0.578</td><td class="num">0.422</td></tr>
+    </tbody>
+  </table></div>
+  <p>The current-data fit is \(M_{\text{opt}} = 0.1715\,C^{0.5243}\) and \(D_{\text{opt}} = 5.8316\,C^{0.4757}\). The spread matters: over \(10^3\) times more compute, the optimal model grows \(10^{3 \cdot 0.450} = 22\times\) on the early data but \(10^{3 \cdot 0.578} = 54\times\) on OpenWebText2, a factor of 2.4 apart. The paper's explanation is an "intuitive speculation": high-quality data has "logical clarity and less predictive difficulty after sufficient training", so extra compute is better spent on model size. It also suggests the exponent could serve as an indirect measure of data quality. Treat that as a hypothesis with no controlled test, since the three datasets also differ in size and composition, and note that it offers a candidate explanation for the Kaplan-versus-Chinchilla gap that <a href="13-scaling-laws.html#discrepancy">page 13</a> compares with two other explanations. A practical corollary: refit the allocation whenever the data recipe changes.</p>
+  <p>One more cross-check from these formulas (our arithmetic): at the 67B's compute, \(C = 9.9 \times 10^{23}\), the fitted optimum is \(M_{\text{opt}} = 6.5 \times 10^{11}\) with 1.5T tokens. The 67B has \(M = 5.0 \times 10^{11}\) (24% smaller) and saw 2T tokens (32% more). DeepSeek picked the conventional 67B size, not the fitted optimum, and sits on the flat part of the valley. The paper does not claim the 67B is compute-optimal.</p>
+
+  <h3 id="llm-align">Alignment: SFT, then DPO</h3>
+  <p>The alignment set has about 1.5M instances in English and Chinese: 1.2M helpfulness (31.2% general language, 46.6% math, 22.2% code) and 300K safety <a href="https://arxiv.org/abs/2401.02954">[§4]</a>. The 7B was fine-tuned for 4 epochs and the 67B for only 2, "since we observed the overfitting problem is serious on the 67B model" (learning rates 1e-5 and 5e-6). As math SFT data grew, so did a repetition failure (responses that never terminate): 2.0% of 3,868 test prompts after stage one for the 7B. Two fixes worked: a second SFT stage on conversational data only (repetition 2.0% to 1.4%, HumanEval unchanged at 48.2, GSM8K 63.9 to 63.0; Tab. 12) and DPO. DPO ran for one epoch (learning rate 5e-6, batch 512, cosine with warmup) on helpfulness and harmlessness pairs whose candidates were sampled from DeepSeek's own chat models. It "can strengthen the model's open-ended generation skill" and changed standard benchmarks little (67B Chat: MMLU 71.1 to 70.9, GSM8K 84.1 to 85.2, MATH 32.6 to 30.2; Tab. 17). The DPO mechanics are on <a href="21-preference-optimization.html#dpo-gradient">page 21</a>.</p>
+  <p>Results for the base models against Llama 2 at the same 2T tokens (each benchmark in the few-shot setting the report specifies): DeepSeek 67B versus Llama 2 70B scores MMLU 71.3 versus 69.0, GSM8K 63.4 versus 58.4, MATH 18.7 versus 13.5, HumanEval 42.7 versus 28.7 and BBH 68.7 versus 62.9 <a href="https://arxiv.org/abs/2401.02954">[Tab. 5]</a>. All evaluations use DeepSeek's internal framework, which matters when comparing with numbers from other papers (the V2 report re-measures the same 67B model at HumanEval 45.1).</p>
+</section>
+
+<section>
+  <h2 id="deepseekmoe">DeepSeekMoE (January 2024): specialization as an explicit design goal</h2>
+
+  <p>Six days after the DeepSeek LLM report came the architecture paper that V2 would build on. DeepSeekMoE starts from two diagnoses of the conventional 8 to 16 expert MoE layer (Switch, GShard) <a href="https://arxiv.org/abs/2401.06066">[Dai et al. 2024, §1]</a>. <strong>Knowledge hybridity:</strong> with few experts, the tokens routed to one expert cover very different kinds of knowledge, which a single FFN must store together. <strong>Knowledge redundancy:</strong> tokens routed to different experts still need some common knowledge, so several experts learn copies of it. The claim is that both problems stop experts from specializing, so conventional MoE falls short of the ideal "upper bound" (a dense model with the same total parameters).</p>
+
+  <p>Each diagnosis gets one fix, both at constant total parameters and constant activated FLOPs. <strong>Fine-grained expert segmentation</strong> splits each expert's FFN into \(m\) smaller ones and activates \(m\) times as many, which multiplies the number of expert combinations a token can use. <strong>Shared expert isolation</strong> reserves a few always-on experts for common knowledge so that routed experts can afford to specialize. The mechanics, the combinatorics (from 120 to \(4.4 \times 10^9\) choices in the paper's own example) and the router are on <a href="08-mixture-of-experts.html#deepseekmoe">page 08</a>. Here the questions are how DeepSeek validated the idea and what the evidence does and does not support.</p>
+
+  <h3 id="moe-ladder">A validation ladder: 2B, then 16B, then 145B</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>2B (ablations)</th><th>16B</th><th>145B (preliminary)</th></tr></thead>
+    <tbody>
+      <tr><td>Training tokens</td><td class="num">100B</td><td class="num">2T</td><td class="num">245B</td></tr>
+      <tr><td>Shape</td><td>small validation models</td><td>28 layers, \(d = 2{,}048\), 16 heads</td><td>62 layers, \(d = 4{,}096\), 32 heads</td></tr>
+      <tr><td>Experts (size relative to a standard FFN)</td><td>1 shared + 63 routed, 7 active (0.25×)</td><td>2 shared + 64 routed, 6 active (0.25×); first layer dense</td><td>4 shared + 128 routed, 12 active (0.125×); first layer dense</td></tr>
+      <tr><td>Total / activated</td><td class="num">2B / 0.3B</td><td class="num">16.4B / 2.8B</td><td class="num">144.6B / 22.2B</td></tr>
+      <tr><td>Balance losses</td><td>tuned per ablation</td><td>expert-level 0.001; no device loss (all experts of a layer sit on one device, no dropping)</td><td>expert-level 0.003; device-level 0.05 (a layer's experts spread over 4 devices)</td></tr>
+      <tr class="hl"><td>Headline result</td><td>Pile loss 1.808 vs GShard 1.867; ties GShard 2.9B (1.5× expert parameters)</td><td>about DeepSeek 7B (dense, same 2T corpus) at 40.5% of the FLOPs: 74.4T vs 183.5T per 4K tokens; about Llama 2 7B at 39.6%</td><td>about a dense 67B at 28.5% of the FLOPs (585.6T vs 2,057.5T); Pile loss 1.876 vs GShard 137B 1.961; a half-activated 142B variant matches at 18.2%</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: DeepSeekMoE §4 (Tab. 1-2), §5.1-5.2 (Tab. 3-4), §7 (Tab. 6). In the 145B comparison every model, including the dense 67B baseline, is trained on the same 245B tokens, so "dense 67B" here is not the released 2T-token DeepSeek 67B. Detailed 2B ablations (shared-expert counts, expert-masking probes, the 16× dense upper bound) are summarized on page 08.</p>
+
+  <p>Two details in the table are design decisions that matter later. First, <strong>balance losses follow the parallel layout</strong>. At 16B the pipeline puts all of a layer's experts on one device, so a device-level loss is pointless and even the expert-level factor is kept tiny, because "a higher expert-level balance factor cannot increase the computation efficiency, but instead, it will compromise the model performance". At 145B the experts of a layer are spread over 4 devices and the device-level loss is switched on. V2 extends exactly this logic with a third, communication-balance loss (<a href="#v2">below</a>, <a href="08-mixture-of-experts.html#v2-losses">page 08</a>). Second, <strong>16B stops at 64 routed experts</strong>: "an even finer expert segmentation granularity is not employed due to the potential reduction in computational efficiency associated with excessively small expert sizes", with finer granularity left for larger models. The first layer is dense "since we observe that the load balance status converges especially slower for the first layer".</p>
+
+  <div class="decision">
+    <div class="decision-title">Validate an architecture on a ladder of scales</div>
+    <dl>
+      <dt>Problem</dt><dd>MoE ideas that win at 100M parameters often vanish at scale, and a 100B-class run cannot be repeated to debug a design.</dd>
+      <dt>Idea</dt><dd>Test the design against strong same-recipe baselines (GShard, Switch, Hash Layer, dense) at 2B and 100B tokens with ablations, then scale to 16B on the full 2T-token corpus, then run a preliminary 145B.</dd>
+      <dt>Why it works</dt><dd>Each rung answers one question. The 2B rung isolates the mechanism against baselines with equal parameters or FLOPs. The 16B rung shows the gain persists on the production corpus and against existing dense models. The 145B rung checks that the trend holds where expert parallelism becomes necessary.</dd>
+      <dt>Evidence</dt><dd>The gain over GShard is reproduced at all three sizes: 1.808 vs 1.867 Pile loss (2B), comparable to dense 7B at about 40% of FLOPs (16B), 1.876 vs 1.961 against GShard 137B (145B) <a href="https://arxiv.org/abs/2401.06066">[DeepSeekMoE, Tab. 1, 3, 6]</a>.</dd>
+      <dt>Cost</dt><dd>The baselines are re-implemented by the same team, the 145B run has only 245B tokens ("preliminary"), and the ladder never tests the interaction with trillions of tokens. V2 is effectively the next rung.</dd>
+      <dt>Used by</dt><dd>DeepSeek's own later reports: V2 (with 2 shared plus 160 routed experts) and V3 keep the recipe. The V2 report also ran MLA ablations at 16B and 250B MoE scale (<a href="07-kv-efficient-attention.html#mla-evidence">page 07</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="moe-attention">What the 16B model got wrong</h3>
+  <p>DeepSeekMoE 16B beat its dense comparators on language modeling and knowledge tasks (Pile, HellaSwag, TriviaQA), which the authors read as consistent with FFNs storing knowledge, but it "exhibits limitations in addressing multiple-choice tasks": MMLU 45.0 versus 48.2 for DeepSeek 7B, CMMLU 42.5 versus 47.2 <a href="https://arxiv.org/abs/2401.06066">[§5.2.1, Tab. 3]</a>. Their explanation is limited attention capacity: the 16B model has "only about 0.5B attention parameters" (\(28 \cdot 4 \cdot 2048^2 = 0.47\)B by our count) in a model with 2.8B activated, and an earlier DeepSeek 7B variant with multi-query attention "also struggled in MMLU-like tasks". That is a small piece of evidence that shrinking attention hurts, and a useful lens for V2: at \(d = 5{,}120\) with 128 heads, V2's attention holds 8.95B parameters, about 44% of its activated non-embedding parameters (derived <a href="#v2-numbers">below</a>), against roughly 20% for the 16B (0.47B of 2.41B). <span class="unverified" title="Our reading. The V2 report motivates MLA by the KV-cache bottleneck and the quality loss of GQA and MQA, not by the 16B model's multiple-choice results.">It is tempting to read MLA as the answer to "keep attention strong but make the cache small".</span></p>
+</section>
+
+<section>
+  <h2 id="coder-math">DeepSeek-Coder and DeepSeekMath (January to February 2024): data engineering, then GRPO</h2>
+
+  <h3 id="coder">DeepSeek-Coder in one paragraph</h3>
+  <p>DeepSeek-Coder trains 1.3B, 6.7B and 33B models from scratch on 2T tokens: 87% source code from 87 programming languages (public GitHub repositories created before February 2023), 10% English code-related text (Markdown, StackExchange) and 3% Chinese <a href="https://arxiv.org/abs/2401.14196">[Guo et al. 2024, §2]</a>. Two ideas carry forward. <strong>Repository-level data:</strong> instead of shuffling files independently, the pipeline parses import dependencies between files and orders them by a topological sort, so a file's dependencies appear before it in the context; the authors say it can "significantly boost the capability of cross-file code generation". <strong>Fill-in-the-middle (FIM):</strong> documents are split into prefix, middle and suffix and rearranged as prefix-suffix-middle with three sentinel tokens, at a 50% rate. The ablation shows the trade-off that set the rate: 100% FIM gave the best score on the infilling benchmark but the weakest ordinary completion, so 50% was chosen. The context window is 16K (RoPE linear scaling factor 4, base raised from 10,000 to 100,000, then 1,000 more steps at 16K). The 33B model uses GQA with group size 8, and batch size and learning rate follow the DeepSeek LLM laws.</p>
+
+  <h3 id="math-corpus">DeepSeekMath: mining a math corpus from Common Crawl</h3>
+  <p>DeepSeekMath's first contribution is data, not an algorithm: "the publicly accessible Common Crawl data contains valuable information for mathematical purposes", if you can find it <a href="https://arxiv.org/abs/2402.03300">[Shao et al. 2024, §1-2]</a>. The pipeline is an iterated classifier bootstrap:</p>
+  <ol>
+    <li><strong>Seed and classifier.</strong> Take OpenWebMath as positives (500,000 pages) and 500,000 random Common Crawl pages as negatives, and train a fastText classifier (256-dimensional vectors, word n-grams up to 3, 3 epochs). Run it over a deduplicated Common Crawl of 40B HTML pages and keep the top-ranked pages. Pre-training experiments on the top 40B, 80B, 120B and 160B tokens decide how much to keep; the first iteration keeps 40B.</li>
+    <li><strong>Discover domains.</strong> The seed lacks diversity, so many math pages are missed. Group the crawl by domain, and call a domain math-related if over 10% of its pages were collected (for example mathoverflow.net). Humans then annotate which URL paths in those domains are mathematical.</li>
+    <li><strong>Grow the seed and retrain.</strong> The newly found pages join the positives and the classifier is retrained.</li>
+    <li><strong>Stop.</strong> After four iterations the corpus is 35.5M pages and 120B tokens; in iteration 4 "nearly 98%" of the data had already been collected in iteration 3, so collection stops. Benchmark contamination is removed by exact 10-gram matching (and exact matching for benchmark texts of 3 to 9 grams).</li>
+  </ol>
+  <p>The evidence is a controlled comparison: the same 1.3B model trained for 150B tokens on each candidate corpus. On GSM8K and MATH (few-shot chain of thought) it scores 2.9% and 3.0% with no math training, 11.5% and 8.9% on OpenWebMath, 14.3% and 11.2% on Proof-Pile-2 (51.9B tokens), and <strong>23.8% and 13.6%</strong> on the DeepSeekMath corpus (120.2B tokens) <a href="https://arxiv.org/abs/2402.03300">[Tab. 1]</a>. The corpus is larger (about 9 times OpenWebMath), and the model keeps improving where the smaller corpora, repeated for several epochs, plateau. It is also multilingual, which lifts Chinese benchmarks where English-only corpora do not.</p>
+
+  <aside class="callout bridge">
+    <div class="callout-title">From your jet tagger</div>
+    <p>This is signal-versus-background selection with a data-driven signal sample. The seed corpus is a clean but narrow "signal" sample, Common Crawl is the background, and each round retrains the classifier on what the previous round selected. The failure mode you already know applies: the classifier recalls only what looks like its training positives, so DeepSeek adds a second selection mechanism (domain-level statistics plus human URL annotation) to broaden the signal class, and monitors saturation (the 98% overlap) to know when to stop. Selection also biases the corpus toward the seed's style, which the paper does not quantify.</p>
+  </aside>
+
+  <p>Two findings from the pre-training study are negative or surprising results worth remembering (both on a 1.3B model). <strong>Code first helps math.</strong> Training on 400B code tokens and then 150B math tokens beats the same schedule with 400B <em>general</em> tokens first: 21.9% versus 19.1% on GSM8K and 15.3% versus 14.4% on MATH with chain of thought, and 17.4% versus 14.3% and 9.4% versus 6.7% when the model may write Python <a href="https://arxiv.org/abs/2402.03300">[Tab. 6]</a>. This is why DeepSeekMath-Base 7B is initialized from DeepSeek-Coder-Base-v1.5 7B rather than a general model, then trained on 500B tokens (56% math corpus, 4% AlgebraicStack, 10% arXiv, 20% GitHub code, 10% natural language). <strong>arXiv papers do not help.</strong> Adding arXiv text, standard in earlier math corpora, "brings no notable improvements on all mathematical benchmarks adopted in this paper" (1.3B GSM8K: 3.3% with ArXiv-RedPajama against 2.9% with no math training). The result: DeepSeekMath-Base 7B reaches 64.2% on GSM8K and 36.2% on MATH, above Minerva 540B (58.8% and 33.6%), which supports the claim that data quality can substitute for parameters in a narrow domain.</p>
+
+  <h3 id="grpo">GRPO enters, briefly</h3>
+  <p>For RL, DeepSeekMath starts from DeepSeekMath-Instruct 7B (SFT on 776K examples in chain-of-thought, program-of-thought and tool-integrated formats). PPO's value function "is typically another model of comparable size as the policy model", and it is hard to fit accurately at every token when only the last token of a long solution receives a reward. <strong>Group Relative Policy Optimization</strong> <span class="zh">组相对策略优化</span> removes the critic: sample \(G\) outputs per question, score them, and use the group's own statistics as the baseline,</p>
+  \[ \hat A_{i,t} = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)} \quad \text{for every token } t \text{ of output } i, \]
+  <p>inside a PPO-style clipped objective, with the KL penalty to the reference policy added to the loss (using the unbiased estimator \(\pi_{\text{ref}}/\pi_\theta - \log(\pi_{\text{ref}}/\pi_\theta) - 1\)) rather than to the reward <a href="https://arxiv.org/abs/2402.03300">[§4.1]</a>. The paper argues that the group-relative advantage matches the comparative nature of reward models, which are trained on comparisons between outputs for the same question. The full objective, the normalization variants that later work criticized, and R1's use of rule-based rewards are on <a href="24-rlvr-reasoning.html">page 24</a>.</p>
+  <p>The recipe: 144K chain-of-thought questions from the GSM8K and MATH portions of the SFT data, a reward model trained from the 7B base (learning rate 2e-5), policy learning rate 1e-6, KL coefficient 0.04, \(G = 64\) outputs per question, maximum length 1,024, batch size 1,024, and a single policy update per exploration stage. The gains are on the benchmarks the data covers and beyond: GSM8K 82.9% to 88.2%, MATH 46.8% to 51.7%, and the out-of-domain CMATH 84.6% to 88.8% <a href="https://arxiv.org/abs/2402.03300">[Tab. 5]</a>, using only chain-of-thought-format questions from those two training sets.</p>
+
+  <div class="decision">
+    <div class="decision-title">GRPO: a group baseline instead of a critic</div>
+    <dl>
+      <dt>Problem</dt><dd>PPO for LLMs needs a value model about the size of the policy, which costs memory and compute, and a per-token value is hard to learn from one terminal reward.</dd>
+      <dt>Idea</dt><dd>Sample a group of \(G\) outputs per prompt and normalize each reward by the group mean and standard deviation; apply that one advantage to all tokens of the output.</dd>
+      <dt>Why it works</dt><dd>The group mean is a per-prompt baseline computed from the samples you already have, so no value network is trained. Comparing outputs for the same question matches how reward models are trained.</dd>
+      <dt>Evidence</dt><dd>DeepSeekMath-Instruct 7B to RL 7B: GSM8K +5.3, MATH +4.9, CMATH +4.2 points; GRPO beats online rejection sampling in the paper's controlled comparison (Fig. 5) <a href="https://arxiv.org/abs/2402.03300">[DeepSeekMath, §4.2, §5.2]</a>.</dd>
+      <dt>Cost</dt><dd>\(G\) samples per prompt multiplies rollout cost; groups where every output gets the same reward have zero advantage; the std normalization and per-sequence length normalization introduce biases studied later (<a href="24-rlvr-reasoning.html">page 24</a>).</dd>
+      <dt>Used by</dt><dd>DeepSeek-V2 and Coder-V2 alignment, then R1 and V3 (<a href="28-deepseek-3-reasoning.html">page 28</a>); adopted widely as the default RLVR algorithm.</dd>
+    </dl>
+  </div>
+
+  <h3 id="unified">The unified paradigm: SFT, RFT, DPO, PPO and GRPO as one gradient</h3>
+  <p>DeepSeekMath's most reusable idea for interviews is analytical. Every method here updates the model along the gradient of the log-probability of sampled tokens, weighted by a coefficient <a href="https://arxiv.org/abs/2402.03300">[§5.2.1, Eq. 5]</a>:</p>
+  <div class="eq-box">
+  \[ \nabla_\theta \mathcal J_{\mathcal A}(\theta) = \mathbb E_{(q,o) \sim \underbrace{\mathcal D}_{\text{data source}}}\Big[ \frac{1}{|o|}\sum_{t=1}^{|o|} \underbrace{GC_{\mathcal A}(q, o, t, \pi_{rf})}_{\text{gradient coefficient}}\; \nabla_\theta \log \pi_\theta(o_t \mid q, o_{&lt;t}) \Big] \]
+  <div class="eq-label">Three components: the data source \(\mathcal D\), the reward function \(\pi_{rf}\), and the algorithm \(\mathcal A\) that turns data and reward into the coefficient \(GC\)</div>
+  </div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Method</th><th>Data source</th><th>Reward</th><th>Gradient coefficient \(GC\)</th></tr></thead>
+    <tbody>
+      <tr><td>SFT</td><td>\((q,o)\) from the SFT set</td><td>none (human selection)</td><td>\(1\)</td></tr>
+      <tr><td>RFT (rejection sampling FT)</td><td>\(q\) from SFT set, \(o \sim \pi_{\text{sft}}\) (offline)</td><td>rule (answer correct?)</td><td>\(\mathbb 1[o\ \text{correct}]\)</td></tr>
+      <tr><td>Online RFT</td><td>\(o \sim \pi_\theta\) (online)</td><td>rule</td><td>\(\mathbb 1[o\ \text{correct}]\)</td></tr>
+      <tr><td>DPO</td><td>pairs \(o^+, o^- \sim \pi_{\text{sft}}\) (offline)</td><td>human preference (rule for math)</td><td>\(\sigma\big(\beta\log\tfrac{\pi_\theta(o^-)}{\pi_{\text{ref}}(o^-)} - \beta\log\tfrac{\pi_\theta(o^+)}{\pi_{\text{ref}}(o^+)}\big)\), positive on \(o^+\), negative on \(o^-\)</td></tr>
+      <tr><td>PPO</td><td>\(o \sim \pi_\theta\) (online)</td><td>reward model</td><td>\(A_t\) from GAE and a learned value function</td></tr>
+      <tr class="hl"><td>GRPO</td><td>\(\{o_i\}_{i=1}^{G} \sim \pi_\theta\) (online)</td><td>reward model</td><td>\(\hat A_{i,t} + \beta\big(\tfrac{\pi_{\text{ref}}}{\pi_\theta} - 1\big)\)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeekMath Tab. 10 and App. A.1 (Eq. 6 to 21). The PPO and GRPO rows use the paper's simplification of one policy update per exploration stage (\(\pi_{\theta_{\text{old}}} = \pi_\theta\)), which removes the clip. The paper prints the DPO coefficient with per-token log-ratios; the exact DPO gradient weights every token of a response by one sequence-level sigmoid (<a href="21-preference-optimization.html#dpo-gradient">page 21</a>), and the paper's objective (Eq. 12) also length-normalizes the log-ratios.</p>
+
+  <p>Reading the table gives the three levers, and the paper runs an experiment on each <a href="https://arxiv.org/abs/2402.03300">[§5.2.1, Fig. 5-7]</a>:</p>
+  <ul>
+    <li><strong>Data source: offline versus online.</strong> RFT and DPO train on samples from the frozen SFT model; online RFT, PPO and GRPO sample from the current policy. On a 1.3B model, online RFT is comparable to RFT early in training and "gains an absolute advantage in the later stage": early on the policy still resembles the SFT model, later its own samples differ, and they are the relevant distribution.</li>
+    <li><strong>Gradient coefficient: sign and magnitude.</strong> Online RFT gives every correct answer the same weight 1 and never pushes down a wrong answer. GRPO's coefficient depends on the reward and is negative for below-average outputs, so it both reinforces and penalizes with graded strength. GRPO beats online RFT in the experiment, and GRPO with process supervision (step-level rewards, advantage summed over later steps) beats outcome supervision. Two rounds of iterative RL (retraining the reward model on new samples with 10% replay of old data) help, mostly in the first.</li>
+    <li><strong>Reward: model versus rule.</strong> DeepSeekMath's RL uses a learned reward model whose training data comes from rule judgments. Replacing it with the rule itself is what R1 later did (<a href="24-rlvr-reasoning.html">page 24</a>).</li>
+  </ul>
+  <p>The paper's "why does RL work?" analysis is deflationary. RL raises Maj@K but not Pass@K (temperature 0.7), which means it "seems that the improvement is attributed to boosting the correct response from TopK rather than the enhancement of fundamental capabilities": RL sharpens the output distribution rather than adding skills. The conclusion also flags that all these methods "fully TRUST the signal of the reward function", while even the carefully annotated PRM800K contains about 20% incorrect labels. Both points reappear in the debate on page 24 about whether RL adds capability.</p>
+</section>
+
+<section>
+  <h2 id="v2">DeepSeek-V2 (May 2024): MLA plus DeepSeekMoE at 236B</h2>
+
+  <p>The title states the goals: "a strong, economical, and efficient" model. It identifies two bottlenecks and gives each a new component <a href="https://arxiv.org/abs/2405.04434">[DeepSeek-V2, §1-2]</a>. At inference the KV cache limits batch size and context, and GQA and MQA "often compromise performance" in shrinking it, so V2 introduces <strong>multi-head latent attention</strong> (MLA, <a href="07-kv-efficient-attention.html#mla">page 07</a>). In training, FFN FLOPs dominate, so the FFN becomes <strong>DeepSeekMoE</strong> (<a href="08-mixture-of-experts.html#deepseekmoe">page 08</a>). Because expert parallelism introduces communication and load-balance problems of its own, V2 adds device-limited routing, three balance losses and token dropping. Everything not mentioned (RMSNorm, SwiGLU experts, tokenizer) follows DeepSeek 67B.</p>
+
+  <h3 id="v2-arch">The architecture, with each efficiency choice and its reason</h3>
+  <figure class="fig">
+<svg viewBox="0 0 720 478" role="img" aria-labelledby="fig-26-2-title">
+<title id="fig-26-2-title">DeepSeek-V2 block diagram: 60 blocks, each with multi-head latent attention and a DeepSeekMoE feed-forward layer with 2 shared and 160 routed experts, 6 active, limited to 3 of 8 device groups</title>
+<defs><marker id="arrow-26-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="6" y="8" width="150" height="30" rx="6"/>
+<text x="81.0" y="27.0" text-anchor="middle" class="s-small">token ids</text>
+<rect class="s-box" x="6" y="52" width="150" height="44" rx="6"/>
+<text x="81.0" y="70.5" text-anchor="middle" class="s-bold">Embedding</text>
+<text x="81.0" y="85.5" text-anchor="middle" class="s-small">102,400 × 5,120</text>
+<rect class="s-plain" x="6" y="110" width="150" height="236" rx="8"/>
+<text x="81.0" y="130" text-anchor="middle" class="s-bold">Transformer block</text>
+<text x="81.0" y="146" text-anchor="middle" class="s-bold">× 60</text>
+<rect class="s-a" x="16" y="158" width="130" height="52" rx="6"/>
+<text x="81.0" y="180.5" text-anchor="middle" class="s-bold">MLA attention</text>
+<text x="81.0" y="195.5" text-anchor="middle" class="s-small">all 60 layers</text>
+<rect class="s-c" x="16" y="222" width="130" height="68" rx="6"/>
+<text x="81.0" y="245.0" text-anchor="middle" class="s-bold">FFN</text>
+<text x="81.0" y="260.0" text-anchor="middle" class="s-small">layer 1: dense, 12,288</text>
+<text x="81.0" y="275.0" text-anchor="middle" class="s-small">layers 2 to 60: MoE</text>
+<text x="81.0" y="312" text-anchor="middle" class="s-small s-muted">d = 5,120 · 128 heads</text>
+<text x="81.0" y="328" text-anchor="middle" class="s-small s-muted">RMSNorm before each</text>
+<rect class="s-box" x="6" y="360" width="150" height="28" rx="6"/>
+<text x="81.0" y="378.0" text-anchor="middle" class="s-small">final RMSNorm</text>
+<rect class="s-box" x="6" y="402" width="150" height="44" rx="6"/>
+<text x="81.0" y="420.5" text-anchor="middle" class="s-bold">LM head (untied)</text>
+<text x="81.0" y="435.5" text-anchor="middle" class="s-small">5,120 × 102,400</text>
+<text x="81.0" y="466" text-anchor="middle" class="s-small s-muted">logits over 102,400 tokens</text>
+<path class="s-line" d="M81.0,38 L81.0,52" marker-end="url(#arrow-26-2)"/>
+<path class="s-line" d="M81.0,96 L81.0,110" marker-end="url(#arrow-26-2)"/>
+<path class="s-line" d="M81.0,346 L81.0,360" marker-end="url(#arrow-26-2)"/>
+<path class="s-line" d="M81.0,388 L81.0,402" marker-end="url(#arrow-26-2)"/>
+<rect class="s-plain s-dash" x="176" y="4" width="540" height="470" rx="8"/>
+<text x="188" y="22" class="s-bold">One block (layers 2 to 60)</text>
+<path class="s-line s-dash" d="M156,130 L176,60"/>
+<path class="s-line s-dash" d="M156,346 L176,448"/>
+<rect class="s-a" x="188" y="44" width="516" height="128" rx="8" style="fill-opacity:.35"/>
+<text x="200" y="64" class="s-bold">Multi-head latent attention</text>
+<text x="692" y="64" text-anchor="end" class="s-small s-muted">mechanism: page 07</text>
+<rect class="s-box" x="200" y="76" width="140" height="40" rx="6"/>
+<text x="270.0" y="92.5" text-anchor="middle" class="s-bold">c<tspan baseline-shift="super" font-size="9">Q</tspan> = h W<tspan baseline-shift="super" font-size="9">DQ</tspan></text>
+<text x="270.0" y="107.5" text-anchor="middle" class="s-small">1,536 (queries only)</text>
+<rect class="s-a" x="354" y="76" width="140" height="40" rx="6"/>
+<text x="424.0" y="92.5" text-anchor="middle" class="s-bold">c<tspan baseline-shift="super" font-size="9">KV</tspan> = h W<tspan baseline-shift="super" font-size="9">DKV</tspan></text>
+<text x="424.0" y="107.5" text-anchor="middle" class="s-small">512, cached</text>
+<rect class="s-c" x="508" y="76" width="140" height="40" rx="6"/>
+<text x="578.0" y="92.5" text-anchor="middle" class="s-bold">k<tspan baseline-shift="super" font-size="9">R</tspan> = RoPE(h W<tspan baseline-shift="super" font-size="9">KR</tspan>)</text>
+<text x="578.0" y="107.5" text-anchor="middle" class="s-small">64, shared, cached</text>
+<text x="200" y="136" class="s-small">128 heads: query and key 192 = 128 content + 64 RoPE, value 128; scale 1/√192</text>
+<text x="200" y="154" class="s-small">cache per token per layer: 512 + 64 = 576 numbers; then W<tspan baseline-shift="super" font-size="9">O</tspan>: 16,384 → 5,120</text>
+<circle class="s-plain" cx="446.0" cy="190" r="9"/><text x="446.0" y="194" text-anchor="middle" class="s-small s-bold">+</text>
+<rect class="s-c" x="188" y="212" width="516" height="246" rx="8" style="fill-opacity:.35"/>
+<text x="200" y="232" class="s-bold">DeepSeekMoE feed-forward</text>
+<text x="692" y="232" text-anchor="end" class="s-small s-muted">mechanism: page 08</text>
+<rect class="s-box" x="200" y="244" width="150" height="40" rx="6"/>
+<text x="275.0" y="260.5" text-anchor="middle" class="s-bold">Router</text>
+<text x="275.0" y="275.5" text-anchor="middle" class="s-small">softmax over 160</text>
+<rect class="s-c" x="364" y="244" width="150" height="40" rx="6"/>
+<text x="439.0" y="260.5" text-anchor="middle" class="s-bold">2 shared experts</text>
+<text x="439.0" y="275.5" text-anchor="middle" class="s-small">always on, gate 1</text>
+<rect class="s-box" x="528" y="244" width="164" height="40" rx="6"/>
+<text x="610.0" y="260.5" text-anchor="middle" class="s-bold">sum: u + shared</text>
+<text x="610.0" y="275.5" text-anchor="middle" class="s-small">+ Σ g<tspan baseline-shift="sub" font-size="9">i</tspan> FFN<tspan baseline-shift="sub" font-size="9">i</tspan>(u)</text>
+<text x="200" y="304" class="s-small s-bold">160 routed experts (d<tspan baseline-shift="sub" font-size="9">e</tspan> = 1,536), 8 device groups of 20</text>
+<rect class="s-plain" x="200" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="205.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="214.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="223.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="233.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="242.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="205.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="214.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="223.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="233.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="242.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="205.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="214.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="223.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="233.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="242.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="205.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="214.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="223.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="233.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="242.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="226.0" y="388" text-anchor="middle" class="s-small s-muted">D1</text>
+<rect class="s-c" x="260" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="265.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="274.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="283.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-c" x="293.2" y="317.0" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="302.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="265.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="274.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="283.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="293.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-c" x="302.6" y="327.5" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="265.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="274.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="283.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="293.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="302.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="265.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="274.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="283.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="293.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="302.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="286.0" y="388" text-anchor="middle" class="s-small s-muted">D2</text>
+<rect class="s-plain" x="320" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="325.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="334.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="343.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="353.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="362.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="325.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="334.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="343.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="353.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="362.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="325.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="334.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="343.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="353.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="362.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="325.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="334.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="343.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="353.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="362.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="346.0" y="388" text-anchor="middle" class="s-small s-muted">D3</text>
+<rect class="s-plain" x="380" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="385.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="394.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="403.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="413.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="422.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="385.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="394.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="403.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="413.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="422.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="385.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="394.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="403.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="413.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="422.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="385.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="394.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="403.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="413.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="422.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="406.0" y="388" text-anchor="middle" class="s-small s-muted">D4</text>
+<rect class="s-c" x="440" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-c" x="445.0" y="317.0" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="454.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="463.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="473.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="482.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="445.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="454.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="463.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="473.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="482.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="445.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-c" x="454.4" y="338.0" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="463.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="473.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="482.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="445.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="454.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-c" x="463.8" y="348.5" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="473.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="482.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="466.0" y="388" text-anchor="middle" class="s-small s-muted">D5</text>
+<rect class="s-plain" x="500" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="505.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="514.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="523.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="533.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="542.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="505.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="514.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="523.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="533.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="542.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="505.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="514.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="523.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="533.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="542.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="505.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="514.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="523.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="533.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="542.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="526.0" y="388" text-anchor="middle" class="s-small s-muted">D6</text>
+<rect class="s-c" x="560" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="565.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="574.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="583.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="593.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="602.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-c" x="565.0" y="327.5" width="7" height="7" rx="1.5" style=""/>
+<rect class="s-fill-muted" x="574.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="583.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="593.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="602.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="565.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="574.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="583.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="593.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="602.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="565.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="574.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="583.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="593.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="602.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="586.0" y="388" text-anchor="middle" class="s-small s-muted">D7</text>
+<rect class="s-plain" x="620" y="312" width="52" height="62" rx="5"/>
+<rect class="s-fill-muted" x="625.0" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="634.4" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="643.8" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="653.2" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="662.6" y="317.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="625.0" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="634.4" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="643.8" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="653.2" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="662.6" y="327.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="625.0" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="634.4" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="643.8" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="653.2" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="662.6" y="338.0" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="625.0" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="634.4" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="643.8" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="653.2" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<rect class="s-fill-muted" x="662.6" y="348.5" width="7" height="7" rx="1.5" style="opacity:.45"/>
+<text x="646.0" y="388" text-anchor="middle" class="s-small s-muted">D8</text>
+<text x="200" y="408" class="s-small">Top-6 (filled) come from the 3 best-scoring device groups (M = 3): here D2, D5, D7.</text>
+<text x="200" y="425" class="s-small">6 of 160 routed experts run per token (3.75%), plus the 2 shared ones.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> One DeepSeek-V2 block. All 60 layers use MLA; layer 1 has a dense FFN and layers 2 to 60 use DeepSeekMoE. MLA caches only the 512-dimensional latent and the 64-dimensional shared RoPE key (576 numbers per token per layer). Each token uses 2 shared experts plus 6 of 160 routed experts, and the 6 must sit on at most 3 of the 8 device groups. The dashed lines connect the stack on the left to the expanded block on the right.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Setting</th><th class="num">DeepSeek-V2</th><th class="num">V2-Lite</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Layers, hidden size \(d\)</td><td class="num">60, 5,120</td><td class="num">27, 2,048</td><td>§3.1.2, App. B</td></tr>
+      <tr><td>Heads \(n_h\) and head dimension \(d_h\)</td><td class="num">128, 128</td><td class="num">16, 128</td><td>§3.1.2, App. B</td></tr>
+      <tr><td>KV latent \(d_c\), query latent \(d_c'\), RoPE dimension \(d_h^R\)</td><td class="num">512, 1,536, 64</td><td class="num">512, none, 64</td><td>§3.1.2, App. B</td></tr>
+      <tr><td>FFN layers</td><td class="num">layer 1 dense (12,288), layers 2 to 60 MoE</td><td class="num">layer 1 dense (10,944), layers 2 to 27 MoE</td><td><code>config.json</code></td></tr>
+      <tr><td>Experts: shared + routed, active routed, expert width</td><td class="num">2 + 160, 6, 1,536</td><td class="num">2 + 64, 6, 1,408</td><td>§3.1.2, App. B</td></tr>
+      <tr><td>Routing</td><td class="num">softmax, device-limited (\(M = 3\) of 8 groups)</td><td class="num">softmax, plain top-6</td><td>§2.2, <code>config.json</code></td></tr>
+      <tr><td>Vocabulary, embeddings</td><td class="num">102,400, untied</td><td class="num">102,400, untied</td><td><code>config.json</code></td></tr>
+      <tr><td>Context</td><td class="num">4K trained, 128K via YaRN</td><td class="num">32K</td><td>§3.1.4, App. B</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The next table is the "walk me through V2" answer: for each choice, the bottleneck it targets, and what the report offers as evidence (or not). Two checks against the released code: the routing config is <code>topk_method: group_limited_greedy</code> with <code>n_group: 8</code> and <code>topk_group: 3</code>, and the code scores each group by its best expert before taking the top 3 groups. The released code also multiplies the softmax gates by <code>routed_scaling_factor: 16</code> without renormalizing (<a href="08-mixture-of-experts.html#router-math">page 08</a>).</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Choice</th><th>Bottleneck</th><th>Mechanism and numbers</th><th>Evidence in the report</th></tr></thead>
+    <tbody>
+      <tr><td>MLA</td><td>KV cache (capacity and bandwidth at decode)</td><td>Cache \(d_c + d_h^R = 576\) numbers per token per layer, equal to GQA with 2.25 groups (\(d_c = 4d_h\), \(d_h^R = d_h/2\))</td><td>MLA at or above MHA in the 16B and 250B MoE ablations (App. D; <a href="07-kv-efficient-attention.html#mla-evidence">page 07</a>)</td></tr>
+      <tr><td>DeepSeekMoE, 2 + 160 experts, top-6</td><td>training FLOPs per token</td><td>21B of 236B parameters active; activated FFN width \((6+2) \cdot 1{,}536 = 12{,}288\), equal to the dense layer's width</td><td>172.8K vs 300.6K GPU-hours per trillion tokens against dense 67B (§3.2.3)</td></tr>
+      <tr><td>Device-limited routing, \(M = 3\)</td><td>all-to-all traffic, proportional to the number of devices a token reaches</td><td>Pick the 3 devices with the highest-scoring experts, then top-6 among their experts</td><td>"when \(M \ge 3\)" quality is "roughly aligned with the unrestricted top-\(K\) routing" (no table)</td></tr>
+      <tr><td>Three balance losses</td><td>routing collapse; device compute skew; skew in what devices receive</td><td>\(\alpha_1 = 0.003\) (expert), \(\alpha_2 = 0.05\) (device), \(\alpha_3 = 0.02\) (communication), \(D = 8\) (<a href="08-mixture-of-experts.html#v2-losses">page 08</a>)</td><td>none isolated</td></tr>
+      <tr><td>Device-level token dropping</td><td>stragglers when a device is overloaded</td><td>Capacity factor 1.0 per device; drop the lowest-affinity tokens; never drop tokens of about 10% of training sequences; no dropping at evaluation (<a href="08-mixture-of-experts.html#capacity">page 08</a>)</td><td>none isolated</td></tr>
+      <tr><td>No tensor parallelism</td><td>per-layer TP all-reduces on a bandwidth-limited interconnect</td><td>16-way zero-bubble pipeline, 8-way expert parallelism, ZeRO-1, activation recomputation (<a href="#v2-train">below</a>)</td><td>stated rationale only</td></tr>
+      <tr><td>Shared experts overlapped with all-to-all</td><td>exposed communication time</td><td>Compute the always-on experts while the routed tokens are in flight</td><td>described only</td></tr>
+      <tr><td>FP8 weights, 6-bit KV cache at serving</td><td>inference memory and bandwidth</td><td>KV elements compressed to 6 bits on average</td><td>throughput claim (<a href="#v2-claims">below</a>)</td></tr>
+      <tr><td>YaRN on the decoupled key only</td><td>128K context at low cost</td><td>\(s = 40\), \(\alpha = 1\), \(\beta = 32\), target 160K; 1,000 steps at 32K</td><td>needle-in-a-haystack up to 128K (Fig. 4; <a href="10-long-context.html#yarn">page 10</a>)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Sources: V2 §2.1.4 (Table 1), §2.2, §3.1.2-3.1.4, §3.2.3; released <code>config.json</code> and <code>modeling_deepseek.py</code>. "None isolated" means the report gives no ablation of that component alone.</p>
+
+  <p>Two stability details are easy to miss: the low-rank compression and fine-grained experts change the output scale of a layer, so the report adds RMSNorm layers after the compressed latents and multiplies "additional scaling factors at the width bottlenecks (i.e., the compressed latent vectors and the intermediate hidden states of routed experts)" <a href="https://arxiv.org/abs/2405.04434">[§3.1.2]</a>. Parameters are initialized with standard deviation 0.006 as in DeepSeek LLM.</p>
+
+  <h3 id="v2-numbers">Worked numbers: where the 236B and 21B live</h3>
+  <p>Everything below follows from <code>config.json</code> (layers 60, \(d = 5{,}120\), vocabulary 102,400, untied embeddings). A SwiGLU expert has three matrices of size \(d \times d_e\) and MLA's matrices are those of <a href="07-kv-efficient-attention.html#mla-numbers">page 07</a> at V2's shape. The total matches the Hugging Face safetensors metadata exactly (235,741,434,880 parameters), which validates the accounting.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th>Arithmetic</th><th class="num">Parameters</th></tr></thead>
+    <tbody>
+      <tr><td>MLA, one layer</td><td>\(W^{DQ}\) 5,120 × 1,536 = 7,864,320; \(W^{UQ}, W^{QR}\) 1,536 × 128 · 192 = 37,748,736; \(W^{DKV}, W^{KR}\) 5,120 × 576 = 2,949,120; \(W^{UK}, W^{UV}\) 512 × 128 · 256 = 16,777,216; \(W^O\) 16,384 × 5,120 = 83,886,080; two latent norms 2,048</td><td class="num">149,227,520</td></tr>
+      <tr><td>MLA, 60 layers</td><td>60 × 149,227,520</td><td class="num">8,953,651,200</td></tr>
+      <tr><td>Dense FFN, layer 1</td><td>3 × 5,120 × 12,288</td><td class="num">188,743,680</td></tr>
+      <tr><td>One expert</td><td>3 × 5,120 × 1,536</td><td class="num">23,592,960</td></tr>
+      <tr><td>Routed experts, 59 MoE layers</td><td>59 × 160 × 23,592,960</td><td class="num">222,717,542,400</td></tr>
+      <tr><td>Shared experts, 59 layers</td><td>59 × 2 × 23,592,960</td><td class="num">2,783,969,280</td></tr>
+      <tr><td>Routers, 59 layers</td><td>59 × 5,120 × 160</td><td class="num">48,332,800</td></tr>
+      <tr><td>Input embedding and LM head</td><td>2 × 102,400 × 5,120</td><td class="num">1,048,576,000</td></tr>
+      <tr><td>RMSNorm weights</td><td>60 × 2 × 5,120 + 5,120</td><td class="num">619,520</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td>reported: 236B</td><td class="num"><strong>235,741,434,880</strong></td></tr>
+      <tr><td>Activated FFN per MoE layer</td><td>(6 + 2) × 23,592,960 + router 819,200</td><td class="num">189,562,880</td></tr>
+      <tr class="hl"><td><strong>Activated, non-embedding</strong></td><td>8,953,651,200 + 188,743,680 + 59 × 189,562,880 + 619,520</td><td class="num"><strong>20,327,224,320</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>Routed experts hold 94.5% of all parameters but only 41% of the activated non-embedding ones (\(59 \cdot 6 \cdot 23.59\text{M} = 8.35\)B): a token uses 6 of 160 routed experts, 3.75%. Attention is the reverse: 3.8% of the total but 44.0% of the activated count, because every token uses all of it. The shared experts (2.78B) are 13.7% of the activated count, and the dense layer, routers and norms about 1%. The total is 11.6 times the activated non-embedding count.</p>
+
+  <p><strong>Which convention gives "21B"?</strong> Adding the LM head (a 524M-parameter matmul every token performs) gives 20.85B, and adding both vocabulary matrices gives 21.38B. All three are consistent with "21B". Reports do not say which they use, and checking the same recipe on DeepSeek's other configs shows that no single convention reproduces every reported figure (our counts; the first three totals match the Hugging Face safetensors metadata to the parameter):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Model</th><th class="num">Reported total / activated</th><th class="num">Our total</th><th class="num">Activated: non-embedding</th><th class="num">+ LM head</th><th class="num">+ both matrices</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeekMoE 16B</td><td class="num">16.4B / 2.8B</td><td class="num">16.376B</td><td class="num">2.41B</td><td class="num">2.62B</td><td class="num">2.83B</td></tr>
+      <tr><td>DeepSeek-V2-Lite</td><td class="num">15.7B / 2.4B</td><td class="num">15.706B</td><td class="num">2.24B</td><td class="num">2.45B</td><td class="num">2.66B</td></tr>
+      <tr class="hl"><td>DeepSeek-V2</td><td class="num">236B / 21B</td><td class="num">235.741B</td><td class="num">20.33B</td><td class="num">20.85B</td><td class="num">21.38B</td></tr>
+      <tr><td>DeepSeek-V3 (<a href="08-mixture-of-experts.html#numbers">page 08</a>)</td><td class="num">671B / 37B</td><td class="num">671.026B</td><td class="num">35.70B</td><td class="num">36.63B</td><td class="num">37.55B</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">The 16B's 2.8B matches "both matrices" (2.83B); V2-Lite's 2.4B matches only the LM head alone (2.45B, truncated); V2's and V3's figures fit either. (V3's checkpoint file, 684.5B parameters, also holds the multi-token-prediction module and FP8 scale tensors, about 13.5B more than the count above.) The drill for this page (<code>exercises/drills/deepseek_params.py</code>) takes the convention as an argument. When you quote an activated count in an interview, say which one it is.</p>
+
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: 236B is total, 21B is per-token compute</div>
+    <p>Memory scales with the 236B (weights in bf16 are 471 GB; FP8 halves that), FLOPs per token with the 21B. That is why V2 trains cheaply per token yet needs several nodes just to hold the weights, and why MoE serving is memory-first (<a href="08-mixture-of-experts.html#serving">page 08</a>).</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="v2-train">V2 in training: data, schedule, layout, and alignment</h2>
+
+  <h3 id="v2-recipe">Data and hyperparameters</h3>
+  <p>The corpus has 8.1T tokens with the 67B's 100K byte-level BPE tokenizer. Relative to the 67B corpus it adds volume, "especially Chinese data" (Chinese tokens are about 12% more than English ones), recovers data that earlier cleaning "mistakenly deleted", improves the quality filter, and removes "contentious content" to reduce regional-culture bias (App. E discusses the effect) <a href="https://arxiv.org/abs/2405.04434">[V2, §3.1.1]</a>. The report gives no mixture proportions, so the data recipe cannot be reproduced from it. Optimization is DeepSeek LLM's recipe with a batch ramp: AdamW (\(\beta = (0.9, 0.95)\), weight decay 0.1), gradient clip 1.0, peak learning rate \(2.4 \times 10^{-4}\) after 2,000 warmup steps, multiplied by 0.316 at about 60% and again at about 90% of tokens, sequence length 4K, and a batch that grows from 2,304 to 9,216 sequences (9.4M to 37.7M tokens) over the first 225B tokens and then stays constant <a href="https://arxiv.org/abs/2405.04434">[§3.1.2]</a>. The ramp follows the critical-batch-size logic of <a href="13-scaling-laws.html#hyperparameters">page 13</a>: small batches early are sample-efficient, and large batches later cut the step count. Figure 2 shows how these settings sit relative to DeepSeek LLM's fitted laws.</p>
+
+  <h3 id="v2-layout">Layout and the decision not to use tensor parallelism</h3>
+  <p>V2 trains with HAI-LLM using a "16-way zero-bubble pipeline parallelism, an 8-way expert parallelism, and ZeRO-1 data parallelism" on H800 nodes (8 GPUs on NVLink/NVSwitch, InfiniBand across nodes). The report's reason for omitting tensor parallelism is one sentence: "Given that DeepSeek-V2 has relatively few activated parameters, and a portion of the operators are recomputed to save activation memory, it can be trained without the necessity of tensor parallelism, thereby decreasing the communication overhead" <a href="https://arxiv.org/abs/2405.04434">[§3.1.3]</a>. Alongside that, the shared experts' computation is overlapped with the expert-parallel all-to-all, custom CUDA kernels handle communication, routing and fused expert matmuls, and MLA is built on an improved FlashAttention-2.</p>
+
+  <div class="decision">
+    <div class="decision-title">No tensor parallelism for V2 training</div>
+    <dl>
+      <dt>Problem</dt><dd>Tensor parallelism splits every layer's matmuls across GPUs and pays all-reduces (or reduce-scatter and all-gather) inside every layer, on the critical path, over the fastest link in the machine (<a href="15-distributed-training.html#tp-cost">page 15</a>). On H800s that link is NVLink at 400 GB/s per GPU, down from 900 GB/s on H100 for export-compliance reasons <a href="https://arxiv.org/abs/2505.09343">[Zhao et al. 2025, §4.1]</a>.</dd>
+      <dt>Idea</dt><dd>Make the model small enough per GPU that TP is not needed: shard layers by pipeline parallelism (16 stages), experts by expert parallelism (8 ranks), optimizer state by ZeRO-1, and recompute cheap operators instead of storing activations.</dd>
+      <dt>Why it works</dt><dd>Only 21B parameters are active, and the 236B are mostly experts that EP spreads out. Our arithmetic: routed experts 222.7B over \(16 \times 8 = 128\) GPUs is 1.74B each, plus the 13.0B of non-routed parameters over 16 stages, 0.81B each (replicated across the EP ranks): about <strong>2.55B parameters per GPU</strong>, or 46 GB of training state at 18 bytes per parameter before ZeRO-1 shards the optimizer part. That fits in 80 GB with recomputation. A dense 67B with the same 16-way pipeline would hold 4.2B parameters per GPU (76 GB at 18 bytes), too tight without TP or heavier sharding.</dd>
+      <dt>Evidence</dt><dd>The stated rationale above and the achieved cost: 172.8K GPU-hours per trillion tokens. For V3, the later "Insights" paper is explicit that "Tensor Parallelism is avoided during training due to its inefficiency under limited NVLink bandwidth" <a href="https://arxiv.org/abs/2505.09343">[§4.2]</a>. The V2 report gives no with-versus-without-TP measurement.</dd>
+      <dt>Cost</dt><dd>Pipeline bubbles (mitigated by zero-bubble scheduling), expert-parallel all-to-all (mitigated by device-limited routing and overlap), and no headroom if the per-GPU model grows. Attention is not sharded, so MLA's up-projections and activations must fit on one GPU.</dd>
+      <dt>Used by</dt><dd>V3 ("without using costly Tensor Parallelism", <a href="15-distributed-training.html#plan-c">page 15</a>), which adds DualPipe and 64-way EP. The reasoning does not carry to inference: V3's decoding uses TP4 for attention (<a href="07-kv-efficient-attention.html#tp">page 07</a>).</dd>
+    </dl>
+  </div>
+  <p>The per-GPU numbers are illustrations, since the report does not state the data-parallel degree or memory use. The dense DeepSeek LLM report lists tensor parallelism among HAI-LLM's tools but also gives no degrees, so "the 67B used TP and V2 did not" is an inference from the framework description and the arithmetic above.</p>
+
+  <h3 id="v2-long">Long context</h3>
+  <p>After pre-training, YaRN extends the window from 4K to 128K. It is applied only to the decoupled key \(k^R_t\), "as it is responsible for carrying RoPE" (the content path is position-free; <a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>). Settings: scale \(s = 40\), \(\alpha = 1\), \(\beta = 32\), target length 160K (the config's <code>max_position_embeddings</code> is \(4096 \times 40 = 163{,}840\)), and the attention-entropy factor \(\sqrt t = 0.0707 \ln s + 1\) chosen to minimize perplexity (1.26 at \(s = 40\)). The extension trains for only 1,000 steps at 32K with 576 sequences per batch, about 18.9B tokens, 0.23% of the 8.1T. Although trained only at 32K, the model passes needle-in-a-haystack tests up to 128K <a href="https://arxiv.org/abs/2405.04434">[§3.1.4, Fig. 4]</a>; <a href="10-long-context.html#yarn">page 10</a> covers YaRN and why passing a needle test is a weak criterion.</p>
+
+  <h3 id="v2-align">Alignment: SFT, then two-stage online GRPO</h3>
+  <p><strong>SFT</strong> uses 1.5M instances (1.2M helpfulness, 0.3M safety) for 2 epochs at learning rate \(5 \times 10^{-6}\), with data quality improved "to mitigate hallucinatory responses and enhance writing proficiency" <a href="https://arxiv.org/abs/2405.04434">[§4.1]</a>. The discussion (§4.4) reports a data-quantity finding worth quoting: earlier work argued that fewer than 10K instances suffice, but "we observe a significant performance decline on the IFEval benchmark if we use fewer than 10K instances", so a language model needs "a certain amount of data to develop specific skills". <strong>RL</strong> uses GRPO (the group baseline of the <a href="#grpo">previous section</a>) to avoid a critic as large as the policy. The training runs in two stages because RL on reasoning data behaves differently from RL on general data: "the mathematical and coding abilities of our model can keep improving over a longer period of training steps":</p>
+  <ol>
+    <li><strong>Reasoning alignment.</strong> A reward model \(RM_{\text{reasoning}}\) trained for code and math scores the outputs; code preference data comes from compiler feedback, math preference data from ground-truth labels.</li>
+    <li><strong>Human preference alignment.</strong> A multi-reward framework, \(r_i = c_1 RM_{\text{helpful}}(o_i) + c_2 RM_{\text{safety}}(o_i) + c_3 RM_{\text{rule}}(o_i)\), with reward models initialized from DeepSeek-V2 Chat (SFT) and trained with point-wise or pair-wise losses.</li>
+  </ol>
+  <p>Two findings shape everything after. <strong>Online beats offline:</strong> "the online approach significantly outperforms the offline approach", so the team invested in an online RL framework (a hybrid engine using different parallel layouts for training and generation, vLLM as the rollout backend, and a CPU-offload schedule), reserving a fuller comparison for future work. This is the same lever as the unified paradigm's data-source axis. <strong>There is an alignment tax:</strong> preference RL raised open-ended scores (V2 Chat RL: 38.9 length-controlled AlpacaEval 2.0, 8.97 MT-Bench, 7.91 AlignBench) but "can negatively impact the performance on some standard benchmarks such as BBH", which they only partly mitigated. The contrast with DeepSeek LLM is instructive: there, offline DPO on a fixed preference set; here, online GRPO with reward models. Offline DPO and why online DPO exists are covered on <a href="21-preference-optimization.html#online-dpo">page 21</a>.</p>
+
+  <h3 id="v2-results">Results, and V2-Lite</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Base models, DeepSeek's internal harness</th><th class="num">DeepSeek 67B</th><th class="num">Qwen1.5 72B</th><th class="num">Mixtral 8x22B</th><th class="num">Llama 3 70B</th><th class="num">DeepSeek-V2</th></tr></thead>
+    <tbody>
+      <tr><td>Activated / total parameters</td><td class="num">67B / 67B</td><td class="num">72B / 72B</td><td class="num">39B / 141B</td><td class="num">70B / 70B</td><td class="num">21B / 236B</td></tr>
+      <tr><td>MMLU (5-shot)</td><td class="num">71.3</td><td class="num">77.2</td><td class="num">77.6</td><td class="num">78.9</td><td class="num">78.5</td></tr>
+      <tr><td>GSM8K (8-shot)</td><td class="num">63.4</td><td class="num">77.9</td><td class="num">80.3</td><td class="num">83.0</td><td class="num">79.2</td></tr>
+      <tr><td>MATH (4-shot)</td><td class="num">18.7</td><td class="num">41.4</td><td class="num">42.5</td><td class="num">42.2</td><td class="num">43.6</td></tr>
+      <tr><td>HumanEval (0-shot)</td><td class="num">45.1</td><td class="num">43.9</td><td class="num">53.1</td><td class="num">48.2</td><td class="num">48.8</td></tr>
+      <tr><td>MBPP (3-shot)</td><td class="num">57.4</td><td class="num">53.6</td><td class="num">64.2</td><td class="num">68.6</td><td class="num">66.6</td></tr>
+      <tr><td>C-Eval (5-shot)</td><td class="num">66.1</td><td class="num">83.7</td><td class="num">59.6</td><td class="num">67.5</td><td class="num">81.7</td></tr>
+      <tr><td>CMMLU (5-shot)</td><td class="num">70.8</td><td class="num">84.3</td><td class="num">60.0</td><td class="num">69.3</td><td class="num">84.0</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: DeepSeek-V2 Table 2 (a subset of its rows). All models were evaluated by the authors in one harness. The report notes V2 "is trained on fewer than a quarter of English tokens" compared with Llama 3 70B and acknowledges "a slight gap in basic English capabilities".</p>
+  <p>Read the table as the quality half of the "economical" claim: V2 matches the 70B-class dense models on most rows with 21B activated parameters, wins clearly on math and Chinese, and trails Llama 3 on English knowledge. Note how V2 compares with the same lab's 67B: MMLU +7.2, GSM8K +15.8, MATH +24.9, C-Eval +15.6.</p>
+
+  <p><strong>V2-Lite</strong> is the artifact for people who want to study MLA and DeepSeekMoE without a 236B checkpoint <a href="https://arxiv.org/abs/2405.04434">[V2, App. B]</a>. It has 27 layers, \(d = 2{,}048\), 16 heads, KV latent 512, <em>no query compression</em>, 2 shared plus 64 routed experts of width 1,408 with top-6, and totals 15.7B parameters with 2.4B activated. It was trained on 5.7T tokens (peak learning rate \(4.2 \times 10^{-4}\), constant batch of 4,608 sequences, step decays at 80% and 90%) with only a small expert-level balance loss (0.001), since all experts of a layer share one device, and extended to 32K context. Its MMLU is 58.3 against 48.2 for DeepSeek 7B and 45.0 for DeepSeekMoE 16B. Remember when quoting this that V2-Lite saw 5.7T tokens against those models' 2T, from a larger corpus, so the table combines architecture and data, and it says little about MLA alone.</p>
+</section>
+
+<section>
+  <h2 id="v2-claims">Auditing V2's headline claims</h2>
+
+  <p>The abstract says that, compared with DeepSeek 67B, V2 "saves 42.5% of training costs, reduces the KV cache by 93.3%, and boosts the maximum generation throughput to 5.76 times" <a href="https://arxiv.org/abs/2405.04434">[V2, Abstract]</a>. Each is a ratio of two measurements, so each has a numerator, a denominator, and conditions. Interviewers like this topic because a strong candidate reconstructs the number instead of repeating it.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Claim</th><th>Arithmetic</th><th>What is compared</th><th>What to ask</th></tr></thead>
+    <tbody>
+      <tr><td>42.5% cheaper training</td><td>\(1 - 172.8/300.6\)</td><td>GPU-hours per trillion tokens, V2 versus dense 67B, on the H800 cluster (§3.2.3)</td><td>Per token or per model? Same precision, sequence length, software maturity? Per unit quality?</td></tr>
+      <tr><td>93.3% smaller KV cache</td><td>\(1 - 25{,}920/389{,}120\)</td><td>Bytes per token: V2 with MLA and a 6-bit cache versus 67B with GQA-8 (our reconstruction)</td><td>How much is MLA and how much is quantization? Is the baseline GQA or MHA?</td></tr>
+      <tr><td>5.76× throughput</td><td>\(>50\text{K} / 8.7\text{K}\) tokens/s (implied)</td><td>Maximum generation throughput on one 8×H800 node, V2 in FP8 with a 6-bit cache versus 67B, on the request distribution of the deployed 67B service</td><td>Same precision for the baseline? Throughput or latency? Which batch size?</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="claim-train">"Saves 42.5% of training costs"</h3>
+  <p>The numbers are 300.6K GPU-hours per trillion tokens for the dense 67B and 172.8K for V2, both on the H800 cluster, so \((300.6 - 172.8)/300.6 = 42.5\%\). Four checks:</p>
+  <ol>
+    <li><strong>It is a rate, not a total.</strong> V2 trained on 8.1T tokens and the 67B on 2T. At these rates the whole V2 pre-training costs \(172.8\text{K} \times 8.1 = 1.40\)M GPU-hours against \(300.6\text{K} \times 2 = 0.60\)M for the 67B (our arithmetic, assuming constant cost per token over the run): 2.3 times more. "Cheaper to train" means cheaper per token at a size where quality is much higher (MMLU 78.5 versus 71.3), not a cheaper run.</li>
+    <li><strong>It falls short of the FLOP saving.</strong> Counting \(6N\) with the activated parameters, V2 needs \(21/67.4 = 31\%\) of the 67B's FLOPs per token, a 69% cut, yet GPU-hours fell only 42.5%. Converting to utilization against a 989 TFLOP/s BF16 peak (V2's training precision is not stated; we assume BF16): the 67B runs at \(6 \cdot 67.4\text{B} \cdot 10^{12} / (300.6\text{K} \cdot 3600\ \text{s}) = 374\) TFLOP/s per GPU, about 38% MFU, and V2 at \(6 \cdot 21\text{B} \cdot 10^{12} / (172.8\text{K} \cdot 3600) = 203\) TFLOP/s, about 20%. Including attention with the "Insights" paper's 155 GFLOPs per token for V2 at sequence length 4,096 <a href="https://arxiv.org/abs/2505.09343">[Zhao et al. 2025, Tab. 2]</a> gives 249 TFLOP/s, about 25%. <span class="unverified" title="Our interpretation. The report does not decompose the utilization gap.">The gap is the price of sparsity: expert-parallel all-to-all traffic, smaller matmuls (expert width 1,536), load imbalance and token dropping, and pipeline bubbles.</span> It is also why device-limited routing and the balance losses exist.</li>
+    <li><strong>The conditions differ beyond architecture.</strong> The two runs used different parallel layouts, different data, and different code maturity, and both figures are DeepSeek's internal measurements. Seven months later V3 reports 180K GPU-hours per trillion tokens with 37B activated parameters (1.76 times V2's, by the both-matrices count) <a href="https://arxiv.org/abs/2412.19437">[V3, §1]</a>, so part of V2's ratio reflects 2024 infrastructure rather than MoE alone.</li>
+    <li><strong>What is excluded.</strong> The figure covers pre-training tokens only: not the 32K extension (about 19B tokens), SFT, RL, ablations or failed runs.</li>
+  </ol>
+
+  <h3 id="claim-kv">"Reduces the KV cache by 93.3%"</h3>
+  <p>The 67B is GQA with 8 KV heads and 95 layers, so it caches \(95 \cdot 2 \cdot 8 \cdot 128 = 194{,}560\) elements per token: 380 KiB in bf16. V2 with MLA caches \(60 \cdot (512 + 64) = 34{,}560\) elements. Then:</p>
+  \[ \underbrace{1 - \frac{34{,}560 \cdot 2}{194{,}560 \cdot 2}}_{\text{MLA alone, both bf16}} = 82.2\%, \qquad \underbrace{1 - \frac{34{,}560 \cdot 6/8}{194{,}560 \cdot 2}}_{\text{MLA plus 6-bit cache}} = 1 - \frac{25{,}920\ \text{B}}{389{,}120\ \text{B}} = 93.3\%. \]
+  <p>The second line reproduces the abstract to three digits, and Figure 1(b) of the report draws V2's bar at about 25 KB on a 0 to 400 KB axis. So the 93.3% is the product of an architecture (a 5.6 times smaller cache than GQA-8) and a serving technique: the report says the deployed V2 compresses "each element in its KV cache into 6 bits on average" <a href="https://arxiv.org/abs/2405.04434">[§3.2.3]</a>. Two consequences. First, the baseline is already GQA: against a multi-head model of the same shape (\(2 \cdot 64 \cdot 128 \cdot 95 = 1{,}556{,}480\) elements) MLA would look far better, 97.8%. Second, the quantization could be applied to the 67B as well: a 6-bit 67B cache would be 142.5 KiB per token, and MLA's own advantage would then be \(142.5/25.3 = 5.6\times\) rather than 15×. Neither is a criticism of MLA, whose quality claim is tested separately in the ablations on <a href="07-kv-efficient-attention.html#mla-evidence">page 07</a>; it is a reminder to ask what is in the numerator.</p>
+
+  <h3 id="claim-thru">"5.76 times the maximum generation throughput"</h3>
+  <p>V2's parameters are converted to FP8 for serving, its KV cache to about 6 bits, and on "a single node with 8 H800 GPUs" it generates over 50K tokens per second, which is 5.76 times the 67B's maximum, using "the prompt and generation length distribution from the actually deployed DeepSeek 67B service" (prompt throughput exceeds 100K tokens per second) <a href="https://arxiv.org/abs/2405.04434">[§3.2.3]</a>. Implied: about 8.7K tokens per second or more for the 67B on the same node. Three ingredients are confounded. <strong>Compute:</strong> 21B activated versus 67B parameters is 3.2 times fewer FLOPs per token. <strong>Weight traffic behaves differently from FLOPs:</strong> at the large batches a throughput maximum measures, a decode step touches nearly every expert, so the bytes streamed per step approach the full 236B (about 236 GB in FP8, against 135 GB for the 67B in bf16) and the "activated parameters" bandwidth advantage is gone (<a href="17-inference-serving.html#moe-batch">page 17</a>). What MoE gains is that this traffic is amortized over a much larger batch. <strong>Cache capacity:</strong> that larger batch is possible because the cache is 15 times smaller per token. On 8 GPUs with 80 GB each (our arithmetic, ignoring activations and fragmentation), V2's 236 GB of FP8 weights leave \((640 - 236)\,\text{GB} / 25.3\,\text{KiB} \approx 15.6\)M cached tokens, while the 67B in bf16 leaves \((640 - 135)\,\text{GB} / 380\,\text{KiB} \approx 1.3\)M, 12 times fewer. The baseline's precision is not stated in the report, and a throughput maximum describes the large-batch regime: per-request latency, the number users feel, is a separate measurement. No ablation attributes the 5.76× to its parts.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">How to answer "evaluate this claim"</div>
+    <p>State the ratio's numerator and denominator, reconstruct it from config and arithmetic, list what differs between the two sides (model, tokens, precision, hardware, software, workload), and name what is excluded. Then say what you would run to isolate the component you care about: an MLA-versus-GQA ablation at equal training tokens and cache precision, a same-precision serving benchmark at matched latency, a FLOPs-normalized utilization comparison for training.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="successors">Coder-V2, V2.5, and the hand-off to V3</h2>
+
+  <p><strong>DeepSeek-Coder-V2</strong> (17 June 2024) shows how cheaply the V2 architecture could be reused. It is "further pre-trained from an intermediate checkpoint of DeepSeek-V2 with additional 6 trillion tokens": 60% source code (1,170B code tokens from GitHub and Common Crawl, mined with the DeepSeekMath pipeline), 10% math (221B tokens, about double the DeepSeekMath corpus) and 30% natural language sampled from V2's own corpus, in order to preserve general ability <a href="https://arxiv.org/abs/2406.11931">[Coder-V2, §1-2]</a>. The model has now been exposed to 10.2T tokens (4.2T from V2's data plus the 6T). Programming languages grow from 86 to 338, the window from 16K to 128K, and there are two sizes, 236B with 21B activated and a 16B with 2.4B activated (the V2-Lite shape). Alignment reuses the recipe: SFT on code and math from the earlier Coder and Math projects plus V2's general data, then GRPO with compiler and test-case feedback and a reward model, and FIM during fine-tuning of the 16B. The report claims parity with GPT-4-Turbo on coding (HumanEval 90.2%) and 75.7% on MATH; these are the authors' own evaluations. The design lesson is the mixture: a code-heavy continuation that keeps 30% general text preserves general ability, with MMLU 79.2 under the simple-evals pipeline against V2's 78.5 in DeepSeek's own harness (different pipelines, so only roughly comparable).</p>
+
+  <p><strong>DeepSeek-V2.5</strong> (5 September 2024) merges the two lines. The model card calls it "an upgraded version that combines DeepSeek-V2-Chat and DeepSeek-Coder-V2-Instruct", and the release note says both API names (<code>deepseek-chat</code> and <code>deepseek-coder</code>) now reach the new model, with function calling, FIM completion and JSON output unchanged. The model card's table moves AlpacaEval 2.0 from 46.6 (V2-0628) and 44.5 (Coder-V2-0724) to 50.5, ArenaHard from 68.3 and 66.3 to 76.2, and HumanEval (Python) from 84.5 and 87.2 to 89.0. A later checkpoint, V2.5-1210 (10 December 2024), reports MATH-500 rising from 74.8% to 82.8% and LiveCodeBench from 29.2% to 34.4%. No new pre-training is reported for either.</p>
+  <p>What changed architecturally? We diffed the released configs. V2.5 and the 236B Coder-V2 are identical to each other, and differ from V2 only in the YaRN entries <code>mscale</code> and <code>mscale_all_dim</code> (0.707 in V2, 1.0 in both) plus an <code>ep_size</code> field. In the released code the attention logits are scaled by \((0.1 \cdot \text{mscale} \cdot \ln s + 1)^2\): V2's 0.707 reproduces the report's coefficient 0.0707 (\(\sqrt t = 1.26\) at \(s = 40\)), while 1.0 restores the original YaRN coefficient 0.1 (1.37, and V3's config also uses 1.0, <a href="10-long-context.html#yarn">page 10</a>). <span class="unverified" title="Our reading of the configs and code. The model card does not explain the change.">So the V2.5 generation appears to have retuned the long-context attention temperature, and nothing else in the architecture.</span> The Coder-V2-Lite config is V2-Lite's, unchanged.</p>
+
+  <aside class="callout key">
+    <div class="callout-title">What stayed fixed from V2 to V3</div>
+    <p>MLA's constants: \(d_c = 512\), \(d_c' = 1{,}536\), \(d_h^R = 64\), 128 heads of dimension 128, per the released V2 and V3 configs, and the DeepSeekMoE recipe with fine-grained plus shared experts. V3 scales width to 7,168 and experts to 1 shared plus 256 routed with 8 active, replaces the three balance losses with bias-based balancing, and adds multi-token prediction, FP8 training and DualPipe: <a href="27-deepseek-2-v3.html">page 27</a>. The line then continues with R1, V3.1, V3.2 (sparse attention) and V4 (compressed attention, mHC residuals, Muon): <a href="28-deepseek-3-reasoning.html">page 28</a>. The pieces from this page that persist longest are MLA, fine-grained plus shared experts, GRPO, and the habit of designing around the interconnect.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="style">The DeepSeek research style</h2>
+
+  <p>Across these papers, four habits recur. Each is stated below with its source and its limit, because "DeepSeek is efficient and open" is the kind of sentence an interviewer will ask you to back up.</p>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Habit</th><th>Evidence</th><th>Limit</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Design around what the hardware makes expensive</strong></td><td>V2 avoids tensor parallelism and bounds all-to-all traffic with device-limited routing (\(M = 3\)). The H800 is the same Hopper architecture as the H100 but with NVLink cut from 900 to 400 GB/s (and reduced FP64) <a href="https://arxiv.org/abs/2505.09343">[Zhao et al. 2025, §4.1]</a>, and V3 reports NVLink at 160 GB/s achieved versus InfiniBand at 50 GB/s, then limits routing to 4 nodes (<a href="08-mixture-of-experts.html#node-limited">page 08</a>). Before all this, Fire-Flyer 2 (10,000 PCIe A100 GPUs, built in 2021) reached about 83% of a DGX-A100's matmul throughput at 60% of the node price and 40% less energy, and the authors say it supports the training of the DeepSeek LLMs <a href="https://arxiv.org/abs/2408.14158">[An et al. 2024, §III-C, Tab. II, Acknowledgment]</a>.</td><td>Constraints are self-reported. Some choices are conditional on the hardware: V4 drops the node limit once a fused kernel makes cross-node dispatch cheap (<a href="08-mixture-of-experts.html#lineage">page 08</a>). "Device-limited routing at \(M \ge 3\) loses nothing" has no table.</td></tr>
+      <tr><td><strong>Lead with the cost ratio</strong></td><td>DeepSeekMoE's abstract ends with "28.5% (maybe even 18.2%) of computations"; V2's with 42.5%, 93.3% and 5.76×. The standard for "good" is matching a strong dense predecessor, then reporting how much less it costs.</td><td>Ratios need denominators (<a href="#v2-claims">audit above</a>). A cheaper model at equal quality can still be a larger and costlier project overall.</td></tr>
+      <tr><td><strong>Open weights, configs and unusually complete recipes</strong></td><td>Weights and <code>config.json</code> for every model here are on Hugging Face, which is why this page can reconcile parameter counts to the last digit. Reports give learning rates, batch sizes, warmup, decay points, tokenizer sizes, the model-scale formula \(M\) and the fitted constants.</td><td>Data mixtures are largely undisclosed (V2 gives no proportions), the training framework is internal, and evaluations run in an internal harness against baselines the authors also ran.</td></tr>
+      <tr><td><strong>Report what did not work</strong></td><td>DeepSeek LLM added 20M Chinese multiple-choice questions to SFT and saw MMLU rise from 49.4 to 60.9 and C-Eval from 47.0 to 71.3, then excluded them because they "would result in overfitting to benchmarks and would not contribute to achieving true intelligence" <a href="https://arxiv.org/abs/2401.02954">[§5.5]</a>; it found instruction data in the last 10% of pre-training no better than the same data in SFT. DeepSeekMath found arXiv text useless and RL raising Maj@K but not Pass@K. DeepSeekMoE 16B is weak on multiple-choice tasks. V2 reports an alignment tax on BBH. The R1 report has a section on unsuccessful attempts (process reward models, Monte Carlo tree search) and notes that a 7B dense and a 16B MoE base failed to improve under its RL recipe <a href="https://arxiv.org/abs/2501.12948">[R1, Supp. G.1-G.2]</a>.</td><td>These are honest limitations more often than full negative-result tables, and some headline design choices (depth over width, "\(M \ge 3\)", the balance-loss weights) come without an ablation.</td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout key">
+    <div class="callout-title">The pattern behind the choices</div>
+    <p>Ask what is scarce, then design against it. <strong>Memory capacity and bandwidth at decode</strong> gave GQA at 67B and then MLA. <strong>FLOPs per token in training</strong> gave DeepSeekMoE. <strong>Interconnect bandwidth</strong> gave device-limited routing, no tensor parallelism and overlap of shared experts with all-to-all. <strong>Critic memory in RL</strong> gave GRPO. <strong>Compute wasted on a wrong hyperparameter or a wrong model size</strong> gave the scaling laws. When an interviewer asks "why did DeepSeek do X", the answer usually starts with which resource X saves and ends with the number that shows it.</p>
+  </aside>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"V2 is 42.5% cheaper to train than DeepSeek 67B."</strong> It needs 42.5% fewer GPU-hours <em>per trillion tokens</em>. V2 trained on 8.1T tokens against 2T, so its whole pre-training took about 1.40M GPU-hours against 0.60M, 2.3 times as many. And a 69% cut in FLOPs per token became a 42.5% cut in GPU-hours because utilization fell (about 38% to 20 to 25% MFU by our estimate).</li>
+    <li><strong>"MLA alone gives V2 a 93.3% smaller cache."</strong> MLA against the 67B's GQA-8 cache is 82.2% at equal precision. The rest is the 6-bit KV quantization used in deployment. The baseline is GQA, not MHA.</li>
+    <li><strong>"V2 has 21B parameters."</strong> It has 235.7B parameters, of which about 20.3B to 21.4B are activated per token depending on whether the LM head and input embedding are counted. Reports do not state their convention, and DeepSeek's own reports are not consistent with each other.</li>
+    <li><strong>"DeepSeek's batch-size and learning-rate laws are universal."</strong> They were fitted on dense models between \(10^{17}\) and \(2 \times 10^{19}\) FLOPs as functions of \(C\) only, then extrapolated by five orders of magnitude. The paper itself notes the optimum shifts with the model-versus-data split, an independent refit differs in the learning-rate law by a factor of 2 to 3 (<a href="13-scaling-laws.html#hyperparameters">page 13</a>), and V2's own settings sit off the line.</li>
+    <li><strong>"6ND is exact enough for scaling studies."</strong> DeepSeek showed \(6N\) mis-states cost by up to about 50% for small models, and that the sign of the error flips depending on whether embeddings are counted. Their \(M\) fixes this for MHA dense models and needs adapting for GQA and MoE.</li>
+    <li><strong>"GRPO was invented for R1."</strong> It was introduced in DeepSeekMath in February 2024, with a learned reward model, and used for V2's alignment. Rule-based verifiable rewards and the reasoning-model recipe came with R1 (<a href="24-rlvr-reasoning.html">page 24</a>).</li>
+    <li><strong>"Fine-grained plus shared experts always win."</strong> DeepSeekMoE 16B lagged its dense comparator on multiple-choice tasks, which the authors tie to its 0.5B attention parameters, and the 145B run trailed a dense 67B trained on the same 245B tokens on MMLU (39.4 versus 45.1). Later models split on shared experts (<a href="08-mixture-of-experts.html#shared">page 08</a>).</li>
+    <li><strong>"A step schedule is a worse cosine."</strong> On the one comparison reported (1.6B parameters, 100B tokens) the two matched. The step schedule was chosen because its first stage can be reused for longer runs and for scaling-law experiments.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Put the DeepSeek releases from November 2023 to September 2024 in order and give the one idea each contributed.</summary>
+    <div class="answer">
+      <p><strong>DeepSeek LLM</strong> (weights November 2023, report 5 January 2024): a LLaMA-style 7B and 67B on 2T tokens, plus the hyperparameter scaling laws, the model-scale variable \(M\), the multi-step learning rate, and SFT plus DPO. <strong>DeepSeekMoE</strong> (11 January): fine-grained and shared experts, validated at 2B, 16B and 145B. <strong>DeepSeek-Coder</strong> (25 January): repository-level data ordering and fill-in-the-middle. <strong>DeepSeekMath</strong> (5 February): a 120B-token math corpus mined from Common Crawl with an iterated fastText classifier, GRPO, and the unified view of post-training. <strong>DeepSeek-V2</strong> (7 May): MLA plus DeepSeekMoE, 236B total and 21B activated, 8.1T tokens, 128K context via YaRN, device-limited routing and two-stage online GRPO. <strong>Coder-V2</strong> (17 June): 6T more tokens on a V2 checkpoint. <strong>V2.5</strong> (5 September): merges the chat and coder lines.</p>
+      <p>The through-line is cost per unit of quality, and the mechanism is a shared recipe (optimizer, schedule, framework) that lets each paper add one idea.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> How does DeepSeek LLM 67B differ from Llama 2 70B?</summary>
+    <div class="answer">
+      <p>The skeleton is the same: pre-norm RMSNorm, SwiGLU, RoPE, and GQA with 8 KV heads at this size. The differences: <strong>shape</strong>, 95 layers with FFN width 22,016 (\(2.69d\)) against 80 layers and 28,672 (\(3.5d\)), a move from width to depth that the report justifies as "aiming for better performance" and easier pipeline partitioning, without an ablation; <strong>tokenizer</strong>, 102,400 bilingual byte-level BPE against 32,000; <strong>data</strong>, 2T English and Chinese tokens with deduplication across 91 Common Crawl dumps; <strong>schedule</strong>, multi-step (31.6% at 80% of tokens, 10% at 90%) against cosine; <strong>hyperparameters</strong> from its own laws (batch 4,608 sequences, about 18.9M tokens, peak learning rate \(3.2 \times 10^{-4}\)); and <strong>post-training</strong> with SFT plus DPO. Parameter counts are close (67.4B against 69.0B from the configs). In DeepSeek's harness the base model scored MMLU 71.3 against 69.0, GSM8K 63.4 against 58.4 and HumanEval 42.7 against 28.7.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> State DeepSeek-V2's headline numbers and what each one is compared with.</summary>
+    <div class="answer">
+      <p>236B total and 21B activated parameters, 8.1T training tokens, 128K context. Against the dense DeepSeek 67B the abstract claims 42.5% lower training cost (GPU-hours per trillion tokens, 172.8K against 300.6K on H800s), a 93.3% smaller KV cache (per token, with V2's 6-bit cache quantization), and 5.76 times the maximum generation throughput (over 50K tokens per second on one 8-GPU H800 node, V2 in FP8). All three are DeepSeek's own measurements against its own previous model, and each has conditions worth naming (see the audit question below).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What did DeepSeek LLM contribute to scaling-law methodology?</summary>
+    <div class="answer">
+      <p>Four things. (1) <strong>Hyperparameters as laws of compute.</strong> Grid searches over batch size and learning rate at budgets from \(10^{17}\) to \(2 \times 10^{19}\) FLOPs, treating settings within 0.25% of the best error as near-optimal, gave \(\eta_{\text{opt}} = 0.3118\,C^{-0.1250}\) and \(B_{\text{opt}} = 0.2920\,C^{0.3271}\), validated at \(10^{20}\) and used to set the 7B and 67B (both within 10% of the laws). This makes each point of a scaling study properly tuned. (2) <strong>Model scale \(M\).</strong> Non-embedding FLOPs per token, \(72Ld^2 + 12Ldl_{\text{seq}}\), with \(C = MD\), replacing \(N\) and \(6ND\): \(6N_1\) and \(6N_2\) are off by up to about 50% for small models, in opposite directions, and refits in \(M\) predicted the 7B and 67B losses best. (3) <strong>Data quality moves the allocation.</strong> The model exponent was 0.450, 0.524 and 0.578 on three datasets of rising quality, against 0.49 for Chinchilla and 0.73 for Kaplan, offered as a candidate explanation for their disagreement. (4) <strong>Cheap experiments</strong> through a multi-step learning rate whose first stage is reused across budgets. They predicted the 7B and 67B losses from runs with about 1,000 times less compute.</p>
+      <p>Limits: dense models only; fitted below \(2 \times 10^{19}\) and applied at \(10^{24}\); \(C\) alone does not determine the optimum (the paper says so); the data-quality explanation is a hypothesis without a controlled test.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Using DeepSeek LLM's laws, what batch size and learning rate would you start from for a \(10^{24}\)-FLOP run? How does V2 compare, and how far do you trust the answer?</summary>
+    <div class="answer">
+      <p>\(\eta = 0.3118 \cdot (10^{24})^{-0.125} = 0.3118 \cdot 10^{-3} = 3.1 \times 10^{-4}\). \(B = 0.2920 \cdot 10^{0.3271 \cdot 24} = 0.2920 \cdot 10^{7.850} = 2.07 \times 10^{7}\) tokens, about 5,050 sequences of 4,096. For a 2T-token run that is about 97,000 steps. Each 10× in compute multiplies \(B\) by 2.12 and \(\eta\) by 0.75.</p>
+      <p>V2's compute, taking \(C \approx 6 N_{\text{act}} D = 6 \cdot 20.3\text{B} \cdot 8.1\text{T} \approx 9.9 \times 10^{23}\), is almost exactly this. V2 used a peak rate of \(2.4 \times 10^{-4}\) (0.77× the law) and a batch ramping from 9.4M to 37.7M tokens (1.8× the law at the end). The report does not say the laws were used, and \(C\) for a MoE is a modeling choice. <strong>Trust:</strong> as a starting point for a sweep, yes. The laws were fitted on dense models, extrapolated about 4.7 orders of magnitude beyond the fit, ignore the model-versus-data split, and an independent refit finds a learning-rate exponent 0.11 different, a factor of 2 to 3 in the predicted rate at large scale. I would run a coarse \(2\times\) grid of \(B\) and \(\eta\) at a small proxy and check that the optimum has the predicted shape, and use \(\mu\)P or a per-width check if the architecture differs from a plain dense transformer (<a href="14-optimization.html#mup">page 14</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did DeepSeek use a multi-step learning-rate schedule instead of cosine?</summary>
+    <div class="answer">
+      <p>Cosine depends on the total token budget, so any change of budget restarts the run. A step schedule holds the peak for 80% of tokens, then drops to 31.6% and 10% of the peak at 80% and 90%. Its first stage is therefore shared by all runs with larger budgets: continued training extends stage one, and the scaling-law grid (hundreds of small runs) was trained by "reusing the first stage". On a 1.6B model with 100B tokens the final performance matched cosine ("essentially consistent"), and other stage splits were slightly better, but 80/10/10 was kept to balance reuse against performance. The factor 0.316 is \(1/\sqrt{10}\). V2 moved the first drop to about 60%. It is the same idea as warmup-stable-decay (<a href="14-optimization.html#decay">page 14</a>). Caveat: one small-scale comparison, so "matches cosine" is weak evidence at 67B or 236B.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Summarize DeepSeekMoE's two ideas and the evidence for them.</summary>
+    <div class="answer">
+      <p><strong>Diagnosis:</strong> with 8 to 16 large experts, each expert mixes unrelated knowledge (hybridity), and experts duplicate common knowledge (redundancy). <strong>Fine-grained segmentation:</strong> split each expert into \(m\) smaller ones and activate \(m\) times as many, at constant parameters and FLOPs, which multiplies the number of expert combinations (from 120 to \(4.4 \times 10^9\) in the paper's example). <strong>Shared expert isolation:</strong> a few always-on experts hold common knowledge, so routed experts can specialize.</p>
+      <p><strong>Evidence:</strong> at 2B parameters and 100B tokens, Pile loss 1.808 against GShard's 1.867, matching GShard with 1.5× the expert parameters and approaching the dense-with-16×-FFN upper bound (1.806); disabling the shared expert raises the loss to 2.414. At 16B on 2T tokens it matches dense DeepSeek 7B and Llama 2 7B at about 40% of the FLOPs. At 145B on 245B tokens it matches a dense 67B trained on the same tokens at 28.5% of the FLOPs and beats GShard 137B (1.876 against 1.961).</p>
+      <p><strong>Limits:</strong> baselines re-implemented by the same team; 16B is weak on multiple-choice benchmarks (MMLU 45.0 against 48.2), tied to its 0.5B attention parameters; the 145B run is preliminary; whether shared experts still help at hundreds of experts is contested (Qwen3 dropped them; <a href="08-mixture-of-experts.html#deepseekmoe-evidence">page 08</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What is DeepSeekMath's "unified paradigm" view of post-training methods?</summary>
+    <div class="answer">
+      <p>Every method updates \(\theta\) along \(\mathbb E_{(q,o) \sim \mathcal D}\big[\tfrac{1}{|o|}\sum_t GC(q,o,t,\pi_{rf})\,\nabla_\theta\log\pi_\theta(o_t \mid q, o_{&lt;t})\big]\). The methods differ in three components: the <strong>data source</strong> \(\mathcal D\) (fixed SFT data, samples from the frozen SFT model, or samples from the live policy), the <strong>reward function</strong> (none, a rule such as answer correctness, or a reward model), and the <strong>gradient coefficient</strong>. SFT: coefficient 1. RFT: \(\mathbb 1[\text{correct}]\) on offline samples. Online RFT: the same on online samples. DPO: a sigmoid of the implicit-reward gap, positive on the chosen and negative on the rejected output, on offline pairs. PPO: the GAE advantage, online. GRPO: the group-normalized advantage \((r_i - \bar r)/\text{std}\) plus a KL term \(\beta(\pi_{\text{ref}}/\pi_\theta - 1)\), online.</p>
+      <p>The paper's experiments vary one axis at a time: online beat offline sampling, graded and signed coefficients (GRPO) beat binary ones that never penalize wrong answers (online RFT), step-level (process) rewards beat outcome-only, and iterative RL helped mostly in its first round. RL improved Maj@K but not Pass@K, so the paper reads it as sharpening rather than adding capability. Interview use: given a new algorithm, say what its data source, reward and coefficient are and you can predict its failure modes.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Walk through DeepSeek-V2's architecture and explain each efficiency choice.</summary>
+    <div class="answer">
+      <p>60 layers, \(d = 5{,}120\), pre-norm RMSNorm. <strong>Attention is MLA</strong> with 128 heads: the KV is compressed to a 512-dimensional latent, queries to 1,536, RoPE lives in a separate 64-dimensional decoupled key shared by all heads. The cache is \(512 + 64 = 576\) numbers per token per layer, equal to GQA with 2.25 groups, while quality matches or beats MHA in the ablations. Weight absorption makes decode an MQA over the latent (<a href="07-kv-efficient-attention.html">page 07</a>). <strong>The FFN is DeepSeekMoE</strong> in layers 2 to 60 (layer 1 is dense): 2 shared plus 160 routed experts of width 1,536, top-6 with softmax gates. Only 21B of 236B parameters are active, so training FLOPs per token are that of a 21B model, and the activated FFN width \((6+2) \cdot 1{,}536 = 12{,}288\) equals a dense layer's.</p>
+      <p><strong>Systems choices follow.</strong> Device-limited routing (each token's experts on at most 3 of 8 device groups) caps all-to-all traffic. Three balance losses (expert, device, communication) plus device-level token dropping keep load even. Training uses 16-way zero-bubble pipeline parallelism, 8-way expert parallelism and ZeRO-1 with recomputation and no tensor parallelism, and overlaps shared experts with all-to-all. Long context comes from YaRN on the decoupled key only, 1,000 steps at 32K. Serving uses FP8 weights and a 6-bit KV cache. Alignment is SFT then two-stage online GRPO. The question behind each: what is scarce (cache bytes, FLOPs, interconnect) and what is the number that shows the saving.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why did DeepSeek avoid tensor parallelism in V2 training?</summary>
+    <div class="answer">
+      <p>The report's reason: V2 "has relatively few activated parameters" and recomputes some operators to save activation memory, so it "can be trained without the necessity of tensor parallelism, thereby decreasing the communication overhead". Tensor parallelism puts all-reduces inside every layer, on the critical path, over NVLink, and the H800's NVLink is 400 GB/s against the H100's 900 GB/s. The later V3 hardware paper says outright that TP is avoided "due to its inefficiency under limited NVLink bandwidth".</p>
+      <p>Arithmetic that shows it is feasible: routed experts (222.7B) over 16 pipeline stages times 8 expert-parallel ranks is 1.74B parameters per GPU, plus 13.0B of other parameters over 16 stages (0.81B each), about 2.55B per GPU, 46 GB of training state at 18 bytes per parameter before ZeRO-1 sharding. A dense 67B with a 16-way pipeline would hold 4.2B per GPU (76 GB), too tight without TP. The price is pipeline bubbles and expert all-to-all, which is why V2 uses zero-bubble scheduling, device-limited routing and shared-expert overlap. TP is not banned everywhere: at inference V3 uses TP4 for attention.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Reconcile DeepSeek-V2's 236B total and 21B activated parameters from its config.</summary>
+    <div class="answer">
+      <p>Config: 60 layers, \(d = 5{,}120\), 128 heads, \(d_c = 512\), \(d_c' = 1{,}536\), \(d_h = 128\), \(d_h^R = 64\), dense FFN 12,288 in layer 1, 59 MoE layers with 160 routed and 2 shared experts of width 1,536, top-6, vocabulary 102,400 untied. <strong>Expert:</strong> \(3 \cdot 5{,}120 \cdot 1{,}536 = 23.59\)M. <strong>Routed per MoE layer:</strong> \(160 \times 23.59\text{M} = 3.775\)B, so 222.7B in 59 layers. <strong>Shared:</strong> 2.78B. <strong>MLA per layer:</strong> 149.2M (\(7.86 + 37.75 + 2.95 + 16.78 + 83.89\)M plus norms), 8.95B in 60 layers. <strong>Dense FFN:</strong> 189M. <strong>Embeddings:</strong> \(2 \cdot 102{,}400 \cdot 5{,}120 = 1.05\)B. Sum: 235.74B, matching the checkpoint metadata exactly.</p>
+      <p><strong>Activated:</strong> attention 8.95B + dense layer 0.19B + shared 2.78B + \(59 \cdot 6 \cdot 23.59\text{M} = 8.35\)B routed + routers 0.05B = 20.33B without embeddings, 20.85B with the LM head, 21.38B with both matrices. The reported 21B is inside that range and the report does not say which convention it uses, so state yours.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How would you evaluate the claim "V2 saves 42.5% of training cost compared with DeepSeek 67B"?</summary>
+    <div class="answer">
+      <p>Reconstruct it: \(1 - 172.8/300.6 = 42.5\%\), where both numbers are GPU-hours per trillion tokens on the H800 cluster. Then interrogate the denominator and conditions. (1) <strong>It is a rate.</strong> V2 trained on 8.1T tokens and the 67B on 2T, so whole pre-training is \(172.8\text{K} \times 8.1 = 1.40\)M against \(300.6\text{K} \times 2 = 0.60\)M GPU-hours. What was saved is cost per token, at a much stronger model (MMLU 78.5 against 71.3). (2) <strong>Compare with the FLOP ratio.</strong> Activated parameters 21B against 67.4B imply 69% fewer FLOPs per token, but only 42.5% fewer hours, so utilization dropped: at a 989 TFLOP/s BF16 peak, about 38% MFU for the 67B and 20 to 25% for V2 depending on how attention FLOPs are counted (\(6N\) versus the 155 GFLOPs per token in DeepSeek's later hardware paper). Plausible reasons are all-to-all communication, small expert matmuls, load imbalance with token dropping, and pipeline bubbles, which the report does not break down. (3) <strong>Confounds:</strong> different data, parallel layouts and code maturity (V3, seven months later, reports 180K GPU-hours per trillion tokens at 1.76× V2's activated size). (4) <strong>Exclusions:</strong> context extension, SFT, RL, ablations.</p>
+      <p>To isolate MoE from everything else I would run both models with the same framework, precision and sequence length on the same cluster, report MFU alongside hours, and compare at matched loss rather than matched tokens.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you must pretrain a 200B-class MoE on GPUs whose intra-node interconnect is weak and whose memory is 80 GB. Which V2 choices would you carry over, and what would you verify first?</summary>
+    <div class="answer">
+      <p><strong>Carry over,</strong> each tied to a constraint. (1) <em>No tensor parallelism</em>: with about 20B activated parameters and about 2.5B parameters per GPU under PP16 by EP8, TP's per-layer all-reduces on a slow link cost more than they save. Check per-GPU memory first (state at 18 bytes per parameter plus activations, with recomputation of norms and up-projections). (2) <em>Fine-grained plus shared experts</em> with device-limited routing (\(M \approx 3\) of 8 groups): the all-to-all volume is proportional to the number of devices a token touches, so bound it. Measure the fraction of tokens whose unrestricted top-\(k\) would violate the limit and the loss cost of the restriction at small scale. (3) <em>Balance</em>: expert- and device-level losses, plus a communication-balance term if receive-side skew shows up in profiles; in a newer design consider bias-based balancing (<a href="08-mixture-of-experts.html#aux-free">page 08</a>). (4) <em>Overlap</em> shared-expert compute with all-to-all. (5) <em>MLA</em> if long-context serving is a goal, otherwise GQA-8 is a simpler baseline (<a href="07-kv-efficient-attention.html">page 07</a>).</p>
+      <p><strong>Deviate or verify:</strong> token dropping trades quality for stragglers, so try dropless kernels first. Fit batch size and learning rate on a proxy rather than borrowing DeepSeek's dense-fit constants. Compare a zero-bubble pipeline with an interleaved one under your bubble budget. And log MFU per phase from day one, because V2's 42.5% saving came with a large drop in utilization that a design review should expect. What I would ask before committing: which link is slowest, what fraction of step time is exposed communication, and how does that scale if I double experts.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How would you build a domain corpus the way DeepSeekMath did, and what could go wrong?</summary>
+    <div class="answer">
+      <p><strong>Pipeline:</strong> pick a clean seed set (OpenWebMath) as positives and random web pages as negatives; train a cheap classifier (fastText, 256-d, word 3-grams); score a deduplicated crawl (40B pages); keep the top-ranked pages; find domains where over 10% of pages were selected, annotate math URL paths by hand, add those pages to the positives, retrain; repeat until new rounds add little (in iteration four 98% was already collected). Result: 35.5M pages, 120B tokens. <strong>Validate</strong> with a controlled test: train the same small model (1.3B for 150B tokens) on each candidate corpus and compare downstream scores (GSM8K 23.8% against 11.5% for OpenWebMath and 14.3% for Proof-Pile-2), and choose the cut-off size from such runs (top 40B, 80B, 120B, 160B tokens).</p>
+      <p><strong>Failure modes:</strong> the classifier recalls only what resembles its seed, so the corpus inherits the seed's style and misses different math; the fix here (domain statistics plus human URL annotation) adds labor and bias. Saturation is measured against the classifier's own recall, not the true coverage. Contamination: the paper removes exact 10-gram matches, which does not catch paraphrases. Ablations can surprise: code before math helped (21.9% against 19.1% GSM8K against a general-data first stage) and arXiv text did not, so verify each source separately rather than assuming "more math-looking text" is better.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>DeepSeek parameter accounting and the DeepSeek LLM laws.</strong> Implement <code>mla_params</code>, <code>moe_layer_params</code> and <code>count_params</code> for MLA plus MoE configs with shared experts, first-k dense layers and untied embeddings, with a switch for which vocabulary matrices count as activated (<code>"both"</code>, <code>"head"</code>, <code>"none"</code>). Then implement <code>model_scale_flops</code> (\(M\)), <code>hp_scaling</code> (batch size in tokens and learning rate from compute) and <code>optimal_allocation</code>. The tests check DeepSeek-V3 (671,026,404,352 total, 37.55B activated), V2 (235,741,434,880, the Hugging Face checkpoint count) and V2-Lite to the parameter, a tiny config against a count built from <code>nn.Linear</code> modules, the structural identity "total minus activated = idle routed experts plus embeddings", and the laws against DeepSeek LLM's Tables 2 and 3. An interviewer would expect the parameter count in 25 to 35 minutes and the laws in about 5. <span class="ex-path">exercises/drills/deepseek_params.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_deepseek_params.py</code>; add <code>--solutions</code> to check the reference. For a stretch goal, add an <code>mha_moe</code> variant and reproduce DeepSeekMoE 16B's 16,375,728,128 parameters.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2401.02954">DeepSeek-AI (2024). DeepSeek LLM: Scaling Open-Source Language Models with Longtermism.</a> <span class="why">Why read it: §3 for the hyperparameter laws, the model-scale variable \(M\) and the data-quality result; §2.3 for the multi-step schedule; §5.5 for what the team tried and rejected.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.06066">Dai et al. (2024). DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models.</a> <span class="why">Why read it: §3 for the two ideas, §4 for the ablations and expert-masking probes, §5.2.1 for the multiple-choice weakness, §7 for the 145B run.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.14196">Guo et al. (2024). DeepSeek-Coder: When the Large Language Model Meets Programming.</a> <span class="why">Why read it: §2.2 for repository-level dependency ordering and §3.1 for the fill-in-the-middle rate ablation.</span></li>
+    <li><a href="https://arxiv.org/abs/2402.03300">Shao et al. (2024). DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.</a> <span class="why">Why read it: §2 for the corpus pipeline and ablations, §4 for GRPO, §5.2 and Appendix A.1 for the unified paradigm and the online-versus-offline experiments.</span></li>
+    <li><a href="https://arxiv.org/abs/2405.04434">DeepSeek-AI (2024). DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.</a> <span class="why">Why read it: §2 architecture, §3.1.3 infrastructure, §3.2.3 the efficiency claims, §4 alignment, and Appendix B (V2-Lite) and D (attention ablations).</span></li>
+    <li><a href="https://arxiv.org/abs/2406.11931">DeepSeek-AI (2024). DeepSeek-Coder-V2: Breaking the Barrier of Closed-Source Models in Code Intelligence.</a> <span class="why">Why read it: a template for continued pre-training from a released checkpoint, with the 60/10/30 data mixture and the 10.2T-token accounting.</span></li>
+    <li><a href="https://arxiv.org/abs/2505.09343">Zhao et al. (2025). Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures.</a> <span class="why">Why read it: DeepSeek's own account of hardware-aware design (H800 interconnect, avoiding tensor parallelism, node-limited routing, cost per token of MoE versus dense).</span></li>
+    <li><a href="https://arxiv.org/abs/2408.14158">An et al. (2024). Fire-Flyer AI-HPC: A Cost-Effective Software-Hardware Co-Design for Deep Learning.</a> <span class="why">Why read it: the infrastructure origin of the efficiency-first style, a 10,000-GPU PCIe A100 cluster designed around cost per unit of training throughput.</span></li>
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: what V2's recipe became; §3.2 for training without tensor parallelism and §1 for the 180K GPU-hours per trillion tokens figure (<a href="27-deepseek-2-v3.html">page 27</a>).</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Timeline (arXiv v1):</strong> DeepSeek LLM 5 Jan 2024 (weights Nov 2023) · DeepSeekMoE 11 Jan · Coder 25 Jan · Math 5 Feb · V2 7 May · Coder-V2 17 Jun · V2.5 5 Sep (V2.5-1210 on 10 Dec).</li>
+      <li><strong>DeepSeek LLM:</strong> 7B = 30 layers, \(d\) 4,096, MHA; 67B = 95 layers, \(d\) 8,192, GQA-8, FFN 22,016 (Llama 2 70B: 80 layers, 28,672). 2T tokens; batch 2,304 and 4,608 sequences of 4,096; peak LR \(4.2\times10^{-4}\) and \(3.2\times10^{-4}\); multi-step LR (31.6% at 80%, 10% at 90%, 2,000 warmup steps); SFT 1.5M instances, then DPO.</li>
+      <li><strong>Laws:</strong> \(\eta = 0.3118\,C^{-0.1250}\), \(B = 0.2920\,C^{0.3271}\) tokens, \(C = MD\), \(M = 72Ld^2 + 12Ldl\); fitted \(10^{17}\) to \(2\times10^{19}\). At \(10^{22}\): 4.59M tokens, \(5.5\times10^{-4}\). At \(10^{24}\): 20.7M tokens, \(3.1\times10^{-4}\). Per 10× compute: batch ×2.12, LR ×0.75. Allocation: \(M_{\text{opt}} = 0.1715\,C^{0.5243}\), \(D_{\text{opt}} = 5.8316\,C^{0.4757}\); model exponent 0.450, 0.524, 0.578 as data quality rises.</li>
+      <li><strong>DeepSeekMoE:</strong> fine-grained (\(m\times\) more, smaller experts) plus shared experts. 2B: Pile loss 1.808 vs GShard 1.867. 16B (2 + 64, top-6, 16.4B/2.8B): about dense 7B at 40% FLOPs, weak on multiple choice (0.5B attention). 145B (4 + 128, top-12, 144.6B/22.2B): about dense 67B (same 245B tokens) at 28.5% FLOPs.</li>
+      <li><strong>DeepSeekMath:</strong> corpus by 4 fastText iterations, 35.5M pages, 120B tokens; base from Coder-v1.5 + 500B tokens: GSM8K 64.2, MATH 36.2. Code before math helps, arXiv does not. GRPO: \(G = 64\), KL 0.04, LR \(10^{-6}\); \(\hat A = (r - \bar r)/\text{std}\). Unified paradigm: gradient \(= \mathbb E_{\mathcal D}[\tfrac1{|o|}\sum_t GC\,\nabla\log\pi]\); SFT 1, RFT \(\mathbb 1[\text{correct}]\), DPO sigmoid, PPO \(A_t\), GRPO \(\hat A + \beta(\pi_{\text{ref}}/\pi - 1)\). RL raises Maj@K, not Pass@K.</li>
+      <li><strong>V2:</strong> 60 layers, \(d\) 5,120, 128 heads, \(d_c\) 512, \(d_c'\) 1,536, \(d_h^R\) 64 (576 cached per token per layer); layer 1 dense (12,288), then 2 shared + 160 routed experts (1,536), top-6, \(M = 3\) of 8 device groups; \(\alpha = 0.003, 0.05, 0.02\); token dropping (capacity 1.0). 8.1T tokens; peak LR \(2.4\times10^{-4}\); batch 2,304 to 9,216 sequences over 225B tokens; PP16 zero-bubble + EP8 + ZeRO-1, no TP; YaRN \(s = 40\) on \(k^R\), 1,000 steps at 32K. 1.5M SFT, two-stage online GRPO.</li>
+      <li><strong>V2 parameters:</strong> total 235,741,434,880 (routed experts 222.7B = 94.5%); activated 20.33B non-embedding, 20.85B with LM head, 21.38B with both matrices; attention 8.95B = 44% of activated. Expert = 3 × 5,120 × 1,536 = 23.59M.</li>
+      <li><strong>Claims:</strong> 42.5% = \(1 - 172.8/300.6\) GPU-hours per trillion tokens (whole run: 1.40M vs 0.60M GPU-hours; implied MFU about 38% vs 20 to 25%). 93.3% = \(1 - 25{,}920/389{,}120\) (MLA alone 82.2%; 6-bit cache does the rest; baseline is GQA-8, 380 KiB/token). 5.76× = over 50K tokens/s on 8×H800, V2 in FP8.</li>
+      <li><strong>After V2:</strong> Coder-V2 = 6T more tokens on a V2 checkpoint (60/10/30 code/math/text); V2.5 = merge, configs differ from V2 only in YaRN mscale (0.707 to 1.0). MLA constants persist into V3.</li>
+      <li><strong>Style:</strong> design around scarce resources (H800 NVLink 400 GB/s vs H100 900), lead with cost ratios, release weights and configs, report failures (MC data excluded, arXiv no gain, PRM and MCTS failed).</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

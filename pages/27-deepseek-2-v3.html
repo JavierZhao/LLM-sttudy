@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>27 · DeepSeek II: V3 end to end · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="27" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VI · Model case studies · Page 27</div>
+  <h1>DeepSeek II: V3 end to end</h1>
+  <div class="meta">
+    <span class="badge p0">P0</span>
+    <span>~75 min</span>
+    <span>Prereqs: <a href="07-kv-efficient-attention.html">07 MLA</a>, <a href="08-mixture-of-experts.html">08 MoE</a>, <a href="11-stability-tweaks.html">11 Stability and MTP</a>, <a href="14-optimization.html">14 Optimization</a>, <a href="15-distributed-training.html">15 Parallelism and precision</a>, <a href="26-deepseek-1-foundations.html">26 DeepSeek I</a></span>
+  </div>
+  <p class="lede">DeepSeek-V3 (December 2024) is a 671B-parameter mixture-of-experts model that activates 37B parameters per token and was trained on 14.8T tokens in 2.788M H800 GPU-hours. This page walks the technical report in order (architecture, multi-token prediction, infrastructure, FP8 training, data and hyperparameters, long context, post-training, cost) and gives the reason behind each decision, linking to the mechanism pages instead of re-deriving them.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">What interviewers probe</div>
+  <ul>
+    <li><strong>The whole model in two minutes:</strong> "Walk me through V3 and justify each component." The strong answer ties every piece to a bottleneck: KV cache (MLA), FLOPs (sparse MoE), router collapse (bias balancing), data efficiency (MTP), matmul throughput and memory (FP8), cross-node communication (node-limited routing, DualPipe), and memory without tensor parallelism.</li>
+    <li><strong>FP8 with the details right:</strong> which GEMMs run in FP8, 1×128 activation tiles versus 128×128 weight blocks and why they differ, promotion to FP32 every 128 elements of K, E4M3 on every tensor, and what stays in BF16 or FP32.</li>
+    <li><strong>Balancing and MTP semantics:</strong> how the bias update works, why a sequence-wise loss is kept anyway, what the MTP module predicts, and how it is used (or discarded) at inference.</li>
+    <li><strong>Cost literacy:</strong> rebuild the "$5.6M" from GPU-hours, say what it excludes, and back out an MFU from 6ND. Interviewers use this to test whether you can reason about a headline number.</li>
+    <li><strong>Critical reading:</strong> the report has no DualPipe ablation, no measured FP8 speedup, and no MFU. Know what is evidence and what is assertion, and what you would try to cut cost another 2×.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Recite V3's verified configuration and derived counts (61 layers, 3 dense then 58 MoE, 1 shared plus 256 routed experts with 8 active, 671B total and 37B activated parameters, 70,272 bytes of KV cache per token) and name the bottleneck each component addresses.</li>
+    <li>Explain auxiliary-loss-free balancing together with the sequence-wise backstop, the MTP module and its training schedule, and derive the speculative-decoding speedup from the reported acceptance rate.</li>
+    <li>State the FP8 recipe exactly (which GEMMs, tile and block shapes, scale rule, accumulation interval, E4M3 everywhere, what stays high precision) and simulate it in a few dozen lines.</li>
+    <li>Explain why V3 uses no tensor parallelism, what DualPipe changes (with the Table 2 arithmetic at 16 stages), and what node-limited routing and the custom all-to-all kernels buy.</li>
+    <li>Reconstruct the phase plan of the run (learning rate, batch ramp, bias speed, MTP weight, YaRN) and the post-training pipeline.</li>
+    <li>Rebuild the cost accounting from Table 1, bracket MFU from 6ND, and discuss the "$5.6M" headline responsibly.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 id="overview">V3 at a glance: what was inherited, what is new</h2>
+
+  <p>DeepSeek-V3 is the DeepSeek-V2 recipe (MLA for attention, DeepSeekMoE for the feed-forward layers, both "thoroughly validated" in V2 according to the report; see <a href="26-deepseek-1-foundations.html">page 26</a>) scaled up and hardened with four additions <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §1, §2.1]</a>. First, <strong>auxiliary-loss-free load balancing</strong> <span class="zh">无辅助损失负载均衡</span>. Second, a <strong>multi-token prediction</strong> objective <span class="zh">多词元预测</span>. Third, <strong>FP8 mixed-precision training</strong> <span class="zh">混合精度训练</span> at a scale where the report says it is validated "for the first time". Fourth, a training system built around the cost of moving expert activations between nodes: the DualPipe pipeline schedule <span class="zh">流水线并行</span> plus custom all-to-all kernels. The report describes the result as "our optimized co-design of algorithms, frameworks, and hardware". That phrase is the right frame for interviews: nothing in V3 is a stand-alone trick, and each part answers a specific bottleneck (KV cache: MLA; FLOPs: sparse MoE; router collapse: bias balancing; signal per token: MTP; matmul throughput and memory: FP8; all-to-all: node-limited routing and DualPipe).</p>
+
+  <h3 id="config">The verified configuration</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Item</th><th>Value</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Layers, width</td><td>\(L = 61\), \(d = 7168\); the first 3 FFNs are dense (\(d_{ff} = 18{,}432\)), the other 58 are MoE</td><td>Report §4.2; <code>config.json</code></td></tr>
+      <tr><td>MLA</td><td>\(n_h = 128\) heads, \(d_h = 128\), KV latent \(d_c = 512\), query latent \(d_c' = 1536\), decoupled RoPE dimension \(d_h^R = 64\)</td><td>Report §4.2</td></tr>
+      <tr><td>MoE layer</td><td>1 shared plus 256 routed experts of width \(d_e = 2048\); 8 routed active; sigmoid affinities normalized over the selected 8; at most \(M = 4\) nodes per token (config: 8 groups, top 4 groups); routed scaling factor 2.5 (config only)</td><td>Report §2.1.2, §4.2; <code>config.json</code></td></tr>
+      <tr><td>Vocabulary, embeddings</td><td>129,280 tokens (the report says "128K" byte-level BPE); input and output matrices untied</td><td>Report §4.1; <code>config.json</code></td></tr>
+      <tr><td>Parameters</td><td>671B total, 37B activated (report). Our count from the config: 671,026,404,352 total and 37.55B activated when both vocabulary matrices are included (<a href="08-mixture-of-experts.html#numbers">page 08</a>). The MTP module adds 11.5B unique parameters (<a href="11-stability-tweaks.html#mtp-evidence">page 11</a>)</td><td>Report abstract; pages 08 and 11</td></tr>
+      <tr><td>MTP</td><td>Depth \(D = 1\)</td><td>Report §4.2</td></tr>
+      <tr><td>Initialization</td><td>Standard deviation 0.006 for all learnable parameters. (The released config lists <code>initializer_range</code> 0.02, a field that says nothing about what training used.)</td><td>Report §4.2; <code>config.json</code></td></tr>
+      <tr><td>Context</td><td>4K in pretraining; YaRN with \(s = 40\) to 32K, then 128K (config: 163,840 positions)</td><td>Report §4.3; <code>config.json</code></td></tr>
+      <tr><td>Data, hardware</td><td>14.8T tokens; 2,048 NVIDIA H800 GPUs in nodes of 8</td><td>Report §3.1, §4.1</td></tr>
+      <tr class="hl"><td>KV cache</td><td>\(576 \times 61 \times 2\) B = 70,272 B per token, 8.6 GiB for one 128K-token sequence</td><td><a href="07-kv-efficient-attention.html#mla-numbers">Page 07</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <aside class="callout key">
+    <div class="callout-title">Key idea: three levers</div>
+    <p>Read every V3 decision as pulling one of three levers. <strong>Compute:</strong> sparse activation (37B of 671B), FP8 matmuls, and the extra training signal of MTP. <strong>Communication:</strong> node-limited routing, FP8 dispatch, DualPipe overlap and hand-written kernels, because MoE turns each layer into an all-to-all across a cluster whose scale-out network is 3.2× slower than its scale-up network. <strong>Memory:</strong> MLA, recomputation, FP8 and BF16 storage, and a parallel layout that needs no tensor parallelism. When a question starts with "why did they...", name the lever first.</p>
+  </aside>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 484" role="img" aria-labelledby="fig-27-1-title">
+<title id="fig-27-1-title">DeepSeek-V3 overview: 61 transformer blocks with MLA and DeepSeekMoE, shared embedding and output head, and the depth-1 multi-token-prediction module</title>
+<defs><marker id="arrow-27-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="196" y="16" text-anchor="middle" class="s-bold">Main model: next-token prediction</text>
+<text x="560" y="16" text-anchor="middle" class="s-bold">MTP module, depth D = 1</text>
+<line class="s-line s-dash" x1="396" y1="6" x2="396" y2="470"/>
+<rect class="s-box" x="90" y="26" width="210" height="28" rx="6"/>
+<text x="195.0" y="44.5" text-anchor="middle" class="s-small">Loss: predict next token</text>
+<path class="s-line" d="M195,66 L195,54" marker-end="url(#arrow-27-1)"/>
+<rect class="s-c" x="90" y="66" width="210" height="30" rx="6"/>
+<text x="195.0" y="85.5" text-anchor="middle" class="s-small">Output head (shared with MTP)</text>
+<path class="s-line" d="M195,118 L195,96" marker-end="url(#arrow-27-1)"/>
+<rect class="s-plain s-dash" x="24" y="118" width="342" height="254" rx="8"/>
+<text x="34" y="135" text-anchor="start" class="s-small s-bold">Transformer block × 61 (pre-norm, residual)</text>
+<rect class="s-plain" x="40" y="150" width="100" height="96" rx="6"/>
+<text x="90.0" y="185.5" text-anchor="middle" class="s-bold s-small">Layers 1–3</text>
+<text x="90.0" y="202.5" text-anchor="middle" class="s-small">dense FFN</text>
+<text x="90.0" y="219.5" text-anchor="middle" class="s-small">d_ff = 18,432</text>
+<rect class="s-d" x="150" y="150" width="204" height="96" rx="6"/>
+<text x="252.0" y="168.5" text-anchor="middle" class="s-bold s-small">Layers 4–61: DeepSeekMoE</text>
+<text x="252.0" y="185.5" text-anchor="middle" class="s-small">1 shared + 256 routed experts</text>
+<text x="252.0" y="202.5" text-anchor="middle" class="s-small">expert width d_e = 2048</text>
+<text x="252.0" y="219.5" text-anchor="middle" class="s-small">top-8 of (s + b), at most 4 nodes</text>
+<text x="252.0" y="236.5" text-anchor="middle" class="s-small">gates from sigmoid s, normalized</text>
+<path class="s-line" d="M197,282 L197,246" marker-end="url(#arrow-27-1)"/>
+<path class="s-line" d="M90,282 L90,246" marker-end="url(#arrow-27-1)"/>
+<rect class="s-b" x="40" y="282" width="314" height="72" rx="6"/>
+<text x="197.0" y="304.5" text-anchor="middle" class="s-bold s-small">RMSNorm, then MLA</text>
+<text x="197.0" y="322.5" text-anchor="middle" class="s-small">128 heads; latents c<tspan baseline-shift="super" font-size="9">Q</tspan> (1536), c<tspan baseline-shift="super" font-size="9">KV</tspan> (512)</text>
+<text x="197.0" y="340.5" text-anchor="middle" class="s-small">cached per token: c<tspan baseline-shift="super" font-size="9">KV</tspan> + k<tspan baseline-shift="super" font-size="9">R</tspan> = 576 values</text>
+<rect class="s-c" x="80" y="384" width="230" height="26" rx="6"/>
+<text x="195.0" y="401.5" text-anchor="middle" class="s-small">Embedding (shared with MTP)</text>
+<path class="s-line" d="M195,384 L195,372" marker-end="url(#arrow-27-1)"/>
+<rect class="s-box" x="80" y="422" width="230" height="26" rx="6"/>
+<text x="195.0" y="439.5" text-anchor="middle" class="s-small">Input tokens t<tspan baseline-shift="sub" font-size="9">1</tspan> … t<tspan baseline-shift="sub" font-size="9">T</tspan></text>
+<path class="s-line" d="M195,422 L195,410" marker-end="url(#arrow-27-1)"/>
+<rect class="s-box" x="415" y="22" width="290" height="40" rx="6"/>
+<text x="560.0" y="38.5" text-anchor="middle" class="s-small">MTP loss: predict token t after next</text>
+<text x="560.0" y="54.5" text-anchor="middle" class="s-small">weight λ = 0.3 (first 10T tokens), then 0.1</text>
+<path class="s-line" d="M560,76 L560,62" marker-end="url(#arrow-27-1)"/>
+<rect class="s-c" x="415" y="76" width="290" height="30" rx="6"/>
+<text x="560.0" y="95.5" text-anchor="middle" class="s-small">Output head (shared with main model)</text>
+<path class="s-line" d="M560,128 L560,106" marker-end="url(#arrow-27-1)"/>
+<rect class="s-e" x="415" y="128" width="290" height="86" rx="6"/>
+<text x="560.0" y="150.0" text-anchor="middle" class="s-bold s-small">Transformer block TRM<tspan baseline-shift="sub" font-size="9">1</tspan></text>
+<text x="560.0" y="167.0" text-anchor="middle" class="s-small">same design as a main-model layer:</text>
+<text x="560.0" y="184.0" text-anchor="middle" class="s-small">MLA + DeepSeekMoE (1 shared + 256 routed)</text>
+<text x="560.0" y="201.0" text-anchor="middle" class="s-small">11.5B unique parameters</text>
+<path class="s-line" d="M560,236 L560,214" marker-end="url(#arrow-27-1)"/>
+<rect class="s-plain" x="415" y="236" width="290" height="30" rx="6"/>
+<text x="560.0" y="255.5" text-anchor="middle" class="s-small">Linear M<tspan baseline-shift="sub" font-size="9">1</tspan>: 2d → d  (14,336 → 7,168)</text>
+<path class="s-line" d="M560,284 L560,266" marker-end="url(#arrow-27-1)"/>
+<rect class="s-plain" x="415" y="284" width="290" height="24" rx="6"/>
+<text x="560.0" y="300.5" text-anchor="middle" class="s-small">concatenate [ · ; · ]</text>
+<path class="s-line" d="M482,326 L482,308" marker-end="url(#arrow-27-1)"/>
+<path class="s-line" d="M632,326 L632,308" marker-end="url(#arrow-27-1)"/>
+<rect class="s-plain" x="415" y="326" width="135" height="30" rx="6"/>
+<text x="482.5" y="345.5" text-anchor="middle" class="s-small">RMSNorm(h⁰ᵢ)</text>
+<rect class="s-plain" x="560" y="326" width="145" height="30" rx="6"/>
+<text x="632.5" y="345.5" text-anchor="middle" class="s-small">RMSNorm(Emb(tᵢ₊₁))</text>
+<path class="s-line" d="M195,107 L404,107 L404,372 L482,372 L482,358" marker-end="url(#arrow-27-1)"/>
+<text x="378" y="101" text-anchor="middle" class="s-small s-muted">h⁰ᵢ</text>
+<path class="s-line" d="M310,397 L632,397 L632,358" marker-end="url(#arrow-27-1)"/>
+<text x="470" y="391" text-anchor="middle" class="s-small s-muted">shared embedding lookup of the next token</text>
+<text x="560" y="426" text-anchor="middle" class="s-small s-muted">Inference: drop the module, or use its prediction</text>
+<text x="560" y="441" text-anchor="middle" class="s-small s-muted">as a draft token (85 to 90% accepted, 1.8× TPS)</text>
+<rect class="s-c" x="24" y="463" width="14" height="12" rx="2"/><text x="44" y="473" text-anchor="start" class="s-small">shared with main model</text>
+<rect class="s-d" x="215" y="463" width="14" height="12" rx="2"/><text x="235" y="473" text-anchor="start" class="s-small">routed and shared experts</text>
+<rect class="s-b" x="395" y="463" width="14" height="12" rx="2"/><text x="415" y="473" text-anchor="start" class="s-small">latent attention</text>
+<rect class="s-e" x="520" y="463" width="14" height="12" rx="2"/><text x="540" y="473" text-anchor="start" class="s-small">extra block, training only</text>
+</svg>
+    <figcaption><b>Figure 1.</b> DeepSeek-V3 in one picture. The main model (left) is 61 pre-norm blocks: MLA for attention, then a dense FFN in layers 1 to 3 and DeepSeekMoE in layers 4 to 61. The MTP module (right) takes the main model's final hidden state \(h^0_i\) and the embedding of the next token, projects the concatenation from \(2d\) back to \(d\), runs one more transformer block, and predicts the token after next. Green boxes are the parameters it shares with the main model, so the only new parameters are the projection and the block (11.5B unique parameters, mostly the block's experts). The report's Figure 2 and Figure 3 show the same two pieces.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2 id="architecture">Architecture: each component and the reason for it</h2>
+
+  <p>V3 keeps V2's block: pre-norm transformer layers with MLA for attention and DeepSeekMoE for the feed-forward layers <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §2.1]</a>. The report treats this as a recap. For an interview the useful question is what each part is for.</p>
+
+  <h3 id="arch-mla">MLA: the cache is the constraint</h3>
+  <p>Serving cost at long context is dominated by KV bytes read per generated token (<a href="06-decoding-kv-cache.html">page 06</a>). MLA caches one 512-dimensional latent plus one 64-dimensional RoPE key per token per layer, 576 values, which is 70,272 bytes per token across 61 layers, less than Llama-3-8B's 131,072 although V3 has over 80 times as many total parameters (<a href="07-kv-efficient-attention.html#mla">page 07</a>). Two details from the report: the query is compressed too (\(d_c' = 1536\)) but only "to reduce the activation memory during training", since queries are never cached; and RMSNorm layers follow the latents, with extra scaling factors at the width bottlenecks, both inherited from V2 <a href="https://arxiv.org/abs/2412.19437">[§4.2]</a>. Position lives only in the 64-dimensional decoupled key, so YaRN touches only that key (<a href="#longctx">below</a>).</p>
+
+  <h3 id="arch-moe">DeepSeekMoE: 671B stored, 37B computed</h3>
+  <p>Each MoE layer has one shared expert used by every token and 256 routed experts of which the router picks 8, each a SwiGLU network of width 2048 (\(3 \times 7168 \times 2048 = 44{,}040{,}192\) parameters). The nine active experts do \(9 \times 2048 = 18{,}432\) units of hidden width of work, exactly the \(d_{ff}\) of the three dense layers, so an MoE layer costs the FLOPs of a dense layer of that width while holding 257 experts. Experts hold 656.5B of the 671.0B parameters (97.8%), only \(9/257 = 3.5\%\) of them are active per token, and the always-active parts bring the activated total to 5.3% to 5.6% of the model (<a href="08-mixture-of-experts.html#numbers">page 08</a>). Four other choices:</p>
+  <ul>
+    <li><strong>Three dense layers first.</strong> The report gives no reason. Circumstantial evidence on <a href="08-mixture-of-experts.html#lineage">page 08</a>: balance converged slowest in the first layer of DeepSeekMoE, and V4 later replaces these layers with hash-routed MoE layers.</li>
+    <li><strong>Sigmoid affinities, normalized over the selected experts.</strong> V2 used a softmax over all experts. V3 computes \(s_{i,t} = \sigma(u_t^\top e_i)\) per expert and divides the 8 selected scores by their sum <a href="https://arxiv.org/abs/2412.19437">[§2.1.2]</a>. The report gives no rationale. Our reading: each affinity stays in \((0,1)\), the units in which the balancing bias is added, and renormalization keeps the selected gates summing to 1.</li>
+    <li><strong>Node-limited routing, \(M = 4\).</strong> The 256 experts form 8 groups of 32 (one node each in training). A group scores as the sum of its top \(K_r/M = 2\) biased affinities, the best 4 groups survive, and the top 8 experts are taken inside them. NVLink offers 160 GB/s and IB 50 GB/s, so a token crosses IB to at most 4 nodes and NVLink forwards it onward. A token can use about 3.2 experts per node at no extra NVLink cost, so the same communication would support \(4 \times 3.2 = 12.8\), about 13, routed experts <a href="https://arxiv.org/abs/2412.19437">[§3.2.2]</a> (<a href="08-mixture-of-experts.html#node-limited">page 08</a> has the routing-freedom cost).</li>
+    <li><strong>No token dropping</strong> in training or inference <a href="https://arxiv.org/abs/2412.19437">[§2.1.2]</a>: no capacity factor to tune and no train-inference mismatch from dropping.</li>
+  </ul>
+
+  <h3 id="arch-balance">Load balancing: a bias controller plus a tiny sequence-wise loss</h3>
+  <p>Auxiliary balance losses fight the language-modeling loss: too small and routing collapses, too large and the interference gradients hurt quality. V3 removes the balance term from the gradient. Each routed expert has a bias \(b_i\) added to its affinity only when choosing the top-\(k\); the gate multiplied into the expert output still comes from the unbiased \(s_{i,t}\) <a href="https://arxiv.org/abs/2412.19437">[§2.1.2, Eq. 16]</a>. After every step, an expert overloaded over the whole batch has its bias lowered by \(\gamma\) and an underloaded one raised by \(\gamma\): a sign-based integral controller on load error (derived on <a href="08-mixture-of-experts.html#aux-free">page 08</a>).</p>
+  <p><strong>Why keep a loss at all?</strong> The controller balances a <em>batch</em>. A sequence made entirely of code can still send most of its tokens to a few experts while the batch average stays flat, and a serving batch is far less diverse than a training batch. So V3 adds a sequence-wise loss \(\mathcal{L}_{\text{Bal}} = \alpha \sum_i f_i P_i\) with \(\alpha = 10^{-4}\), "just to avoid extreme imbalance within any single sequence" <a href="https://arxiv.org/abs/2412.19437">[§2.1.2, §4.2]</a>. Batch-wise scope is deliberate: it lets experts specialize by domain (expert-load plots on the Pile), and a batch-wise auxiliary loss matched the bias method's validation loss (2.253 versus 2.253 at 1B, 2.080 versus 2.080 at 3B, against 2.258 and 2.085 for sequence-wise) <a href="https://arxiv.org/abs/2412.19437">[§4.5.3, Fig. 9]</a>. The report names the two costs of batch-wise balance: imbalance inside small batches, absorbed by large micro-batches from large-scale expert and data parallelism, and domain shift at inference, absorbed by redundant experts (<a href="#deploy">below</a>).</p>
+
+  <div class="decision">
+    <div class="decision-title">Auxiliary-loss-free balancing with a sequence-wise backstop</div>
+    <dl>
+      <dt>Problem</dt><dd>Balance losses trade quality for balance, and unbalanced experts stall expert parallelism because the slowest GPU sets the step time.</dd>
+      <dt>Idea</dt><dd>Steer top-\(k\) selection with a per-expert bias updated by \(\pm\gamma\) from the previous step's load, keep gates unbiased, add a very small (\(\alpha = 10^{-4}\)) sequence-wise loss, drop no tokens.</dd>
+      <dt>Why it works</dt><dd>No balance gradient reaches the backbone or router, and batch-level balancing leaves room for domain-specialized experts. The sequence-wise term closes the one hole a batch-level controller has.</dd>
+      <dt>Evidence</dt><dd>Small (15.7B) and large (228.7B) MoE ablations improve on most benchmarks (Pile BPB 0.727 to 0.724 and 0.656 to 0.652; large-model MMLU 68.3 to 67.2) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 5]</a>; single runs by the adopting lab.</dd>
+      <dt>Cost</dt><dd>A schedule for \(\gamma\) (0.001 for the first 14.3T tokens, then 0.0 for the last 500B, when the biases freeze; the report does not say why), extra checkpointed state, and inference-time redundant experts for domain shift.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3 and V4; Kimi K2's released config uses the same <code>noaux_tc</code> method (<a href="08-mixture-of-experts.html#aux-free">page 08</a>); Ling 2.0 says its strategy "follows a design similar to DeepSeek-V3" <a href="https://arxiv.org/abs/2510.22115">[Ling 2.0, §2.2]</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="mtp">Multi-token prediction: extra signal in training, a free draft head at inference</h2>
+
+  <p>Standard training gives position \(i\) one target, \(x_{i+1}\). V3 adds a second: a small module predicts \(x_{i+2}\), trained jointly and weighted by \(\lambda\) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §2.2]</a>. The report's two motivations are hedged: the objective "densifies the training signals and may improve data efficiency", and it "may enable the model to pre-plan its representations". Neither is shown causally. Equations and the comparison with Gloeckle et al.'s parallel heads are on <a href="11-stability-tweaks.html#mtp-v3">page 11</a>; what matters end to end:</p>
+
+  <ul>
+    <li><strong>Wiring (Figure 1).</strong> Module \(k\) takes the previous depth's hidden state \(h^{k-1}_i\) and the embedding of token \(t_{i+k}\), RMS-normalizes each, concatenates them (\(2d = 14{,}336\)), projects back to \(d\) with \(M_k \in \R^{d \times 2d}\), and runs one transformer block. Its output goes through the <em>shared</em> output head. Because module \(k\) sees the true next tokens, the causal chain is kept at every depth, unlike independent parallel heads.</li>
+    <li><strong>Loss.</strong> \(\mathcal{L}_{\text{MTP}} = \frac{\lambda}{D}\sum_{k=1}^{D}\mathcal{L}^k_{\text{MTP}}\) with \(D = 1\); \(\lambda = 0.3\) for the first 10T tokens and \(0.1\) for the last 4.8T <a href="https://arxiv.org/abs/2412.19437">[§4.2]</a>, changing when the learning-rate cosine decay starts.</li>
+    <li><strong>Cost.</strong> 11.5B unique parameters (1.7%), almost all in the block's 257 experts, and about 3.2 GFLOP per token forward against 74 for the main model, roughly 4% (<a href="11-stability-tweaks.html#mtp-evidence">page 11</a>). The extra vocabulary head alone is \(2 \times 129{,}280 \times 7168 = 1.85\) GFLOP, 1.6 times an activated MoE layer (1.17 GFLOP).</li>
+    <li><strong>Placement.</strong> DualPipe puts the shallowest layers (with the embedding) and the deepest (with the head) on one pipeline rank, so the shared tensors' "parameters and gradients" are physically shared with the MTP module <a href="https://arxiv.org/abs/2412.19437">[§3.2.3]</a>.</li>
+  </ul>
+
+  <p><strong>Ablation.</strong> Two MoE baselines differ only by a depth-1 module: 15.7B parameters on 1.33T tokens and 228.7B on 540B <a href="https://arxiv.org/abs/2412.19437">[Tab. 4]</a>. Of 20 benchmark cells, 17 improve, one ties and two get worse. Gains concentrate on generative code and math (large model: HumanEval 44.5 to 53.7, GSM8K 72.3 to 74.0), Pile bits-per-byte barely moves (0.658 to 0.657), and large-model MMLU falls from 67.5 to 66.6. Single runs from the adopting lab at a tenth or less of the final token count: encouraging, not proven.</p>
+
+  <h3 id="mtp-inference">At inference: discard it, or use it as a draft</h3>
+  <p>The module exists mainly to improve the main model, so it can be dropped, leaving inference cost identical to a model trained without it. Alternatively its prediction of \(x_{i+2}\) is a one-token draft for speculative decoding (<a href="17-inference-serving.html#speculative">page 17</a>). The report measures a second-token acceptance rate of 85% to 90% across topics and a resulting 1.8× tokens per second <a href="https://arxiv.org/abs/2412.19437">[§5.4.3]</a>. The two numbers are consistent, as a whiteboard check shows. With one draft accepted with probability \(p\), each step emits \(1 + p\) tokens: 1.85 at \(p = 0.85\), 1.90 at \(p = 0.90\). A measured 1.8× then implies a step with a draft costs \((1+p)/1.8 - 1 = 2.8\%\) to \(5.6\%\) more than a plain step, plausible when decode is memory-bound and the module is one block (my inference; the report does not state the overhead). This is the simple one-draft model (page 17 has the general formula), and with an MoE, verifying two tokens touches more experts, which page 17 quantifies.</p>
+
+  <div class="decision">
+    <div class="decision-title">Multi-token prediction, DeepSeek-V3 style</div>
+    <dl>
+      <dt>Problem</dt><dd>Next-token prediction gives one training signal per position, and decoding produces one token per forward pass.</dd>
+      <dt>Idea</dt><dd>Chain one extra transformer block that predicts the token after next from the main hidden state and the next token's embedding, sharing embedding and head, with loss weight \(\lambda\) (0.3, then 0.1).</dd>
+      <dt>Why it works</dt><dd>More supervision per token and pressure to encode information about upcoming tokens (an argument, not a proof). The module is also a ready-made drafter for speculative decoding.</dd>
+      <dt>Evidence</dt><dd>17 of 20 ablation cells improve, mostly code and math <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, Tab. 4]</a>; 85% to 90% acceptance and 1.8× TPS <a href="https://arxiv.org/abs/2412.19437">[§5.4.3]</a>.</dd>
+      <dt>Cost</dt><dd>About 1.7% more parameters and roughly 4% more training FLOPs (our estimate), one more logits tensor in memory, nothing at inference if discarded.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3 and V4; Ling 2.0 uses depth 1 with \(\lambda = 0.1\) <a href="https://arxiv.org/abs/2510.22115">[Ling 2.0, §2.2]</a>.</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2 id="infra">Infrastructure: 671B parameters on 2,048 H800s, without tensor parallelism</h2>
+
+  <h3 id="cluster">The cluster and the numbers that shape the design</h3>
+  <p>V3 trains on 2,048 NVIDIA H800 GPUs in nodes of 8, joined by NVLink and NVSwitch inside a node and InfiniBand across nodes <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.1]</a>. Two figures drive most of the systems design: NVLink delivers 160 GB/s and IB 50 GB/s, a factor of 3.2, and each H800 has 132 streaming multiprocessors (SMs), of which the communication kernels take 20 <a href="https://arxiv.org/abs/2412.19437">[§3.2.2, §3.5.1]</a>. The H800 is the export-market Hopper part: <span class="unverified" title="Aggregator spec sheets list H800 tensor throughput equal to H100 SXM and NVLink at 400 GB/s versus H100's 900 GB/s (NVIDIA's H100 page lists 900 GB/s); NVIDIA's own H800 datasheet could not be retrieved, so treat this as a widely repeated but unchecked claim.">its tensor-core throughput matches the H100 SXM and its NVLink is capped at 400 GB/s against the H100's 900 GB/s</span>, so the links, more than the tensor cores, set the pace. That is why FP8 (which halves bytes as well as doubling peak FLOP/s), node-limited routing and computation-communication overlap appear in the same report.</p>
+
+  <h3 id="layout">The parallel layout, and why there is no tensor parallelism</h3>
+  <p>The layout is 16-way pipeline parallelism, 64-way expert parallelism <span class="zh">专家并行</span> spanning 8 nodes, and ZeRO-1 data parallelism <a href="https://arxiv.org/abs/2412.19437">[§3.2]</a>. That is 128 GPUs per pipeline stage, with routed experts sharded 64 ways inside a stage (the leftover factor of 2 is our inference). <a href="15-distributed-training.html#plan-c">Page 15</a> works the memory arithmetic: about 97% of parameters are routed experts, leaving about 1.7B parameters per GPU. The report's stated goal is to optimize memory "making it possible to train DeepSeek-V3 without using costly tensor parallelism" <a href="https://arxiv.org/abs/2412.19437">[§1]</a>. It says only that TP (<a href="15-distributed-training.html#tp-sp">page 15</a>) is "costly"; three reasons make it a bad fit here (our reading):</p>
+  <ul>
+    <li><strong>Its collectives sit on the critical path of every layer.</strong> Tensor-parallel all-reduces block, while MoE all-to-all and pipeline transfers can be overlapped with other chunks' compute (DualPipe, next).</li>
+    <li><strong>The GEMMs are already small.</strong> An expert has width 2048, and splitting its matrices further would shrink per-GPU tiles and tensor-core efficiency.</li>
+    <li><strong>The memory it would save is not needed.</strong> Expert parallelism shards 97% of the weights, ZeRO-1 shards optimizer states, recomputation trims activations, and BF16 Adam moments shrink the rest.</li>
+  </ul>
+
+  <h3 id="dualpipe">DualPipe: hiding the all-to-all inside the pipeline schedule</h3>
+  <p>Cross-node expert parallelism makes the ratio of computation to communication "approximately 1:1", which the report calls inefficient <a href="https://arxiv.org/abs/2412.19437">[§3.2.1]</a>. Three ideas combine to fix it.</p>
+  <ol>
+    <li><strong>Split each chunk into components.</strong> A forward chunk is attention, all-to-all dispatch, MLP and all-to-all combine. As in Zero Bubble, the backward chunk splits attention and MLP each into backward-for-input (needed by the previous layer) and backward-for-weights (needed only by the optimizer), with pipeline transfers as a fifth component. The weight-gradient parts have no communication dependency, so they are ideal filler.</li>
+    <li><strong>Pair a forward chunk with a backward chunk</strong> so each all-to-all runs under compute from the <em>other</em> chunk (Figure 2a). The SM split between communication and computation is tuned by hand, and "both all-to-all and PP communication can be fully hidden".</li>
+    <li><strong>Feed micro-batches from both ends of the pipeline.</strong> Each device holds two stages, one per direction, so fill and drain overlap and the bubble roughly halves. This is why DualPipe needs two parameter copies.</li>
+  </ol>
+
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Schedule</th><th>Bubble</th><th>Parameter copies</th><th>Peak activations</th></tr></thead>
+    <tbody>
+      <tr><td>1F1B</td><td>\((PP-1)(F+B)\)</td><td class="num">1×</td><td class="num">\(PP\)</td></tr>
+      <tr><td>ZB1P</td><td>\((PP-1)(F+B-2W)\)</td><td class="num">1×</td><td class="num">\(PP\)</td></tr>
+      <tr class="hl"><td>DualPipe</td><td>\((\tfrac{PP}{2}-1)(F\&amp;B+B-3W)\)</td><td class="num">2×</td><td class="num">\(PP+1\)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">Source: V3 report, Table 2 (the DualPipe README repeats it). \(F\), \(B\), \(W\): execution times of a forward chunk, a full backward chunk and a weight-gradient chunk; \(F\&amp;B\): a mutually overlapped forward-backward pair.</p>
+
+  <p><strong>Worked numbers at \(PP = 16\).</strong> The report gives no chunk times, so Figure 2b uses two illustrative settings, in units of a forward chunk's compute time. In setting A there is no exposed communication, \(F = 1, B = 2, W = 1\), and pairing gains nothing (\(F\&amp;B = F + B = 3\)): 1F1B has bubble \(15 \times 3 = 45\), ZB1P \(15 \times (1 + 2 - 2) = 15\), DualPipe \((8 - 1)(3 + 2 - 3) = 14\). In setting B the all-to-all is as long as the compute it serves, exposed in the serial schedules (\(F = 2, B = 4, W = 1\)) but hidden in the overlapped pair (\(F\&amp;B = 3\)): 1F1B \(15 \times 6 = 90\), ZB1P \(15 \times 4 = 60\), DualPipe \(7 \times (3 + 4 - 3) = 28\). Two lessons. In pure compute terms DualPipe barely beats ZB1P (14 versus 15), because splitting \(B\) from \(W\) removes most of the bubble. DualPipe's distinct contribution is the overlap, worth a factor of about 2 to 3 once communication is exposed, and the report notes that neither bubble nor activation memory grows with the number of micro-batches.</p>
+
+  <p><strong>What the report does not show.</strong> Table 2 is analytical: there is no ablation against 1F1B and no measured bubble or MFU. Independent teams report mixed experience. Kimi K2 declines DualPipe because it "doubles the memory required for parameters and gradients", too costly above 1T parameters, and uses interleaved 1F1B with overlapped all-to-all and EP = 16 <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.4.2]</a>. Ling 2.0 found "the end-to-end acceleration remained limited", citing the need for a large expert-parallel group (its run used EP = 8), the sensitivity of large groups to routing imbalance, and imbalanced routing in shallow layers <a href="https://arxiv.org/abs/2510.22115">[Ling 2.0, §5.6]</a>. The README also lists "DualPipeV", the same bubble on half the devices <a href="https://github.com/deepseek-ai/DualPipe">[DualPipe README]</a>. DualPipe pays off in V3's regime: a large expert-parallel group with comparable compute and communication times.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 396" role="img" aria-labelledby="fig-27-2-title">
+<title id="fig-27-2-title">DualPipe: overlapping a forward and a backward chunk so all-to-all communication hides behind compute, and the pipeline bubble at 16 stages for three schedules</title>
+<defs><marker id="arrow-27-2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<text x="10" y="16" text-anchor="start" class="s-bold s-small">(a) One overlapped forward and backward chunk pair (schematic after the V3 report, Fig. 4)</text>
+<text x="104" y="52" text-anchor="end" class="s-small s-bold">Compute</text>
+<text x="104" y="90" text-anchor="end" class="s-small s-bold">Communication</text>
+<rect class="s-c" x="112.0" y="32" width="96.9" height="32"/>
+<text x="160.4" y="52.0" text-anchor="middle" class="s-small">MLP backward</text>
+<rect class="s-a" x="208.9" y="32" width="54.4" height="32"/>
+<text x="236.1" y="52.0" text-anchor="middle" class="s-small">MLP W</text>
+<rect class="s-e" x="263.3" y="32" width="103.4" height="32"/>
+<text x="315.0" y="52.0" text-anchor="middle" class="s-small">MLP forward</text>
+<rect class="s-fill-muted" x="366.7" y="32" width="5.7" height="32"/>
+<rect class="s-c" x="372.4" y="32" width="171.6" height="32"/>
+<text x="458.2" y="52.0" text-anchor="middle" class="s-small">attention backward</text>
+<rect class="s-a" x="544.0" y="32" width="60.9" height="32"/>
+<text x="574.5" y="52.0" text-anchor="middle" class="s-small">attn W</text>
+<rect class="s-e" x="604.9" y="32" width="86.2" height="32"/>
+<text x="648.0" y="52.0" text-anchor="middle" class="s-small">attn forward</text>
+<rect class="s-fill-muted" x="691.1" y="32" width="6.1" height="32"/>
+<rect class="s-e" x="112.0" y="70" width="109.2" height="32"/>
+<text x="166.6" y="90.0" text-anchor="middle" class="s-small">dispatch (F)</text>
+<rect class="s-c" x="221.2" y="70" width="145.5" height="32"/>
+<text x="293.9" y="90.0" text-anchor="middle" class="s-small">dispatch (B)</text>
+<rect class="s-fill-muted" x="366.7" y="70" width="5.7" height="32"/>
+<rect class="s-e" x="372.4" y="70" width="151.7" height="32"/>
+<text x="448.2" y="90.0" text-anchor="middle" class="s-small">combine (F)</text>
+<rect class="s-d" x="524.1" y="70" width="33.7" height="32"/>
+<text x="541.0" y="90.0" text-anchor="middle" class="s-small">PP</text>
+<rect class="s-c" x="557.8" y="70" width="133.3" height="32"/>
+<text x="624.5" y="90.0" text-anchor="middle" class="s-small">combine (B)</text>
+<rect class="s-fill-muted" x="691.1" y="70" width="6.1" height="32"/>
+<text x="10" y="122" text-anchor="start" class="s-small s-muted">time →</text>
+<rect class="s-e" x="112" y="112" width="12" height="12"/>
+<text x="129" y="122" text-anchor="start" class="s-small">forward</text>
+<rect class="s-c" x="186.9" y="112" width="12" height="12"/>
+<text x="203.9" y="122" text-anchor="start" class="s-small">backward for input</text>
+<rect class="s-a" x="324.5" y="112" width="12" height="12"/>
+<text x="341.5" y="122" text-anchor="start" class="s-small">backward for weights</text>
+<rect class="s-d" x="473.5" y="112" width="12" height="12"/>
+<text x="490.5" y="122" text-anchor="start" class="s-small">PP communication</text>
+<rect class="s-fill-muted" x="599.7" y="112" width="12" height="12"/>
+<text x="616.7" y="122" text-anchor="start" class="s-small">barrier</text>
+<text x="10" y="143" text-anchor="start" class="s-small s-muted">Each all-to-all and PP transfer runs beneath compute belonging to the other chunk. The share of SMs given to</text>
+<text x="10" y="158" text-anchor="start" class="s-small s-muted">communication is tuned by hand (the all-to-all kernels use 20 of 132).</text>
+<text x="10" y="190" text-anchor="start" class="s-bold s-small">(b) Pipeline bubble at PP = 16, in units of one forward chunk (illustrative chunk times, formulas from Table 2)</text>
+<text x="10" y="212" text-anchor="start" class="s-small">A: no exposed communication (F = 1, B = 2, W = 1, F&amp;B = 3)</text>
+<text x="104" y="233" text-anchor="end" class="s-small">1F1B</text>
+<rect class="s-fill-a" x="112" y="220" width="235.0" height="18" rx="2"/>
+<text x="353.0" y="233" text-anchor="start" class="s-small s-bold">45</text>
+<text x="104" y="257" text-anchor="end" class="s-small">ZB1P</text>
+<rect class="s-fill-c" x="112" y="244" width="78.3" height="18" rx="2"/>
+<text x="196.3" y="257" text-anchor="start" class="s-small s-bold">15</text>
+<text x="104" y="281" text-anchor="end" class="s-small">DualPipe</text>
+<rect class="s-fill-d" x="112" y="268" width="73.1" height="18" rx="2"/>
+<text x="191.1" y="281" text-anchor="start" class="s-small s-bold">14</text>
+<text x="10" y="304" text-anchor="start" class="s-small">B: all-to-all exposed unless overlapped (F = 2, B = 4, W = 1, F&amp;B = 3)</text>
+<text x="104" y="325" text-anchor="end" class="s-small">1F1B</text>
+<rect class="s-fill-a" x="112" y="312" width="470.0" height="18" rx="2"/>
+<text x="588.0" y="325" text-anchor="start" class="s-small s-bold">90</text>
+<text x="104" y="349" text-anchor="end" class="s-small">ZB1P</text>
+<rect class="s-fill-c" x="112" y="336" width="313.3" height="18" rx="2"/>
+<text x="431.3" y="349" text-anchor="start" class="s-small s-bold">60</text>
+<text x="104" y="373" text-anchor="end" class="s-small">DualPipe</text>
+<rect class="s-fill-d" x="112" y="360" width="146.2" height="18" rx="2"/>
+<text x="264.2" y="373" text-anchor="start" class="s-small s-bold">28</text>
+</svg>
+    <figcaption><b>Figure 2.</b> (a) The overlapped forward and backward chunk pair, redrawn schematically from the V3 report's Figure 4 (block widths follow the report, which says chunk boundaries are not aligned). Dispatch communication sits under MLP compute, and combine and PP communication under attention compute. (b) Bubble sizes at 16 stages from the Table 2 expressions for two assumed sets of chunk times. With no communication to hide (A), DualPipe (14) is only slightly below ZB1P (15). When all-to-all time equals compute time (B), hiding it is worth a further factor of two.</figcaption>
+  </figure>
+
+  <div class="decision">
+    <div class="decision-title">DualPipe</div>
+    <dl>
+      <dt>Problem</dt><dd>Cross-node expert parallelism makes communication as long as computation (about 1:1), and pipeline bubbles add idle time on top.</dd>
+      <dt>Idea</dt><dd>Split chunks into attention, dispatch, MLP and combine (plus backward-for-input and backward-for-weights), overlap each forward chunk with a backward chunk, and feed micro-batches from both ends.</dd>
+      <dt>Why it works</dt><dd>Each all-to-all runs beneath compute from the other chunk, weight-gradient chunks fill idle slots, and the two directions overlap fill and drain, so the bubble factor is \(PP/2 - 1\) instead of \(PP - 1\).</dd>
+      <dt>Evidence</dt><dd>Analytical Table 2 in the V3 report; no ablation. Independent reports are mixed (Kimi K2 rejects it on memory grounds, Ling 2.0 saw limited gains).</dd>
+      <dt>Cost</dt><dd>Two parameter copies per device, \(PP+1\) activation slots, stages and micro-batches divisible by 2, hand-tuned SM allocation. V3 finds the extra copy cheap because expert parallelism is large.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3; V4's training framework builds on this infrastructure (<a href="15-distributed-training.html#plan-c">page 15</a>).</dd>
+    </dl>
+  </div>
+
+  <h3 id="a2a">Cross-node all-to-all kernels: 20 SMs for communication</h3>
+  <p>The kernels are co-designed with the gating rule and the network. A token first travels over IB to the GPU with the same in-node index on each of its (at most 4) target nodes, and is then forwarded over NVLink to the GPUs hosting its experts without waiting behind later tokens. Combine reverses the path and accumulates on the way. The two stages overlap, and 20 of the 132 SMs saturate both IB and NVLink. The 20 SMs form 10 communication channels, and warp specialization gives dispatch three kinds of warps (IB send, IB-to-NVLink forward, NVLink receive) and combine three (NVLink send, NVLink-to-IB forward with accumulation, IB receive with accumulation), with counts adjusted dynamically. Custom PTX and an auto-tuned chunk size limit L2 use and interference with compute SMs <a href="https://arxiv.org/abs/2412.19437">[§3.2.2]</a>. The open-source implementation is DeepEP (FP8 dispatch, BF16 combine, per its <a href="https://github.com/deepseek-ai/DeepEP">README</a>). The price is real: 20 of 132 SMs is 15.2% of the chip moving data, which the report says "will limit the computational throughput" (<a href="#hardware">below</a>).</p>
+
+  <h3 id="memory">Memory savings that cost almost nothing</h3>
+  <p>Three techniques complete the no-TP story <a href="https://arxiv.org/abs/2412.19437">[§3.2.3]</a>. <strong>Recompute RMSNorm and the MLA up-projections</strong> in backward rather than store their outputs: the up-projected \(k^C\) and \(v^C\) alone are \(128 \times (128 + 128) = 32{,}768\) values per token per layer, 64 times the 512-value latent that regenerates them (page 07 prices the rebuild at 33.5M FLOPs per token per layer). <strong>Keep the parameter EMA in CPU memory</strong>, updated asynchronously, for an early read on quality after learning-rate decay at no GPU cost. <strong>Share the embedding and output head</strong> with the MTP module through pipeline placement. Low-precision storage is the next section.</p>
+</section>
+
+<section>
+  <h2 id="fp8">FP8 training: the full recipe</h2>
+
+  <p><a href="15-distributed-training.html#fp8">Page 15</a> introduces FP8 formats and summarizes V3's scheme. This is the detailed version, because interviewers follow up on exactly which tensors are FP8, why the groups have those shapes, and what "promotion" means. The motivation is twofold. FP8 tensor cores have twice the peak of BF16 (about 1,979 versus 989 dense TFLOP/s on an H100, half of the sparse figures on <a href="https://www.nvidia.com/en-us/data-center/h100/">NVIDIA's H100 page</a>; the report says FP8 "theoretically doubles the computational speed"), and FP8 storage halves the bytes of cached activations and MoE dispatch. The obstacles are twofold too: FP8 has very little range and precision, and Hopper's FP8 tensor cores accumulate imprecisely.</p>
+
+  <p><strong>What E4M3 is.</strong> One sign bit, 4 exponent bits (bias 7), 3 mantissa bits: largest finite value 448, smallest normal \(2^{-6} = 0.0156\), smallest subnormal \(2^{-9} = 0.00195\), no infinities, and 253 distinct finite values (127 non-negative including zero, counted in the drill). In a binade \([2^e, 2^{e+1})\) values are \(2^{e-3}\) apart, so relative rounding error is at most 6.25% and about 2.6% RMS on Gaussian data. The format spans \(\log_2(448/2^{-9}) = 17.8\) binades, about \(2.3 \times 10^5\) from smallest subnormal to maximum: generous, but not unlimited, and that decides what follows.</p>
+
+  <h3 id="fp8-what">What runs in FP8, and what does not</h3>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Component</th><th>Precision</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>The three GEMMs of every Linear operator: Fprop, Dgrad, Wgrad</td><td>FP8 (E4M3) inputs, BF16 or FP32 outputs</td><td>The projections, dense FFNs and all experts are Linear operators <a href="https://arxiv.org/abs/2412.19437">[§3.3.1]</a></td></tr>
+      <tr><td>Embedding, output head, MoE gating, normalization, attention operators</td><td>BF16 or FP32</td><td>Sensitive or cheap. "Attention operators" is our reading for the softmax core, not the projections</td></tr>
+      <tr><td>Master weights, weight gradients</td><td>FP32</td><td>Gradients "used for batch size accumulation" <a href="https://arxiv.org/abs/2412.19437">[§3.3.3]</a></td></tr>
+      <tr><td>AdamW first and second moments</td><td>BF16</td><td>"Without incurring observable performance degradation"</td></tr>
+      <tr><td>Activations cached for backward</td><td>FP8 in 1×128 tiles</td><td>Exceptions: the input of the Linear after attention uses custom E5M6; SwiGLU inputs cached in FP8, output recomputed</td></tr>
+      <tr><td>MoE dispatch, and the gradient before the down-projections</td><td>FP8, power-of-two scales</td><td>Matches the FP8 Fprop that follows</td></tr>
+      <tr><td>MoE combine, forward and backward</td><td>BF16</td><td>"To preserve training precision in critical parts"</td></tr>
+    </tbody>
+  </table></div>
+  <p>The released checkpoint reflects the same granularity: its <code>config.json</code> has a quantization config with format E4M3, dynamic activation quantization and 128×128 weight blocks <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json">[DeepSeek-V3 config]</a>. The E5M6 exception (5 exponent, 6 mantissa bits) applies to the attention output that feeds \(W^O\), which the backward pass of the attention operator also needs and the report calls precision-sensitive. Power-of-two scales for that tensor and for dispatched tensors make re-scaling exact (only the exponent changes), so converting a tile from 1×128 to 128×1 in the backward pass adds no rounding error.</p>
+
+  <h3 id="fp8-quant">Fine-grained quantization: one scale per small group</h3>
+  <p>Standard FP8 training scales a whole tensor so its largest absolute value (amax) lands on 448. One outlier then sets the scale for everything: if amax is \(10^5\) times the typical magnitude, typical values land near \(0.005\) on the scaled axis, inside the subnormal region where spacing is fixed at \(0.00195\), and are quantized with tens of percent error or flushed to zero. V3 confines each outlier to a small group <span class="zh">细粒度量化</span> <a href="https://arxiv.org/abs/2412.19437">[§3.3.2]</a>:</p>
+  <ul>
+    <li><strong>Activations:</strong> one scale per <em>1×128 tile</em>, that is, per token per 128 channels.</li>
+    <li><strong>Weights:</strong> one scale per <em>128×128 block</em>, per 128 input channels and 128 output channels.</li>
+    <li><strong>Rule:</strong> \(s = \mathrm{amax}_{\text{group}}/448\), computed <em>online</em> from the current values, and \(q = \mathrm{round}_{\text{E4M3}}(x/s)\). The report contrasts this with the "delayed quantization" of tensor-wise frameworks, which infers the scale from the amax history of earlier iterations.</li>
+  </ul>
+  <p>Scale overhead is small: an FP32 scale per 128 activations is \(32/128 = 0.25\) bits per element and \(32/16{,}384 = 0.002\) bits per weight, assuming FP32 scales (the report does not state the dtype; DeepGEMM takes FP32 scales on Hopper, <a href="https://github.com/deepseek-ai/DeepGEMM">[README]</a>).</p>
+  <p><strong>Why tiles for activations but blocks for weights?</strong> The report does not spell out the rationale, but Appendix B.2 gives the evidence. Quantizing all tensors of Dgrad (the activation gradients) in 128×128 blocks made a 16B MoE diverge within about 300B tokens, and the authors hypothesize that activation gradients "are highly imbalanced among tokens, resulting in token-correlated outliers" that a block spanning 128 tokens cannot isolate <a href="https://arxiv.org/abs/2412.19437">[App. B.2]</a>. A 1×128 tile holds one token, so a loud token cannot damage its neighbors. Our reading of the other half: weights are static and their outliers are not token-correlated, so blocks amortize scale storage, and a block-quantized tensor transposes for the backward pass without re-quantizing (as the report notes).</p>
+  <p><strong>Backward regrouping.</strong> Scales must run along each GEMM's contraction dimension. In Fprop that is the channel dimension \(K\), so activations are grouped 1×128. Wgrad contracts over <em>tokens</em>, so the same activations (and output gradients) must be grouped 128×1: the forward tiles are "read out, dequantized, transposed, re-quantized into 128x1 tiles, and stored in HBM" <a href="https://arxiv.org/abs/2412.19437">[§3.5.2]</a>, an extra memory pass the report lists as a hardware wish (<a href="#hardware">below</a>).</p>
+
+  <h3 id="fp8-acc">Accumulation: why partial sums are promoted every 128 elements</h3>
+  <p>The report found that "the accumulation precision of FP8 GEMM on NVIDIA H800 GPUs is limited to retaining around 14 bits". Per §3.5.2: after aligning 32 mantissa products by right-shifting to the maximum exponent, the tensor core keeps only the top 14 bits of each product and truncates the rest, and accumulation into registers is also 14-bit. Error grows with the inner dimension \(K\); for random matrices with \(K = 4096\) a preliminary test gave a maximum relative error of nearly 2% <a href="https://arxiv.org/abs/2412.19437">[§3.3.2]</a>. The fix is <strong>promotion</strong>: the tensor cores run a short MMA chain, and at each interval of \(N_C\) elements the partial result is copied to FP32 registers on the CUDA cores and accumulated in full precision. The report picks \(N_C = 128\), "equivalent to 4 WGMMAs" (32 elements of \(K\) each), as the smallest interval that significantly improves precision without substantial overhead.</p>
+  <p>Promotion also makes per-group scaling along \(K\) feasible. A standard FP8 GEMM takes one scale per operand and cannot rescale each 128-wide slice of \(K\). But if each MMA chain covers exactly one scale group, the tensor core can work on raw codes and the scales are multiplied in during promotion: dequantization at almost no extra cost. Tile width, block width and promotion interval are all \(N_C = 128\) by design. One output element is</p>
+  <div class="eq-box">
+  \[ y_{ij} \;=\; \sum_{g=0}^{K/128-1} s^{A}_{i,g}\; s^{W}_{g,\lfloor j/128\rfloor} \Bigl(\sum_{k=128g}^{128g+127} a^{q}_{ik}\, w^{q}_{kj}\Bigr) \]
+  <div class="eq-label">Inner sum: tensor core on E4M3 codes. Outer sum: CUDA-core FP32 accumulation with both scales applied per chunk</div>
+  </div>
+  <p>For \(K = 7168\) that is 56 promotions per output tile, and 16 for an expert's down-projection (\(K = 2048\)). The cost is partial results moving between tensor cores and CUDA cores, which lowers one warpgroup's MMA issue rate. The report notes that H800 typically keeps two WGMMAs in flight, so while one warpgroup promotes the other multiplies.</p>
+
+  <figure class="fig">
+<svg viewBox="0 0 720 372" role="img" aria-labelledby="fig-27-3-title">
+<title id="fig-27-3-title">Dataflow of one FP8 GEMM in DeepSeek-V3: online tile and block quantization, tensor-core MMA over 128-element chunks of K, and promotion with scales into FP32 registers</title>
+<defs><marker id="arrow-27-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="s-arrowhead"/></marker></defs>
+<rect class="s-box" x="10" y="22" width="84" height="64" rx="6"/>
+<text x="52.0" y="42.5" text-anchor="middle" class="s-bold">x</text>
+<text x="52.0" y="58.5" text-anchor="middle" class="s-small">BF16</text>
+<text x="52.0" y="74.5" text-anchor="middle" class="s-small">M × K</text>
+<path class="s-line" d="M94,54 L112,54" marker-end="url(#arrow-27-3)"/>
+<rect class="s-plain" x="112" y="22" width="166" height="64" rx="6"/>
+<text x="195.0" y="42.5" text-anchor="middle" class="s-bold s-small">1×128 tiles</text>
+<text x="195.0" y="58.5" text-anchor="middle" class="s-small">s = amax / 448, online</text>
+<text x="195.0" y="74.5" text-anchor="middle" class="s-small">q = E4M3( x / s )</text>
+<path class="s-line" d="M278,54 L296,54" marker-end="url(#arrow-27-3)"/>
+<rect class="s-a" x="296" y="22" width="304" height="64" rx="6"/>
+<text x="448.0" y="49.5" text-anchor="middle" class="s-small">x<tspan baseline-shift="sub" font-size="9">q</tspan>: E4M3 codes, M × K</text>
+<text x="448.0" y="67.5" text-anchor="middle" class="s-small">s<tspan baseline-shift="sub" font-size="9">A</tspan>: FP32 scales, one per tile (M × K/128)</text>
+<rect class="s-box" x="10" y="286" width="84" height="64" rx="6"/>
+<text x="52.0" y="306.5" text-anchor="middle" class="s-bold">W</text>
+<text x="52.0" y="322.5" text-anchor="middle" class="s-small">FP32 master</text>
+<text x="52.0" y="338.5" text-anchor="middle" class="s-small">K × N</text>
+<path class="s-line" d="M94,318 L112,318" marker-end="url(#arrow-27-3)"/>
+<rect class="s-plain" x="112" y="286" width="166" height="64" rx="6"/>
+<text x="195.0" y="306.5" text-anchor="middle" class="s-bold s-small">128×128 blocks</text>
+<text x="195.0" y="322.5" text-anchor="middle" class="s-small">s = amax / 448, online</text>
+<text x="195.0" y="338.5" text-anchor="middle" class="s-small">q = E4M3( W / s )</text>
+<path class="s-line" d="M278,318 L296,318" marker-end="url(#arrow-27-3)"/>
+<rect class="s-a" x="296" y="286" width="304" height="64" rx="6"/>
+<text x="448.0" y="313.5" text-anchor="middle" class="s-small">w<tspan baseline-shift="sub" font-size="9">q</tspan>: E4M3 codes, K × N</text>
+<text x="448.0" y="331.5" text-anchor="middle" class="s-small">s<tspan baseline-shift="sub" font-size="9">W</tspan>: FP32 scales, one per block (K/128 × N/128)</text>
+<rect class="s-plain s-dash" x="270" y="104" width="398" height="164" rx="10"/>
+<text x="460" y="120" text-anchor="middle" class="s-small s-bold">for each K chunk g</text>
+<text x="460" y="134" text-anchor="middle" class="s-small s-muted">K/128 chunks in total</text>
+<rect class="s-b" x="278" y="150" width="152" height="84" rx="6"/>
+<text x="354.0" y="172.5" text-anchor="middle" class="s-bold s-small">Tensor core, FP8 MMA</text>
+<text x="354.0" y="188.5" text-anchor="middle" class="s-small">raw codes, no scales</text>
+<text x="354.0" y="204.5" text-anchor="middle" class="s-small">partial<tspan baseline-shift="sub" font-size="9">g</tspan> = x<tspan baseline-shift="sub" font-size="9">q</tspan> · w<tspan baseline-shift="sub" font-size="9">q</tspan></text>
+<text x="354.0" y="220.5" text-anchor="middle" class="s-small">~14-bit accumulator</text>
+<path class="s-line" d="M430,192 L480,192" marker-end="url(#arrow-27-3)"/>
+<rect class="s-e" x="480" y="150" width="176" height="84" rx="6"/>
+<text x="568.0" y="172.5" text-anchor="middle" class="s-bold s-small">CUDA cores, FP32 registers</text>
+<text x="568.0" y="188.5" text-anchor="middle" class="s-small">promote and dequantize:</text>
+<text x="568.0" y="204.5" text-anchor="middle" class="s-small">out += partial<tspan baseline-shift="sub" font-size="9">g</tspan></text>
+<text x="568.0" y="220.5" text-anchor="middle" class="s-small">× s<tspan baseline-shift="sub" font-size="9">A</tspan>[i, g] × s<tspan baseline-shift="sub" font-size="9">W</tspan>[g, j/128]</text>
+<path class="s-line" d="M668,192 L684,192" marker-end="url(#arrow-27-3)"/>
+<rect class="s-box" x="684" y="164" width="32" height="56" rx="6"/>
+<text x="700" y="187" text-anchor="middle" class="s-bold">y</text>
+<text x="700" y="202" text-anchor="middle" class="s-small">BF16</text>
+<text x="700" y="215" text-anchor="middle" class="s-small">/FP32</text>
+<path class="s-line" d="M355,86 L355,150" marker-end="url(#arrow-27-3)"/>
+<text x="349" y="99" text-anchor="end" class="s-small s-muted">codes</text>
+<path class="s-line" d="M568,86 L568,150" marker-end="url(#arrow-27-3)"/>
+<text x="562" y="99" text-anchor="end" class="s-small s-muted">scales</text>
+<path class="s-line" d="M355,286 L355,234" marker-end="url(#arrow-27-3)"/>
+<text x="349" y="262" text-anchor="end" class="s-small s-muted">codes</text>
+<path class="s-line" d="M568,286 L568,234" marker-end="url(#arrow-27-3)"/>
+<text x="562" y="262" text-anchor="end" class="s-small s-muted">scales</text>
+<text x="10" y="134" text-anchor="start" class="s-small s-muted">The MMA sees raw E4M3 codes only,</text>
+<text x="10" y="149" text-anchor="start" class="s-small s-muted">with about 14 bits of accumulator,</text>
+<text x="10" y="164" text-anchor="start" class="s-small s-muted">so it sums just 128 products.</text>
+<text x="10" y="194" text-anchor="start" class="s-small s-muted">Scales enter only at promotion, in</text>
+<text x="10" y="209" text-anchor="start" class="s-small s-muted">FP32. That is what allows per-group</text>
+<text x="10" y="224" text-anchor="start" class="s-small s-muted">scales along K: a plain FP8 GEMM</text>
+<text x="10" y="239" text-anchor="start" class="s-small s-muted">has one scale per tensor.</text>
+</svg>
+    <figcaption><b>Figure 3.</b> The dataflow of one FP8 GEMM (Fprop shown; Dgrad and Wgrad follow the same pattern with different group shapes). Both operands are quantized online in groups, the tensor core multiplies raw E4M3 codes over one 128-element chunk of \(K\) in its narrow accumulator, and the CUDA cores multiply the partial sum by the activation-tile and weight-block scales and add it into an FP32 register. The loop over chunks is the report's promotion at interval \(N_C = 128\) (its Figure 7b).</figcaption>
+  </figure>
+
+  <h3 id="fp8-e4m3">E4M3 on every tensor</h3>
+  <p>Earlier FP8 recipes use E4M3 forward and E5M2 for gradients, since gradients need range <a href="https://arxiv.org/abs/2209.05433">[Micikevicius et al. 2022]</a>. V3 uses E4M3 everywhere for its extra mantissa bit ("mantissa over exponents"). The report's explanation: with per-group scaling, the scale acts as a shared exponent for the group, mitigating the format's limited range <a href="https://arxiv.org/abs/2412.19437">[§3.3.2]</a>. The range that E5M2's extra exponent bit would give across a tensor is supplied by the group scales, so the element format can spend its bits on precision. The same reasoning says why the recipe fails when groups get large (the block-wise Dgrad divergence).</p>
+
+  <h3 id="fp8-evidence">What was validated, and what was not reported</h3>
+  <p><strong>Validated.</strong> On roughly 16B parameters trained on 1.33T tokens and roughly 230B on about 0.9T (the main text says "approximately 1 trillion tokens"), FP8 loss stays within 0.25% relative error of BF16 throughout <a href="https://arxiv.org/abs/2412.19437">[§3.3, App. B.1, Fig. 10]</a>. The main run then used the recipe for 14.8T tokens with no irrecoverable loss spikes. <strong>Not reported:</strong> measured FP8-versus-BF16 throughput, MFU, and ablations of promotion interval or group size. Independent evidence fills part of the gap:</p>
+  <ul>
+    <li><strong>Ling 2.0</strong> used the same layout (activations and gradients in [1,128] groups, weights in [128,128] blocks, E4M3, FP32 scales) at 1T parameters: loss within 0.25% of BF16 (averaging about 0.1%) over 900B tokens, and about +15% MFU over BF16. It also needed QKNorm, because outliers in the QKV projection grew with depth and amplified quantization error <a href="https://arxiv.org/abs/2510.22115">[Ling 2.0, §5.1]</a>.</li>
+    <li><strong>Kimi K2</strong> adopted only the storage half: FP8-E4M3 1×128 tiles with FP32 scales for cached MoE and SwiGLU inputs, and no FP8 computation, because of "potential risks of performance degradation" seen in preliminary study <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.4.3]</a>.</li>
+    <li><strong>Meta</strong> states Llama 4 Behemoth was pre-trained in FP8 on 32K GPUs at 390 TFLOPs per GPU, with no recipe given <a href="https://ai.meta.com/blog/llama-4-multimodal-intelligence/">[Llama 4 blog]</a>. <strong>DeepGEMM</strong> reports up to 1550 TFLOPS on an H800 <a href="https://github.com/deepseek-ai/DeepGEMM">[README, as of 2026]</a>, about 78% of the 1,979 dense FP8 peak (assuming the H800 matches the H100).</li>
+  </ul>
+  <p>Read together: quality parity is well supported, and the speed benefit is real but well below 2× end to end, unsurprising when attention, the output head, normalization and communication stay outside FP8 and quantization and promotion add memory traffic and CUDA-core work.</p>
+
+  <div class="decision">
+    <div class="decision-title">Fine-grained FP8 training</div>
+    <dl>
+      <dt>Problem</dt><dd>Per-tensor FP8 scaling is defeated by outliers, and Hopper's FP8 tensor cores accumulate in only about 14 bits, so errors grow with the inner dimension.</dd>
+      <dt>Idea</dt><dd>Quantize activations in 1×128 tiles and weights in 128×128 blocks with online amax scales, use E4M3 for every tensor, promote partial sums to FP32 on CUDA cores every 128 elements of \(K\), and keep sensitive operators, master weights and optimizer math in BF16 or FP32.</dd>
+      <dt>Why it works</dt><dd>An outlier damages only its own group, the group scale plays the role of a shared exponent, and the promotion step is where the scales can be applied cheaply.</dd>
+      <dt>Evidence</dt><dd>Relative loss error under 0.25% versus BF16 at two scales (about 16B and 230B parameters), then a 14.8T-token run <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.3, App. B]</a>; Ling 2.0 reproduces it at 1T scale.</dd>
+      <dt>Cost</dt><dd>Custom kernels (DeepGEMM), scale tensors, an extra dequantize-transpose-requantize pass in backward, CUDA-core promotion work, no measured end-to-end speedup in the report, and dependence on Hopper's accumulator behavior.</dd>
+      <dt>Used by</dt><dd>DeepSeek-V3 (V4's stack keeps the FP8 layers, and NVIDIA's NVFP4 study uses the same scaling for its FP8 baseline, per <a href="15-distributed-training.html#fp8">page 15</a>); Ling 2.0.</dd>
+    </dl>
+  </div>
+
+  <h3 id="fp8-numbers">Worked numbers from the drill</h3>
+  <p>The drill (<a href="#exercises">below</a>) simulates all of this on CPU. Three experiments use its reference implementation, with fixed seeds.</p>
+  <p><strong>1. Granularity versus outliers.</strong> A \(1024 \times 1024\) standard-normal "activation" matrix has 8 whole rows (tokens) multiplied by a factor. The table gives the RMS error on the other 1016 rows relative to their RMS, and the fraction of those entries flushed to zero:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Outlier tokens larger by</th><th class="num">Per-tensor scale</th><th class="num">128×128 blocks</th><th class="num">1×128 tiles</th></tr></thead>
+    <tbody>
+      <tr><td>\(10^3\)</td><td class="num">2.66% (0.62% zeroed)</td><td class="num">2.65% (0.38%)</td><td class="num">2.57% (0%)</td></tr>
+      <tr><td>\(10^4\)</td><td class="num">4.53% (6.14%)</td><td class="num">3.60% (3.73%)</td><td class="num">2.57% (0%)</td></tr>
+      <tr class="hl"><td>\(10^5\)</td><td class="num">44.4% (55.8%)</td><td class="num">31.5% (35.0%)</td><td class="num">2.57% (0%)</td></tr>
+    </tbody>
+  </table></div>
+  <p>First, 2.57% is the E4M3 noise floor: 3 mantissa bits cost that much on Gaussian data whatever the scheme. Second, a per-tensor scale is fine until the outlier ratio nears the format's usable range, then collapses: at \(10^5\) more than half the ordinary entries flush to zero. Third, blocks spanning many tokens degrade almost as badly as one global scale when outliers are token-correlated, while a tile holding one token is untouched: the qualitative content of Appendix B.2. (With 16 isolated single-element outliers at \(10^5\) instead, the errors are 12.6% per-tensor, 6.7% block and 2.6% tile.)</p>
+
+  <p><strong>2. Accumulation width.</strong> E4M3-valued random matrices with \(K = 4096\) and unit scales (so only the accumulator matters), with the tensor core modeled as rounding the running sum to \(b\) significant bits after every product. Relative Frobenius error against an exact float64 product:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Accumulator bits \(b\)</th><th class="num">One chain over all of \(K\)</th><th class="num">Promoted every 128</th><th class="num">Improvement</th></tr></thead>
+    <tbody>
+      <tr><td>10</td><td class="num">\(1.8\times10^{-2}\)</td><td class="num">\(3.2\times10^{-3}\)</td><td class="num">5.7×</td></tr>
+      <tr><td>12</td><td class="num">\(4.5\times10^{-3}\)</td><td class="num">\(6.3\times10^{-4}\)</td><td class="num">7.1×</td></tr>
+      <tr class="hl"><td>14</td><td class="num">\(9.3\times10^{-4}\)</td><td class="num">\(1.1\times10^{-4}\)</td><td class="num">8.8×</td></tr>
+      <tr><td>16</td><td class="num">\(1.6\times10^{-4}\)</td><td class="num">\(1.8\times10^{-5}\)</td><td class="num">9.1×</td></tr>
+    </tbody>
+  </table></div>
+  <p>This is a model, not the hardware: real tensor cores align and truncate rather than round to nearest after each add, and the report's "nearly 2%" is a maximum element-wise relative error, a more sensitive metric than ours. What transfers is the mechanism: error grows with the length of the narrow chain (like a random walk of rounding errors), and cutting it to 128 terms buys nearly an order of magnitude at every width.</p>
+
+  <p><strong>3. The end-to-end GEMM.</strong> Quantizing a \(64 \times 1024\) activation matrix in 1×128 tiles and a \(1024 \times 256\) weight matrix in 128×128 blocks, then running the promoted GEMM, gives 3.7% relative error against the FP32 product: the two operands' 2.6% noise floors added in quadrature (\(\sqrt{2} \times 2.6\% \approx 3.7\%\)). With this recipe, accumulation is no longer the dominant error source.</p>
+
+<pre><code class="language-python">import torch
+
+E4M3_MAX = 448.0
+
+def round_to_e4m3(x):
+    ax = x.abs().clamp(max=E4M3_MAX)
+    e = torch.floor(torch.log2(ax)).clamp(min=-6)           # binade; the clamp gives subnormal spacing 2**-9
+    step = torch.exp2(e - 3)                                # 3 mantissa bits: 8 steps per binade
+    return torch.sign(x) * torch.round(ax / step) * step    # ties to even, saturating at 448
+
+def quantize_tiles(x, tile=(1, 128)):                       # tile (1,128) for activations, (128,128) for weights
+    R, C = x.shape; gr, gc = tile
+    amax = x.abs().reshape(R // gr, gr, C // gc, gc).amax(dim=(1, 3))
+    s = amax / E4M3_MAX                                     # one scale per group (assumes amax > 0)
+    return round_to_e4m3(x / s.repeat_interleave(gr, 0).repeat_interleave(gc, 1)), s
+
+def fp8_matmul(a_q, a_s, w_q, w_s, chunk=128):              # a_q (M,K), a_s (M,K/128), w_q (K,N), w_s (K/128,N/128)
+    out = torch.zeros(a_q.shape[0], w_q.shape[1])           # the FP32 registers on the CUDA cores
+    for g in range(a_q.shape[1] // chunk):
+        k = slice(g * chunk, (g + 1) * chunk)
+        partial = a_q[:, k] @ w_q[k]                        # "tensor core": raw E4M3 codes, no scales
+        out += partial * a_s[:, g:g + 1] * w_s[g].repeat_interleave(128)   # promote: rescale, add in FP32
+    return out
+</code></pre>
+</section>
+
+<section>
+  <h2 id="pretrain">Pretraining: data, tokenizer, hyperparameters, stability</h2>
+
+  <h3 id="data">Data and tokenizer</h3>
+  <p>The corpus is 14.8T tokens (counted in V3's own tokenizer). Compared with V2 the report raises the share of mathematics and programming samples, extends multilingual coverage beyond English and Chinese, and refines the pipeline "to minimize redundancy while maintaining corpus diversity" (<a href="12-pretraining-data.html">page 12</a>). Documents are packed into 4K sequences "for data integrity", with no cross-sample attention masking during training, the opposite choice from Llama 3 (<a href="10-long-context.html#packing">page 10</a>) <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §4.1]</a>. Fill-in-the-middle is applied at a rate of 0.1 in the prefix-suffix-middle layout, <code>&lt;|fim_begin|&gt; f_pre &lt;|fim_hole|&gt; f_suf &lt;|fim_end|&gt; f_middle &lt;|eos_token|&gt;</code>, at the document level during pre-packing. The justification is inherited from DeepSeekCoder-V2: FIM did not harm next-token prediction while teaching the model to fill in from context.</p>
+  <p>The tokenizer is byte-level BPE with a "128K" vocabulary (129,280 entries in the config; <a href="02-tokenization.html">page 02</a>), with the pretokenizer and tokenizer training data modified for multilingual compression. One change has a side effect worth knowing: the new pretokenizer produces tokens that combine punctuation and line breaks, which compresses well but creates <em>token-boundary bias</em> when a multi-line prompt ends without a final line break (few-shot prompts are the typical case), because the merged token that normally covers the final punctuation and line break cannot form when the prompt stops before the line break (our gloss on the bias the report cites). V3's fix is to randomly split a proportion of such combined tokens during training, exposing the model to both forms.</p>
+
+  <h3 id="hparams">The hyperparameters as a phase plan</h3>
+  <p>The constants are AdamW with \(\beta_1 = 0.9\), \(\beta_2 = 0.95\), weight decay 0.1, gradient-norm clipping 1.0, sequence length 4K, initialization standard deviation 0.006, node limit \(M = 4\), and sequence-wise balance weight \(\alpha = 10^{-4}\) <a href="https://arxiv.org/abs/2412.19437">[§4.2]</a>. Everything else changes at token milestones, and it reads best as a single plan for the whole recipe (the schedule is discussed on <a href="14-optimization.html#v3-numbers">page 14</a>):</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Tokens seen</th><th>Learning rate</th><th>Batch (sequences)</th><th>Bias speed \(\gamma\)</th><th>MTP weight \(\lambda\)</th></tr></thead>
+    <tbody>
+      <tr><td>0 to 469B</td><td>linear warmup over 2K steps to \(2.2\times10^{-4}\), then constant</td><td class="num">3,072 → 15,360</td><td class="num">0.001</td><td class="num">0.3</td></tr>
+      <tr><td>469B to 10T</td><td>\(2.2\times10^{-4}\)</td><td class="num">15,360</td><td class="num">0.001</td><td class="num">0.3</td></tr>
+      <tr><td>10T to 14.3T</td><td>cosine decay to \(2.2\times10^{-5}\)</td><td class="num">15,360</td><td class="num">0.001</td><td class="num">0.1</td></tr>
+      <tr><td>14.3T to 14.633T</td><td>\(2.2\times10^{-5}\)</td><td class="num">15,360</td><td class="num">0</td><td class="num">0.1</td></tr>
+      <tr><td>14.633T to 14.8T</td><td>\(7.3\times10^{-6}\)</td><td class="num">15,360</td><td class="num">0</td><td class="num">0.1</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sanity arithmetic: \(10 + 4.3 + 0.333 + 0.167 = 14.8\)T. The final batch is \(15{,}360 \times 4096 = 62.9\)M tokens, so the whole run is roughly 240,000 optimizer steps (page 14 derives 235,000 to 265,000 depending on the shape of the ramp). Two design patterns stand out. The plateau-then-decay shape (as in WSD, page 14) means checkpoints from the plateau are reusable and the decay can be re-run (the report's CPU-resident EMA gives an early read on post-decay quality). And the recipe changes several knobs together at the same milestones: the MTP weight drops from 0.3 to 0.1 as the cosine decay begins, and the bias speed goes to zero for the final 500B tokens, freezing the routing biases while the weights finish annealing.</p>
+
+  <h3 id="stability">Stability, as reported</h3>
+  <p>The report claims twice that "we did not experience any irrecoverable loss spikes or perform any rollbacks" during the entire run <a href="https://arxiv.org/abs/2412.19437">[abstract, §1]</a>. That sentence is careful: it does not say the loss curve was free of spikes, only that none required a restart, and it attributes the stability to nothing in particular. Our reading of the plausible contributors, none of them ablated: a moderate peak learning rate (\(2.2\times10^{-4}\)) with \(\beta_2 = 0.95\) and clipping at 1.0 (<a href="14-optimization.html#settings">page 14</a>), a small batch early in the run that grows only as noise allows, RMSNorm on the MLA latents and scaling at width bottlenecks, no balance-loss gradient in the router (<a href="08-mixture-of-experts.html#aux-free">page 08</a>), and the FP8 safeguards of high-precision sensitive operators. Compare how other reports describe the same problem: Kimi K2 credits MuonClip's QK-clip, and DeepSeek-V4 added anticipatory routing against outlier-driven spikes (<a href="11-stability-tweaks.html">page 11</a>, <a href="08-mixture-of-experts.html#lineage">page 08</a>). Treat V3's clean run as an outcome worth explaining, not a recipe that has been shown to transfer.</p>
+</section>
+
+<section>
+  <h2 id="longctx">Long-context extension</h2>
+  <p>After the 14.8T tokens at 4K, V3 applies YaRN and trains two phases of 1,000 steps each, 4K to 32K and then 32K to 128K. The YaRN settings are identical in both phases (scale \(s = 40\), \(\alpha = 1\), \(\beta = 32\), attention factor \(0.1\ln s + 1\)), the learning rate is \(7.3\times10^{-6}\), the final pretraining rate, and batch sizes are 1,920 sequences of 32K then 480 of 128K <a href="https://arxiv.org/abs/2412.19437">[§4.3]</a>. YaRN "is applied exclusively to the decoupled shared key \(k^R\)", because that is the only place position lives (<a href="07-kv-efficient-attention.html#decoupled-rope">page 07</a>; <a href="10-long-context.html#deepseek-v3-recipe">page 10</a> gives the details, including that the code rotates \(q^R\) with the same frequencies).</p>
+  <p>Two numbers are worth deriving. Both phases process \(1{,}920 \times 32{,}768 = 480 \times 131{,}072 = 62.9\)M tokens per step, the same token batch as the end of pretraining, so the extension is about \(2000 \times 62.9\)M = 126B tokens, 0.85% of pretraining. Yet it costs 119K GPU-hours, 4.3% of the total: \(119{,}000 / 126 \approx 945\) GPU-hours per billion tokens against \(180{,}000/1000 = 180\) in pretraining, a 5.3× premium per token (my arithmetic; attention cost per token grows with sequence length, and the report does not break the 119K down further). Long-context data is expensive per token, which is one reason to do it late and briefly. Evidence in the report is the needle-in-a-haystack grid to 128K after SFT (its Figure 8) and LongBench v2 accuracy of 48.7 against GPT-4o's 48.1 and Claude-3.5-Sonnet's 41.0 (its Table 6).</p>
+</section>
+
+<section>
+  <h2 id="post">Post-training: SFT, distilled reasoning data, and GRPO</h2>
+
+  <p>Post-training costs 5K GPU-hours, 0.18% of the total, and is where V3 imports the reasoning behavior of a separate model <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §5]</a>. The pipeline, step by step:</p>
+  <ol>
+    <li><strong>Expert models.</strong> The reasoning data come from an internal DeepSeek-R1 model, whose output is accurate but suffers from "overthinking, poor formatting, and excessive length" (<a href="28-deepseek-3-reasoning.html">page 28</a> covers R1 itself). So the team first builds, for each domain (code, mathematics, general reasoning), an expert model with a combined SFT and RL pipeline, and that expert becomes the data generator for the final model. The goal is a balance between R1's accuracy and the concision of regularly formatted answers.</li>
+    <li><strong>Two sample types per problem.</strong> One pairs the problem with its original response, the other adds a carefully designed system prompt that induces reflection and verification and pairs it with the R1 response. During RL the expert samples at high temperature and, without any system prompt, learns to mix both patterns; "after hundreds of RL steps" it has absorbed R1's style.</li>
+    <li><strong>Rejection sampling.</strong> The finished expert models generate candidates, and rejection sampling curates the SFT data for the final model, retaining R1's strengths while keeping answers concise (<a href="19-sft-distillation.html">page 19</a>).</li>
+    <li><strong>Non-reasoning data</strong> (creative writing, role-play, simple question answering) comes from DeepSeek-V2.5, with human annotators verifying it. The final SFT set is 1.5M instances.</li>
+    <li><strong>SFT.</strong> Two epochs at a cosine learning rate from \(5\times10^{-6}\) to \(1\times10^{-6}\). Samples are packed into sequences but masked so they are mutually invisible, in contrast to pretraining, where packed documents can attend to each other.</li>
+    <li><strong>Reinforcement learning.</strong> Rule-based rewards where an answer can be checked (a final answer in a box for math, compiler and test cases for LeetCode problems), which the report says are "resistant to manipulation or exploitation". Otherwise a model-based reward model trained from V3 SFT checkpoints, whose preference data include the chain of thought leading to the reward, to reduce reward hacking (<a href="21-preference-optimization.html">page 21</a>). The optimizer is GRPO (<a href="24-rlvr-reasoning.html">page 24</a>; introduced in DeepSeekMath, <a href="26-deepseek-1-foundations.html">page 26</a>), with no critic and a group baseline \(A_i = (r_i - \mathrm{mean}(r))/\mathrm{std}(r)\) over \(G\) samples per prompt, a clipped policy ratio and a KL penalty to a reference model, on prompts from coding, math, writing, role-play and question answering.</li>
+    <li><strong>Self-rewarding for open-ended prompts.</strong> Where no verifier exists, V3 follows the constitutional-AI approach, using the voting results of V3 itself as the feedback signal, optionally steered by extra constitutional inputs. As a judge V3 scores 87.0 on RewardBench (Claude-3.5-Sonnet-1022: 88.7, GPT-4o-0806: 86.7), and 89.6 with majority voting over 6 samples <a href="https://arxiv.org/abs/2412.19437">[§5.3.4, §5.4.2, Tab. 8]</a>.</li>
+  </ol>
+
+  <p><strong>The distillation trade-off.</strong> The ablation is on DeepSeek-V2.5 (not V3), with a short-CoT baseline against data from the expert checkpoints <a href="https://arxiv.org/abs/2412.19437">[§5.4.1, Tab. 9]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>V2.5</th><th class="num">LiveCodeBench-CoT</th><th class="num">Avg. length</th><th class="num">MATH-500</th><th class="num">Avg. length</th></tr></thead>
+    <tbody>
+      <tr><td>Baseline (short CoT)</td><td class="num">31.1</td><td class="num">718</td><td class="num">74.6</td><td class="num">769</td></tr>
+      <tr class="hl"><td>+ R1 distillation</td><td class="num">37.4</td><td class="num">783</td><td class="num">83.2</td><td class="num">1,510</td></tr>
+    </tbody>
+  </table></div>
+  <p>Accuracy rises 6.3 and 8.6 points, but MATH-500 responses nearly double in length (769 to 1,510), which is a serving cost as well as a style change. This is why the pipeline works so hard to control style and length, and "carefully selected optimal settings" for V3. The tension between reasoning length and cost is the thread that <a href="28-deepseek-3-reasoning.html">page 28</a> picks up.</p>
+
+  <p><strong>Where V3 landed (December 2024).</strong> On base-model benchmarks V3-Base (37B activated) beat LLaMA-3.1 405B Base (11 times the activated parameters) on most tasks, for example MMLU 87.1 versus 84.4, MMLU-Pro 64.4 versus 52.8, HumanEval 65.2 versus 54.9 and MATH 61.6 versus 49.0 <a href="https://arxiv.org/abs/2412.19437">[Tab. 3]</a>. The chat model against the two leading closed models of that moment, all evaluated by the authors with outputs capped at 8K tokens <a href="https://arxiv.org/abs/2412.19437">[Tab. 6]</a>:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Benchmark</th><th class="num">DeepSeek-V3</th><th class="num">GPT-4o-0513</th><th class="num">Claude-3.5-Sonnet-1022</th></tr></thead>
+    <tbody>
+      <tr><td>MMLU (EM)</td><td class="num">88.5</td><td class="num">87.2</td><td class="num">88.3</td></tr>
+      <tr><td>MMLU-Pro (EM)</td><td class="num">75.9</td><td class="num">72.6</td><td class="num">78.0</td></tr>
+      <tr><td>GPQA-Diamond (Pass@1)</td><td class="num">59.1</td><td class="num">49.9</td><td class="num">65.0</td></tr>
+      <tr><td>SimpleQA (correct)</td><td class="num">24.9</td><td class="num">38.2</td><td class="num">28.4</td></tr>
+      <tr><td>LongBench v2 (acc.)</td><td class="num">48.7</td><td class="num">48.1</td><td class="num">41.0</td></tr>
+      <tr><td>LiveCodeBench (Pass@1-CoT)</td><td class="num">40.5</td><td class="num">33.4</td><td class="num">36.3</td></tr>
+      <tr><td>SWE-bench Verified (resolved)</td><td class="num">42.0</td><td class="num">38.8</td><td class="num">50.8</td></tr>
+      <tr><td>MATH-500 (EM)</td><td class="num">90.2</td><td class="num">74.6</td><td class="num">78.3</td></tr>
+      <tr><td>AIME 2024 (Pass@1)</td><td class="num">39.2</td><td class="num">9.3</td><td class="num">16.0</td></tr>
+    </tbody>
+  </table></div>
+  <p>The pattern to remember: V3 leads decisively on math and competition code (the domains R1 distillation targets), is roughly level with, or slightly behind, the closed models on knowledge benchmarks, and trails on English factual recall (SimpleQA, which the report attributes to spending more training tokens on Chinese knowledge) and on agentic software engineering. The benchmarks are the report's own runs, and by 2026 all of them are saturated or superseded (<a href="18-evaluation.html">page 18</a>).</p>
+</section>
+
+<section>
+  <h2 id="cost">Cost accounting: what the $5.576M is, and what it is not</h2>
+
+  <h3 id="cost-table">Rebuilding Table 1</h3>
+  <p>The report's headline (Table 1) is a rental-price valuation: GPU-hours multiplied by an assumed $2 per H800-hour <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §1, Tab. 1]</a>. Every entry can be checked from two numbers in the text, 180K GPU-hours per trillion tokens and 2,048 GPUs:</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Phase</th><th class="num">H800 GPU-hours</th><th class="num">Cost at $2</th><th class="num">Share</th><th class="num">Wall-clock on 2,048 GPUs</th></tr></thead>
+    <tbody>
+      <tr><td>Pretraining (14.8T tokens)</td><td class="num">2,664K</td><td class="num">$5.328M</td><td class="num">95.6%</td><td class="num">54.2 days</td></tr>
+      <tr><td>Context extension</td><td class="num">119K</td><td class="num">$0.238M</td><td class="num">4.3%</td><td class="num">2.4 days</td></tr>
+      <tr><td>Post-training</td><td class="num">5K</td><td class="num">$0.010M</td><td class="num">0.18%</td><td class="num">2.4 hours</td></tr>
+      <tr class="hl"><td><strong>Total</strong></td><td class="num">2,788K</td><td class="num">$5.576M</td><td class="num">100%</td><td class="num">about 57 days</td></tr>
+    </tbody>
+  </table></div>
+  <p>Arithmetic: \(180\text{K} \times 14.8 = 2{,}664\text{K}\) exactly matches the pretraining row. \(180{,}000 / 2048 = 87.9\) hours, the report's "3.7 days" per trillion tokens, and \(2{,}664{,}000/2048 = 1{,}301\) hours = 54.2 days, "less than two months". Dollars are just \(\times 2\): \(2.788\text{M} \times \$2 = \$5.576\text{M}\).</p>
+
+  <h3 id="mfu">Backing out MFU from 6ND</h3>
+  <p>The report gives no MFU, but the numbers imply one (<a href="15-distributed-training.html#mfu">page 15</a> defines it, <a href="13-scaling-laws.html">page 13</a> derives \(C \approx 6ND\)). For an MoE use activated parameters. With \(N = 37\)B and \(D = 14.8\)T:</p>
+  \[ C \approx 6 \times 37\times10^{9} \times 14.8\times10^{12} = 3.29\times10^{24}\ \text{FLOPs}, \qquad \text{MFU} = \frac{C}{\text{GPU-hours} \times 3600 \times \text{peak}} \]
+  <p>The peaks are the H100 SXM dense figures, 989.4 TFLOP/s in BF16 and 1,978.9 in FP8 (<span class="unverified" title="Assumes the H800 SXM has the same tensor-core throughput as the H100 SXM, which aggregator spec sheets state; NVIDIA's H800 datasheet could not be retrieved. The report itself gives no peak.">assuming the H800 matches</span>). The rows add what \(6N\) leaves out. All are my estimates.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>FLOPs per token counted</th><th class="num">GFLOP/token</th><th class="num">Achieved TFLOP/s per GPU</th><th class="num">vs BF16 peak</th><th class="num">vs FP8 peak</th></tr></thead>
+    <tbody>
+      <tr><td>\(6N\), \(N = 37\)B (a lower bound)</td><td class="num">222.0</td><td class="num">342.6</td><td class="num">34.6%</td><td class="num">17.3%</td></tr>
+      <tr><td>plus causal attention, 4K sequences (30.7 GFLOP)</td><td class="num">252.7</td><td class="num">390.0</td><td class="num">39.4%</td><td class="num">19.7%</td></tr>
+      <tr class="hl"><td>plus the MTP module (\(3 \times 3.2\) GFLOP)</td><td class="num">262.4</td><td class="num">404.9</td><td class="num">40.9%</td><td class="num">20.5%</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Derivation.</strong> Tokens per second per GPU: \(10^{12}/(180{,}000 \times 3600) = 1{,}543\), so the first row is \(222\text{ GFLOP} \times 1543 = 342.6\) TFLOP/s. Attention: the MLA core in MHA mode does \(2 n_h (192 + 128) = 81{,}920\) FLOPs per cached token per layer (page 07), the average causal context in a 4K packed sequence is about 2,048, and forward plus backward is 3× the forward, so \(3 \times 61 \times 81{,}920 \times 2048 = 30.7\) GFLOP per token. MTP: \(3 \times 3.23\) GFLOP (page 11's forward estimate) \(= 9.7\) GFLOP.</p>
+  <p><strong>How to read it.</strong> Against the BF16 peak V3 runs at roughly 35% to 41% MFU, on par with the best dense runs (Llama 3 405B reports 38% to 43%, <a href="15-distributed-training.html#mfu">page 15</a>), which is remarkable for an MoE that shuffles activations across nodes at every layer. Against the FP8 peak it is only 17% to 21%. Neither denominator is right on its own, because only some FLOPs are FP8: the attention core and the two vocabulary heads stay in BF16, about 16% of the FLOPs in this accounting, so a blended peak of \(1/(0.84/1979 + 0.16/989) \approx 1{,}700\) TFLOP/s gives about 24%. The honest summary is a range, with the assumptions stated. Three caveats: the 180K-per-trillion figure is the report's throughput statement and it is not clear whether it includes restarts, checkpointing and evaluation; MFU as usually defined counts model FLOPs only, so recomputation (RMSNorm, MLA up-projections) does not raise it; and MoE routing and FP8 quantization work are overheads that no FLOP formula sees.</p>
+
+  <h3 id="llama-compare">Where the saving comes from: compare with Llama 3 405B</h3>
+  <p>Llama 3.1 405B took 30.84M H100 GPU-hours <a href="https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md">[Llama 3.1 model card]</a> on 15.6T tokens (<a href="14-optimization.html#documented">page 14</a>). Under the same 6ND convention: \(6 \times 405\text{B} \times 15.6\text{T} = 3.79\times10^{25}\) FLOPs, which is 11.5 times V3's \(3.29\times10^{24}\), against 30.84M/2.664M = 11.6 times the pretraining GPU-hours. The implied MFU of Llama 3 405B is \(3.79\times10^{25}/(30.84\text{M} \times 3600 \times 989.4\text{T}) = 34.5\%\), essentially V3's 34.6%. So V3's cost advantage over a 405B dense model is almost exactly the ratio of activated parameters times tokens; on this crude measure its hardware efficiency is the same, not better. That is itself the systems achievement (an MoE with cross-node all-to-all matching dense-model utilization), but it locates the savings: sparsity buys the 11×, and FP8, DualPipe and the kernels are what keep the sparse model from losing it to communication. At the report's own convention Llama 3 405B would be priced \(30.84\text{M} \times \$2 = \$61.7\)M (Meta's actual hardware and pricing differ).</p>
+
+  <h3 id="headline">The "$5.6M" headline, responsibly</h3>
+  <p>The report is explicit about what the figure is: "the aforementioned costs include only the official training of DeepSeek-V3, excluding the costs associated with prior research and ablation experiments on architectures, algorithms, or data". Beyond that sentence, our list of what a total cost of building V3 would add:</p>
+  <ul>
+    <li><strong>Ablations.</strong> The report's own tables imply a lower bound. Counting each table column as a separate run and using \(6ND\) with the active-parameter counts printed there, the MTP ablation (Tab. 4: 2 large runs at 20.9B active on 540B tokens, 2 small at 2.4B on 1.33T), the balancing ablation (Tab. 5: 2 large at 578B, 2 small), and the FP8-versus-BF16 comparison (App. B.1: an FP8 and a BF16 run each at about 16B parameters on 1.33T tokens and at about 230B on about 0.9T; we take 2.4B and 21B active) add up to about \(6.2\times10^{23}\) FLOPs, 19% of the main run, or about 0.5M GPU-hours (\(\approx\$1.0\)M) at V3's own rate. This omits every unreported experiment, hyperparameter search and failed run.</li>
+    <li><strong>The R1-series model and expert models</strong> that generated the post-training data. The 5K GPU-hours are V3's own SFT and RL only.</li>
+    <li><strong>Data</strong> collection, filtering and annotation, <strong>staff</strong>, <strong>evaluation</strong>, and <strong>debugging and restarts</strong>.</li>
+    <li><strong>Ownership of the cluster</strong> rather than renting at $2 an hour. One outside estimate (SemiAnalysis, January 2025) puts DeepSeek's fleet at around 50,000 Hopper GPUs and total server capital expenditure near $1.6B, and calls the paper's figure "just the GPU cost of the pre-training run" <a href="https://newsletter.semianalysis.com/p/deepseek-debates">[SemiAnalysis]</a>; <span class="unverified" title="Third-party analyst estimate, not confirmed by DeepSeek; included only to show the order of magnitude that a total-cost figure would have.">treat that magnitude as unconfirmed</span>.</li>
+  </ul>
+  <aside class="callout warn">
+    <div class="callout-title">Pitfall: two ways to misuse the number</div>
+    <p>It is a fair <em>marginal compute price</em> of the final run at market rental rates, and it is checkable (2.788M GPU-hours, \(3.29\times10^{24}\) FLOPs, about 35% BF16 MFU) and comparable across labs that use the same convention. It is not the cost of building a frontier model, and it is not reproducible by someone who rents the same GPUs without the systems stack (FP8 kernels, DualPipe, DeepEP, MLA kernels): a 35% MFU on H800 is the output of engineering that sits in the excluded research and development. A good interview answer states both halves.</p>
+  </aside>
+</section>
+
+<section>
+  <h2 id="deploy">Inference deployment and hardware suggestions</h2>
+
+  <p>V3's serving layout is covered on <a href="17-inference-serving.html#disagg-prod">page 17</a>; here is the reasoning in brief <a href="https://arxiv.org/abs/2412.19437">[DeepSeek-V3, §3.4]</a>. The report separates prefill and decode "to simultaneously ensure both the SLO for online services and high throughput", and sizes each stage for what limits it.</p>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th></th><th>Prefill unit</th><th>Decode unit</th></tr></thead>
+    <tbody>
+      <tr><td>Size</td><td>4 nodes, 32 GPUs</td><td>40 nodes, 320 GPUs</td></tr>
+      <tr><td>Attention</td><td>TP4 with sequence parallelism, DP8</td><td>TP4 with sequence parallelism, DP80</td></tr>
+      <tr><td>MoE</td><td>EP32; 32 redundant experts, so each GPU holds its 8 experts plus 1 redundant</td><td>EP320; one expert per GPU, 64 GPUs hold redundant and shared experts</td></tr>
+      <tr><td>Overlap</td><td>Two micro-batches: attention and MoE of one hide dispatch and combine of the other</td><td>Attention of one micro-batch overlaps dispatch, MoE and combine of another (explored)</td></tr>
+      <tr><td>All-to-all</td><td>IB then NVLink, as in training</td><td>Direct point-to-point over IB with IBGDA for low latency</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>Why a wide expert-parallel group in decode.</strong> Each expert needs enough tokens per step to use its tensor cores. Pooling requests from 80 data-parallel attention replicas into EP320 does that, yet the report notes the batch per expert is "usually within 256 tokens", where memory access, not computation, is the bottleneck. Since each GPU loads the weights of only one expert, memory traffic per step is small, and only a small share of SMs needs to go to dispatch, MoE and combine (<a href="08-mixture-of-experts.html#serving">page 08</a>).</li>
+    <li><strong>Why small TP for attention.</strong> TP4 keeps tensor-parallel communication small, and MLA's latent cache is shared by all heads, so head-sharded TP would replicate it (<a href="07-kv-efficient-attention.html#tp">page 07</a>). Scaling out with data parallelism (DP80) is the alternative.</li>
+    <li><strong>Redundant experts</strong> answer the one weakness of batch-wise balancing: load shifts with the domain of live traffic. Hot experts are detected from online statistics and re-placed periodically (every 10 minutes in the prefill example), without adding cross-node traffic.</li>
+    <li><strong>Reported gains.</strong> More than 2× end-to-end generation speed versus V2 (<a href="https://arxiv.org/abs/2412.19437">[§6]</a>), and 1.8× from MTP speculation (<a href="#mtp-inference">above</a>). The report concedes the recommended deployment unit is "relatively large" and "might pose a burden for small-sized teams".</li>
+  </ul>
+
+  <h3 id="hardware">The hardware wish list (§3.5)</h3>
+  <p>The report ends its systems section with concrete asks to chip vendors, each traceable to a cost paid above <a href="https://arxiv.org/abs/2412.19437">[§3.5]</a>:</p>
+  <ul>
+    <li><strong>Offload communication from the SMs.</strong> The 20 SMs forward data between IB and NVLink, move data between RDMA buffers and input and output buffers, run the combine reductions and manage fine-grained memory layout. The ask is a co-processor (like NVIDIA SHARP), and one interface that unifies the IB scale-out and NVLink scale-up networks with simple read, write, multicast and reduce primitives.</li>
+    <li><strong>Higher accumulation precision in FP8 tensor cores</strong>, replacing the 14-bit truncating adder that forced promotion to CUDA cores.</li>
+    <li><strong>Native tile- and block-wise scaling</strong>: let tensor cores receive scale factors and finish accumulation and dequantization internally, avoiding the frequent tensor-core-to-CUDA-core copies.</li>
+    <li><strong>Online quantization support</strong>: today 128 BF16 values are read from HBM, quantized, written back as FP8 and read again for the MMA. The ask is a fused FP8 cast with TMA access (or a near-memory cast, reducing off-chip traffic by roughly 50%).</li>
+    <li><strong>Transposed GEMM reads</strong> from shared memory, to remove the dequantize-transpose-requantize pass of the backward step.</li>
+  </ul>
+  <p>The report remarks that its tile scaling is "highly consistent with the idea of microscaling formats" and that Blackwell's tensor cores announced support for finer-grained microscaling (<a href="15-distributed-training.html#microscaling">page 15</a>): hardware moving toward what V3 did in software.</p>
+</section>
+
+<section>
+  <h2 id="field">What V3 changed in the field: sourced statements only</h2>
+  <p>Influence is easy to overstate, so this list contains only what other reports themselves say.</p>
+  <ul>
+    <li><strong>Architecture as a template.</strong> Kimi K2 states that its architecture "follows a similar design to DeepSeek-V3", with MLA, hidden size 7168 and expert width 2048, and changes three things: 384 experts (sparsity 48), 64 heads instead of 128, and 1 dense layer instead of 3 <a href="https://arxiv.org/abs/2507.20534">[Kimi K2, §2.3, Tab. 2]</a>. Ling 2.0 uses 256 routed plus 1 shared expert with 8 active, DeepSeek-style balancing and depth-1 MTP <a href="https://arxiv.org/abs/2510.22115">[Ling 2.0, §2]</a>.</li>
+    <li><strong>Balancing.</strong> Auxiliary-loss-free balancing appears in Kimi K2's config, in Ling 2.0 and in DeepSeek-V4. Qwen3 instead adopted global-batch auxiliary-loss balancing, the same batch-wise principle (<a href="08-mixture-of-experts.html#global-batch">page 08</a>).</li>
+    <li><strong>FP8.</strong> Ling 2.0 calls itself the largest open model trained entirely in FP8, using V3's group shapes. Kimi K2 borrowed the FP8 tile storage without FP8 compute. Meta reports FP8 pre-training for Llama 4 Behemoth without giving a recipe. DeepSeek-V4's stack keeps the FP8 layers (<a href="15-distributed-training.html#fp8">page 15</a>).</li>
+    <li><strong>Counter-signals.</strong> Kimi K2 declined DualPipe and uses EP = 16, Ling 2.0 saw limited gains from communication overlap, and K2 cut attention heads because 128 heads make long-context decode expensive (<a href="07-kv-efficient-attention.html#head-count">page 07</a>). The field took the architecture and the balancing method far more readily than the systems stack.</li>
+  </ul>
+  <p>Where V3 went next (V3-0324, V3.1's hybrid thinking, V3.2's sparse attention, V4's compressed attention) is <a href="28-deepseek-3-reasoning.html">page 28</a>.</p>
+</section>
+
+<section id="pitfalls">
+  <h2>Common misconceptions</h2>
+  <ul>
+    <li><strong>"V3 cost $5.6M to build."</strong> $5.576M is the rental value of the GPU time of the final run (pretraining, context extension, post-training) at an assumed $2 per H800-hour. The report itself excludes prior research and ablations. Data, staff, the R1-series models that generated post-training data, and cluster ownership are also outside it.</li>
+    <li><strong>"FP8 training means every tensor is FP8."</strong> Only the inputs of the Linear-layer GEMMs (plus some stored activations and the MoE dispatch) are FP8. Embedding, output head, gating, normalization and the attention core stay BF16 or FP32, master weights and weight gradients are FP32, and Adam moments are BF16.</li>
+    <li><strong>"Fine-grained scaling and FP32 promotion are the same trick."</strong> They fix different problems. Group scales handle outliers and range, and promotion handles the tensor core's roughly 14-bit accumulator. The tile width, block width and promotion interval coincide (\(N_C = 128\)) so that the scales can be applied at the promotion step, but neither mechanism makes the other unnecessary.</li>
+    <li><strong>"Auxiliary-loss-free means no balancing loss at all."</strong> V3 still has a sequence-wise loss with \(\alpha = 10^{-4}\). The bias controller balances a batch, and the small loss stops single sequences from collapsing onto a few experts.</li>
+    <li><strong>"MTP is how V3 generates several tokens at once."</strong> The module is a training objective first. At inference it is discarded or used as a one-token draft for speculative decoding, where it predicts one extra token, verified by the main model, giving 1.8× TPS at 85% to 90% acceptance.</li>
+    <li><strong>"DualPipe wins by pipelining better."</strong> With no communication to hide, DualPipe's bubble is barely below ZB1P's (14 versus 15 at 16 stages in our illustration); splitting weight gradients from input gradients does most of that work. Its distinct win is overlapping the all-to-all, and it costs two parameter copies per device.</li>
+    <li><strong>"No tensor parallelism means the model is not sharded."</strong> V3 shards with 16 pipeline stages, 64-way expert parallelism and ZeRO-1. It avoids only the per-layer tensor-parallel collectives.</li>
+    <li><strong>"Top-8 routing sends a token to 8 nodes."</strong> Routing is node-limited: at most 4 nodes per token, 32 experts per node, and NVLink forwarding makes extra experts on a reached node nearly free.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions</h2>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Walk me through DeepSeek-V3's architecture and the reason for each component.</summary>
+    <div class="answer">
+      <p>61 pre-norm transformer layers, width 7168, 671B parameters of which 37B are activated per token, trained on 14.8T tokens. <strong>Attention is MLA</strong> (128 heads, KV latent 512, decoupled RoPE key 64): it caches 576 values per token per layer, 70,272 bytes per token, because serving is bounded by KV bytes. <strong>Feed-forward is DeepSeekMoE</strong> in 58 of the layers (the first 3 are dense): 1 shared and 256 routed experts of width 2048 with 8 routed active, so each token pays for 9 small experts while the model stores 257. Affinities are sigmoids normalized over the selected experts. <strong>Routing is node-limited</strong> to 4 nodes because IB is 3.2× slower than NVLink. <strong>Balancing is auxiliary-loss-free</strong> (a per-expert bias steering top-k), plus a tiny sequence-wise loss, and no tokens are dropped, so balance costs no gradient interference. <strong>MTP</strong> (depth 1) adds training signal and a draft head. The systems side is part of the design: <strong>FP8</strong> GEMMs with fine-grained scales for throughput and memory, <strong>DualPipe</strong> and custom all-to-all kernels to hide communication, and PP16 × EP64 with ZeRO-1 and no tensor parallelism. The through-line is compute, communication and memory levers under one co-design.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Calculate the activated parameters of V3 from its config, and the fraction of parameters that are routed experts.</summary>
+    <div class="answer">
+      <p>One expert is a SwiGLU network with three \(7168 \times 2048\) matrices: 44,040,192 parameters. Routed experts: \(58 \times 256 \times 44.04\text{M} = 653.9\)B, shared: \(58 \times 44.04\text{M} = 2.55\)B, so experts hold 656.5B of 671.0B, 97.8%. Active per token: 8 routed plus 1 shared = 9 experts per MoE layer, \(58 \times 9 \times 44.04\text{M} = 22.99\)B. Always-active parts: MLA \(61 \times 187.1\text{M} = 11.41\)B, three dense FFNs \(3 \times 3 \times 7168 \times 18{,}432 = 1.19\)B, routers \(58 \times 7168 \times 256 = 0.11\)B, and the two vocabulary matrices \(2 \times 129{,}280 \times 7168 = 1.85\)B. Total 37.55B with both matrices; 36.6B counting only the output head, 35.7B with neither. The reported "37B" sits inside that range, which is why the embedding convention matters at the 5% level. Only \(9/257 = 3.5\%\) of expert parameters are used per token, which is why compute follows the activated count while memory follows the total.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is MTP in V3, and how is it used at inference?</summary>
+    <div class="answer">
+      <p>MTP adds a second training target: a module predicts the token <em>after</em> the next one. Module \(k\) RMS-normalizes the previous depth's hidden state and the embedding of the next token, concatenates them (\(2d\)), projects back to \(d\), runs one transformer block, and uses the main model's shared output head. The loss is weighted by \(\lambda = 0.3\) for the first 10T tokens and 0.1 for the last 4.8T. It keeps the full causal chain, unlike independent parallel heads. Ablation: 17 of 20 benchmark cells improve, mostly code and math, at 15.7B and 228.7B scale.</p>
+      <p>At inference there are two options. Drop it: the model is then exactly as expensive as one trained without MTP. Or use it as a one-token drafter for speculative decoding: with the reported second-token acceptance of 85% to 90%, each step emits \(1+p\) = 1.85 to 1.90 tokens on average, and the reported 1.8× TPS implies a per-step overhead of only about 3% to 6%.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Which operations run in FP8 in V3, and which do not?</summary>
+    <div class="answer">
+      <p>All three GEMMs of every Linear operator (Fprop, Dgrad, Wgrad) take FP8 (E4M3) inputs and output BF16 or FP32. Kept in BF16 or FP32: the embedding, the output head, MoE gating, normalization and the attention operators. Master weights and weight gradients are FP32 and the Adam moments are BF16. Cached activations are stored in FP8 (the input to the Linear after attention uses a custom E5M6 format, and SwiGLU inputs are cached in FP8 with the output recomputed). MoE dispatch is FP8 and combine is BF16. The rule of thumb: FP8 wherever the tensor feeds a big matmul, high precision wherever the operation is cheap or numerically sensitive.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How does auxiliary-loss-free balancing work, and why add a sequence-wise loss anyway?</summary>
+    <div class="answer">
+      <p>Each routed expert has a bias \(b_i\). Top-\(k\) selection uses \(s_{i,t} + b_i\), but the gate that multiplies the expert output is still the unbiased sigmoid score, normalized over the selected experts. After each step, measured over the whole batch, an overloaded expert's bias falls by \(\gamma\) and an underloaded expert's rises by \(\gamma\) (\(\gamma = 0.001\) for the first 14.3T tokens, then 0). No balance term enters the loss, so no interference gradient reaches the router or backbone, unlike an auxiliary loss where the coefficient trades balance against quality.</p>
+      <p>The controller only sees batch-level load. A single sequence, say all code, can still pile onto a few experts while the batch average is flat, and serving batches are less diverse than training batches. So V3 adds a sequence-wise loss with \(\alpha = 10^{-4}\), "just to avoid extreme imbalance within any single sequence". Batch-wise scope is intended: it allows domain specialization (a batch-wise auxiliary loss matched the bias method's validation loss, 2.253 versus 2.253 at 1B, against 2.258 for sequence-wise). The costs the report names are imbalance in small batches, handled by big micro-batches, and inference domain shift, handled by redundant experts. No tokens are dropped.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How did DeepSeek make FP8 training work? Why fine-grained scaling?</summary>
+    <div class="answer">
+      <p>Three ingredients. (1) <strong>Fine-grained scales.</strong> Per-tensor scaling maps the tensor's amax to 448, so one outlier pushes everything else toward E4M3's subnormal range and flushes small values to zero. V3 uses one scale per 1×128 activation tile (per token per 128 channels) and per 128×128 weight block, computed online as amax/448. An outlier now damages only its group. (2) <strong>FP32 promotion.</strong> The Hopper FP8 tensor core accumulates in about 14 bits, giving nearly 2% maximum relative error at \(K = 4096\), so every \(N_C = 128\) elements of \(K\) the partial sum is copied to FP32 registers on CUDA cores, where the scales are also applied. (3) <strong>Mixed precision.</strong> E4M3 everywhere (the group scales act as shared exponents), high precision for embedding, head, gating, norms and attention, FP32 masters, BF16 moments.</p>
+      <p>Evidence: relative loss error under 0.25% versus BF16 at two scales (about 16B and 230B parameters), then a 14.8T-token run. Not reported: a measured speedup or MFU. Ling 2.0 independently reproduced the recipe at 1T parameters (within 0.25% loss, +15% MFU over BF16), but needed QKNorm to tame outliers.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why promote partial sums to FP32 every 128 elements? What breaks without it?</summary>
+    <div class="answer">
+      <p>Without promotion the whole \(K\)-long chain accumulates in the tensor core's narrow (about 14-bit) adder, which aligns products to the largest exponent and truncates low bits, so once the running sum is large, later small products vanish, and error grows with \(K\). Promotion cuts the narrow chain to 128 terms and sums the chunks in FP32. In a toy model (round the running sum to \(b\) bits after each add; \(K = 4096\)), promotion every 128 cut the relative error 5.7× to 9.1× for \(b\) from 10 to 16. It also enables the scaling scheme: a standard FP8 GEMM has one scale per operand, so it cannot apply a different scale to each 128-wide slice of \(K\). Because each MMA chain covers exactly one scale group, the tensor core multiplies raw codes and the CUDA cores multiply the two group scales into each partial sum: \(y_{ij} = \sum_g s^A_{i,g} s^W_{g,\lfloor j/128\rfloor}\,(\text{partial}_g)\). The price is data movement between tensor cores and CUDA cores and a lower MMA issue rate for one warpgroup, mostly hidden because two warpgroups alternate. The report asks hardware vendors to fix it natively.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why no tensor parallelism? What problem does DualPipe solve?</summary>
+    <div class="answer">
+      <p><strong>No TP.</strong> The report says tensor parallelism is "costly", and V3's layout makes it unnecessary and unattractive (our reading): about 97% of parameters are routed experts, sharded 64 ways by expert parallelism across 16 pipeline stages, leaving roughly 1.7B parameters per GPU (page 15's arithmetic); ZeRO-1 shards optimizer state; recomputation of RMSNorm and MLA up-projections, FP8 activations and BF16 moments cut activation and state memory. Tensor-parallel all-reduces would sit on every layer's critical path on NVLink that the expert all-to-all already needs, and would shrink already small expert GEMMs.</p>
+      <p><strong>DualPipe.</strong> Cross-node expert parallelism makes communication about as long as computation. DualPipe splits chunks into attention, dispatch, MLP and combine (backward split into input and weight gradients), overlaps a forward chunk with a backward chunk so each all-to-all hides behind the other's compute, and feeds micro-batches from both pipeline ends. Bubble \((PP/2 - 1)(F\&amp;B + B - 3W)\) versus \((PP-1)(F+B)\) for 1F1B, at the price of 2× parameter copies and \(PP+1\) activation slots.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Is "$5.6M to train V3" a fair statement? What does it include and exclude?</summary>
+    <div class="answer">
+      <p>It is a correct statement about one thing: 2.788M H800 GPU-hours (2.664M pretraining, 119K context extension, 5K post-training) times an assumed $2 per hour gives $5.576M, and the numbers reconcile (180K GPU-hours per trillion tokens times 14.8T is 2.664M). It excludes, as the report says, prior research and ablation experiments. Also outside it: the R1-series model and expert models that produced post-training data, data work, staff, evaluation, failed or restarted runs, and owning the cluster instead of renting (one outside estimate puts server capex near $1.6B, unconfirmed). The report's own tables imply at least about 19% of the main run's FLOPs in ablations.</p>
+      <p>Fair use: a marginal compute price for the final run at market rates, comparable to other labs' figures computed the same way (Llama 3 405B would be about $61.7M at $2 per GPU-hour). Unfair use: the cost of building a frontier model, or a claim that anyone renting H800s could reproduce it for that price, since reaching about 35% MFU took the excluded systems engineering.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Back out V3's MFU from the report. State your assumptions.</summary>
+    <div class="answer">
+      <p>Throughput: 180K GPU-hours per trillion tokens is \(10^{12}/(180{,}000 \times 3600) = 1{,}543\) tokens per second per GPU. FLOPs per token with \(N = 37\)B activated: \(6N = 222\) GFLOP, so \(222 \times 1543 = 342.6\) TFLOP/s per GPU. Against the H100/H800 dense BF16 peak of 989.4 that is 34.6% (equivalently \(6ND = 3.29\times10^{24}\) over \(2.664\text{M} \times 3600 \times 989.4\text{T}\)). Adding causal attention at 4K (about 30.7 GFLOP per token for forward plus backward over 61 layers) and the MTP module (about 9.7 GFLOP) gives about 262 GFLOP per token, 405 TFLOP/s, 40.9%. Against the FP8 peak (1,979) it is 17% to 20%; against a blended peak (about 84% of FLOPs in FP8 GEMMs) about 24%.</p>
+      <p>Assumptions to state: the peak (H800 assumed equal to H100 SXM), which parameters count (37B versus 37.55B), whether the 180K figure includes restarts, MFU counts model FLOPs not recomputation, and the attention convention. Sanity check: Llama 3 405B implies 34.5% by the same method from its 30.84M GPU-hours, so V3's hardware efficiency is comparable to a good dense run, and its cost advantage is the 11× lower FLOPs.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Why tiles (1×128) for activations but blocks (128×128) for weights, and why E4M3 for every tensor?</summary>
+    <div class="answer">
+      <p>The report's evidence is Appendix B.2: quantizing the activation gradients of Dgrad in 128×128 blocks made a 16B MoE diverge within about 300B tokens, and the authors attribute it to token-correlated outliers, since activation gradients are highly imbalanced across tokens. A 1×128 tile contains one token, so a loud token cannot degrade its neighbors. Weights are static, and (our reading) their outliers are not token-correlated, so blocks amortize scale storage and can be transposed for the backward pass without re-quantization. Activations do need regrouping to 128×1 in the backward pass because Wgrad contracts over tokens, which costs an extra dequantize-transpose-requantize pass.</p>
+      <p>E4M3 everywhere, instead of E5M2 for gradients: per-group scaling makes each group's scale act as a shared exponent, so the element format does not need the extra exponent bit for range and can spend it on a third mantissa bit. That precision is lost again if groups get large, which is the block-wise divergence.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> If you had to cut V3's training cost by another 2×, what would you try?</summary>
+    <div class="answer">
+      <p>Start from the identity cost = \(6 N_{\text{act}} D / (\text{MFU} \times \text{peak})\) times price per GPU-hour, and where the money is: 95.6% is pretraining. Levers, with expected gain and risk:</p>
+      <ul>
+        <li><strong>Utilization (about 1.3× to 1.5×).</strong> V3 sits at roughly 35% to 41% of BF16 peak and about 17% to 24% of FP8 peak. Levers: get the 20 communication SMs (15% of the chip) back through hardware offload or fused kernels, native group-scaled MMA to remove promotion overhead, better overlap. Risk: engineering effort with diminishing returns, and independent teams saw limited gains from overlap.</li>
+        <li><strong>Sparser MoE (about 1.15×).</strong> Kimi K2's sparsity scaling law says sparsity 48 needs 1.15× fewer FLOPs than 32 for the same validation loss (V3 is 256/8 = 32). Risk: more communication and serving complexity.</li>
+        <li><strong>Token or optimizer efficiency (uncertain, up to 2× if it holds).</strong> Muon (Moonlight: about 52% of AdamW's FLOPs at their scale; but Wen et al. found only 1.1× at 1.2B under careful tuning), better or synthetic data, more MTP depth. Risk: gains often shrink at scale, so validate on a scaling-law ladder first (page 13).</li>
+        <li><strong>Lower precision (small today).</strong> FP4 experts need hardware support and quantization-aware training to pay off; V4's FP4 gain is currently memory, not FLOP/s (page 15).</li>
+        <li><strong>Long-context stage (about 4%).</strong> It costs 5.3× more per token; pretrain with long sequences natively only if the recipe saves elsewhere.</li>
+      </ul>
+      <p>Multiplying sparsity, utilization and a partial optimizer gain gets close to 2× but none is guaranteed. I would first spend on small-scale proxies (as V3 did with 16B and 230B ablations), reserving the large run for the combination. Price per GPU-hour is a non-algorithmic lever.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Compute the pipeline bubble at 16 stages for 1F1B, ZB1P and DualPipe with F = 2, B = 4, W = 1 and F&amp;B = 3. When does DualPipe stop paying off?</summary>
+    <div class="answer">
+      <p>Using V3's Table 2 with \(PP = 16\): 1F1B \((16-1)(2+4) = 90\); ZB1P \((16-1)(2+4-2) = 60\); DualPipe \((8-1)(3+4-3) = 28\), in units where a forward chunk is 2. These times model an all-to-all as long as the compute it serves, exposed in serial schedules (\(F\), \(B\)) but hidden in the overlapped pair (\(F\&amp;B = 3 < F + B = 6\)). If there is no communication to hide (\(F = 1, B = 2, W = 1, F\&amp;B = 3\)), the numbers are 45, 15 and 14: DualPipe barely improves on ZB1P.</p>
+      <p>It stops paying off when (a) the expert-parallel group is small or the compute-to-communication ratio is far from 1:1 (nothing to overlap; Ling 2.0 saw limited end-to-end gains), (b) memory is tight, because it holds two parameter copies (Kimi K2 rejected it above 1T parameters), (c) routing imbalance makes the slowest rank dominate, or (d) stages or micro-batches cannot be divisible by 2. Also note the report has no ablation, so the size of the real-world win is asserted through the analytical table.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Design question: you port V3's FP8 recipe to hardware with native microscaling (MXFP8). What becomes unnecessary, what carries over, and what would you re-validate?</summary>
+    <div class="answer">
+      <p>The report's own wish list (§3.5.2) asks for tensor cores that take scale factors and finish accumulation and dequantization internally, and for higher accumulation precision. MXFP8 hardware puts a shared power-of-two (E8M0) scale on each block of 32 elements (page 15). If the hardware also accumulates at adequate precision, the CUDA-core promotion loop, and its data movement, can go away. That last condition must be measured with a \(K = 4096\)-style test, not assumed.</p>
+      <p>What changes: groups shrink from 128 to 32, which isolates outliers better, but power-of-two scales cannot map a group's amax exactly to 448, so the group's largest value lands between 224 and 448 and up to one binade of range is wasted (our reasoning). What carries over: E4M3 on every tensor, online scaling, keeping embedding, head, gating, norms and attention core in high precision, FP32 masters, and the backward-pass regrouping logic (Wgrad still contracts over tokens). What I would re-validate before committing: a BF16-versus-FP8 loss comparison at 16B and a larger scale (the report's Appendix B.1 protocol, target under 0.25% relative loss error), Dgrad's sensitivity to token-correlated outliers (Appendix B.2), and actual speedup, because the report never measured one.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Read the V3 report critically: which claims are evidence and which are assertions?</summary>
+    <div class="answer">
+      <p><strong>Well supported:</strong> the cost arithmetic (it reconciles), the FP8 loss parity at two scales (Fig. 10, under 0.25%), the config and parameter counts (checkable against the released config), and reported benchmark results (the authors' own runs, capped at 8K output tokens). <strong>Supported by single ablations from the adopting lab, at a small fraction of the final token count:</strong> MTP (17 of 20 cells improve, but MMLU falls 0.9 on the large model and gains concentrate on code and math), aux-loss-free balancing (consistent small gains, large-model MMLU down 1.1), and the batch-wise versus sequence-wise finding. <strong>Asserted without measurement:</strong> DualPipe's practical bubble and overlap (only an analytical table), FP8's speedup ("theoretically doubles"), any MFU, why the run was stable (no spikes needing rollback, no attribution), why the first 3 layers are dense, why sigmoid, and why the bias freezes for the last 500B tokens. <strong>Unknowable from the report:</strong> the full cost of research and ablations. A strong answer names what independent replication has added (Ling 2.0 reproduced FP8; Kimi K2 rejected DualPipe and FP8 compute) and proposes the missing experiment, for example an MFU and bubble measurement with DualPipe on and off.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <div class="exercise">
+    <p><strong>FP8 quantization and the promoted GEMM.</strong> Simulate V3's recipe on CPU: <code>round_to_e4m3</code> (E4M3 rounding with subnormals and saturation, checked against <code>torch.float8_e4m3fn</code> in the tests), <code>quantize_per_tensor</code>, <code>quantize_tiles</code> (1×128), <code>quantize_blocks</code> (128×128), <code>dequantize</code>, a narrow-accumulator model <code>tensor_core_mma</code> built on <code>round_to_bits</code>, and <code>fp8_matmul</code> with FP32 promotion every 128 elements of \(K\). The tests check that tiles beat blocks beat one per-tensor scale under injected token outliers, that the promoted GEMM equals the dequantized matmul and is within a few percent of FP32, and that promotion repairs a 12-bit accumulator. An interviewer would expect the rounding and the tile quantizer in 20 minutes and the promoted GEMM in another 20. <span class="ex-path">exercises/drills/fp8.py</span></p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_fp8.py</code>; add <code>--solutions</code> to check the reference. Then reproduce the tables in the <a href="#fp8-numbers">worked numbers</a> with your implementation.</p>
+</section>
+
+<section id="papers">
+  <h2>Primary sources</h2>
+  <ol class="papers">
+    <li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI (2024). DeepSeek-V3 Technical Report.</a> <span class="why">Why read it: the source for this whole page. Read §3.2 to §3.5 and Appendix B closely; note what is measured (Tables 4, 5, Fig. 10) and what is only asserted.</span></li>
+    <li><a href="https://arxiv.org/abs/2408.15664">Wang, Gao, Zhao, Sun, Dai (2024). Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts.</a> <span class="why">Why read it: the bias-controller method V3 scaled up, with the update-rule ablations (page 08).</span></li>
+    <li><a href="https://arxiv.org/abs/2404.19737">Gloeckle et al. (2024). Better &amp; Faster Large Language Models via Multi-token Prediction.</a> <span class="why">Why read it: the parallel-heads MTP that V3 modifies into sequential modules, with the scale-dependence result.</span></li>
+    <li><a href="https://arxiv.org/abs/2209.05433">Micikevicius et al. (2022). FP8 Formats for Deep Learning.</a> <span class="why">Why read it: the E4M3 and E5M2 definitions and the per-tensor recipe that V3's fine-grained scheme replaces.</span></li>
+    <li><a href="https://arxiv.org/abs/2401.10241">Qi et al. (2023). Zero Bubble Pipeline Parallelism.</a> <span class="why">Why read it: the backward-input versus backward-weight split behind ZB1P and DualPipe.</span></li>
+    <li><a href="https://github.com/deepseek-ai/DualPipe">DeepSeek open-infra: DualPipe</a>, <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>, <a href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a>, <a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a>. <span class="why">Why read them: the released implementations of the schedule, the all-to-all kernels, the FP8 GEMMs and the MLA decode kernel (page 16). READMEs change; the numbers above are as of September 2026.</span></li>
+    <li><a href="https://arxiv.org/abs/2507.20534">Kimi Team (2025). Kimi K2: Open Agentic Intelligence.</a> <span class="why">Why read it: an independent team's account of what it kept from V3 (MLA, MoE shape) and what it changed or rejected (DualPipe, FP8 compute, head count).</span></li>
+    <li><a href="https://arxiv.org/abs/2510.22115">Ling Team (2025). Ling 2.0 Technical Report.</a> <span class="why">Why read it: the closest independent replication of V3's FP8 recipe at 1T scale, with an honest account of DualPipe-style overlap giving limited gains.</span></li>
+    <li><a href="https://arxiv.org/abs/2405.04434">DeepSeek-AI (2024). DeepSeek-V2.</a> <span class="why">Why read it: MLA and DeepSeekMoE as first introduced (pages 07, 08 and 26).</span></li>
+  </ol>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet</h2>
+  <div class="cheatsheet">
+    <ul>
+      <li><strong>Config:</strong> 61 layers (3 dense, 58 MoE), \(d = 7168\), 128 heads, \(d_c = 512\), \(d_h^R = 64\); 1 shared + 256 routed experts, \(d_e = 2048\), top-8, at most 4 nodes; \(V = 129{,}280\); 671B total, 37B activated (37.55B with both vocab matrices); 14.8T tokens; KV cache 70,272 B/token.</li>
+      <li><strong>Balancing:</strong> bias \(b_i\) in top-k only, gates unbiased, \(\pm\gamma\) per step (0.001 for 14.3T tokens, then 0), sequence-wise loss \(\alpha = 10^{-4}\), no token dropping.</li>
+      <li><strong>MTP:</strong> \(D = 1\), \(\lambda = 0.3\) (10T) then 0.1 (4.8T), shared embedding and head, 11.5B unique parameters, 85% to 90% acceptance, 1.8× TPS, \(1 + p\) tokens per step.</li>
+      <li><strong>Systems:</strong> 2,048 H800; PP16 × EP64 (8 nodes) + ZeRO-1, no TP; NVLink 160 GB/s vs IB 50 GB/s (3.2×); 20 of 132 SMs for all-to-all; DualPipe bubble \((PP/2-1)(F\&amp;B+B-3W)\), 2× parameters, \(PP+1\) activations.</li>
+      <li><strong>FP8:</strong> Fprop, Dgrad, Wgrad in E4M3; activations 1×128 tiles, weights 128×128 blocks, scale = amax/448, online; promote to FP32 every \(N_C = 128\) (H800 accumulates about 14 bits, about 2% error at \(K = 4096\)); BF16 for embedding, head, gating, norms, attention core; FP32 masters; BF16 Adam moments; E5M6 for the Linear input after attention; dispatch FP8, combine BF16; loss error under 0.25% vs BF16.</li>
+      <li><strong>E4M3:</strong> max 448, min normal \(2^{-6}\), min subnormal \(2^{-9}\), 253 finite values, about 2.6% RMS rounding error on Gaussian data.</li>
+      <li><strong>Run:</strong> AdamW (0.9, 0.95), wd 0.1, clip 1.0; LR 2.2e-4 (2K warmup, constant to 10T, cosine to 2.2e-5 by 14.3T, 333B at 2.2e-5, 167B at 7.3e-6); batch 3,072 → 15,360 over 469B tokens; FIM 0.1; YaRN \(s = 40\), 4K → 32K → 128K in 2 × 1,000 steps at 7.3e-6.</li>
+      <li><strong>Post-training:</strong> 1.5M SFT instances, R1-distilled reasoning data via expert models, 2 epochs; GRPO with rule-based and model-based rewards; V2.5 ablation: MATH-500 74.6 → 83.2 with responses 769 → 1,510 long.</li>
+      <li><strong>Cost:</strong> 2,664K + 119K + 5K = 2,788K H800-hours \(\times\) $2 = $5.576M; 180K hours per trillion tokens; \(6ND = 3.29\times10^{24}\); MFU 34.6% (6N only) to about 41% of BF16 peak, 17% to 20% of FP8 peak; Llama 3 405B needs 11.5× the FLOPs and 11.6× the GPU-hours.</li>
+      <li><strong>Deployment:</strong> prefill 32 GPUs (TP4+SP, DP8, EP32), decode 320 GPUs (TP4+SP, DP80, EP320), redundant experts re-picked every 10 minutes, per-expert decode batch under 256 tokens.</li>
+      <li><strong>Not in the report:</strong> DualPipe ablation, FP8 speedup, MFU, why the run was stable, ablation and research cost.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

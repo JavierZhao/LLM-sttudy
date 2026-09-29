@@ -133,6 +133,26 @@ def test_sdpa_uses_scale_one_over_sqrt_d(impl):
     torch.testing.assert_close(impl.scaled_dot_product_attention(q, k, v), a @ v, atol=1e-5, rtol=1e-5)
 
 
+def test_no_builtin_softmax_or_sdpa_is_called(impl, monkeypatch):
+    """The drill says: write softmax and attention yourself (no torch.softmax, F.softmax, Tensor.softmax,
+    F.scaled_dot_product_attention)."""
+    x = torch.randn(2, 5)
+    q, k, v = torch.randn(1, 3, 4), torch.randn(1, 5, 4), torch.randn(1, 5, 4)
+    mask = torch.ones(3, 5, dtype=torch.bool)
+    xs = torch.randn(1, 4, 8)
+
+    def banned(*args, **kwargs):
+        raise AssertionError("built-in softmax / scaled_dot_product_attention used; implement it by hand")
+
+    monkeypatch.setattr(torch, "softmax", banned)
+    monkeypatch.setattr(torch.Tensor, "softmax", banned)
+    monkeypatch.setattr(F, "softmax", banned)
+    monkeypatch.setattr(F, "scaled_dot_product_attention", banned)
+    impl.softmax(x)
+    impl.scaled_dot_product_attention(q, k, v, mask)
+    impl.MultiHeadAttention(8, 2)(xs)
+
+
 # ------------------------------------------------------------------ MultiHeadAttention
 def _make(impl, d=16, h=4, dtype=torch.float64):
     torch.manual_seed(0)

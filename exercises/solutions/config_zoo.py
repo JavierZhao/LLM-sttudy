@@ -92,7 +92,7 @@ def params(s: Spec, active_embeddings: str = "both") -> Tuple[int, int]:
     """(total, activated) parameter counts of the decoder (no vision tower, no MTP module)."""
     if active_embeddings not in ("both", "head", "none"):
         raise ValueError(f"active_embeddings must be 'both', 'head' or 'none', got {active_embeddings!r}")
-    if s.n_local + _global_layers(s) != s.n_layers and not _is_mla(s):
+    if s.n_local + _global_layers(s) != s.n_layers:
         raise NotImplementedError("linear-attention layers are not modeled")
     n_glob = _global_layers(s)
     total = n_glob * _attn_params(s, True) + s.n_local * _attn_params(s, False) + s.n_layers * s.norms_per_layer * s.d

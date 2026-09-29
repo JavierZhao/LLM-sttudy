@@ -638,7 +638,7 @@ print(float(wb), float(wf))                           # 0.02001953125 vs 0.32001
 <text x="8" y="334" class="s-small">f: identity in the forward pass, all-reduce in the backward pass.   g: all-reduce in the forward pass, identity in the backward pass.</text>
 <text x="8" y="354" class="s-small">Shapes: b·T tokens, model width d, FFN width d<tspan baseline-shift="sub" font-size="10">ff</tspan>, t = 2 GPUs here. Llama-3-8B with t = 8: 14,336 / 8 = 1,792 columns per GPU.</text>
 </svg>
-    <figcaption><b>Figure 2.</b> A tensor-parallel MLP on two GPUs. The first matrix is split by columns, so the nonlinearity runs on local data; the second is split by rows, so each GPU produces a partial sum of the output; a single all-reduce (\(g\)) combines them. In the backward pass the roles of \(f\) and \(g\) swap.</figcaption>
+    <figcaption><b>Figure 2.</b> A tensor-parallel MLP on two GPUs. The first matrix is split by columns, so the nonlinearity runs on local data; the second is split by rows, so each GPU produces a partial sum of the output; one all-reduce, the operator \(g\), combines them. In the backward pass the roles of \(f\) and \(g\) swap.</figcaption>
   </figure>
 
 <pre><code class="language-python">def tp_mlp(x, W1, W2, tp, act=F.gelu):            # x: (..., d), W1: (d, d_ff), W2: (d_ff, d)

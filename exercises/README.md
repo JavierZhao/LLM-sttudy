@@ -34,6 +34,7 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 07 | GQA with a KV cache; MHA→GQA mean-pool conversion | `drills/gqa.py` |
 | 07 | MLA: decompressed forward and absorbed decode; KV bytes per token | `drills/mla.py` |
 | 08 | Mixture of Experts: router, MoE layer, balance losses, aux-loss-free bias, capacity mask | `drills/moe.py` |
+| 09 | Beyond full attention: sliding window, linear/delta-rule recurrence, top-k sparse attention | `drills/efficient_attention.py` |
 | 10 | RoPE scaling for context extension: PI, NTK-aware, dynamic NTK, YaRN, Llama 3.1 rule | `drills/rope_scaling.py` |
 | 11 | Training stability primitives (RMSNorm, QK-norm attention, z-loss, soft-cap, attention entropy) and multi-token prediction | `drills/stability.py` |
 | 12 | Web-data pipeline: Gopher quality filter, MinHash, LSH deduplication | `drills/data_pipeline.py` |

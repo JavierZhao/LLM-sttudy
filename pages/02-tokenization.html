@@ -665,11 +665,9 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
   <h2>Common misconceptions</h2>
   <ul>
     <li><strong>"A token is a word."</strong> A token is an entry in a learned table of byte strings. A word can be one token (<code> hello</code>) or several (<code>HELLO</code> is three in GPT-2), and its id changes with a leading space or capitalization.</li>
-    <li><strong>"BPE finds the best vocabulary."</strong> It is a greedy, frequency-only heuristic with one deterministic segmentation and no notion of morphology.</li>
     <li><strong>"Byte-level BPE means the model sees bytes."</strong> It sees ids of variable-length byte strings. Bytes are only the base alphabet that guarantees coverage.</li>
     <li><strong>"A bigger vocabulary is free."</strong> It costs \(2Vd\) LM-head FLOPs per token and \(BTV\) logit memory, adds under-trained rows, and English compression is flat from 50K to 200K in our measurement. In small models it is 20% to 30% of the parameters.</li>
     <li><strong>"LLMs can't count letters because they are not smart enough."</strong> The letters are not in the input, whether the word is one token or three. Byte-level models that see them score near 100% on spelling.</li>
-    <li><strong>"The tokenizer is just preprocessing, so it can be swapped."</strong> Its ids index the embedding and LM-head rows. Another tokenizer, template or normalization is another input distribution.</li>
     <li><strong>"<code>vocab_size</code> in the config is the tokenizer's size."</strong> It is the embedding row count, usually padded to a multiple of 128 (Qwen3.5: 248,070 ids, 248,320 rows).</li>
     <li><strong>"Special tokens are just strings."</strong> They are matched before BPE. Allowing them in user text lets users forge turns, and a missing BOS or wrong end token shifts the distribution silently.</li>
   </ul>
@@ -681,36 +679,29 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> Why do LLMs use subword tokens instead of characters or words?</summary>
     <div class="answer">
-      <p>A length versus vocabulary trade-off. Characters: open vocabulary but 5.5 times longer sequences (Sennrich's German corpus: 550M versus 100M), and attention grows as \(T^2\). Words: short sequences but 1.75M types, unseen words, and rare-word embeddings learned from a few examples. BPE gave 112M tokens (12% above words) from 63K types with no unknowns, since any word falls back to smaller pieces. Byte-level subwords add guaranteed coverage.</p>
+      <p>A length versus vocabulary trade-off. Characters: open vocabulary but 5.5 times longer sequences (Sennrich's German corpus: 550M versus 100M), and attention grows as \(T^2\). Words: short sequences but 1.75M types, unseen words, rare-word embeddings learned from a few examples. BPE gave 112M tokens (12% above words) from 63K types with no unknowns, since any word falls back to smaller pieces. Byte-level subwords add guaranteed coverage.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> What is GPT-2's vocabulary made of, and why is there no unknown token?</summary>
     <div class="answer">
-      <p>256 byte tokens, 50,000 merges and <code>&lt;|endoftext|&gt;</code>: 50,257. Every string is a UTF-8 byte sequence and every byte is in the vocabulary, so any input round-trips. WordPiece, by contrast, emits <code>[UNK]</code>. The cost: scripts without merges take 2 to 4 tokens per character.</p>
+      <p>256 byte tokens, 50,000 merges and <code>&lt;|endoftext|&gt;</code>: 50,257. Every string is a UTF-8 byte sequence and every byte is in the vocabulary, so any input round-trips. WordPiece emits <code>[UNK]</code> instead. The cost: scripts without merges take 2 to 4 tokens per character.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="warmup">
     <summary><span class="tier">Warm-up</span> Compute the embedding and unembedding parameters of Llama-3-8B and their share. What if they were tied?</summary>
     <div class="answer">
-      <p>\(V=128{,}256\), \(d=4096\): 525,336,576 entries per matrix, 1,050,673,152 untied, which is 13.1% of 8,030,261,248. Tying saves 525M parameters (7.0% of the remaining 7.50B) but the LM head still costs \(2Vd=1.05\) GFLOPs per token, about 7% of the matmul FLOPs: tying shares storage, not compute.</p>
-    </div>
-  </details>
-
-  <details class="qa" data-tier="warmup">
-    <summary><span class="tier">Warm-up</span> What is a special token, and what goes wrong if user text contains one?</summary>
-    <div class="answer">
-      <p>A hand-added vocabulary entry (BOS, EOS, role marker, end of turn), matched as a literal string before pre-tokenization. If user text is tokenized with special tokens enabled, a user can type <code>&lt;|eot_id|&gt;</code> plus a fake header and forge a turn boundary. Safe stacks encode user content with special tokens disabled and add the structure themselves. The other common bug is a template mismatch (double BOS, wrong end token).</p>
+      <p>\(V=128{,}256\), \(d=4096\): 525,336,576 entries per matrix, 1,050,673,152 untied, which is 13.1% of 8,030,261,248. Tying saves 525M parameters, but the LM head still costs \(2Vd=1.05\) GFLOPs per token, about 7% of the matmul FLOPs: tying shares storage, not compute.</p>
     </div>
   </details>
 
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Walk me through training BPE. How do you encode new text with it?</summary>
     <div class="answer">
-      <p>Start from the 256 bytes and a corpus of pre-tokens with counts. Until the vocabulary is full: count adjacent pairs weighted by pre-token frequency, take the most frequent (fixed tie rule), mint an id, replace the pair everywhere, append the merge. The ordered merge list is the model, and a merge with count \(c\) removes \(c\) tokens.</p>
-      <p>To encode, start from each pre-token's bytes and repeatedly merge the adjacent pair with the lowest rank until none is in the list: this replays training order, and is not longest match. Decoding concatenates the tokens' bytes and decodes UTF-8 with replacement.</p>
+      <p>Start from the 256 bytes and a corpus of pre-tokens with counts. Until the vocabulary is full: count adjacent pairs weighted by pre-token frequency, take the most frequent (fixed tie rule), mint an id, replace the pair everywhere, append the merge. The ordered merge list is the model; a merge with count \(c\) removes \(c\) tokens.</p>
+      <p>To encode, start from each pre-token's bytes and repeatedly merge the adjacent pair with the lowest rank until none is in the list: this replays training order and is not longest match. Decoding concatenates the tokens' bytes and decodes UTF-8 with replacement.</p>
       <p>Naive training recounts at every merge, \(O(NV)\). The incremental version keeps pair counts, an inverted index and a heap, and updates only the neighbors of each merged occurrence (\(O(1)\) each, at most \(N\) in total): about \(O((N+V)\log N)\). Encoding a pre-token of length \(n\) is \(O(n^2)\) naively, \(O(n\log n)\) with a heap, plus a cache.</p>
     </div>
   </details>
@@ -725,7 +716,7 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Why is there a regex before BPE, what does GPT-2's do, and what changed in cl100k and Llama 3?</summary>
     <div class="answer">
-      <p>Raw greedy BPE learns many versions of a word glued to punctuation (<em>dog</em>, <em>dog.</em>, <em>dog!</em>). The regex cuts pre-tokens (contractions; optional space plus letters, digits or punctuation; whitespace runs leaving the last space for the next word) and BPE runs inside each, so merges never cross categories. The space attaches to the next word: <code>hello</code> and <code> hello</code> are different tokens.</p>
+      <p>Raw greedy BPE learns many versions of a word glued to punctuation (<em>dog</em>, <em>dog.</em>, <em>dog!</em>). The regex cuts pre-tokens (contractions; optional space plus letters, digits or punctuation; whitespace runs leaving the last space for the next word) and BPE runs inside each. The space attaches to the next word, so <code>hello</code> and <code> hello</code> are different tokens.</p>
       <p>cl100k and Llama 3: case-insensitive contractions, digit groups of at most 3 (GPT-2: unbounded), a letter run may absorb one preceding non-letter and punctuation absorbs trailing newlines (helps code: <code>.get</code> is one token). o200k adds case-aware splitting; Qwen and Gemma split every digit. The regex is a hand-written prior that forbids multi-word tokens, which SuperBPE shows costs efficiency.</p>
     </div>
   </details>
@@ -735,6 +726,13 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
     <div class="answer">
       <p>Doubling \(V\) doubles embedding and LM-head parameters (\(2Vd\) untied), LM-head FLOPs (\(2Vd\) per token) and logit memory, and thins the tail, so more rows are under-trained. It buys shorter sequences with diminishing returns: English compression is flat at about 4.9 bytes per token from 50K to 200K, so growth mostly buys other languages, code and numbers. In a small model the vocabulary is already 20% to 30% of the parameters.</p>
       <p>Method: fix the language and domain mix, train tokenizers at several sizes on the model's data, measure bytes per token per language, price the cost side (Llama-3-8B at 128K: 1.05 of 15.0 GFLOPs per token, 13% of parameters), and compare per-byte loss at equal FLOPs. Tao et al. find the optimum grows with compute (\(N_v\propto N_{nv}^{0.83}\)), exceeds common practice (at least 216K for 70B), and shrinks when data is scarce.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Calculate: a tokenizer change lifts English compression from 3.17 to 3.94 characters per token while \(V\) grows from 32K to 128K (\(d=4096\), 6.98B other parameters). Is it a compute win?</summary>
+    <div class="answer">
+      <p>Forward matmul FLOPs per token are \(2N_{\text{body}}+2Vd\): \(13.96+0.26=14.22\) GFLOPs at 32K, \(13.96+1.05=15.01\) at 128K (5.6% more). But the same text needs 19.5% fewer tokens (\(1-3.17/3.94\)). Per character, \(14.22/3.17=4.49\) versus \(15.01/3.94=3.81\) GFLOPs: 15% cheaper. Attention scores shrink by about \(1-0.805^2=35\%\), and the context holds 24% more text. Caveats: the body is held fixed, compression varies by language, and rare tokens may be under-trained. That is the Llama 3 argument.</p>
     </div>
   </details>
 
@@ -762,13 +760,6 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
     </div>
   </details>
 
-  <details class="qa" data-tier="core">
-    <summary><span class="tier">Core</span> Calculate: a tokenizer change lifts English compression from 3.17 to 3.94 characters per token while \(V\) grows from 32K to 128K (\(d=4096\), 6.98B other parameters). Is it a compute win?</summary>
-    <div class="answer">
-      <p>Forward matmul FLOPs per token are \(2N_{\text{body}}+2Vd\): \(13.96+0.26=14.22\) GFLOPs at 32K, \(13.96+1.05=15.01\) at 128K (5.6% more). But the same text needs 19.5% fewer tokens (\(1-3.17/3.94\)). Per character, \(14.22/3.17=4.49\) versus \(15.01/3.94=3.81\) GFLOPs: 15% cheaper. Attention scores shrink by about \(1-0.805^2=35\%\), and the context holds 24% more text. Caveats: the body is held fixed, compression varies by language, the vocabulary adds 0.5B parameters per matrix, and rare tokens may be under-trained. That is the Llama 3 argument.</p>
-    </div>
-  </details>
-
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> What goes wrong if you extend a tokenizer's vocabulary for a new language and continue training?</summary>
     <div class="answer">
@@ -779,8 +770,8 @@ suspects = E.norm(dim=1).argsort()[:50]                       # lowest-norm rows
   <details class="qa" data-tier="deep">
     <summary><span class="tier">Deep-dive</span> Design question: a multilingual model for 20 languages including Chinese, Hindi and Tamil. How do you design the tokenizer?</summary>
     <div class="answer">
-      <p>Target near-equal premium across languages within a budget. Byte-level BPE (no unknowns) with a large vocabulary, 150K to 250K (Gemma and Qwen3.5 range, consistent with Tao et al.). Train on a <em>balanced</em> sample: web text is English-heavy, and a merge enters the vocabulary only if it is frequent in the sample (we measured Llama 3's 28K added tokens helping Hindi and Thai but not Tamil). Upweight low-resource scripts and track bytes per token and premium per language on a parallel corpus such as FLORES during tokenizer training.</p>
-      <p>Details: a pre-tokenizer that does not assume whitespace words (split CJK runs, or SentencePiece-style raw text), single or right-aligned digits, normalization decided early and applied identically at serving, reserved special tokens, a clean template, then audits for unreachable and under-trained tokens. Compare tokenizers by bits per byte. Trade-offs: more non-English tokens slightly lower English compression, and every token pays the bigger LM head.</p>
+      <p>Target near-equal premium across languages within a budget. Byte-level BPE (no unknowns) with a large vocabulary, 150K to 250K (Gemma and Qwen3.5 range, consistent with Tao et al.). Train on a <em>balanced</em> sample: web text is English-heavy, and a merge enters the vocabulary only if it is frequent in the sample (Llama 3's 28K added tokens helped Hindi and Thai but not Tamil). Upweight low-resource scripts and track bytes per token and premium per language on a parallel corpus such as FLORES during tokenizer training.</p>
+      <p>Details: a pre-tokenizer that does not assume whitespace words (split CJK runs, or SentencePiece-style raw text), single or right-aligned digits, normalization decided early and applied identically at serving, reserved special tokens, audits for unreachable and under-trained tokens. Compare tokenizers by bits per byte. Trade-off: more non-English tokens slightly lower English compression, and every token pays the bigger LM head.</p>
     </div>
   </details>
 

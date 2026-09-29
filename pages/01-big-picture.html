@@ -522,7 +522,7 @@ def lm_loss(model, tokens, pad_id):
 <text x="706" y="340" text-anchor="end" class="s-small">post-training (SFT + RL): 5K (0.2%)</text>
 <text x="8" y="362" class="s-small s-muted">InstructGPT (175B), in PF-days: SFT 4.9 and PPO-ptx 60, against 3,640 for GPT-3 pretraining (0.1% and 1.6%).</text>
 </svg>
-    <figcaption><b>Figure 3.</b> The pipeline and its cost profile. Pretraining dominates compute; SFT and RL use far fewer tokens and GPU-hours (0.1% to 5% of pretraining in the reports cited below) but change behavior most visibly. The dashed arrow marks the reverse flow that is now standard: outputs of a stronger post-trained model become SFT data (rejection sampling, distillation). GPU-hour shares exclude data creation, annotation, prior research and ablations.</figcaption>
+    <figcaption><b>Figure 3.</b> The pipeline and its cost profile. Pretraining dominates compute; SFT and RL use a small fraction of the GPU-hours (0.1% to 5% of pretraining in the reports cited below) but change behavior most visibly. The dashed arrow marks the reverse flow that is now standard: outputs of a stronger post-trained model become SFT data (rejection sampling, distillation). GPU-hour shares exclude data creation, annotation, prior research and ablations.</figcaption>
   </figure>
 
   <h3 id="stage-1">Stage 1: pretraining and the base model</h3>

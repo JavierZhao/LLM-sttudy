@@ -63,7 +63,7 @@ exactly. Required elements (the QA script checks the ids):
    where needed. Include at least one "calculate X" question and at least one "design /
    trade-off" question.
 7. `section#exercises`: "Hands-on", linking the drill files you created (see §9).
-8. `section#papers`: "Primary sources", an `ol.papers` with 4 to 10 entries, each with a
+8. `section#papers`: "Primary sources", an `ol.papers` with 4 to 12 entries, each with a
    one-line "why read it".
 9. `section#cheatsheet`: "Cheat sheet", one screen of the facts and formulas to memorize.
 10. `nav.pager` (empty; site.js fills it).

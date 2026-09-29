@@ -71,7 +71,7 @@ VI (26–33) → VII (34–37).
 | 5 | 26–28 | done: written, fact-checked; 28 extended to V4.1-Flash (Sep 2026) |
 | 6 | 29, 30, 34 | done: written, fact-checked |
 | 7 | 31–33, 35–37 | done: written, fact-checked; 36 and 37 are generated (tools/build_bank.py; page 37 generators in docs/wip/37) |
-| Follow-up | 10, 21, 25, 32, 37 | in progress: Olmo 3 (2512.13961) and DR Tulu (2511.19399) depth, requested by the user |
+| Follow-up | 10, 21, 25, 32, 37 | done: Olmo 3 (2512.13961) and DR Tulu (2511.19399) depth, written and fact-checked; Olmo 3 added to the must-read list (now 26) |
 
 Fact-check yield so far (errors fixed before commit): page 01 (vacuous test, citation scope),
 02 (4 errors: digit grouping, Unigram unk, vocab-extension count, byte-level claim),

@@ -52,7 +52,7 @@ open("/tmp/w37/must.html", "w", encoding="utf-8").write("\n".join(out) + "\n")
 
 # reading budgets table
 TIERDESC = {1: ("Tier 1", "Read before any interview loop", "The 12 papers whose content is asked about most directly: attention, kernels, scaling, the reference recipe, memory accounting, the RLHF and RL objectives, MLA and the DeepSeek-V3 design, and DeepSeek-V4 for long-context efficiency."),
-            2: ("Tier 2", "Read for depth", "Papers that sharpen an answer you already have: position encoding, GQA, the original scaling laws, tensor parallelism, MoE design, RL at scale, sparse attention and context extension."),
+            2: ("Tier 2", "Read for depth", "Papers that sharpen an answer you already have: position encoding, GQA, the original scaling laws, tensor parallelism, MoE design, RL at scale, sparse attention, context extension and one complete open recipe (Olmo 3)."),
             3: ("Tier 3", "Read when it is your target or your research", "The newest KV-compression design, the linear-attention layer used in hybrids, and two open model families that made different choices from DeepSeek.")}
 rows = []
 tot = 0
@@ -61,7 +61,7 @@ for t in (1, 2, 3):
     mins = sum(minutes(p[7], p[9]) for p in P if p[10] == t)
     tot += mins
     rows.append(f'<tr><td><b>{TIERDESC[t][0]}</b>: {esc(TIERDESC[t][1])}<br><span class="small muted">{len(names)} papers, {mins} min (about {mins / 60:.1f} h)</span></td><td>{esc("; ".join(names))}. <span class="small muted">{esc(TIERDESC[t][2])}</span></td></tr>')
-rows.append(f'<tr class="hl"><td><b>All 25</b><br><span class="small muted">{tot} min (about {tot / 60:.0f} h)</span></td><td>One working weekend of reading.</td></tr>')
+rows.append(f'<tr class="hl"><td><b>All 26</b><br><span class="small muted">{tot} min (about {tot / 60:.0f} h)</span></td><td>One working weekend of reading.</td></tr>')
 budgets = ('<div class="table-wrap"><table class="data"><thead><tr><th>Tier</th><th>Which papers, and why</th></tr></thead><tbody>'
            + "".join(rows) + '</tbody></table></div>')
 open("/tmp/w37/budgets.html", "w", encoding="utf-8").write(budgets + "\n")

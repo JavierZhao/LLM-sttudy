@@ -51,7 +51,7 @@ window.LLM_MANIFEST = {
           desc: "Bytes per parameter, activation memory, bf16/fp8, ZeRO/FSDP, tensor/pipeline/expert/context parallelism, MFU." },
         { n: "16", drills: ["flash"], slug: "16-gpus-kernels", title: "GPUs, kernels & FlashAttention", tier: "P1", minutes: 60, status: "planned",
           desc: "GPU memory hierarchy, roofline, kernel fusion, FlashAttention 1→3 and online softmax, Triton basics." },
-        { n: "17", drills: ["speculative"], slug: "17-inference-serving", title: "Inference optimization & serving", tier: "P1", minutes: 60, status: "planned",
+        { n: "17", drills: ["speculative"], slug: "17-inference-serving", title: "Inference optimization & serving", tier: "P1", minutes: 60, status: "written",
           desc: "Quantization, speculative decoding, continuous batching, PagedAttention, prefix caching, disaggregated serving." },
         { n: "18", drills: ["evals"], slug: "18-evaluation", title: "Evaluation", tier: "P1", minutes: 45, status: "written",
           desc: "Benchmark taxonomy, pass@k, likelihood vs generative evals, contamination, eval noise, LLM-as-judge." }

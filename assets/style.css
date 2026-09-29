@@ -150,7 +150,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
     box-shadow: 0 0 40px rgba(0,0,0,.25);
   }
   body.nav-open #sidebar { transform: none; }
-  #content { padding: 64px 16px 64px; }
+  #content { padding: 24px 16px 80px; }
   .nav-toggle { display: inline-flex !important; }
 }
 
@@ -179,7 +179,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
 .side-list .num { font-family: var(--mono); font-size: 11px; color: var(--fg-muted); }
 .side-list .done-mark { color: var(--key); font-size: 12px; }
 .nav-toggle {
-  display: none; position: fixed; top: 12px; left: 12px; z-index: 40;
+  display: none; position: fixed; bottom: 16px; right: 16px; z-index: 40; box-shadow: 0 2px 10px rgba(0,0,0,.18);
   align-items: center; gap: 6px;
   border: 1px solid var(--border); background: var(--bg); color: var(--fg);
   border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer;
@@ -314,16 +314,20 @@ table.data tr.hl td { background: var(--accent-soft); }
 details.qa {
   border: 1px solid var(--border); border-radius: var(--radius); margin: .6rem 0; background: var(--bg);
 }
+/* summary is a block (not flex) so inline math and text wrap normally */
 details.qa > summary {
-  cursor: pointer; padding: 10px 14px; list-style: none; font-weight: 600; line-height: 1.45;
-  display: flex; gap: 10px; align-items: baseline;
+  cursor: pointer; padding: 10px 14px 10px 34px; list-style: none; font-weight: 600; line-height: 1.5;
+  display: block; position: relative;
 }
 details.qa > summary::-webkit-details-marker { display: none; }
-details.qa > summary::before { content: "▸"; color: var(--fg-muted); flex: none; transition: transform .15s; }
+details.qa > summary::before {
+  content: "▸"; color: var(--fg-muted); position: absolute; left: 14px; top: 10px; transition: transform .15s;
+}
 details.qa[open] > summary::before { transform: rotate(90deg); }
 details.qa .tier {
-  flex: none; font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
-  border-radius: 999px; padding: 1px 8px; border: 1px solid currentColor;
+  display: inline-block; margin-right: 8px; vertical-align: 1px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  border-radius: 999px; padding: 0 8px; border: 1px solid currentColor; line-height: 1.6;
 }
 details.qa[data-tier="warmup"] .tier { color: var(--key); }
 details.qa[data-tier="core"] .tier { color: var(--note); }

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*__create_pull_request",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"You just opened a pull request in this repo. Codex (the chatgpt-codex-connector bot) reviews every new PR here. Now call subscribe_pr_activity for this PR so its review comments and CI results arrive as events, and keep watching until the PR is merged or closed. For each Codex finding: verify it against the page and the sources it cites; if it is correct, fix it, run python3 tools/qa.py on the changed pages, push, reply on the thread naming the commit, and resolve the thread; if it is wrong, reply once explaining why. Per its own review note, Codex reviews on PR open, on ready-for-review, or when someone comments @codex review, so later pushes are not re-reviewed automatically.\"}}'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

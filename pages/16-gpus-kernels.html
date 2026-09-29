@@ -482,17 +482,17 @@ def rmsnorm(x, w, eps=1e-6):                        # x: (n_rows, n_cols) bf16, 
 <rect class="s-box" x="380" y="8" width="332" height="244" rx="8" opacity="0.6"/>
 <text x="392" y="28" class="s-bold">On chip: one thread block</text>
 <rect class="s-a" x="392" y="40" width="94" height="38" rx="5"/>
-<text x="439" y="57" text-anchor="middle" class="s-small s-bold">Q<tspan baseline-shift="sub" font-size="9">i</tspan> resident</text>
-<text x="439" y="71" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">r</tspan> × d</text>
+<text x="439" y="55" text-anchor="middle" class="s-small s-bold">Q<tspan baseline-shift="sub" font-size="9">i</tspan> resident</text>
+<text x="439" y="73" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">r</tspan> × d</text>
 <rect class="s-a" x="498" y="40" width="202" height="38" rx="5"/>
-<text x="599" y="57" text-anchor="middle" class="s-small s-bold">K<tspan baseline-shift="sub" font-size="9">j</tspan>, V<tspan baseline-shift="sub" font-size="9">j</tspan> streamed</text>
-<text x="599" y="71" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">c</tspan> × d each, one tile per step</text>
+<text x="599" y="55" text-anchor="middle" class="s-small s-bold">K<tspan baseline-shift="sub" font-size="9">j</tspan>, V<tspan baseline-shift="sub" font-size="9">j</tspan> streamed</text>
+<text x="599" y="73" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">c</tspan> × d each, one tile per step</text>
 <rect class="s-c" x="392" y="94" width="148" height="38" rx="5"/>
-<text x="466" y="111" text-anchor="middle" class="s-small s-bold">S = Q<tspan baseline-shift="sub" font-size="9">i</tspan> K<tspan baseline-shift="sub" font-size="9">j</tspan>ᵀ / √d</text>
-<text x="466" y="125" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">r</tspan> × B<tspan baseline-shift="sub" font-size="9">c</tspan>, never stored</text>
+<text x="466" y="109" text-anchor="middle" class="s-small s-bold">S = Q<tspan baseline-shift="sub" font-size="9">i</tspan> K<tspan baseline-shift="sub" font-size="9">j</tspan>ᵀ / √d</text>
+<text x="466" y="127" text-anchor="middle" class="s-small">B<tspan baseline-shift="sub" font-size="9">r</tspan> × B<tspan baseline-shift="sub" font-size="9">c</tspan>, never stored</text>
 <rect class="s-c" x="552" y="94" width="148" height="38" rx="5"/>
-<text x="626" y="111" text-anchor="middle" class="s-small s-bold">P̃ = exp(S − m′)</text>
-<text x="626" y="125" text-anchor="middle" class="s-small">bf16 copy feeds P̃ V</text>
+<text x="626" y="109" text-anchor="middle" class="s-small s-bold">P̃ = exp(S − m′)</text>
+<text x="626" y="127" text-anchor="middle" class="s-small">bf16 copy feeds P̃ V</text>
 <rect class="s-d" x="392" y="148" width="308" height="94" rx="5"/>
 <text x="404" y="166" class="s-small s-bold">state per row (fp32): m, ℓ, O accumulator</text>
 <text x="404" y="184" class="s-small">m′ = max(m, rowmax S),   α = exp(m − m′)</text>

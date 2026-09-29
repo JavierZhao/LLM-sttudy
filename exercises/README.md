@@ -57,4 +57,5 @@ Interview practice tip: time-box each drill to what an interview gives you (usua
 | 29 | Llama configs: Meta FFN rounding rule, exact parameter counts (dense and Llama 4 MoE), KV cache with local layers | `drills/llama_config.py` |
 | 30 | Qwen building blocks: gated attention output, micro- vs global-batch balance loss, Qwen3-MoE parameter counts, hybrid KV plus recurrent-state bytes | `drills/qwen_bits.py` |
 | 31 | Attention sinks and hybrid layers: softmax with sink, banded masks, layer schedules, hybrid KV bytes, MXFP4 quantizer and weight bytes | `drills/sinks.py` |
+| 32 | QK-Clip from Kimi K2 MuonClip: per-head max attention logit, per-head W_q/W_k rescale, MLA variant with the shared rotary key untouched | `drills/muonclip.py` |
 | 34 | Back-of-envelope formulas: params, FLOPs, training time and cost, memory, KV bytes, roofline decode/prefill, all-reduce, pipeline bubble, MoE all-to-all, Chinchilla optimum | `drills/napkin.py` |

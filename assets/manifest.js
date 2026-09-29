@@ -96,7 +96,7 @@ window.LLM_MANIFEST = {
           desc: "Qwen2/2.5/3, QK-norm, hybrid thinking, global-batch balancing, Qwen3-Next Gated DeltaNet hybrid." },
         { n: "31", drills: ["sinks"], slug: "31-mistral-gemma-gptoss", title: "Mistral, Gemma, gpt-oss", tier: "P1", minutes: 45, status: "written",
           desc: "Sliding window, Mixtral MoE, Gemma local/global and distillation, gpt-oss attention sinks and MXFP4." },
-        { n: "32", drills: ["muonclip"], slug: "32-frontier-open-models", title: "Kimi, GLM, MiniMax, OLMo, Nemotron", tier: "P1", minutes: 50, status: "planned",
+        { n: "32", drills: ["muonclip"], slug: "32-frontier-open-models", title: "Kimi, GLM, MiniMax, OLMo, Nemotron", tier: "P1", minutes: 50, status: "written",
           desc: "Kimi K2 and MuonClip, GLM-4.5, MiniMax lightning attention and CISPO, OLMo open recipes, Nemotron-H." },
         { n: "33", drills: ["config_zoo"], slug: "33-architecture-atlas", title: "Architecture atlas", tier: "P0", minutes: 35, status: "planned",
           desc: "Side-by-side configs for ~20 models, a timeline, and what converged and why." }

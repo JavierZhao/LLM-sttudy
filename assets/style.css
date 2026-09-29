@@ -392,6 +392,7 @@ svg .s-line-a { fill: none; stroke: var(--s-a); stroke-width: 1.6; }
 svg .s-line-b { fill: none; stroke: var(--s-b); stroke-width: 1.6; }
 svg .s-line-c { fill: none; stroke: var(--s-c); stroke-width: 1.6; }
 svg .s-line-d { fill: none; stroke: var(--s-d); stroke-width: 1.6; }
+svg .s-line-e { fill: none; stroke: var(--s-e); stroke-width: 1.6; }
 svg .s-dash  { stroke-dasharray: 5 4; }
 svg .s-arrowhead { fill: var(--fg-muted); }
 svg text.s-muted { fill: var(--fg-muted); }

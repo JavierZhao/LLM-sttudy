@@ -60,7 +60,7 @@ window.LLM_MANIFEST = {
     {
       id: "IV", title: "Post-training: SFT & preferences",
       pages: [
-        { n: "19", drills: ["sft"], slug: "19-sft-distillation", title: "SFT, instruction tuning & distillation", tier: "P0", minutes: 55, status: "planned",
+        { n: "19", drills: ["sft"], slug: "19-sft-distillation", title: "SFT, instruction tuning & distillation", tier: "P0", minutes: 55, status: "written",
           desc: "Chat formatting, loss masking, packing, data quality, rejection sampling, logit/sequence/on-policy distillation." },
         { n: "20", drills: ["lora"], slug: "20-peft-lora", title: "Parameter-efficient finetuning (LoRA, QLoRA)", tier: "P1", minutes: 40, status: "written",
           desc: "LoRA math and initialization, α/r, QLoRA and NF4, DoRA, what low-rank updates cannot do." },

@@ -536,7 +536,7 @@ class SwiGLU(nn.Module):
 <text x="64" y="173">RMSNorm gains: 32 × 8,192 + 4,096 = 266,240 (0.003%, too thin to see)</text>
 <text x="40" y="198" class="s-bold">Total: 8,030,261,248 parameters</text>
 </svg>
-    <figcaption><b>Figure 3.</b> Where Llama-3-8B's parameters live. Bar widths are proportional to parameter counts. The two vocabulary matrices together hold 13.1% of the model, and they hold no FLOPs except the LM head's matmul.</figcaption>
+    <figcaption><b>Figure 3.</b> Where Llama-3-8B's parameters live. Bar widths are proportional to parameter counts. The two vocabulary matrices together hold 13.1% of the model, and only the LM head's half of them costs any FLOPs (through its matmul).</figcaption>
   </figure>
 
   <h3 id="rule-12">The 12Ld² rule and why it is only a rule of thumb</h3>

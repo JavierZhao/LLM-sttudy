@@ -45,7 +45,7 @@ window.LLM_MANIFEST = {
           desc: "Common Crawl pipelines, heuristic and model-based filtering, dedup, mixtures, annealing, synthetic data, contamination." },
         { n: "13", drills: ["scaling"], slug: "13-scaling-laws", title: "Scaling laws", tier: "P0", minutes: 60, status: "written",
           desc: "Kaplan vs Chinchilla, IsoFLOP analysis, C≈6ND, overtraining for inference, data-constrained and MoE scaling." },
-        { n: "14", drills: ["optim"], slug: "14-optimization", title: "Optimizers, schedules & hyperparameters", tier: "P0", minutes: 65, status: "planned",
+        { n: "14", drills: ["optim"], slug: "14-optimization", title: "Optimizers, schedules & hyperparameters", tier: "P0", minutes: 65, status: "written",
           desc: "AdamW details, warmup, cosine vs WSD, batch size, clipping, μP, Muon/MuonClip, a loss-spike playbook." },
         { n: "15", drills: ["parallel"], slug: "15-distributed-training", title: "Memory, precision & parallelism", tier: "P0", minutes: 80, status: "written",
           desc: "Bytes per parameter, activation memory, bf16/fp8, ZeRO/FSDP, tensor/pipeline/expert/context parallelism, MFU." },

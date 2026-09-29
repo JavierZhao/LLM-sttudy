@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>37 · Reading list &amp; glossary · LLM Interview Prep</title>
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" id="hljs-light" href="../assets/vendor/hljs/github.min.css">
+<link rel="stylesheet" id="hljs-dark" href="../assets/vendor/hljs/github-dark.min.css" disabled>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-page="37" data-root="..">
+<div class="layout">
+<nav id="sidebar" aria-label="Curriculum"></nav>
+<main id="content">
+
+<header class="page-header">
+  <div class="crumbs">Part VII · Interview toolkit · Page 37</div>
+  <h1>Reading list &amp; glossary</h1>
+  <div class="meta">
+    <span class="badge p2">P2</span>
+    <span>~20 min to read, then a reference</span>
+    <span>Prereqs: none; most useful after pages 01 to 32</span>
+  </div>
+  <p class="lede">The 25 papers worth reading in full, with the sections to read, a time estimate and the course page each one supports; all @@N_SOURCES@@ primary sources the course cites, grouped by part; and a bilingual glossary of @@N_TERMS@@ concepts. Read it once to decide what to read, then use it as an index.</p>
+</header>
+
+<aside class="callout lens" id="interview-lens">
+  <div class="callout-title">How to use this list</div>
+  <ul>
+    <li><strong>Interviewers ask about papers as designs, not titles.</strong> "Walk me through how DeepSeek-V3 balances its experts", "why did Chinchilla disagree with Kaplan", "what would you ablate first?" For every paper below the list names the sections that answer such questions, so you read the method and the evidence, not the related work.</li>
+    <li><strong>Numbers come from tables, not abstracts.</strong> Expect "what was the baseline?" and "what does that figure compare against?". The <a href="#pitfalls">reading pitfalls</a> below collect the standard traps.</li>
+    <li><strong>Recency is scored.</strong> Frontier labs expect you to know the current generation. The newest reports in the course are DeepSeek-V4 (2026) and DeepSeek-V4.1-Flash (September 2026); say "as of September 2026" when you call any model the latest.</li>
+    <li><strong>Fluency in English.</strong> The interview is in English. The <a href="#glossary">glossary</a> gives each concept's English term first and the Chinese term second. Cover the definition column and check that you can state each concept in one English sentence.</li>
+    <li><strong>Budgets.</strong> Tier 1 (12 papers) takes about @@T1_H@@ hours and all 25 about @@ALL_H@@. With only two hours, read Vaswani et al., Chinchilla, PPO, DPO and DeepSeek-V2 (about @@PATH_MIN@@ minutes): attention, scaling, RL, preferences and modern KV and expert design.</li>
+  </ul>
+</aside>
+
+<section id="objectives">
+  <h2>After this page you can</h2>
+  <ul>
+    <li>Choose which of the 25 papers to read for a two-hour, one-day or one-weekend budget, and name the sections that carry the interview-relevant content.</li>
+    <li>Say in one sentence what problem each of the 25 papers solves and which course page teaches it.</li>
+    <li>Find the primary source behind any claim in pages 01 to 35 using the extended list of @@N_SOURCES@@ sources.</li>
+    <li>Give the English term and the standard Chinese term for the @@N_TERMS@@ concepts the course defines, and define each in one English sentence.</li>
+    <li>Explain the 30 core terms of the <a href="#cheatsheet">cheat sheet</a> in a minute each, with the key formula or number.</li>
+    <li>Read a technical report critically: find the baseline behind an abstract number, check error bars and paper versions, and separate what was measured from what was asserted.</li>
+  </ul>
+</section>
+
+<section id="papers">
+  <h2 id="must-read">Must-read 25: primary sources to read in full</h2>
+
+  <p>The list uses three criteria: how often the course itself cites the source (DeepSeek-V4 is the most-cited source, linked from 19 pages, then DeepSeek-V3 on 18 and Llama 3 on 17), how often interviewers ask about its content, and your own research on efficient long-context models. It is ordered as a reading sequence: groups A to E, and within a group each paper assumes the ones before it. Each entry gives the sections worth your time (the rest is related work, benchmarks and appendices), the course pages that build on it, and a time estimate.</p>
+
+  <aside class="callout note"><div class="callout-title">How the times are estimated</div>
+    <p>Times assume a careful first read: 4 minutes per PDF page for the sections marked Read (equations, tables and figures included) and 1.5 minutes per page for those marked Skim, rounded to the nearest 5 minutes. Page counts come from the arXiv PDFs as of September 2026 and shift by a page or so between versions. Section numbers follow those versions too, so check the numbering if a later version reorders the paper.</p></aside>
+
+  <h3 id="budgets">Reading budgets</h3>
+  @@BUDGETS@@
+
+@@MUST@@
+
+  <aside class="callout note"><div class="callout-title">Left off the list on purpose</div>
+    <p>Three well-known papers are not among the 25. <a href="https://arxiv.org/abs/2005.14165">GPT-3</a> (in-context learning and the scale anchors: <a href="01-big-picture.html">page 01</a> gives the numbers you need). <a href="https://arxiv.org/abs/2101.03961">Switch Transformer</a> (top-1 routing and the auxiliary loss: <a href="08-mixture-of-experts.html">page 08</a> derives both, and DeepSeekMoE plus V3 are the designs you will be asked about). <a href="https://arxiv.org/abs/2312.00752">Mamba</a> (selective state spaces: <a href="09-beyond-full-attention.html">page 09</a> covers it, and Gated DeltaNet is the layer that current hybrids use). The first two are in the extended list below; Mamba is linked from the text of page 09 only.</p></aside>
+</section>
+
+<section>
+  <h2 id="extended">Extended list: every primary source in the course</h2>
+  <p>Generated from the primary-source lists of pages 01 to 35 (@@N_SOURCES@@ unique sources). A source sits in the part of the earliest page that lists it. The last column links every page that lists it (to that page's Primary sources section) and, after a semicolon, the pages that link it only in the running text. ★ marks the must-read 25.</p>
+@@EXTENDED@@
+</section>
+
+<section>
+  <h2 id="glossary">Glossary: English and 中文</h2>
+  <p>@@N_TERMS@@ concepts, one row each, sorted alphabetically by English term: the English term in bold, the standard Chinese term in parentheses, a one-line definition that follows the course, and a link to the page that defines the concept (usually where the Chinese term is first given; where that is only a passing mention, the page that treats it), to the nearest section. "also" lists the other pages that use the term. When two pages rendered the same concept differently, the rows merge them and the variant is shown under the definition (see <a href="#zh-conventions">the conventions</a>).</p>
+@@GLOSSARY@@
+</section>
+
+<section>
+  <h2 id="zh-conventions">Chinese-term conventions</h2>
+  <p>The course fixes one Chinese term per concept: MFU is 模型浮点运算利用率, and token is 词元 (Chinese reports and forums often keep the English word, as in 首 token 延迟). Where Chinese-language papers and discussions use more than one rendering, every page of the course uses the term in the second column below, and the glossary lists the others under "also heard", because you will meet them too. Short forms such as 外推, 重计算 or 蒸馏 still appear where the context makes them clear.</p>
+@@CONVENTIONS@@
+</section>
+
+<section id="pitfalls">
+  <h2>Common reading mistakes</h2>
+  <ul>
+    <li><strong>"The abstract's number is the paper's result."</strong> Abstracts quote the most favorable comparison. DeepSeek-V2's "93.3% smaller KV cache and 5.76× generation throughput" compares against the dense DeepSeek 67B, an end-to-end system comparison and not an isolated MLA ablation (<a href="07-kv-efficient-attention.html">page 07</a>). Before quoting a number, find the table, the baseline, the metric and the setting.</li>
+    <li><strong>"A benchmark gap is a real gap."</strong> Ask for error bars: for accuracy \(\hat p\) on \(n\) questions the standard error is \(\sqrt{\hat p(1-\hat p)/n}\) (<a href="18-evaluation.html">page 18</a>). DeepSeek-R1's AIME 2024 figures of 79.8% pass@1, 86.7% cons@64 and 90.0% pass@64 are three different quantities, so read which one a comparison uses.</li>
+    <li><strong>"An ablation transfers across labs and scales."</strong> DeepSeek's own ablations put MLA ahead of MHA on 7 of 8 comparisons, while Llama 2's 30B ablation found GQA roughly matching MHA; parameter matching, training length and benchmark choice differ (<a href="07-kv-efficient-attention.html">page 07</a>). Small-scale evidence is weak evidence about frontier scale: ST-MoE notes that small models are rarely unstable, so stability tricks are hard to test cheaply (<a href="11-stability-tweaks.html">page 11</a>).</li>
+    <li><strong>"If a report gives no reason for a choice, the choice was validated."</strong> Technical reports skip ablations. Qwen3's MoE drops the shared expert, and the report gives no reason and no ablation (<a href="30-qwen.html">page 30</a>). Mark such choices "unexplained", not "proven", and say so in an interview.</li>
+    <li><strong>"Read the newest report first."</strong> DeepSeek-V4 and V4.1-Flash build on V2 and V3: to see what CSA and HCA replace you need MLA's cache model and V3's expert layout. Read in release order, as the list is sequenced.</li>
+    <li><strong>"Numbers from different papers are comparable."</strong> Check which \(N\) (total, non-embedding, activated), which peak (dense or with sparsity) and which unit (GB or GiB) each paper uses. Using the sparse 1,979 TFLOP/s peak instead of the dense 989 halves every MFU you compute (<a href="04-transformer-block.html">page 04</a>, <a href="34-back-of-envelope.html">page 34</a>).</li>
+    <li><strong>"An arXiv link is one fixed document."</strong> Versions change numbers. DeepSeek-R1's January 2026 arXiv v2 differs from v1 in places, so cite the version you read (<a href="24-rlvr-reasoning.html">page 24</a>, <a href="28-deepseek-3-reasoning.html">page 28</a>).</li>
+    <li><strong>"Having read it means being able to say it."</strong> Interviews test recall under pressure. After a paper, close it and rebuild one equation or table from memory: the DPO loss, the \(2N + 2N + KN\) memory accounting of ZeRO, the KV bytes per token of GQA.</li>
+  </ul>
+</section>
+
+<section id="questions">
+  <h2>Interview questions: can you explain it in one minute?</h2>
+  <p>Self-test prompts built from the glossary. Each answer is what you would say in about a minute; try it aloud before opening the answer, and follow the link if any number is not yours yet.</p>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Explain the KV cache and how large it is for Llama-3-8B.</summary>
+    <div class="answer">
+      <p>Causal attention never changes the keys and values of earlier tokens, so a decode step stores them and computes only the new token's query, key and value. The cost is memory: \(2\,n_{kv}\,d_h\,L\) elements per token. For Llama-3-8B (\(n_{kv}=8\), \(d_h=128\), \(L=32\), bf16) that is \(2 \cdot 8 \cdot 128 \cdot 32 \cdot 2 = 131{,}072\) bytes, 128 KiB per token, so an 8K context is exactly 1 GiB per sequence. Every decode step must also stream this cache from HBM, which is why decode is memory-bound. See <a href="06-decoding-kv-cache.html">page 06</a> and <a href="07-kv-efficient-attention.html">page 07</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> What is perplexity, and why is it not comparable across tokenizers?</summary>
+    <div class="answer">
+      <p>Perplexity is \(\exp\) of the mean per-token loss in nats: the effective number of equally likely next tokens. It is per token, so a tokenizer that cuts the same text into fewer, longer tokens has a higher per-token loss without being a worse model. To compare models across tokenizers, normalize by the text itself: total negative log-likelihood divided by the number of bytes, in bits per byte. See <a href="01-big-picture.html">page 01</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="warmup">
+    <summary><span class="tier">Warm-up</span> Define MFU, and say what value is normal.</summary>
+    <div class="answer">
+      <p>Model FLOPs utilization (模型浮点运算利用率) is the model FLOP throughput you observe divided by the hardware's dense peak, counting about \(6N\) FLOPs per token for training. An H100 SXM's dense bf16 peak is 989 TFLOP/s; the 1,979 figure on the datasheet assumes sparsity and halves every MFU if used by mistake. Llama 3 405B reports 430 TFLOP/s per GPU, 43%, on 8,192 GPUs; values from 30% to 45% are typical at scale. See <a href="04-transformer-block.html">page 04</a> and <a href="34-back-of-envelope.html">page 34</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Compare the KV cache of MHA, GQA and MLA with numbers.</summary>
+    <div class="answer">
+      <p>Cached elements per token per layer: MHA \(2n_hd_h\), GQA \(2n_{kv}d_h\), MLA \(d_c + d_h^R\). Llama-3-8B with GQA caches \(2 \cdot 8 \cdot 128 = 2048\) elements per layer, so 128 KiB per token over 32 layers; with MHA it would be 4 times that (\(n_h/n_{kv} = 4\)). DeepSeek-V3 with MLA caches \(512 + 64 = 576\) per layer, 70,272 bytes (68.6 KiB) per token over 61 layers in bf16, about 57 times less than MHA at its 128 heads (\(2 \cdot 128 \cdot 128 = 32{,}768\) elements). GQA's savings come from sharing heads, MLA's from a low-rank latent shared by all heads. See <a href="07-kv-efficient-attention.html">page 07</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How do you decide model size and token count, and why do labs over-train?</summary>
+    <div class="answer">
+      <p>Use \(C \approx 6ND\) and the compute-optimal rule of about 20 tokens per parameter (Chinchilla), so \(N_{\text{opt}} \approx \sqrt{C/120}\). For \(C = 10^{24}\) FLOPs that is about 91B parameters and 1.8T tokens. That rule minimizes loss at fixed training compute and ignores inference. If the model will serve trillions of tokens, a smaller model trained much longer gives the same quality for less serving cost: Llama 3 8B saw 15T tokens, about 1,900 tokens per parameter, roughly 90 times the optimum. See <a href="13-scaling-laws.html">page 13</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Total versus activated parameters in an MoE: what does sparsity save, and what does it not?</summary>
+    <div class="answer">
+      <p>The FFN is replaced by \(n_r\) routed experts plus shared ones, and a router sends each token to \(k\) of them. FLOPs per token follow the activated parameters, \(C \approx 6N_{\text{act}}D\), but every expert must still be stored, so memory follows the total. DeepSeek-V3: 671B total, 37B activated (5.5%), so training FLOPs are about 18 times below a dense 671B model, while the weights still occupy about 671 GB at one byte per parameter (fp8). The price is load balancing (routing collapse, stragglers, overflow) and all-to-all communication under expert parallelism. See <a href="08-mixture-of-experts.html">page 08</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> Derive the DPO loss in one minute.</summary>
+    <div class="answer">
+      <p>The KL-regularized objective \(\max_\pi \E[r] - \beta\,\KL(\pi \Vert \pi_{\text{ref}})\) has the optimum \(\pi^\star(y|x) = \pi_{\text{ref}}(y|x)\,e^{r(x,y)/\beta}/Z(x)\). Invert it: \(r = \beta\log\frac{\pi^\star}{\pi_{\text{ref}}} + \beta\log Z(x)\). Bradley-Terry needs only the reward difference \(r(x,y_w) - r(x,y_l)\), so the intractable \(Z(x)\) cancels. Substituting and maximizing the likelihood of the preferences gives \(-\log\sigma\big(\beta[\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}]\big)\): a classification loss with no reward model and no RL loop. Its limits are offline data and likelihood displacement. See <a href="21-preference-optimization.html">page 21</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> What does GRPO change relative to PPO, and what do DAPO's fixes address?</summary>
+    <div class="answer">
+      <p>PPO estimates advantages with a learned critic, a second model as large as the policy (a 7B critic adds about 112 GB of training state at 16 bytes per parameter). GRPO samples a group of responses per prompt and uses the group's mean reward as the baseline (normalized by the standard deviation), so it needs no critic; the clipped ratio and the KL term stay. At scale, runs suffer entropy collapse and batches full of zero-advantage groups, and DAPO's four fixes target these and related problems: clip-higher (against entropy collapse), dynamic sampling (drop groups whose rewards are all equal), a token-level loss (normalize by total tokens, not per sample), and overlong reward shaping (against truncation noise). The reward is often a verifier (RLVR). See <a href="24-rlvr-reasoning.html">page 24</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="core">
+    <summary><span class="tier">Core</span> How many bytes per parameter does mixed-precision Adam need, and what does each ZeRO stage shard?</summary>
+    <div class="answer">
+      <p>bf16 weights (2) plus bf16 gradients (2) plus fp32 master weights and two Adam moments (4 + 4 + 4 = 12): \(2N + 2N + KN\) with \(K = 12\), so 16 bytes per parameter before activations. ZeRO stage 1 shards the optimizer states across the \(N_d\) data-parallel ranks, stage 2 adds the gradients, stage 3 adds the parameters, giving \(16N/N_d\) bytes per GPU. A 70B model needs 1.12 TB of states, so 17.5 GB per GPU on 64 GPUs at stage 3. Stages 1 and 2 keep the communication of plain data parallelism; stage 3 costs about 1.5 times as much. See <a href="15-distributed-training.html">page 15</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Why is batch-1 decode slow, and how does speculative decoding help without changing the output?</summary>
+    <div class="answer">
+      <p>One decode step reads all weights and the KV cache and does only about one FLOP per byte, far below the H100 ridge of 295 FLOPs per byte, so it is memory-bound and the time is about (weight bytes + KV bytes)/HBM bandwidth. Llama-3-8B in bf16: 16.06 GB at 3.35 TB/s is 4.8 ms, about 208 tokens per second at batch 1. Speculative decoding uses the slack: a cheap draft \(q\) proposes \(\gamma\) tokens, the target \(p\) scores all \(\gamma + 1\) positions in one pass (intensity rises to about \(\gamma + 1\), still far below 295), and an acceptance rule keeps a prefix so that the output distribution is exactly \(p\). See <a href="17-inference-serving.html">page 17</a> and <a href="34-back-of-envelope.html">page 34</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> How does a linear-attention or hybrid layer differ from full attention in memory and in recall?</summary>
+    <div class="answer">
+      <p>Full attention caches \(2d_h\) numbers per token per KV head, growing with context. Linear attention keeps a fixed \(d_k \times d_v\) state per head (16,384 numbers for \(d_k = d_v = 128\), the cache of 64 tokens for one KV head), updated by a recurrence, so memory and per-token cost do not grow. The price is exact recall: any causal recurrent model needs \(\Omega(N)\) bits of state to solve multi-query associative recall over \(N\) tokens. Hybrids keep a few softmax layers to repair this (Qwen3-Next: 3 Gated DeltaNet layers to 1 softmax layer), and the gated delta rule adds decay (fast erasure) to the delta update (targeted overwrite). DeepSeek-V4 takes the other route: keep softmax attention but compress the KV cache along the sequence (CSA compresses every \(m\) tokens into one entry and then selects the top-\(k\) entries; HCA compresses every \(m' \gg m\) tokens into one). See <a href="09-beyond-full-attention.html">page 09</a>.</p>
+    </div>
+  </details>
+
+  <details class="qa" data-tier="deep">
+    <summary><span class="tier">Deep-dive</span> Explain RoPE and how YaRN extends its context.</summary>
+    <div class="answer">
+      <p>RoPE rotates each pair of dimensions of \(q\) and \(k\) at position \(t\) by the angle \(t\theta_i\) with \(\theta_i = b^{-2i/d_h}\), so \(q_t \cdot k_j\) depends only on \(t - j\). Beyond the trained length it fails for two reasons: angles the network never saw, and attention dilution over more keys. Position interpolation divides every position by the scale \(s\), which also squeezes the high-frequency pairs that resolve local order. YaRN treats pairs by wavelength: pairs that turn many times inside the trained window are left alone, pairs with wavelength at least \(L\) are divided by \(s\), and pairs in between are blended. It also multiplies the logits by \((0.1\ln s + 1)^2\) to counter dilution. DeepSeek-V3 uses it to go from 4K to 128K. See <a href="05-positional-encoding.html">page 05</a> and <a href="10-long-context.html">page 10</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section id="exercises">
+  <h2>Hands-on</h2>
+  <p>This page has no drill of its own. The drills that turn the reading into recall are on <a href="34-back-of-envelope.html#exercises">page 34</a> and <a href="35-coding-drills.html#exercises">page 35</a>, plus one paper drill below.</p>
+  <div class="exercise">
+    <p><strong>The napkin module (page 34).</strong> Nineteen small functions for parameters, FLOPs, training time and cost, memory (with the ZeRO stages), KV bytes for MHA, GQA, MQA and MLA, decode and prefill time, all-reduce time and the Chinchilla optimum, tested against the worked answers of the page. It reproduces the numbers you meet in ZeRO, Llama 3 and DeepSeek-V3 when you read them. Budget 20 to 40 minutes; interviewers ask for the parameter and memory functions on a whiteboard. <span class="ex-path">exercises/drills/napkin.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>Coding drills (page 35).</strong> LayerNorm and RMSNorm backward, and beam search with length normalization, each with a brute-force or autograd oracle. They are the from-scratch implementations that interviews ask for after a paper discussion. Budget 25 minutes for LayerNorm forward and backward and 30 for beam search. <span class="ex-path">exercises/drills/layernorm_backward.py</span> and <span class="ex-path">exercises/drills/beam_search.py</span></p>
+  </div>
+  <div class="exercise">
+    <p><strong>The five-line paper card.</strong> Pick three Tier 1 papers. For each, allow the time in the list, then write five lines from memory: Problem, Idea, Why it works, Evidence (the table or figure number), Cost. Compare with the design-decision card on the course page that the paper supports, and reproduce one number by hand (the KV bytes per token of Llama-3-8B, the 16 bytes per parameter of mixed-precision Adam, or the DPO loss from the KL-optimal policy). Budget 20 minutes per paper after reading.</p>
+  </div>
+  <p class="small muted">Run <code>pytest exercises/tests/test_napkin.py exercises/tests/test_layernorm_backward.py exercises/tests/test_beam_search.py</code>; add <code>--solutions</code> to check the reference implementations.</p>
+</section>
+
+<section id="cheatsheet">
+  <h2>Cheat sheet: the 30 terms to be able to say in a minute</h2>
+  <div class="cheatsheet">
+    <ul>
+@@CHEAT@@
+    </ul>
+  </div>
+</section>
+
+<nav class="pager" aria-label="Previous and next page"></nav>
+</main>
+<aside id="toc" aria-label="On this page"></aside>
+</div>
+<script src="../assets/vendor/katex/katex.min.js"></script>
+<script src="../assets/vendor/katex/auto-render.min.js"></script>
+<script src="../assets/vendor/hljs/highlight.min.js"></script>
+<script src="../assets/manifest.js"></script>
+<script src="../assets/site.js"></script>
+</body>
+</html>

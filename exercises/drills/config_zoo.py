@@ -67,7 +67,8 @@ def params(s: Spec, active_embeddings: str = "both") -> Tuple[int, int]:
       * The n_global global layers use global_head_dim and global_n_kv_heads when global_head_dim > 0
         (else the shared head_dim and n_kv_heads); with global_k_eq_v they have no W_v, so K is counted once.
     Add the input embedding (vocab*d), the output head (another vocab*d unless tie_embeddings) and one final
-    norm of size d. Raise NotImplementedError if n_local + n_global != n_layers (linear-attention layers).
+    norm of size d. Raise NotImplementedError if n_local + n_global != n_layers (linear-attention layers; n_global
+    None counts as n_layers).
 
     "Activated" is total minus the routed experts a token does not select ((n_experts - top_k)*3*d*d_expert per
     MoE layer), then adjusted for embeddings by `active_embeddings`:
@@ -91,8 +92,9 @@ def kv_bytes_per_token(s: Spec, bytes_per_el: int = 2) -> int:
 
 
 def kv_cache_bytes(s: Spec, T: int, bytes_per_el: int = 2) -> int:
-    """Cache of one sequence of T tokens: each global layer holds T tokens, each local layer min(T, window)
-    tokens, at the local shape (2 * n_kv_heads * head_dim numbers per token, or the MLA size)."""
+    """Cache of one sequence of T tokens: each global layer holds T tokens at the global shape (as in
+    kv_bytes_per_token), each local layer min(T, window) tokens at the local shape (2 * n_kv_heads * head_dim
+    numbers per token, or the MLA size)."""
     raise NotImplementedError
 
 
@@ -128,13 +130,15 @@ def load_config(cfg: Mapping) -> Spec:
         Otherwise head_dim = c["head_dim"] if present, else d // n_heads.
       * Biases: mt == "qwen2" always has q, k, v biases (its config has no key for it). Otherwise a true
         attention_bias sets qkv_bias and o_bias, except for mt == "glm4_moe", where it sets only qkv_bias.
-      * QK-norm: "head" for mt in ("qwen3", "qwen3_moe"); "full" for mt == "olmo2".
+      * QK-norm: "head" for mt in ("qwen3", "qwen3_moe"), and for mt == "glm4_moe" when use_qk_norm is true;
+        "full" for mt == "olmo2".
       * Experts: E is the first nonzero of n_routed_experts, num_local_experts, num_experts (else the model is
         dense and d_ff = intermediate_size). With experts: top_k = num_experts_per_tok; d_expert =
         moe_intermediate_size if present, else intermediate_size; d_shared = n_shared_experts * d_expert if
         n_shared_experts is present, else 0. MoE layers: if first_k_dense_replace is present, layers with
-        index >= first_k_dense_replace (moe_layer_freq is 1); elif decoder_sparse_step is present (Qwen3-MoE),
-        layers with (index + 1) % step == 0 that are not in mlp_only_layers; else every layer (Mixtral).
+        index >= first_k_dense_replace and index % moe_layer_freq == 0 (moe_layer_freq missing means 1); elif
+        decoder_sparse_step is present (Qwen3-MoE), layers with (index + 1) % step == 0 that are not in
+        mlp_only_layers; else every layer (Mixtral).
         d_ff = intermediate_size if some layer is dense, else 0.
       * Layout: mt == "mistral" with a sliding_window: every layer is local (n_global = 0, n_local = n_layers,
         window = sliding_window). Otherwise all layers are global (n_global None).

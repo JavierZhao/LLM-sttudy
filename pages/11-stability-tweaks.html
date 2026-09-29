@@ -359,7 +359,7 @@
 <section>
   <h2 id="hyper-connections">Hyper-connections and manifold-constrained hyper-connections</h2>
 
-  <p>A residual stream <span class="zh">残差连接</span> is a bus of width \(d\) that every layer reads and writes. <strong>Hyper-connections</strong> <span class="zh">超连接</span> (HC; ByteDance, ICLR 2025) widen it into \(n\) parallel streams with learned mixing. DeepSeek's <strong>manifold-constrained hyper-connections</strong> <span class="zh">流形约束超连接</span> (mHC; Xie et al., arXiv December 2025) constrain the mixing so it stays stable at scale, and DeepSeek-V4 uses it with \(n = 4\) <a href="https://arxiv.org/abs/2606.19348">[V4, §2.2, §4.2.1]</a>.</p>
+  <p>A residual stream <span class="zh">残差流</span> is a bus of width \(d\) that every layer reads and writes. <strong>Hyper-connections</strong> <span class="zh">超连接</span> (HC; ByteDance, ICLR 2025) widen it into \(n\) parallel streams with learned mixing. DeepSeek's <strong>manifold-constrained hyper-connections</strong> <span class="zh">流形约束超连接</span> (mHC; Xie et al., arXiv December 2025) constrain the mixing so it stays stable at scale, and DeepSeek-V4 uses it with \(n = 4\) <a href="https://arxiv.org/abs/2606.19348">[V4, §2.2, §4.2.1]</a>.</p>
 
   <h3 id="hc-form">The form</h3>
   <p>Let \(X_l \in \R^{n\times d}\) hold the \(n\) streams. A layer \(F\) (attention or MoE, \(d \to d\)) becomes</p>
@@ -558,7 +558,7 @@ class MHC(nn.Module):
 <section>
   <h2 id="mtp">Multi-token prediction</h2>
 
-  <p>The standard objective trains position \(t\) to predict only \(x_{t+1}\). <strong>Multi-token prediction</strong> <span class="zh">多 token 预测</span> (MTP) adds losses for \(x_{t+2}, \dots\) as auxiliary targets. It is an objective change, not a stability fix, but DeepSeek-V3 and V4 use it and interviews ask about it next to these tweaks.</p>
+  <p>The standard objective trains position \(t\) to predict only \(x_{t+1}\). <strong>Multi-token prediction</strong> <span class="zh">多词元预测</span> (MTP) adds losses for \(x_{t+2}, \dots\) as auxiliary targets. It is an objective change, not a stability fix, but DeepSeek-V3 and V4 use it and interviews ask about it next to these tweaks.</p>
 
   <h3 id="mtp-gloeckle">Gloeckle et al. 2024: parallel heads</h3>
   <p>A shared trunk produces \(z_t\), and \(n\) independent heads (one transformer layer each, shared unembedding) predict \(x_{t+1}, \dots, x_{t+n}\). Materializing \(n\) logit tensors of size \(V\) is the memory bottleneck, so the paper runs forward and backward through one head at a time, cutting peak memory from \(O(nV + d)\) to \(O(V + d)\) <a href="https://arxiv.org/abs/2404.19737">[Gloeckle et al., §2]</a>.</p>

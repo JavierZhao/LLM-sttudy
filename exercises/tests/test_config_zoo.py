@@ -9,6 +9,8 @@ MODULE = "config_zoo"
 # relevant keys of each released config.json (Meta's and Google's repositories are gated: public mirrors).
 LLAMA3_8B = dict(model_type="llama", hidden_size=4096, num_hidden_layers=32, num_attention_heads=32,
                  num_key_value_heads=8, intermediate_size=14336, vocab_size=128256, tie_word_embeddings=False)
+LLAMA2_70B = dict(model_type="llama", hidden_size=8192, num_hidden_layers=80, num_attention_heads=64,
+                  num_key_value_heads=8, intermediate_size=28672, vocab_size=32000, tie_word_embeddings=False)
 LLAMA31_405B = dict(model_type="llama", hidden_size=16384, num_hidden_layers=126, num_attention_heads=128,
                     num_key_value_heads=8, intermediate_size=53248, vocab_size=128256, tie_word_embeddings=False)
 MISTRAL_7B = dict(model_type="mistral", hidden_size=4096, num_hidden_layers=32, num_attention_heads=32,
@@ -17,6 +19,9 @@ MISTRAL_7B = dict(model_type="mistral", hidden_size=4096, num_hidden_layers=32, 
 MIXTRAL_8X7B = dict(model_type="mixtral", hidden_size=4096, num_hidden_layers=32, num_attention_heads=32,
                     num_key_value_heads=8, intermediate_size=14336, num_local_experts=8, num_experts_per_tok=2,
                     vocab_size=32000, tie_word_embeddings=False)
+MIXTRAL_8X22B = dict(model_type="mixtral", hidden_size=6144, num_hidden_layers=56, num_attention_heads=48,
+                     num_key_value_heads=8, intermediate_size=16384, num_local_experts=8, num_experts_per_tok=2,
+                     vocab_size=32000, sliding_window=None, tie_word_embeddings=False)
 QWEN25_72B = dict(model_type="qwen2", hidden_size=8192, num_hidden_layers=80, num_attention_heads=64,
                   num_key_value_heads=8, intermediate_size=29568, vocab_size=152064, tie_word_embeddings=False,
                   sliding_window=131072, use_sliding_window=False)          # the window is switched off
@@ -64,11 +69,13 @@ def test_params_dense_families(impl):
     assert _total(impl, QWEN3_32B) == 32_762_123_264
     assert _total(impl, OLMO2_32B) == 32_234_279_936
     assert _total(impl, MISTRAL_7B) == 7_241_732_096
+    assert _total(impl, LLAMA2_70B) == 68_976_648_192          # the checkpoint holds 5,120 more elements: rotary buffers
     mha = {k: v for k, v in LLAMA3_8B.items() if k != "num_key_value_heads"}
     assert _total(impl, mha) - _total(impl, LLAMA3_8B) == 32 * 2 * 4096 * (32 - 8) * 128    # GQA saves K and V columns
 
 
-def _reference_count(d, L, n_h, n_kv, hd, d_ff, V, tie, qkv_bias=False, qk_norm=False, experts=0, d_e=0, shared=0):
+def _reference_count(d, L, n_h, n_kv, hd, d_ff, V, tie, qkv_bias=False, qk_norm=False, experts=0, d_e=0, shared=0,
+                     o_bias=False):
     """Independent count: build modules with nn.Linear / nn.Parameter and sum numel."""
     def lin(i, o, bias=False):
         return nn.Linear(i, o, bias=bias)
@@ -76,7 +83,7 @@ def _reference_count(d, L, n_h, n_kv, hd, d_ff, V, tie, qkv_bias=False, qk_norm=
     for _ in range(L):
         m = nn.ModuleDict(dict(
             q=lin(d, n_h * hd, qkv_bias), k=lin(d, n_kv * hd, qkv_bias), v=lin(d, n_kv * hd, qkv_bias),
-            o=lin(n_h * hd, d)))
+            o=lin(n_h * hd, d, o_bias)))
         m["norms"] = nn.ParameterList([nn.Parameter(torch.ones(d)) for _ in range(2)])
         if qk_norm:
             m["qk"] = nn.ParameterList([nn.Parameter(torch.ones(hd)) for _ in range(2)])
@@ -105,6 +112,8 @@ def test_params_against_torch_modules(impl):
         (dict(base, model_type="llama", tie_word_embeddings=False, attention_bias=False), dict(tie=False)),
         (dict(base, model_type="qwen2", tie_word_embeddings=False), dict(tie=False, qkv_bias=True)),
         (dict(base, model_type="qwen3", tie_word_embeddings=False), dict(tie=False, qk_norm=True)),
+        # a true attention_bias puts biases on q, k, v and on the output projection (gpt-oss)
+        (dict(base, model_type="llama", tie_word_embeddings=False, attention_bias=True), dict(tie=False, qkv_bias=True, o_bias=True)),
     ]
     for cfg, kw in cases:
         got = impl.params(impl.load_config(cfg))[0]
@@ -151,6 +160,7 @@ def test_params_deepseek_v3(impl):
 def test_params_more_moe_models(impl):
     assert impl.params(impl.load_config(DSV2))[0] == 235_741_434_880
     assert impl.params(impl.load_config(MIXTRAL_8X7B)) == (46_702_792_704, 12_879_925_248)
+    assert impl.params(impl.load_config(MIXTRAL_8X22B)) == (140_620_634_112, 39_152_031_744)   # "141B / 39B"
     total, active = impl.params(impl.load_config(QWEN3_235B))
     assert (total, active) == (235_093_634_560, 22_190_763_520)
     # Kimi K2's config recount: the checkpoint holds 62.5M more elements (FP8 scale factors), and the report's 1.04T
@@ -159,6 +169,57 @@ def test_params_more_moe_models(impl):
     # GLM-4.5: 351.2B without embeddings; the report's 355B adds a 3.9B MTP layer
     total, _ = impl.params(impl.load_config(GLM45))
     assert total == 352_797_814_784 and total - 2 * 151552 * 5120 == 351_245_922_304
+
+
+def test_active_embedding_conventions_tied_and_untied(impl):
+    # "head" keeps the output matmul, "none" drops every vocabulary matrix; a tied matrix is one tensor
+    V, d = 128_256, 4096
+    untied = impl.load_config(LLAMA3_8B)
+    total, both = impl.params(untied)
+    assert both == total == 8_030_261_248
+    assert impl.params(untied, "head")[1] == total - V * d
+    assert impl.params(untied, "none")[1] == total - 2 * V * d
+    tied = impl.load_config(dict(LLAMA3_8B, tie_word_embeddings=True))
+    total_t, both_t = impl.params(tied)
+    assert total_t == 8_030_261_248 - V * d == both_t
+    assert impl.params(tied, "head")[1] == total_t                   # the tied matrix is still the head
+    assert impl.params(tied, "none")[1] == total_t - V * d
+
+
+def test_params_gpt_oss_120b_checkpoint(impl):
+    # openai/gpt-oss-120b: 36 layers, 128 experts (gate, up, down) of width 2,880, top-4, biases on q, k, v and o,
+    # 18 banded (128) and 18 full layers. The Hugging Face tensor metadata says 116,829,156,672.
+    s = impl.Spec(n_layers=36, d=2880, vocab=201_088, tie_embeddings=False, n_heads=64, n_kv_heads=8, head_dim=64,
+                  qkv_bias=True, o_bias=True, moe_layers=tuple(range(36)), n_experts=128, top_k=4, d_expert=2880,
+                  n_global=18, n_local=18, window=128)
+    total, both = impl.params(s)
+    assert total == 116_789_336_640
+    # what the Spec does not model: per layer 128 experts x (gate_up bias 2*2880 + down bias 2880), the router bias
+    # (128) and one learned sink logit per query head (64)
+    assert 116_829_156_672 - total == 36 * (128 * (2 * 2880 + 2880) + 128 + 64) == 39_820_032
+    head = impl.params(s, "head")[1]
+    assert round(head / 1e9, 2) == 5.13 and round(both / 1e9, 2) == 5.71       # the card's 5.13B counts the head only
+    assert impl.kv_bytes_per_token(s) == 18 * 2 * 8 * 64 * 2 == 36_864
+    assert impl.kv_cache_bytes(s, 131_072) == (18 * 131_072 + 18 * 128) * 2 * 8 * 64 * 2     # 4.50 GiB
+
+
+def test_params_gemma4_shared_kv_and_report_table(impl):
+    # Gemma 4 31B: 50 local layers (32 heads, 16 KV heads x 256) and 10 global layers (32 heads, 4 KV heads x 512,
+    # keys reused as values, so no W_v), four norms per layer, per-head QK-norm gains, tied embeddings
+    d, dff, V = 5376, 21504, 262_144
+    g4 = impl.Spec(n_layers=60, d=d, vocab=V, tie_embeddings=True, n_heads=32, n_kv_heads=16, head_dim=256,
+                   d_ff=dff, norms_per_layer=4, qk_norm="head", n_global=10, n_local=50, window=1024,
+                   global_n_kv_heads=4, global_head_dim=512, global_k_eq_v=True)
+    local = d * 32 * 256 + 2 * d * 16 * 256 + 32 * 256 * d + 2 * 256
+    glob = d * 32 * 512 + d * 4 * 512 + 32 * 512 * d + 2 * 512            # K only: V is K
+    expected = 50 * local + 10 * glob + 60 * (3 * d * dff + 4 * d) + V * d + d
+    total, _ = impl.params(g4)
+    assert total == expected == 30_697_345_280
+    # the report's Table 1 (text only): 1,410M embedding parameters and 29,290M others
+    assert abs((total - V * d) / 1e6 - 29_290) < 5 and abs(V * d / 1e6 - 1_410) < 2
+    # with separate values the global layers would add 10 * d * 4 * 512 parameters
+    sep = impl.Spec(**{**g4.__dict__, "global_k_eq_v": False})
+    assert impl.params(sep)[0] - total == 10 * d * 4 * 512
 
 
 # ---------------------------------------------------------------- KV cache
@@ -274,3 +335,62 @@ def test_load_config_fields(impl):
     assert impl.load_config(v).moe_layers == (2, 4, 6)
     # None-valued keys count as missing
     assert impl.load_config(dict(LLAMA3_8B, num_key_value_heads=None)).n_kv_heads == 32
+
+
+# ---------------------------------------------------------------- reference only
+
+def _gpt_oss_config():
+    return dict(model_type="gpt_oss", hidden_size=2880, num_hidden_layers=36, num_attention_heads=64,
+                num_key_value_heads=8, head_dim=64, intermediate_size=2880, num_local_experts=128,
+                num_experts_per_tok=4, vocab_size=201_088, attention_bias=True, tie_word_embeddings=False,
+                sliding_window=128, layer_types=["sliding_attention", "full_attention"] * 18)
+
+
+def _maverick_config():
+    text = dict(model_type="llama4_text", hidden_size=5120, num_hidden_layers=48, num_attention_heads=40,
+                num_key_value_heads=8, head_dim=128, intermediate_size=8192, intermediate_size_mlp=16384,
+                num_local_experts=128, num_experts_per_tok=1, moe_layers=list(range(1, 48, 2)),
+                no_rope_layers=[1, 1, 1, 0] * 12, attention_chunk_size=8192, vocab_size=202_048)
+    return dict(model_type="llama4", tie_word_embeddings=False, text_config=text)
+
+
+def _gemma4_26b_config():
+    text = dict(model_type="gemma4_text", hidden_size=2816, num_hidden_layers=30, num_attention_heads=16,
+                num_key_value_heads=8, head_dim=256, global_head_dim=512, num_global_key_value_heads=2,
+                attention_k_eq_v=True, intermediate_size=2112, moe_intermediate_size=704, num_experts=128,
+                top_k_experts=8, layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 5,
+                sliding_window=1024, vocab_size=262_144, tie_word_embeddings=True)
+    return dict(model_type="gemma4", text_config=text)
+
+
+def test_reference_families_used_by_the_atlas(impl):
+    """The atlas tables also read Gemma, Llama 4, gpt-oss and MiniMax configs; the drill does not require them."""
+    if not impl.__name__.startswith("solutions"):
+        pytest.skip("reference only: these key families are not part of the drill")
+    # gpt-oss-120b through load_config (layer_types alternate banded and full); see the Spec test above
+    s = impl.load_config(_gpt_oss_config())
+    assert (s.n_global, s.n_local, s.window, s.qkv_bias, s.o_bias) == (18, 18, 128, True, True)
+    assert impl.params(s)[0] == 116_789_336_640 and impl.kv_bytes_per_token(s) == 36_864
+    # Llama 4 Maverick: the text tensors are the checkpoint (401,583,781,376) minus the 871,932,416 vision parameters;
+    # "17B active" is the both-matrices count; 12 NoPE layers are global, the other 36 see 8,192-token chunks
+    s = impl.load_config(_maverick_config())
+    assert impl.params(s) == (401_583_781_376 - 871_932_416, 17_184_691_200)
+    assert (s.n_global, s.n_local, s.window) == (12, 36, 8192) and impl.kv_bytes_per_token(s) == 12 * 2 * 8 * 128 * 2
+    # Gemma 2 27B: 256,000 embedding rows, tied, 23 global and 23 windowed layers; the checkpoint has 27,227,128,320
+    gemma2 = dict(model_type="gemma2", hidden_size=4608, num_hidden_layers=46, num_attention_heads=32,
+                  num_key_value_heads=16, head_dim=128, intermediate_size=36864, vocab_size=256_000, sliding_window=4096)
+    s = impl.load_config(gemma2)
+    assert impl.params(s)[0] == 27_227_128_320 and (s.n_global, s.n_local) == (23, 23)
+    assert impl.kv_bytes_per_token(s) == 23 * 2 * 16 * 128 * 2 == 188_416
+    # MiniMax-M2: full-width QK-norm; the checkpoint (228,689,764,864) adds 62 * 256 routing biases
+    m2 = dict(model_type="minimax_m2", hidden_size=3072, num_hidden_layers=62, num_attention_heads=48,
+              num_key_value_heads=8, head_dim=128, intermediate_size=1536, num_local_experts=256,
+              num_experts_per_tok=8, vocab_size=200_064, tie_word_embeddings=False)
+    total, both = impl.params(impl.load_config(m2))
+    assert total == 228_689_764_864 - 62 * 256
+    assert round(impl.params(impl.load_config(m2), "none")[1] / 1e9, 2) == 9.80      # the report's "9.8B"
+    # Gemma 4 26B-A4B: dense MLP 2,112 in parallel with 8 of 128 experts of width 704, tied embeddings, shared K = V
+    s = impl.load_config(_gemma4_26b_config())
+    total, both = impl.params(s)
+    assert total == 25_232_800_000 and abs(total / 1e9 - 25.24) < 0.02              # report Table 1: 25.24B
+    assert round(both / 1e9, 1) == 3.8 and impl.kv_bytes_per_token(s) == 5 * 2 * 512 * 2

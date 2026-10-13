@@ -96,10 +96,10 @@ window.LLM_MANIFEST = {
           desc: "Qwen2/2.5/3, QK-norm, hybrid thinking, global-batch balancing, Qwen3-Next Gated DeltaNet hybrid." },
         { n: "31", drills: ["sinks"], slug: "31-mistral-gemma-gptoss", title: "Mistral, Gemma, gpt-oss", tier: "P1", minutes: 45, status: "written",
           desc: "Sliding window, Mixtral MoE, Gemma local/global and distillation, gpt-oss attention sinks and MXFP4." },
-        { n: "32", drills: ["muonclip"], slug: "32-frontier-open-models", title: "Kimi, GLM, MiniMax, OLMo, Nemotron", tier: "P1", minutes: 50, status: "planned",
+        { n: "32", drills: ["muonclip"], slug: "32-frontier-open-models", title: "Kimi, GLM, MiniMax, OLMo, Nemotron", tier: "P1", minutes: 50, status: "written",
           desc: "Kimi K2 and MuonClip, GLM-4.5, MiniMax lightning attention and CISPO, OLMo open recipes, Nemotron-H." },
-        { n: "33", drills: ["config_zoo"], slug: "33-architecture-atlas", title: "Architecture atlas", tier: "P0", minutes: 35, status: "planned",
-          desc: "Side-by-side configs for ~20 models, a timeline, and what converged and why." }
+        { n: "33", drills: ["config_zoo"], slug: "33-architecture-atlas", title: "Architecture atlas", tier: "P0", minutes: 35, status: "written",
+          desc: "Side-by-side configs for 30 models, a timeline, and what converged and why." }
       ]
     },
     {
@@ -107,11 +107,11 @@ window.LLM_MANIFEST = {
       pages: [
         { n: "34", drills: ["napkin"], slug: "34-back-of-envelope", title: "Back-of-envelope calculations", tier: "P0", minutes: 45, status: "written",
           desc: "Parameters, FLOPs, training time, memory, KV cache, MFU, with worked drills." },
-        { n: "35", drills: ["layernorm_backward", "beam_search"], slug: "35-coding-drills", title: "Coding drills", tier: "P0", minutes: 90, status: "planned",
+        { n: "35", drills: ["layernorm_backward", "beam_search"], slug: "35-coding-drills", title: "Coding drills", tier: "P0", minutes: 90, status: "written",
           desc: "From-scratch implementations you should be able to write in an interview, with tests." },
-        { n: "36", drills: [], slug: "36-question-bank", title: "Question bank & mock scenarios", tier: "P0", minutes: 120, status: "planned",
+        { n: "36", drills: [], slug: "36-question-bank", title: "Question bank & mock scenarios", tier: "P0", minutes: 120, status: "written",
           desc: "All page questions in one place, plus open-ended design and debugging scenarios." },
-        { n: "37", drills: [], slug: "37-reading-list-glossary", title: "Reading list & glossary", tier: "P2", minutes: 20, status: "planned",
+        { n: "37", drills: [], slug: "37-reading-list-glossary", title: "Reading list & glossary", tier: "P2", minutes: 20, status: "written",
           desc: "Prioritized papers and an English/Chinese glossary." }
       ]
     }

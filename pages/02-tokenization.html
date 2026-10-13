@@ -571,7 +571,7 @@ bytes_per_token = len(text_english.encode("utf-8")) / n_tokens(text_english)
     </tbody>
   </table></div>
 
-  <p>A <strong>chat template</strong> <span class="zh">对话模板</span> serializes messages into one sequence with these markers. Llama 3's reference code prepends <code>&lt;|begin_of_text|&gt;</code>, encodes each message as header, content and <code>&lt;|eot_id|&gt;</code>, and ends with an empty assistant header <a href="https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py">[llama3 tokenizer.py]</a>. Generation stops at <code>&lt;|eot_id|&gt;</code> or <code>&lt;|end_of_text|&gt;</code>.</p>
+  <p>A <strong>chat template</strong> <span class="zh">聊天模板</span> serializes messages into one sequence with these markers. Llama 3's reference code prepends <code>&lt;|begin_of_text|&gt;</code>, encodes each message as header, content and <code>&lt;|eot_id|&gt;</code>, and ends with an empty assistant header <a href="https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py">[llama3 tokenizer.py]</a>. Generation stops at <code>&lt;|eot_id|&gt;</code> or <code>&lt;|end_of_text|&gt;</code>.</p>
 
 <pre><code>&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
 

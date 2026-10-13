@@ -63,7 +63,7 @@ exactly. Required elements (the QA script checks the ids):
    where needed. Include at least one "calculate X" question and at least one "design /
    trade-off" question.
 7. `section#exercises`: "Hands-on", linking the drill files you created (see §9).
-8. `section#papers`: "Primary sources", an `ol.papers` with 4 to 10 entries, each with a
+8. `section#papers`: "Primary sources", an `ol.papers` with 4 to 12 entries, each with a
    one-line "why read it".
 9. `section#cheatsheet`: "Cheat sheet", one screen of the facts and formulas to memorize.
 10. `nav.pager` (empty; site.js fills it).
@@ -178,7 +178,7 @@ definition: `multi-head attention <span class="zh">多头注意力</span>`. Use 
 established translation the Chinese ML community actually uses (for example
 自回归, 困惑度, 分词器, 键值缓存, 混合专家, 旋转位置编码, 监督微调, 强化学习,
 奖励模型, 直接偏好优化). Do not translate model names or sentences.
-- Use one term per concept across pages. Fixed choices so far: MFU = 模型浮点运算利用率.
+- Use one term per concept across pages. Fixed choices so far: MFU = 模型浮点运算利用率; token = 词元 (multi-token prediction = 多词元预测, but TTFT = 首 token 延迟 as spoken); chat template = 聊天模板; memory bandwidth (GPU) = 显存带宽; arithmetic intensity = 算术强度; permutation equivariance = 置换等变性; RLHF = 基于人类反馈的强化学习; speculative decoding = 投机解码; residual stream = 残差流 (residual connection = 残差连接); length extrapolation = 长度外推; position interpolation = 位置插值. Put a space between Chinese and Latin text (宪法式 AI, 字节级 BPE). Page 37's glossary lists every term.
 
 ## 9. Exercises
 

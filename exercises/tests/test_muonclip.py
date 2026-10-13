@@ -146,6 +146,9 @@ def test_rejects_bad_arguments(impl):
         impl.qk_clip(Wq, Wk, S, 0.0)
     with pytest.raises(ValueError):
         impl.qk_clip(Wq, Wk, S, 1.0, alpha=1.5)
+    x, Wqc, Wkc, Wqr, Wkr = _mla_setup()
+    with pytest.raises(ValueError):
+        impl.qk_clip_mla(Wqc, Wkc, Wqr, Wkr, torch.ones(3, dtype=torch.float64), 0.0)
 
 
 # ----------------------------------------------------------------- qk_clip_mla

@@ -26,8 +26,8 @@ def max_attention_logit(q: Tensor, k: Tensor, causal: bool = True) -> Tensor:
         causal: if True only pairs j <= i count, because those are the only logits that reach
             the softmax; if False all pairs count.
     Returns:
-        (H,) tensor, S_max^h = max over batch entries, i and j of (q_i . k_j) / sqrt(d), where d is
-        the last dimension. This is the signed maximum, not the maximum of the absolute value.
+        (H,) tensor with the dtype of q, S_max^h = max over batch entries, i and j of (q_i . k_j) / sqrt(d),
+        where d is the last dimension. This is the signed maximum, not the maximum of the absolute value.
     """
     raise NotImplementedError
 
@@ -48,10 +48,13 @@ def qk_clip(
         tau: threshold, tau > 0.
         alpha: how the shrink is split between queries and keys, 0 <= alpha <= 1.
     Returns:
-        (W_q_new, W_k_new, gamma), with gamma (H,) the per-head factor. Heads whose max logit
-        does not exceed tau must come back exactly unchanged (gamma = 1). For the others the
-        logits of that head scale by gamma = tau / S_max^h, so the head's max logit on the same
-        inputs becomes exactly tau. New tensors are returned; the inputs are not modified.
+        (W_q_new, W_k_new, gamma), with gamma (H,) the per-head factor in the dtype of W_q_heads.
+        Heads whose max logit does not exceed tau (including zero or negative max logits) must come
+        back exactly unchanged (gamma = 1). For the others W_q is multiplied by gamma**alpha and W_k by
+        gamma**(1 - alpha), so the logits of that head scale by gamma = tau / S_max^h and the head's max
+        logit on the same inputs becomes exactly tau. New tensors are returned; the inputs are not modified.
+    Raises:
+        ValueError: if tau <= 0 or alpha is outside [0, 1].
     """
     raise NotImplementedError
 
@@ -79,7 +82,10 @@ def qk_clip_mla(
     Returns:
         (W_qc_new, W_kc_new, W_qr_new, W_kr_new, gamma). For a head with S_max^h > tau,
         gamma_h = tau / S_max^h and the whole logit of that head scales by gamma_h; other heads
-        are unchanged. The shared W_kr must come back unchanged (rescaling it would shrink every
-        head's rotary term). Inputs are not modified.
+        are unchanged (gamma = 1, including for zero or negative max logits). W_qc and W_kc are each
+        multiplied by sqrt(gamma_h) and W_qr by gamma_h. The shared W_kr must come back unchanged
+        (rescaling it would shrink every head's rotary term). Inputs are not modified.
+    Raises:
+        ValueError: if tau <= 0.
     """
     raise NotImplementedError

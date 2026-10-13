@@ -140,7 +140,7 @@
 <section>
   <h2 id="roofline">The roofline model: bytes versus FLOPs</h2>
 
-  <p>"Is this operation fast?" has no answer without a bound to compare against. Williams, Waterman and Patterson give a two-number bound. They define <strong>operational intensity</strong> as operations per byte of DRAM traffic, counted after the caches have filtered the accesses <a href="https://dl.acm.org/doi/10.1145/1498765.1498785">[Williams et al. 2009, p. 66]</a>. We call it <strong>arithmetic intensity</strong> <span class="zh">计算强度</span> (also written 算术强度, as on <a href="06-decoding-kv-cache.html#intensity">page 06</a>), and count a multiply-add as 2 FLOPs. A kernel with intensity \(I\), on a machine with peak compute \(P\) and memory bandwidth \(\beta\), attains at most</p>
+  <p>"Is this operation fast?" has no answer without a bound to compare against. Williams, Waterman and Patterson give a two-number bound. They define <strong>operational intensity</strong> as operations per byte of DRAM traffic, counted after the caches have filtered the accesses <a href="https://dl.acm.org/doi/10.1145/1498765.1498785">[Williams et al. 2009, p. 66]</a>. We call it <strong>arithmetic intensity</strong> <span class="zh">算术强度</span> (as on <a href="06-decoding-kv-cache.html#intensity">page 06</a>; also written 计算强度), and count a multiply-add as 2 FLOPs. A kernel with intensity \(I\), on a machine with peak compute \(P\) and memory bandwidth \(\beta\), attains at most</p>
 
   <div class="eq-box">
   \[ \text{attainable FLOP/s} = \min\!\big(P,\ \beta \cdot I\big), \qquad I_{\text{ridge}} = P / \beta \]

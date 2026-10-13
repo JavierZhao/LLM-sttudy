@@ -69,7 +69,7 @@ print(llama3_8b * 131_072 / 2**30)                # 16.0 GiB for one 128K-token 
 </code></pre>
 
   <h3 id="bandwidth">Capacity is only half the problem: bandwidth</h3>
-  <p>Memory capacity limits how many sequences fit. <strong>Memory bandwidth</strong> <span class="zh">内存带宽</span> limits how fast each one runs. At every decode step, attention must stream the <em>entire</em> cache of that sequence from HBM to the compute units, do a little math with it, and throw it away. The useful measure is <strong>arithmetic intensity</strong> <span class="zh">算术强度</span>: FLOPs performed per byte read.</p>
+  <p>Memory capacity limits how many sequences fit. <strong>Memory bandwidth</strong> <span class="zh">显存带宽</span> limits how fast each one runs. At every decode step, attention must stream the <em>entire</em> cache of that sequence from HBM to the compute units, do a little math with it, and throw it away. The useful measure is <strong>arithmetic intensity</strong> <span class="zh">算术强度</span>: FLOPs performed per byte read.</p>
 
   <p>For one new query token and one cached token, one layer of GQA attention does \(2 n_h d_h\) FLOPs for the scores (\(q \cdot k\) for every query head) and \(2 n_h d_h\) for the weighted sum of values, so \(4 n_h d_h\) FLOPs in total. It reads \(2 n_{kv} d_h\) elements, which is \(4 n_{kv} d_h\) bytes in bf16. So:</p>
 

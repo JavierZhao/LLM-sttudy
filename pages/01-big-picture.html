@@ -189,10 +189,10 @@ def generate(model, ids, max_new_tokens, eos_id):
   <h2 id="training">Training: next-token cross-entropy is maximum likelihood</h2>
 
   <h3 id="mle">From maximum likelihood to the loss</h3>
-  <p>Training data is a set of sequences drawn from an unknown distribution \(p_{\text{data}}\). <strong>Maximum likelihood estimation</strong> <span class="zh">最大似然估计</span> picks the parameters that make the data most probable. Taking logs, negating and averaging over the \(N\) supervised token positions turns it into a minimization:</p>
+  <p>Training data is a set of sequences \(x^{(1)}, x^{(2)}, \dots\) drawn from an unknown distribution \(p_{\text{data}}\); the superscript \((i)\) indexes the sequence, the subscript \(t\) the position, and sequence \(i\) has \(T_i\) tokens after BOS. <strong>Maximum likelihood estimation</strong> <span class="zh">最大似然估计</span> picks the parameters that make the data most probable. Taking logs, negating and averaging over the \(M\) supervised token positions (\(M\), not \(N\), which is reserved for parameters) turns it into a minimization:</p>
 
   <div class="eq-box">
-  \[ \hat\theta = \argmax_\theta \sum_{i} \log p_\theta(x^{(i)}) = \argmin_\theta \; \underbrace{-\frac{1}{N} \sum_{i} \sum_{t} \log p_\theta\big(x^{(i)}_{t+1} \mid x^{(i)}_{\le t}\big)}_{\mathcal{L}(\theta)\ \text{, mean cross-entropy in nats per token}} \]
+  \[ \hat\theta = \argmax_\theta \sum_{i} \log p_\theta(x^{(i)}) = \argmin_\theta \; \underbrace{-\frac{1}{M} \sum_{i} \sum_{t=0}^{T_i-1} \log p_\theta\big(x^{(i)}_{t+1} \mid x^{(i)}_{\le t}\big)}_{\mathcal{L}(\theta)\ \text{, mean cross-entropy in nats per token}} \]
   <div class="eq-label">Next-token cross-entropy = mean negative log-likelihood = maximum likelihood</div>
   </div>
 
@@ -669,7 +669,7 @@ def lm_loss(model, tokens, pad_id):
   <details class="qa" data-tier="core">
     <summary><span class="tier">Core</span> Why is next-token cross-entropy the maximum-likelihood objective? Derive it.</summary>
     <div class="answer">
-      <p>MLE maximizes \(\sum_i \log p_\theta(x^{(i)})\). By the chain rule \(\log p_\theta(x) = \sum_t \log p_\theta(x_{t+1} \mid x_{\le t})\). Negating and dividing by the number of supervised positions \(N\) gives \(\mathcal{L}(\theta) = -\frac{1}{N}\sum \log p_\theta(x_{t+1} \mid x_{\le t})\), the average negative log-probability of the true next token. Each term is the cross-entropy between the one-hot label \(e_y\) and \(\softmax(z_t)\), that is \(\operatorname{logsumexp}(z_t) - z_{t,y}\), with gradient \(\softmax(z_t) - e_y\).</p>
+      <p>MLE maximizes \(\sum_i \log p_\theta(x^{(i)})\). By the chain rule \(\log p_\theta(x) = \sum_t \log p_\theta(x_{t+1} \mid x_{\le t})\). Negating and dividing by the number of supervised positions \(M\) gives \(\mathcal{L}(\theta) = -\frac{1}{M}\sum \log p_\theta(x_{t+1} \mid x_{\le t})\), the average negative log-probability of the true next token. Each term is the cross-entropy between the one-hot label \(e_y\) and \(\softmax(z_t)\), that is \(\operatorname{logsumexp}(z_t) - z_{t,y}\), with gradient \(\softmax(z_t) - e_y\).</p>
       <p>Equivalently, in expectation \(H(p_{\text{data}}, p_\theta) = H(p_{\text{data}}) + \KL(p_{\text{data}} \,\|\, p_\theta)\), so minimizing cross-entropy minimizes the KL divergence to the data distribution; the entropy term is constant in \(\theta\) and is the floor on the loss. Teacher forcing is what makes every term computable from the data in parallel.</p>
     </div>
   </details>

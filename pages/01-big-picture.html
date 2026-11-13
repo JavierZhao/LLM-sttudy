@@ -196,7 +196,7 @@ def generate(model, ids, max_new_tokens, eos_id):
   <div class="eq-label">Next-token cross-entropy = mean negative log-likelihood = maximum likelihood</div>
   </div>
 
-  <p>Two identities are worth having ready. First, the loss at one position is the cross-entropy between the one-hot label \(e_y\) and the softmax, and it simplifies to</p>
+  <p>Two identities are worth having ready. First, the loss at one position is the cross-entropy between the one-hot label \(e_y\) (where \(y = x_{t+1}\) is the vocabulary index of the true next token) and the softmax, and it simplifies to</p>
   \[ \ell_t = -\log \softmax(z_t)_y = \operatorname{logsumexp}(z_t) - z_{t,y}, \qquad \frac{\partial \ell_t}{\partial z_t} = \softmax(z_t) - e_y . \]
   <p>The gradient is "prediction minus target", exactly as in logistic regression, applied at every position. Second, in expectation over prefixes drawn from the data, the per-token loss decomposes as</p>
   \[ \E_{p_{\text{data}}}[\mathcal{L}] = H(p_{\text{data}}, p_\theta) = H(p_{\text{data}}) + \KL(p_{\text{data}} \,\|\, p_\theta), \]
